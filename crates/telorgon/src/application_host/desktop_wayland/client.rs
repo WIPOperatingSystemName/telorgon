@@ -645,6 +645,39 @@ pub(super) fn retire_submitted_dma_buf(
 mod maximize_preview_tests {
     use super::*;
 
+    fn test_window(size: SizeI, position: PointI) -> ClientWindow {
+        ClientWindow {
+            revision: 1,
+            role: SurfaceRole::XdgToplevel,
+            parent: None,
+            offset: PointI::default(),
+            server_decorated: true,
+            position,
+            size,
+            image_size: size,
+            window_geometry: RectI {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
+            },
+            requested_size: size,
+            resize_anchor: None,
+            resize_final: None,
+            restore_geometry: None,
+            maximized: false,
+            fullscreen: false,
+            minimized: false,
+            chrome_outer: None,
+            chrome_content_offset: None,
+            chrome: None,
+            alpha_mode: ImageAlphaMode::Opaque,
+            pixel_format: ImagePixelFormat::Rgba8,
+            pending_image_update: PendingClientImageUpdate::Unchanged,
+            pixels: Vec::new(),
+        }
+    }
+
     #[test]
     fn maximize_veils_content_without_an_interactive_grab_and_restore_cancels_it() {
         let surface = WaylandSurfaceId::from_raw(42).unwrap();
@@ -653,39 +686,7 @@ mod maximize_preview_tests {
             height: 480,
         };
         let position = PointI { x: 50, y: 60 };
-        let mut windows = BTreeMap::from([(
-            surface,
-            ClientWindow {
-                revision: 1,
-                role: SurfaceRole::XdgToplevel,
-                parent: None,
-                offset: PointI::default(),
-                server_decorated: true,
-                position,
-                size,
-                image_size: size,
-                window_geometry: RectI {
-                    x: 0,
-                    y: 0,
-                    width: size.width,
-                    height: size.height,
-                },
-                requested_size: size,
-                resize_anchor: None,
-                resize_final: None,
-                restore_geometry: None,
-                maximized: false,
-                fullscreen: false,
-                minimized: false,
-                chrome_outer: None,
-                chrome_content_offset: None,
-                chrome: None,
-                alpha_mode: ImageAlphaMode::Opaque,
-                pixel_format: ImagePixelFormat::Rgba8,
-                pending_image_update: PendingClientImageUpdate::Unchanged,
-                pixels: Vec::new(),
-            },
-        )]);
+        let mut windows = BTreeMap::from([(surface, test_window(size, position))]);
         let mut scheduler = ConfigureScheduler::default();
         let area = RectI {
             x: 0,
@@ -725,5 +726,119 @@ mod maximize_preview_tests {
         assert_eq!(resize_veil_owner(&windows, surface), None);
         assert_eq!(windows[&surface].requested_size, size);
         assert_eq!(windows[&surface].position, position);
+    }
+    #[test]
+    fn titlebar_drag_restores_saved_size_and_continues_without_a_jump() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        let size = SizeI {
+            width: 640,
+            height: 480,
+        };
+        let position = PointI { x: 50, y: 60 };
+        let output = SizeI {
+            width: 1280,
+            height: 800,
+        };
+        let area = RectI {
+            x: 0,
+            y: 0,
+            width: output.width,
+            height: output.height,
+        };
+        let config = LinuxDesktopConfig::default();
+        for fraction in [0.1, 0.5, 0.9] {
+            let mut windows = BTreeMap::from([(surface, test_window(size, position))]);
+            let mut scheduler = ConfigureScheduler::default();
+            set_window_maximized(&mut windows, &mut scheduler, surface, true, area, &config)
+                .unwrap();
+            windows.get_mut(&surface).unwrap().chrome_outer = Some(output);
+            let _ = scheduler.drain().collect::<Vec<_>>();
+            let start = PointF {
+                x: fraction * output.width as f32,
+                y: 12.0,
+            };
+            let mut grab = WindowInteraction::begin_move(&windows, surface, start).unwrap();
+            apply_window_interaction(
+                &mut windows,
+                &mut grab,
+                &mut scheduler,
+                PointF {
+                    x: start.x + 1.0,
+                    y: 13.0,
+                },
+                output,
+                &config,
+            )
+            .unwrap();
+            assert!(windows[&surface].maximized, "click/jitter must not restore");
+            let moved = PointF {
+                x: start.x + 20.0,
+                y: 52.0,
+            };
+            apply_window_interaction(
+                &mut windows,
+                &mut grab,
+                &mut scheduler,
+                moved,
+                output,
+                &config,
+            )
+            .unwrap();
+            let window = &windows[&surface];
+            assert!(!window.maximized);
+            assert_eq!(window.requested_size, size);
+            assert!(window.restore_geometry.is_none());
+            assert!(window.resize_final.is_none());
+            assert_eq!(window.position.y, 40);
+            assert_eq!(
+                window.position.x,
+                (moved.x - fraction * size.width as f32).round() as i32
+            );
+            let restored_position = window.position;
+            let configure = scheduler.drain().next().unwrap();
+            assert_eq!(configure.size, size);
+            assert!(!configure.resizing);
+            apply_window_interaction(
+                &mut windows,
+                &mut grab,
+                &mut scheduler,
+                PointF {
+                    x: moved.x + 10.0,
+                    y: moved.y + 15.0,
+                },
+                output,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(
+                windows[&surface].position,
+                PointI {
+                    x: restored_position.x + 10,
+                    y: restored_position.y + 15
+                }
+            );
+            finish_window_interaction(&mut windows, &mut scheduler, grab);
+            assert!(scheduler.drain().next().is_none());
+        }
+    }
+
+    #[test]
+    fn true_fullscreen_and_minimized_windows_do_not_begin_titlebar_moves() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        let mut windows = BTreeMap::from([(
+            surface,
+            test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI::default(),
+            ),
+        )]);
+        windows.get_mut(&surface).unwrap().fullscreen = true;
+        assert!(WindowInteraction::begin_move(&windows, surface, PointF::default()).is_none());
+        windows.get_mut(&surface).unwrap().fullscreen = false;
+        windows.get_mut(&surface).unwrap().minimized = true;
+        assert!(WindowInteraction::begin_move(&windows, surface, PointF::default()).is_none());
     }
 }

@@ -12,6 +12,20 @@ retains the authored title bar; normal and tiled states retain their authored bo
 continues to use the saved client size and position. True fullscreen keeps its existing separate
 output-sized, undecorated host path. No physical/logical conversion is added here.
 
+## Drag to restore
+
+Dragging a maximized title bar restores the saved normal client size after four logical units
+of pointer motion. A click or smaller movement leaves it maximized. The restored window is
+positioned using the horizontal grab fraction and title-bar vertical offset, and the ongoing
+move grab is rebased there so subsequent motion does not jump to the old maximized origin.
+The host clears any pending maximize placeholder and sends a normal-state configure at the
+saved client size. Both compositor title bars and authorized client move requests use this path;
+true fullscreen and minimized windows remain ineligible for these moves.
+
+CPU regressions cover left/center/right grabs, pointer jitter, normal-size restoration, subsequent
+motion, configure state, and cancellation of the maximize placeholder. Interactive verification
+remains necessary on the running compositor.
+
 ## Content placeholder
 
 Maximizing uses the same `resize_preview_color` placeholder as interactive resizing. It hides

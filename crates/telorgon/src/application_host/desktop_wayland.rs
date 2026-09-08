@@ -632,10 +632,11 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                     &config,
                                 )
                             });
-                            if let Some(interaction) = window_interaction {
+                            if let Some(interaction) = window_interaction.as_mut() {
                                 apply_window_interaction(
                                     &mut windows,
                                     interaction,
+                                    &mut configure_scheduler,
                                     pointer_position,
                                     extent,
                                     &config,
@@ -723,10 +724,11 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                     &config,
                                 )
                             });
-                            if let Some(interaction) = window_interaction {
+                            if let Some(interaction) = window_interaction.as_mut() {
                                 apply_window_interaction(
                                     &mut windows,
                                     interaction,
+                                    &mut configure_scheduler,
                                     pointer_position,
                                     extent,
                                     &config,
@@ -1704,14 +1706,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     }
                 }
                 CompositorAction::MoveToplevel(surface) => {
-                    if windows.get(&surface).is_some_and(|window| {
-                        !window.maximized && !window.fullscreen && !window.minimized
-                    }) && wayland
-                        .core()
-                        .seats
-                        .get(&1)
-                        .and_then(|seat| seat.pointer_grab_focus())
-                        .is_some_and(|focus| focus.surface == surface)
+                    if windows
+                        .get(&surface)
+                        .is_some_and(|window| !window.fullscreen && !window.minimized)
+                        && wayland
+                            .core()
+                            .seats
+                            .get(&1)
+                            .and_then(|seat| seat.pointer_grab_focus())
+                            .is_some_and(|focus| focus.surface == surface)
                     {
                         window_interaction =
                             WindowInteraction::begin_move(&windows, surface, pointer_position);

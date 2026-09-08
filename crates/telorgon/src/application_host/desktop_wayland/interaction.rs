@@ -23,6 +23,12 @@ impl WindowInteraction {
         pointer_start: PointF,
     ) -> Option<Self> {
         let window = windows.get(&surface)?;
+        if window.fullscreen
+            || window.minimized
+            || (window.maximized && window.restore_geometry.is_none())
+        {
+            return None;
+        }
         Some(Self::Move {
             surface,
             pointer_start,
@@ -60,12 +66,13 @@ impl WindowInteraction {
 
 pub(super) fn apply_window_interaction(
     windows: &mut BTreeMap<WaylandSurfaceId, ClientWindow>,
-    interaction: WindowInteraction,
+    interaction: &mut WindowInteraction,
+    configure_scheduler: &mut ConfigureScheduler,
     pointer_position: PointF,
     output: SizeI,
     config: &LinuxDesktopConfig,
 ) -> AppResult<()> {
-    match interaction {
+    match *interaction {
         WindowInteraction::Move {
             surface,
             pointer_start,
@@ -74,11 +81,49 @@ pub(super) fn apply_window_interaction(
             let Some(window) = windows.get_mut(&surface) else {
                 return Ok(());
             };
+            if window.maximized {
+                // Keep a click (or small pointer jitter) from restoring the window.
+                if (pointer_position.x - pointer_start.x)
+                    .hypot(pointer_position.y - pointer_start.y)
+                    < 4.0
+                {
+                    return Ok(());
+                }
+                let Some((_, restored_size)) = window.restore_geometry.take() else {
+                    return Ok(());
+                };
+                let outer_width = window
+                    .chrome_outer
+                    .map_or(window.requested_size.width, |s| s.width)
+                    .max(1);
+                let grab_fraction = ((pointer_start.x - window.position.x as f32)
+                    / outer_width as f32)
+                    .clamp(0.0, 1.0);
+                let grab_y = (pointer_start.y - window.position.y as f32).max(0.0);
+                window.maximized = false;
+                window.resize_anchor = None;
+                window.resize_final = None;
+                window.requested_size = restored_size;
+                window.position = PointI {
+                    x: (pointer_position.x - grab_fraction * restored_size.width as f32).round()
+                        as i32,
+                    y: (pointer_position.y - grab_y).round().max(0.0) as i32,
+                };
+                // Rebase the ongoing grab so the next motion continues from the restored
+                // position rather than jumping back to the maximized origin.
+                *interaction = WindowInteraction::Move {
+                    surface,
+                    pointer_start: pointer_position,
+                    position_start: window.position,
+                };
+                configure_scheduler.schedule_final(surface, restored_size);
+                return Ok(());
+            }
             let delta = rounded_pointer_delta(pointer_start, pointer_position);
-            window.position.x = position_start
-                .x
-                .saturating_add(delta.x)
-                .clamp(32_i32.saturating_sub(window.size.width), output.width - 32);
+            window.position.x = position_start.x.saturating_add(delta.x).clamp(
+                32_i32.saturating_sub(window.requested_size.width),
+                output.width - 32,
+            );
             window.position.y = position_start
                 .y
                 .saturating_add(delta.y)
