@@ -39,7 +39,7 @@ pub(super) struct ConfigureScheduler {
     pending: BTreeMap<WaylandSurfaceId, PendingResizeConfigure>,
 }
 
-/// The terminal configure for one interactive resize.
+/// The terminal configure for an interactive resize or a maximization.
 ///
 /// The size is known when the pointer grab ends, but the protocol serial does not exist until the
 /// scheduler emits the configure. Keeping both prevents an older activation configure with the
@@ -716,5 +716,37 @@ mod tests {
             ),
             PointI { x: 68, y: 56 }
         );
+    }
+    #[test]
+    fn measured_maximize_size_requires_its_own_configure_acknowledgement() {
+        use crate::compositor_wayland::{DecorationMode, ToplevelState};
+        let fallback = SizeI {
+            width: 1272,
+            height: 760,
+        };
+        let measured = SizeI {
+            width: 1280,
+            height: 776,
+        };
+        let ack = |serial, size| XdgConfigure {
+            serial,
+            size: Some(size),
+            bounds: None,
+            states: ToplevelState {
+                maximized: true,
+                ..ToplevelState::default()
+            },
+            decoration: DecorationMode::ServerSide,
+        };
+        let mut transition = FinalResizeConfigure::pending(fallback);
+        transition.record_sent(fallback, 10);
+        transition = FinalResizeConfigure::pending(measured);
+        transition.observe_acknowledgement(Some(ack(10, fallback)));
+        assert!(!transition.was_acknowledged());
+        transition.record_sent(measured, 11);
+        transition.observe_acknowledgement(Some(ack(10, fallback)));
+        assert!(!transition.was_acknowledged());
+        transition.observe_acknowledgement(Some(ack(11, measured)));
+        assert!(transition.was_acknowledged());
     }
 }

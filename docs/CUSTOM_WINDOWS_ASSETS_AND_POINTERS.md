@@ -410,7 +410,11 @@ their normal composed backing; during resize the host still excludes that backin
 The curved border segment inside the rectangular content slot is retained even when content is
 transparent. Undecorated/client-decorated windows keep their client-authored shape and use the Linux
 configuration's preview color. No new design fields are required for rounded clipping.
-See [resize-preview behavior and verification](WAYLAND_RESIZE_PREVIEW.md).
+The same placeholder is shown while maximizing until newly configured client content is published.
+It uses the existing preview color and alpha settings; no extra application configuration is needed.
+
+See [resize-preview behavior and verification](WAYLAND_RESIZE_PREVIEW.md) and
+[maximized window geometry](MAXIMIZED_WINDOW_GEOMETRY.md).
 
 `Compositor::icon(name, component)` remains a separate semantic icon registry for compositor-wide
 artwork such as cursor or legacy fallback names. It is not where `EasyWindowFrame` receives its

@@ -212,7 +212,8 @@ pub(super) fn resize_veil_owner(
     for _ in 0..=windows.len() {
         let window = windows.get(&candidate)?;
         if window.role == SurfaceRole::XdgToplevel {
-            return window.resize_anchor.is_some().then_some(candidate);
+            return (window.resize_anchor.is_some() || window.resize_final.is_some())
+                .then_some(candidate);
         }
         candidate = window.parent?;
     }
@@ -638,4 +639,91 @@ pub(super) fn retire_submitted_dma_buf(
             .map_err(app_error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod maximize_preview_tests {
+    use super::*;
+
+    #[test]
+    fn maximize_veils_content_without_an_interactive_grab_and_restore_cancels_it() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        let size = SizeI {
+            width: 640,
+            height: 480,
+        };
+        let position = PointI { x: 50, y: 60 };
+        let mut windows = BTreeMap::from([(
+            surface,
+            ClientWindow {
+                revision: 1,
+                role: SurfaceRole::XdgToplevel,
+                parent: None,
+                offset: PointI::default(),
+                server_decorated: true,
+                position,
+                size,
+                image_size: size,
+                window_geometry: RectI {
+                    x: 0,
+                    y: 0,
+                    width: size.width,
+                    height: size.height,
+                },
+                requested_size: size,
+                resize_anchor: None,
+                resize_final: None,
+                restore_geometry: None,
+                maximized: false,
+                fullscreen: false,
+                minimized: false,
+                chrome_outer: None,
+                chrome_content_offset: None,
+                chrome: None,
+                alpha_mode: ImageAlphaMode::Opaque,
+                pixel_format: ImagePixelFormat::Rgba8,
+                pending_image_update: PendingClientImageUpdate::Unchanged,
+                pixels: Vec::new(),
+            },
+        )]);
+        let mut scheduler = ConfigureScheduler::default();
+        let area = RectI {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        assert_eq!(resize_veil_owner(&windows, surface), None);
+        set_window_maximized(
+            &mut windows,
+            &mut scheduler,
+            surface,
+            true,
+            area,
+            &LinuxDesktopConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(resize_veil_owner(&windows, surface), Some(surface));
+        let window = windows.get(&surface).unwrap();
+        assert!(
+            !window.resizing(),
+            "maximize must not advertise an interactive pointer resize"
+        );
+        assert_eq!(window.resize_final.unwrap().size, window.requested_size);
+        let pending = scheduler.drain().next().unwrap();
+        assert!(!pending.resizing);
+        assert_eq!(pending.size, window.requested_size);
+        set_window_maximized(
+            &mut windows,
+            &mut scheduler,
+            surface,
+            false,
+            area,
+            &LinuxDesktopConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(resize_veil_owner(&windows, surface), None);
+        assert_eq!(windows[&surface].requested_size, size);
+        assert_eq!(windows[&surface].position, position);
+    }
 }

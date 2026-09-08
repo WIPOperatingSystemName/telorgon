@@ -322,6 +322,9 @@ pub(super) fn refresh_window_frames(
                 };
                 if window.requested_size != content_size {
                     window.requested_size = content_size;
+                    // A measured custom-frame size supersedes the fallback configure. Keep
+                    // the placeholder until content for this new transaction is published.
+                    window.resize_final = Some(FinalResizeConfigure::pending(content_size));
                     configure_scheduler.schedule_final(surface, content_size);
                 }
             }

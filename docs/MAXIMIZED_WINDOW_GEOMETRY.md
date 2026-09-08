@@ -12,6 +12,19 @@ retains the authored title bar; normal and tiled states retain their authored bo
 continues to use the saved client size and position. True fullscreen keeps its existing separate
 output-sized, undecorated host path. No physical/logical conversion is added here.
 
+## Content placeholder
+
+Maximizing uses the same `resize_preview_color` placeholder as interactive resizing. It hides
+the existing client content until the terminal configure is acknowledged and a corresponding
+surface publication is applied. Custom frame measurement replaces the pending transaction when
+it supersedes the fallback size, so an acknowledgement for the fallback cannot reveal old pixels.
+The title bar remains visible, and maximizing does not set the protocol's interactive `resizing`
+state. Restoring before completion cancels the pending maximize placeholder.
+
+The existing resize scene/alpha/commit regressions also cover the shared rendering path. Additional
+CPU checks verify maximize starts the veil without a pointer grab, restore cancels it and preserves
+saved geometry, and the measured configure requires its own acknowledgement.
+
 ## Reference audit
 
 The adjacent reference checkout is unavailable. Following the reference guide's bounded-change

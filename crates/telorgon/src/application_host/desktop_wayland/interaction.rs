@@ -224,6 +224,9 @@ pub(super) fn set_window_maximized(
             window.requested_size = size;
         }
     }
+    if maximized {
+        window.resize_final = Some(FinalResizeConfigure::pending(window.requested_size));
+    }
     configure_scheduler.schedule_final(surface, window.requested_size);
     Ok(())
 }
