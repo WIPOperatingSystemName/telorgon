@@ -91,8 +91,10 @@ changes, monitor hotplug, and moving surfaces between differently scaled outputs
   unchanged. Larger raster glyphs still consume the existing bounded atlas capacity.
 - Client windows store both logical surface size and retained image pixel size. SHM transforms sample
   the original buffer directly into an output-density image, avoiding a 1x intermediate that would
-  discard HiDPI detail. The simple untransformed scale-1 path keeps its original image and damage
-  patches. DMA-BUF materialization also targets output density. Buffer scale, transform, and viewport
+  discard HiDPI detail. Untransformed, uncropped SHM images already at the target raster extent reuse
+  their original pixels, including integer HiDPI and fractional-scale viewporter clients; logical
+  geometry is still computed independently. The simple untransformed scale-1 path also keeps its
+  damage patches. DMA-BUF materialization also targets output density. Buffer scale, transform, and viewport
   validation remain in force. SHM allocations retain the 512 MiB bound; Vulkan targets retain device
   extent validation. Existing asynchronous copy, acquire/release, and KMS retirement ownership remain
   intact; logical conversions do not shorten image or scene lifetimes.
@@ -112,6 +114,27 @@ integer-scale clients render at the next integer scale and are resampled to the 
 A client that ignores scaling can still appear blurry when enlarged.
 
 ## Reference review and derived checks
+
+Resize-latency follow-up: the identity SHM mapping now skips allocation and per-pixel sampling after
+the existing scale, source, destination, and allocation-limit validation. Equal raster extents alone
+are insufficient: crops and rotations must still sample. No native-buffer lifetime, configure,
+callback, or placeholder-release rules change. The adjacent reference library remains unavailable;
+this bounded CPU optimization follows the existing coordinate contract, cross-checked against
+the official [surface buffer-scale specification](https://raw.githubusercontent.com/wayland-mirror/wayland/main/protocol/wayland.xml)
+and [viewporter transformation order](https://raw.githubusercontent.com/wayland-mirror/wayland-protocols/main/stable/viewporter/viewporter.xml).
+Tests assert shared pixel allocation for integer/fractional identity mappings and correct pixels
+for same-size cropped/rotated mappings. Returning early solely on matching dimensions was rejected
+because it would ignore those transformations.
+
+The CPU-only `native_density_image_preparation_timing` ignored test measures just this mapping step
+over ten preparations of a 3840×2400 image at 300%. In a local unoptimized test build it changed from
+296.7 ms to 2.3 microseconds per call. This excludes SHM reads, client drawing, retained-image copies,
+GPU upload, and presentation; it is not an end-to-end resize latency claim. Run explicitly with:
+
+```sh
+cargo test -p telorgon --lib --no-default-features --features desktop-wayland-linux \
+  native_density_image_preparation_timing --offline -- --ignored --nocapture
+```
 
 The adjacent `../other-rendering-libs` library was absent in this checkout. The routing in
 [Reference implementations](REFERENCE_IMPLEMENTATIONS.md) was followed with available upstream

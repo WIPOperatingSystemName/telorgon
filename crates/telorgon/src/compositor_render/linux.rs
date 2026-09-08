@@ -296,6 +296,18 @@ pub fn transform_surface_image_at_scale(
         .and_then(|pixels| pixels.checked_mul(4))
         .filter(|bytes| *bytes <= 512 * 1024 * 1024)
         .ok_or_else(|| CompositorRenderError::new("viewport destination is too large"))?;
+    // Integer HiDPI and fractional-scale viewporter clients commonly supply the exact
+    // output-density raster already. Keep its pixels while publishing logical geometry;
+    // resampling this identity mapping needlessly visits every pixel after a resize.
+    if transform == BufferTransform::Normal
+        && raster == image.extent
+        && source.x == 0.0
+        && source.y == 0.0
+        && source.width == logical_width as f64
+        && source.height == logical_height as f64
+    {
+        return Ok((image, destination));
+    }
     let mut pixels = vec![0_u8; destination_len];
     for y in 0..destination_height {
         for x in 0..destination_width {
@@ -524,6 +536,40 @@ mod tests {
     use crate::core::SizeI;
 
     #[test]
+    #[ignore = "CPU-only timing probe; run explicitly with --ignored --nocapture"]
+    fn native_density_image_preparation_timing() {
+        let image = ImageResource {
+            image: ImageId(7),
+            content_version: 1,
+            extent: SizeI {
+                width: 3840,
+                height: 2400,
+            },
+            color_encoding: ImageColorEncoding::Srgb,
+            alpha_mode: ImageAlphaMode::Opaque,
+            pixel_format: ImagePixelFormat::Bgra8,
+            pixels: vec![127; 3840 * 2400 * 4].into(),
+        };
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(
+                transform_surface_image_at_scale(
+                    std::hint::black_box(image.clone()),
+                    3,
+                    BufferTransform::Normal,
+                    None,
+                    crate::platform::ScaleFactor::new(3.0).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        eprintln!(
+            "3840x2400 at 300%: {:?} per preparation (10 iterations)",
+            start.elapsed() / 10
+        );
+    }
+
+    #[test]
     fn xrgb_shm_retains_native_bgra_bytes_and_is_forced_opaque() {
         let buffer = WaylandBufferId::from_raw(7).unwrap();
         let resource = shm_image_resource(
@@ -585,6 +631,56 @@ mod tests {
     }
 
     #[test]
+    fn same_raster_extent_still_applies_cropping_and_rotation() {
+        let image = ImageResource {
+            image: ImageId(7),
+            content_version: 1,
+            extent: SizeI {
+                width: 2,
+                height: 2,
+            },
+            color_encoding: ImageColorEncoding::Srgb,
+            alpha_mode: ImageAlphaMode::Opaque,
+            pixel_format: ImagePixelFormat::Rgba8,
+            pixels: Arc::from([1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255]),
+        };
+        let (cropped, _) = transform_surface_image_at_scale(
+            image.clone(),
+            1,
+            BufferTransform::Normal,
+            Some(ViewportState {
+                source: Some(ViewportSource {
+                    x: 1.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 2.0,
+                }),
+                destination: Some(image.extent),
+            }),
+            crate::platform::ScaleFactor::new(1.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cropped.extent, image.extent);
+        assert_eq!(
+            &*cropped.pixels,
+            &[2, 0, 0, 255, 2, 0, 0, 255, 4, 0, 0, 255, 4, 0, 0, 255]
+        );
+        let (rotated, _) = transform_surface_image_at_scale(
+            image.clone(),
+            2,
+            BufferTransform::Rotate90,
+            None,
+            crate::platform::ScaleFactor::new(2.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rotated.extent, image.extent);
+        assert_eq!(
+            &*rotated.pixels,
+            &[3, 0, 0, 255, 1, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255]
+        );
+    }
+
+    #[test]
     fn surface_transform_scale_and_viewport_change_the_retained_extent() {
         let image = ImageResource {
             image: ImageId(7),
@@ -616,6 +712,7 @@ mod tests {
             }
         );
         assert_eq!(dense.extent, image.extent);
+        assert!(Arc::ptr_eq(&dense.pixels, &image.pixels));
         assert_eq!(
             dense.pixels, image.pixels,
             "2x client detail must survive materialization"
@@ -643,6 +740,7 @@ mod tests {
         );
         assert_eq!(fractional.extent, image.extent);
         assert_eq!(fractional.pixels, image.pixels);
+        assert!(Arc::ptr_eq(&fractional.pixels, &image.pixels));
         assert!(
             transform_surface_image_at_scale(
                 image.clone(),
