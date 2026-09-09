@@ -13,6 +13,8 @@ pub(super) struct ClientWindow {
     pub(super) window_geometry: RectI,
     pub(super) requested_size: SizeI,
     pub(super) native_configure: NativeConfigureState,
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    pub(super) resize_preview: super::x11_windows::ResizePreview,
     pub(super) restore_geometry: Option<(PointI, SizeI)>,
     pub(super) maximized: bool,
     pub(super) fullscreen: bool,
@@ -140,7 +142,20 @@ impl PreparedClientImage {
 }
 
 impl ClientWindow {
+    pub(super) fn resize_veil_active(&self) -> bool {
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if self.resize_preview.active() {
+            return true;
+        }
+        self.native_configure.resize_anchor.is_some()
+            || self.native_configure.resize_final.is_some()
+    }
+
     pub(super) fn resizing(&self) -> bool {
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if self.resize_preview.dragging() {
+            return true;
+        }
         self.native_configure.resize_anchor.is_some()
             && self.native_configure.resize_final.is_none()
     }
@@ -222,10 +237,11 @@ pub(super) fn resize_veil_owner(
     let mut candidate = surface;
     for _ in 0..=windows.len() {
         let window = windows.get(&candidate)?;
-        if window.role == SurfaceRole::XdgToplevel {
-            return (window.native_configure.resize_anchor.is_some()
-                || window.native_configure.resize_final.is_some())
-            .then_some(candidate);
+        if matches!(
+            window.role,
+            SurfaceRole::XdgToplevel | SurfaceRole::Xwayland
+        ) {
+            return window.resize_veil_active().then_some(candidate);
         }
         candidate = window.parent?;
     }
@@ -477,6 +493,8 @@ pub(super) fn apply_surface_publication(
                 chrome_outer,
                 chrome_content_offset,
                 chrome,
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                resize_preview: Default::default(),
                 native_configure: NativeConfigureState {
                     resize_anchor,
                     resize_final: retained_resize_final,
@@ -755,6 +773,8 @@ pub(super) mod maximize_preview_tests {
                 height: size.height,
             },
             requested_size: size,
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            resize_preview: Default::default(),
             native_configure: NativeConfigureState::default(),
             restore_geometry: None,
             maximized: false,

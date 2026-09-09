@@ -31,7 +31,14 @@ coalesced X11 configure commands. Only native windows use xdg configure/ack stat
 X11 server notifications cannot overwrite an in-progress compositor drag.
 Normal X11 windows receive the configured frame template; override-redirect
 windows remain unmanaged. Title metadata is bounded and encoding-checked.
-There is no Alt-drag special case. Full EWMH state/iconification, decoration hints,
+There is no Alt-drag special case. The shared resize-veil predicate now accepts
+either native configure state or X11 resize-completion state; both use the same
+RGBA solid layer, content clip and client-subtree/input suppression. X11 does not
+resize the client for intermediate drag sizes. After release it waits for checked
+server geometry and a newer published image matching the final size; a no-op can
+reuse an already matching image. Superseding grabs discard old targets, measured
+maximized chrome can restart the veil, and timeout is never treated as image
+completion. The existing image/GPU retirement paths are unchanged. Full EWMH state/iconification, decoration hints,
 X11 application icon metadata and the broader compatibility matrix remain separate work.
 
 Reference review for this change reused Telorgon's existing frame, geometry and

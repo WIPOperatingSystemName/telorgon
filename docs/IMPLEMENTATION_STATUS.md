@@ -12,7 +12,11 @@
 > titlebar hit tests and desktop geometry/state actions as native windows, with backend
 > dispatch for focus/close and a separate X11 geometry adapter. The temporary Alt-drag
 > gesture was removed. X11 titles use bounded UTF-8/legacy property readers; popups remain
-> unframed. Live frame/control validation is pending.
+> unframed. The user confirmed the framed window rendering. Resize previews now use the
+> shared RGBA veil and subtree suppression. X11 defers resizing until release and settles
+> against checked server geometry plus matching published content, without xdg acknowledgements.
+> No-op resizes reuse matching content; delayed content and new grabs cannot settle stale targets.
+> The resize-veil change awaits live validation.
 > This user-reported smoke result does not establish the wider hardware/application matrix.
 > Shared activation-environment updates, explicit X11-required launch errors, restarts,
 > broader desktop policy, accelerated capabilities and application/hardware qualification

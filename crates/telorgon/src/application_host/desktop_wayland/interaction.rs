@@ -56,6 +56,12 @@ impl WindowInteraction {
             // Announce the grab without asking the client to redraw at every intermediate size.
             configure_scheduler.schedule_resize(surface, window.configure_size());
         }
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if matches!(window.backend, Some(WindowBackend::X11(_))) {
+            window
+                .resize_preview
+                .begin(window.position, window.requested_size, edge);
+        }
         Some(Self::Resize {
             surface,
             edge,
@@ -103,6 +109,10 @@ pub(super) fn apply_window_interaction(
                     .clamp(0.0, 1.0);
                 let grab_y = (pointer_start.y - window.position.y as f32).max(0.0);
                 window.maximized = false;
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                {
+                    window.resize_preview = Default::default();
+                }
                 window.native_configure.resize_anchor = None;
                 window.native_configure.resize_final = None;
                 window.requested_size = restored_size;
@@ -159,6 +169,12 @@ pub(super) fn finish_window_interaction(
     let WindowInteraction::Resize { surface, .. } = interaction else {
         return;
     };
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    if let Some(window) = windows.get_mut(&surface) {
+        if matches!(window.backend, Some(WindowBackend::X11(_))) {
+            window.resize_preview.finish();
+        }
+    }
     if let Some(window) = windows
         .get_mut(&surface)
         .filter(|window| window.backend == Some(WindowBackend::Wayland))
@@ -244,6 +260,10 @@ pub(super) fn set_window_maximized(
     let Some(window) = windows.get_mut(&surface) else {
         return Ok(());
     };
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    {
+        window.resize_preview = Default::default();
+    }
     window.native_configure.resize_anchor = None;
     window.native_configure.resize_final = None;
     if maximized {
@@ -278,6 +298,10 @@ pub(super) fn set_window_maximized(
             window.requested_size = size;
         }
     }
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    if maximized && matches!(window.backend, Some(WindowBackend::X11(_))) {
+        window.resize_preview.finish();
+    }
     if maximized && window.backend == Some(WindowBackend::Wayland) {
         window.native_configure.resize_final =
             Some(FinalResizeConfigure::pending(window.requested_size));
@@ -297,6 +321,10 @@ pub(super) fn set_window_fullscreen(
     let Some(window) = windows.get_mut(&surface) else {
         return Ok(());
     };
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    {
+        window.resize_preview = Default::default();
+    }
     window.native_configure.resize_anchor = None;
     window.native_configure.resize_final = None;
     if fullscreen {

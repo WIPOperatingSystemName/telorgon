@@ -5,7 +5,8 @@ The real patched Xwayland 24.1.13 payload was built on 2026-09-09 at
 uses that path by default and enables the embedded compatibility feature.
 Build logs and the helper-test results are in `../xwayland-build/` relative to
 the Telorgon repository. On 2026-09-09 the user reported that the fixture spawns
-and is interactable; moving it was missing. This is user-reported smoke evidence,
+and is interactable, and subsequently confirmed the integrated frame/rendering.
+The resize veil was missing and has now been connected. This is user-reported smoke evidence,
 not completion of every test below.
 **Do not execute an artifact built with `/tmp/telorgon-host-COMPILE-ONLY.payload`.**
 
@@ -51,6 +52,10 @@ Repository guidance reserves interactive and hardware-presenting runs for the us
    xmessage manual.
 5. Confirm the fixture uses the same custom frame as Foot, with its X11 title.
    Drag the titlebar normally (no modifier), then resize from edges/corners.
+   While dragging, check that the same configured RGBA resize veil as Foot covers
+   the content. On release, it should remain until the final-sized client content
+   arrives, then reveal that content. A click/release without changing size must
+   not leave a stuck veil. Repeat from top/left edges and with a rapid second resize.
    Check that content remains clickable at its new location. Maximize, restore,
    and close with the frame controls; compare appearance and behavior with Foot.
    Check minimize in a separate run (the existing desktop's local visibility policy

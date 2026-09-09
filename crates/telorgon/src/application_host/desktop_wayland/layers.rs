@@ -328,6 +328,12 @@ pub(super) fn refresh_window_frames(
                         window.native_configure.resize_final =
                             Some(FinalResizeConfigure::pending(content_size));
                     }
+                    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                    if matches!(window.backend, Some(WindowBackend::X11(_))) {
+                        // Measured chrome can supersede an earlier fallback size
+                        // even after that earlier client image has arrived.
+                        window.resize_preview.finish();
+                    }
                     configure_scheduler.schedule_final(surface, content_size);
                 }
             }
@@ -502,7 +508,8 @@ pub(super) fn prepare_desktop_layers(
         })
         .collect::<BTreeMap<_, _>>();
     for surface in stacking_order {
-        let veiled = resize_veil_owner(windows, *surface).is_some();
+        let veil_owner = resize_veil_owner(windows, *surface);
+        let veiled = veil_owner.is_some();
         // Only subsurfaces inherit their toplevel's clip. Popups are independent overlays and
         // may legitimately extend beyond the parent window.
         let mut owner = Some(*surface);
@@ -640,7 +647,7 @@ pub(super) fn prepare_desktop_layers(
         }
         // The live resize preview is a solid retained primitive. Keep the image scene and its
         // pending pixels intact, but do not upload or draw them underneath even a transparent veil.
-        if visible && window.role == SurfaceRole::XdgToplevel && veiled {
+        if visible && veil_owner == Some(*surface) {
             let mut preview = DesktopLayer::solid(
                 DesktopLayerKey::ResizeVeil(surface.get()),
                 DesktopSceneKey::ResizeVeil(surface.get()),
@@ -848,6 +855,132 @@ mod maximize_tests {
 
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
     #[test]
+    fn both_backends_draw_the_same_rgba_veil_and_hide_client_subtrees() {
+        use super::super::client::maximize_preview_tests::test_window;
+        use super::super::scene::DesktopLayerContent;
+        let root = WaylandSurfaceId::from_raw(20).unwrap();
+        let child = WaylandSurfaceId::from_raw(21).unwrap();
+        let color = crate::core::ColorRgba8::rgba(20, 40, 60, 96);
+        let config = LinuxDesktopConfig {
+            resize_preview_color: color,
+            ..Default::default()
+        };
+        for backend in [
+            WindowBackend::Wayland,
+            WindowBackend::X11(crate::xwayland::association::XWindow {
+                generation: 1,
+                xid: 10,
+                incarnation: 1,
+            }),
+        ] {
+            let mut image = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI { x: 100, y: 100 },
+            );
+            image.backend = Some(backend);
+            if matches!(backend, WindowBackend::X11(_)) {
+                image.role = SurfaceRole::Xwayland;
+            }
+            let mut sub = test_window(
+                SizeI {
+                    width: 30,
+                    height: 20,
+                },
+                PointI { x: 110, y: 140 },
+            );
+            sub.role = SurfaceRole::Subsurface;
+            sub.backend = None;
+            sub.server_decorated = false;
+            sub.parent = Some(root);
+            sub.offset = PointI { x: 10, y: 10 };
+            let mut windows = BTreeMap::from([(root, image), (child, sub)]);
+            let mut scheduler = ConfigureScheduler::default();
+            let interaction = WindowInteraction::begin_resize(
+                &mut windows,
+                &mut scheduler,
+                root,
+                ResizeEdge::BottomRight,
+                PointF::default(),
+            )
+            .unwrap();
+            for finishing in [false, true] {
+                if finishing {
+                    finish_window_interaction(&mut windows, &mut scheduler, interaction);
+                }
+                assert_eq!(resize_veil_owner(&windows, child), Some(root));
+                let mut background = Layer::new(
+                    CompositionDriver::for_target(
+                        TestFrame { title_height: 32.0 },
+                        RuntimeTarget::Compositor,
+                    ),
+                    SizeI {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    AssetBundle::default(),
+                    crate::platform::ScaleFactor::new(1.0).unwrap(),
+                )
+                .unwrap();
+                let layers = prepare_desktop_layers(
+                    false,
+                    SizeI {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    0,
+                    true,
+                    &mut background,
+                    &mut BTreeMap::new(),
+                    &mut windows,
+                    &[root, child],
+                    &mut [],
+                    &mut [],
+                    &mut None,
+                    None,
+                    PointF::default(),
+                    None,
+                    PointF::default(),
+                    &config,
+                )
+                .unwrap();
+                let veil = layers
+                    .iter()
+                    .find(|layer| layer.key == DesktopLayerKey::ResizeVeil(root.get()))
+                    .unwrap();
+                assert!(veil.visible);
+                assert!(
+                    matches!(veil.content, DesktopLayerContent::Solid { color: actual, .. } if actual == color)
+                );
+                for surface in [root, child] {
+                    let image = layers
+                        .iter()
+                        .find(|layer| layer.key == DesktopLayerKey::Surface(surface.get()))
+                        .unwrap();
+                    assert!(!image.visible);
+                    assert!(matches!(
+                        image.content,
+                        DesktopLayerContent::Image {
+                            update: DesktopImageUpdate::Unchanged,
+                            ..
+                        }
+                    ));
+                }
+                assert_eq!(
+                    layers
+                        .iter()
+                        .filter(|layer| matches!(layer.key, DesktopLayerKey::ResizeVeil(_)))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    #[test]
     fn native_and_x11_windows_use_the_same_composed_frame_template() {
         use super::super::client::maximize_preview_tests::test_window;
         let declaration = crate::application_host::Compositor::new()
@@ -932,6 +1065,61 @@ mod maximize_tests {
             frames[&native].snapshot.as_ref().unwrap().content.bounds,
             frames[&x11].snapshot.as_ref().unwrap().content.bounds
         );
+    }
+
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    #[test]
+    fn measured_maximized_x11_frame_restarts_the_resize_veil() {
+        use super::super::client::maximize_preview_tests::test_window;
+        let declaration = crate::application_host::Compositor::new()
+            .window_frame(|_: WindowChromeModel| TestFrame { title_height: 53.0 })
+            .background(TestFrame { title_height: 53.0 });
+        let display = Display::new().unwrap();
+        let wayland = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let surface = WaylandSurfaceId::from_raw(20).unwrap();
+        let mut window = test_window(
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+            PointI::default(),
+        );
+        window.role = SurfaceRole::Xwayland;
+        window.backend = Some(WindowBackend::X11(crate::xwayland::association::XWindow {
+            generation: 1,
+            xid: 10,
+            incarnation: 1,
+        }));
+        let mut windows = BTreeMap::from([(surface, window)]);
+        let mut scheduler = ConfigureScheduler::default();
+        let area = RectI {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let config = LinuxDesktopConfig::default();
+        set_window_maximized(&mut windows, &mut scheduler, surface, true, area, &config).unwrap();
+        // Simulate the fallback-sized image arriving before the frame is measured.
+        windows.get_mut(&surface).unwrap().resize_preview = Default::default();
+        refresh_window_frames(
+            declaration.window_frame(),
+            &mut BTreeMap::new(),
+            &mut windows,
+            &wayland,
+            &config,
+            AssetBundle::default(),
+            &crate::AppIconProfile::default(),
+            &EventNotifier::new("maximized veil").unwrap(),
+            0,
+            crate::platform::ScaleFactor::new(1.0).unwrap(),
+            area,
+            &mut scheduler,
+        )
+        .unwrap();
+        assert_eq!(windows[&surface].requested_size.height, 747);
+        assert_eq!(resize_veil_owner(&windows, surface), Some(surface));
+        assert!(windows[&surface].native_configure.resize_final.is_none());
     }
 
     #[test]

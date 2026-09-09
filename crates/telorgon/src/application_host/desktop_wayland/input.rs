@@ -265,7 +265,7 @@ pub(super) fn hit_test_decoration(
                 && position.y < content.bottom() as f32
             {
                 // A veil is compositor content, not a hit target for a lower window's controls.
-                if window.native_configure.resize_anchor.is_some() {
+                if window.resize_veil_active() {
                     return Some((*surface, DecorationHit::Frame));
                 }
                 if !window_is_decorated(window) {

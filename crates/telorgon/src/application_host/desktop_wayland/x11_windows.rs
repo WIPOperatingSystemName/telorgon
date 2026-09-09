@@ -7,6 +7,86 @@ use crate::xwayland::{
     xwm::Xwm,
 };
 
+/// X11 completion evidence for the shared resize veil. X11 has no xdg ack:
+/// a changed size needs both a checked server configure and newly published
+/// content at that size. No-op resizes can reuse already matching content.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) enum ResizePreview {
+    #[default]
+    Idle,
+    Dragging {
+        anchor: ResizeAnchor,
+    },
+    Settling {
+        anchor: Option<ResizeAnchor>,
+        target: Option<ResizeTarget>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResizeTarget {
+    size: SizeI,
+    revision_after: Option<u64>,
+}
+
+impl ResizePreview {
+    pub(super) fn active(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+    pub(super) fn dragging(self) -> bool {
+        matches!(self, Self::Dragging { .. })
+    }
+    pub(super) fn begin(&mut self, position: PointI, size: SizeI, edge: ResizeEdge) {
+        *self = Self::Dragging {
+            anchor: ResizeAnchor::new(position, size, edge),
+        };
+    }
+    pub(super) fn finish(&mut self) {
+        let anchor = self.anchor();
+        *self = Self::Settling {
+            anchor,
+            target: None,
+        };
+    }
+    fn anchor(self) -> Option<ResizeAnchor> {
+        match self {
+            Self::Dragging { anchor } => Some(anchor),
+            Self::Settling { anchor, .. } => anchor,
+            Self::Idle => None,
+        }
+    }
+    fn submitted(&mut self, size: SizeI, revision: u64, matching_content: bool) {
+        if let Self::Settling { target, .. } = self {
+            if target.is_none_or(|old| old.size != size) {
+                *target = Some(ResizeTarget {
+                    size,
+                    revision_after: (!matching_content).then_some(revision),
+                });
+            }
+        }
+    }
+    fn settle(&mut self, server: SizeI, content: SizeI, revision: u64, pending: bool) -> bool {
+        let Self::Settling {
+            target: Some(target),
+            ..
+        } = *self
+        else {
+            return false;
+        };
+        if pending
+            || server != target.size
+            || content != target.size
+            || target
+                .revision_after
+                .is_some_and(|minimum| revision <= minimum)
+        {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+}
+
 #[derive(Default)]
 pub(super) struct X11Windows {
     entries: BTreeMap<XWindow, Entry>,
@@ -52,6 +132,7 @@ impl X11Windows {
         config: &LinuxDesktopConfig,
     ) {
         if unmanaged {
+            window.resize_preview = Default::default();
             window.backend = None;
             window.server_decorated = false;
             window.chrome = None;
@@ -72,6 +153,7 @@ impl X11Windows {
         window.backend = Some(WindowBackend::X11(id));
         window.server_decorated = true;
         if fresh {
+            window.resize_preview = Default::default();
             let offset = window_content_offset(window, config);
             window.position = PointI {
                 x: i32::from(geometry.x).saturating_sub(offset.x).max(0),
@@ -93,7 +175,7 @@ impl X11Windows {
         if let Some(request) = self.requests.remove(&id) {
             // Explicit client configure requests enter shared policy. A server
             // ConfigureNotify is confirmation, not authority to undo a drag.
-            if !window.maximized && !window.fullscreen {
+            if !window.maximized && !window.fullscreen && !window.resize_preview.active() {
                 let offset = window_content_offset(window, config);
                 if let Some(x) = request.x {
                     window.position.x = i32::from(x) - offset.x;
@@ -137,6 +219,9 @@ impl X11Windows {
             {
                 continue;
             }
+            if window.resize_preview.dragging() {
+                continue;
+            }
             if !window.maximized && !window.fullscreen {
                 if let Some(hints) = xwm.normal_hints(*id) {
                     let fallback =
@@ -153,13 +238,53 @@ impl X11Windows {
                     changed |= previous_size != window.requested_size;
                 }
             }
-            let desired = frame_geometry(window, config);
-            if entry.sent == Some(desired) || xwm.commands_pending(*id) {
-                continue;
+            if let Some(anchor) = window.resize_preview.anchor() {
+                let previous = window.position;
+                window.position = anchor.reconcile_position(window.position, window.requested_size);
+                changed |= previous != window.position;
             }
-            xwm.configure_window(*id, desired, Instant::now())?;
-            entry.sent = Some(desired);
-            submitted += 1;
+            let desired = frame_geometry(window, config);
+            let Some(server) = xwm
+                .windows()
+                .and_then(|registry| registry.get(id.xid))
+                .map(|window| window.geometry)
+            else {
+                continue;
+            };
+            let server_size = SizeI {
+                width: server.width.into(),
+                height: server.height.into(),
+            };
+            let target_size = SizeI {
+                width: desired.width.into(),
+                height: desired.height.into(),
+            };
+            let pending = xwm.commands_pending(*id);
+            if !pending && entry.sent != Some(desired) {
+                // Register the image revision before issuing the resize request.
+                window.resize_preview.submitted(
+                    target_size,
+                    window.presentation.revision,
+                    server_size == target_size && window.presentation.size == target_size,
+                );
+                xwm.configure_window(*id, desired, Instant::now())?;
+                entry.sent = Some(desired);
+                submitted += 1;
+            } else if !pending && entry.sent == Some(desired) {
+                window.resize_preview.submitted(
+                    target_size,
+                    window.presentation.revision,
+                    !pending
+                        && server_size == target_size
+                        && window.presentation.size == target_size,
+                );
+            }
+            changed |= window.resize_preview.settle(
+                server_size,
+                window.presentation.size,
+                window.presentation.revision,
+                xwm.commands_pending(*id),
+            );
         }
         Ok(changed)
     }
@@ -302,6 +427,57 @@ mod tests {
             )
             .unwrap();
         registry.get(10).unwrap().id
+    }
+
+    #[test]
+    fn resize_preview_waits_for_checked_matching_new_content_and_can_be_superseded() {
+        let old = SizeI {
+            width: 640,
+            height: 480,
+        };
+        let target = SizeI {
+            width: 800,
+            height: 600,
+        };
+        let mut preview = ResizePreview::default();
+        preview.begin(PointI::default(), old, ResizeEdge::BottomRight);
+        assert!(preview.active() && preview.dragging());
+        assert!(!preview.settle(target, target, 9, false));
+        preview.finish();
+        preview.submitted(target, 7, false);
+        assert!(!preview.dragging());
+        assert!(!preview.settle(target, target, 8, true));
+        assert!(!preview.settle(old, target, 8, false));
+        assert!(!preview.settle(target, old, 8, false));
+        assert!(!preview.settle(target, target, 7, false));
+        assert!(preview.settle(target, target, 8, false));
+        assert!(!preview.active());
+
+        preview.begin(PointI::default(), target, ResizeEdge::TopLeft);
+        preview.finish();
+        preview.submitted(old, 9, false);
+        // Another grab invalidates the old final target, even if it arrives late.
+        preview.begin(PointI::default(), old, ResizeEdge::BottomRight);
+        assert!(!preview.settle(old, old, 10, false));
+        preview.finish();
+        assert!(!preview.settle(old, old, 10, false));
+        preview.submitted(target, 10, false);
+        assert!(!preview.settle(old, old, 11, false));
+        assert!(preview.settle(target, target, 11, false));
+    }
+
+    #[test]
+    fn no_op_resize_can_settle_without_a_new_buffer() {
+        let size = SizeI {
+            width: 640,
+            height: 480,
+        };
+        let mut preview = ResizePreview::default();
+        preview.begin(PointI::default(), size, ResizeEdge::BottomRight);
+        preview.finish();
+        preview.submitted(size, 7, true);
+        assert!(!preview.settle(size, size, 7, true));
+        assert!(preview.settle(size, size, 7, false));
     }
 
     #[test]

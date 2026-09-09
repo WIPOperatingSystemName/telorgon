@@ -198,6 +198,7 @@ impl Compatibility {
                 window.minimized = true;
                 window.desktop_id = None;
                 window.backend = None;
+                window.resize_preview = Default::default();
                 window.server_decorated = false;
             }
         }
