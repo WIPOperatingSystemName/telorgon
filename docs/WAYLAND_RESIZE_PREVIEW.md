@@ -293,3 +293,21 @@ beyond its inner edge. Popups may extend beyond the window, and shadows remain o
 Check resize cursors and press/drag both on the curved outline and just outside all eight edges;
 content immediately inside the border must remain interactive. Confirm hidden bars reserve no title
 height, thicker borders move the content inset once, and tiled/non-resizable edges stay disabled.
+
+### Outer frame corner containment
+
+Retained frame strips now carry the root frame's outer rounded contour as a compositor-space
+clip, including the title-bar strip and side/bottom strips. Content already uses the inner contour;
+rectangular frame allocations must not expose backing paint beyond the outer contour. Clip changes
+use the existing placement-damage path, including rounded/square state transitions.
+
+This deliberately contains all frame paint, including shadows, inside the outline. Proper exterior
+shadows require separate expanded placements; the current frame-sized rectangular placement is not
+suitable for them. Merely changing the content background color was rejected because it conceals,
+rather than bounds, escaping frame paint. The CPU framebuffer regression uses an opaque blue
+rectangular backing and checks all four corners through rounded/square/rounded transitions.
+
+The adjacent reference library is unavailable in this checkout. This bounded correction reuses the
+existing rounded-placement contract and its software/Vulkan implementations; it introduces no new
+GPU mechanism, synchronization, or resource-lifetime changes. Live confirmation of the reported
+artifact remains a user-run check.

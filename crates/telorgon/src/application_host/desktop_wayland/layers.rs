@@ -526,7 +526,7 @@ pub(super) fn prepare_desktop_layers(
         if window_is_decorated(window)
             && let Some(frame) = frames.get_mut(surface)
         {
-            layers.extend(DesktopLayer::retained_frame(
+            let frame_pieces = DesktopLayer::retained_frame(
                 surface.get(),
                 if visible {
                     frame.layer.take_deltas()
@@ -537,7 +537,15 @@ pub(super) fn prepare_desktop_layers(
                 position,
                 visible,
                 (veiled || content_style.is_some()).then_some(content_rect),
-            ));
+            );
+            layers.extend(
+                frame_pieces
+                    .into_iter()
+                    .map(|piece| match frame.border.as_ref() {
+                        Some(border) => piece.with_frame_outline(border, position),
+                        None => piece,
+                    }),
+            );
             if visible
                 && (veiled || content_style.is_some())
                 && let Some(border) = &frame.border

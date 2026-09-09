@@ -98,6 +98,51 @@ fn frame_layers(color: ColorRgba8) -> Vec<DesktopLayer> {
     )
 }
 
+#[test]
+fn rectangular_frame_backing_cannot_leak_outside_round_corners() {
+    let rect = crate::core::RectF {
+        x: 0.0,
+        y: 0.0,
+        width: 28.0,
+        height: 22.0,
+    };
+    let mut border = crate::render::BoxInstance {
+        node: crate::scene::NodeId::new(0, 1),
+        rect,
+        view_bounds: rect,
+        background: None,
+        border: Default::default(),
+        outline: Default::default(),
+        corner_radii: crate::ui::CornerRadii::all(8.0),
+        shadows: Default::default(),
+        opacity: 1.0,
+        clip: crate::render::ClipId(0),
+        spatial: crate::render::SpatialId(0),
+    };
+    let mut raster = Raster::new();
+    // Repeat rounded -> square -> rounded to exercise repaint of the old corners too.
+    for radius in [8.0, 0.0, 8.0] {
+        border.corner_radii = crate::ui::CornerRadii::all(radius);
+        raster.draw(
+            frame_layers(ColorRgba8::rgba(40, 60, 100, 255))
+                .into_iter()
+                .map(|layer| layer.with_frame_outline(&border, PointI { x: 2, y: 1 }))
+                .collect(),
+        );
+        for (x, y) in [(2, 1), (29, 1), (2, 22), (29, 22)] {
+            assert_eq!(
+                raster.pixel(x, y),
+                if radius > 0.0 {
+                    &[0, 255, 0, 255]
+                } else {
+                    &[40, 60, 100, 255]
+                }
+            );
+        }
+        assert_eq!(raster.pixel(16, 3), &[40, 60, 100, 255]);
+    }
+}
+
 fn client(alpha_mode: ImageAlphaMode, pixel: [u8; 4], visible: bool) -> DesktopLayer {
     DesktopLayer::image(
         DesktopLayerKey::Surface(9),

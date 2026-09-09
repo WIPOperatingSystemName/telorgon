@@ -145,6 +145,23 @@ pub(super) struct DesktopLayer {
 }
 
 impl DesktopLayer {
+    /// Frame scenes are rectangular allocations; their paint must stay inside the chrome
+    /// contour even when the scene contains a rectangular backing or a clipped shadow.
+    pub(super) fn with_frame_outline(mut self, border: &BoxInstance, position: PointI) -> Self {
+        self.rounded_clips = [
+            Some(RoundedClip::new(
+                RectF {
+                    x: border.rect.x + position.x as f32,
+                    y: border.rect.y + position.y as f32,
+                    ..border.rect
+                },
+                border.corner_radii,
+            )),
+            None,
+        ];
+        self
+    }
+
     pub(super) fn content_border(
         surface: u32,
         mut instance: BoxInstance,
