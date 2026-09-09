@@ -650,11 +650,43 @@ mod tests {
         };
         set_window_maximized(&mut windows, &mut scheduler, surface, true, work, &config).unwrap();
         assert!(windows[&surface].native_configure.resize_final.is_none());
+        let maximized_size = windows[&surface].requested_size;
+        let preview = &mut windows.get_mut(&surface).unwrap().resize_preview;
+        assert!(preview.active());
+        preview.submitted(maximized_size, 10, false);
+        assert!(preview.settle(maximized_size, maximized_size, 11, false));
         set_window_maximized(&mut windows, &mut scheduler, surface, false, work, &config).unwrap();
+        let preview = &mut windows.get_mut(&surface).unwrap().resize_preview;
+        assert!(preview.active());
+        preview.submitted(saved.1, 11, false);
+        assert!(!preview.settle(saved.1, maximized_size, 12, false));
+        assert!(!preview.settle(saved.1, saved.1, 11, false));
+        assert!(preview.settle(saved.1, saved.1, 12, false));
         assert_eq!(
             (windows[&surface].position, windows[&surface].requested_size),
             saved
         );
+        // Restoring through a titlebar drag uses the same completion gate.
+        set_window_maximized(&mut windows, &mut scheduler, surface, true, work, &config).unwrap();
+        windows.get_mut(&surface).unwrap().resize_preview = ResizePreview::Idle;
+        let mut drag =
+            WindowInteraction::begin_move(&windows, surface, PointF { x: 100.0, y: 10.0 }).unwrap();
+        apply_window_interaction(
+            &mut windows,
+            &mut drag,
+            &mut scheduler,
+            PointF { x: 140.0, y: 50.0 },
+            SizeI {
+                width: 1920,
+                height: 1080,
+            },
+            &config,
+        )
+        .unwrap();
+        assert!(!windows[&surface].maximized);
+        assert_eq!(windows[&surface].requested_size, saved.1);
+        assert!(windows[&surface].resize_preview.active());
+        assert!(windows[&surface].native_configure.resize_final.is_none());
         windows.get_mut(&surface).unwrap().minimized = true;
         adapter.attach(
             id,

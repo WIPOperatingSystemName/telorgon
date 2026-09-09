@@ -58,13 +58,19 @@ Repository guidance reserves interactive and hardware-presenting runs for the us
    not leave a stuck veil. Repeat from top/left edges and with a rapid second resize.
    Check that content remains clickable at its new location. Maximize, restore,
    and close with the frame controls; compare appearance and behavior with Foot.
+   X11 maximize and restore (including titlebar-drag restore) must show the RGBA
+   veil until matching content arrives; late maximized content must not reveal a
+   restoring window early.
    Check minimize in a separate run (the existing desktop's local visibility policy
    applies; a complete X11 task-switcher/iconification contract is still outstanding).
    Alt+left-drag is no longer a compositor gesture. Override-redirect menus and
    tooltips must stay unframed. These frame/control changes await a live retest.
 6. Launch two instances at different positions; alternate clicks between them and
    Foot. Check raising, text visibility, keyboard delivery, and that input does not
-   continue reaching the previously focused client.
+   continue reaching the previously focused client. With overlapping windows,
+   hover a foreground resize border, then move into the exposed background window
+   without clicking. Its client cursor must replace the resize cursor. Repeat with
+   both Foot and the X11 fixture in front; keyboard focus must not move on hover.
 
 ## Shutdown and failure containment
 

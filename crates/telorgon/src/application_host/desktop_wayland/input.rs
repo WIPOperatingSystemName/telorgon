@@ -512,6 +512,14 @@ pub(super) fn hit_test_surface(
     config: &LinuxDesktopConfig,
     session_locked: bool,
 ) -> Option<WaylandSurfaceId> {
+    // A foreground frame can overlap a background client's content. Give the frame
+    // exclusive pointer ownership so leaving it sends a fresh enter to that client,
+    // even when the client had focus before the pointer crossed the frame.
+    if !session_locked
+        && hit_test_decoration(windows, stacking_order, position, config, &[]).is_some()
+    {
+        return None;
+    }
     stacking_order
         .iter()
         .rev()
@@ -557,6 +565,70 @@ pub(super) fn normalized_output_position(normalized: PointF, extent: SizeI) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_resize_border_revokes_background_pointer_focus() {
+        use super::super::client::maximize_preview_tests::test_window;
+        let back = WaylandSurfaceId::from_raw(1).unwrap();
+        let front = WaylandSurfaceId::from_raw(2).unwrap();
+        let config = LinuxDesktopConfig::default();
+        let mut windows = BTreeMap::from([
+            (
+                back,
+                test_window(
+                    SizeI {
+                        width: 800,
+                        height: 600,
+                    },
+                    PointI::default(),
+                ),
+            ),
+            (
+                front,
+                test_window(
+                    SizeI {
+                        width: 200,
+                        height: 200,
+                    },
+                    PointI { x: 200, y: 200 },
+                ),
+            ),
+        ]);
+        let backends = [
+            WindowBackend::Wayland,
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            WindowBackend::X11(crate::xwayland::association::XWindow {
+                generation: 1,
+                xid: 10,
+                incarnation: 1,
+            }),
+        ];
+        for backend in backends {
+            for window in windows.values_mut() {
+                window.backend = Some(backend);
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                if matches!(backend, WindowBackend::X11(_)) {
+                    window.role = SurfaceRole::Xwayland;
+                }
+            }
+            let stack = [back, front];
+            let border = PointF { x: 200.0, y: 280.0 };
+            let behind = PointF { x: 180.0, y: 280.0 };
+            assert!(
+                matches!(hit_test_decoration(&windows, &stack, border, &config, &[]),
+            Some((id, DecorationHit::Resize(_))) if id == front)
+            );
+            assert_eq!(
+                hit_test_surface(&windows, &stack, border, &config, false),
+                None
+            );
+            assert_eq!(
+                hit_test_surface(&windows, &stack, behind, &config, false),
+                Some(back)
+            );
+            assert!(pointer_focus_requires_transition(None, Some(back)));
+        }
+    }
 
     #[test]
     fn seat_focus_is_authoritative_when_the_local_cache_is_stale() {

@@ -116,6 +116,10 @@ pub(super) fn apply_window_interaction(
                 window.native_configure.resize_anchor = None;
                 window.native_configure.resize_final = None;
                 window.requested_size = restored_size;
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                if matches!(window.backend, Some(WindowBackend::X11(_))) {
+                    window.resize_preview.finish();
+                }
                 window.position = PointI {
                     x: (pointer_position.x - grab_fraction * restored_size.width as f32).round()
                         as i32,
@@ -299,7 +303,7 @@ pub(super) fn set_window_maximized(
         }
     }
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
-    if maximized && matches!(window.backend, Some(WindowBackend::X11(_))) {
+    if matches!(window.backend, Some(WindowBackend::X11(_))) {
         window.resize_preview.finish();
     }
     if maximized && window.backend == Some(WindowBackend::Wayland) {
