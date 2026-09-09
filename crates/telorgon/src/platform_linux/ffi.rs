@@ -97,6 +97,8 @@ unsafe extern "C" {
     pub fn libinput_unref(input: *mut libinput) -> *mut libinput;
     pub fn libinput_get_fd(input: *mut libinput) -> c_int;
     pub fn libinput_dispatch(input: *mut libinput) -> c_int;
+    pub fn libinput_suspend(input: *mut libinput);
+    pub fn libinput_resume(input: *mut libinput) -> c_int;
     pub fn libinput_get_event(input: *mut libinput) -> *mut libinput_event;
     pub fn libinput_event_destroy(event: *mut libinput_event);
     pub fn libinput_event_get_type(event: *mut libinput_event) -> c_uint;
@@ -144,6 +146,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn xkb_context_new(flags: c_uint) -> *mut xkb_context;
     pub fn xkb_context_unref(context: *mut xkb_context);
+    pub fn xkb_context_include_path_append(context: *mut xkb_context, path: *const c_char)
+    -> c_int;
     pub fn xkb_keymap_new_from_names(
         context: *mut xkb_context,
         names: *const xkb_rule_names,

@@ -44,16 +44,18 @@ impl WindowInteraction {
         pointer_start: PointF,
     ) -> Option<Self> {
         let window = windows.get_mut(&surface)?;
-        window.resize_anchor = Some(ResizeAnchor::new(
-            window.position,
-            window.requested_size,
-            edge,
-        ));
-        // A new pointer grab supersedes an older final configure even if that client has not
-        // committed a matching buffer yet. A delayed client must never wedge future resizes.
-        window.resize_final = None;
-        // Announce the grab without asking the client to redraw at every intermediate size.
-        configure_scheduler.schedule_resize(surface, window.configure_size());
+        if window.backend == Some(WindowBackend::Wayland) {
+            window.native_configure.resize_anchor = Some(ResizeAnchor::new(
+                window.position,
+                window.requested_size,
+                edge,
+            ));
+            // A new pointer grab supersedes an older final configure even if that client has not
+            // committed a matching buffer yet. A delayed client must never wedge future resizes.
+            window.native_configure.resize_final = None;
+            // Announce the grab without asking the client to redraw at every intermediate size.
+            configure_scheduler.schedule_resize(surface, window.configure_size());
+        }
         Some(Self::Resize {
             surface,
             edge,
@@ -101,8 +103,8 @@ pub(super) fn apply_window_interaction(
                     .clamp(0.0, 1.0);
                 let grab_y = (pointer_start.y - window.position.y as f32).max(0.0);
                 window.maximized = false;
-                window.resize_anchor = None;
-                window.resize_final = None;
+                window.native_configure.resize_anchor = None;
+                window.native_configure.resize_final = None;
                 window.requested_size = restored_size;
                 window.position = PointI {
                     x: (pointer_position.x - grab_fraction * restored_size.width as f32).round()
@@ -157,8 +159,12 @@ pub(super) fn finish_window_interaction(
     let WindowInteraction::Resize { surface, .. } = interaction else {
         return;
     };
-    if let Some(window) = windows.get_mut(&surface) {
-        window.resize_final = Some(FinalResizeConfigure::pending(window.requested_size));
+    if let Some(window) = windows
+        .get_mut(&surface)
+        .filter(|window| window.backend == Some(WindowBackend::Wayland))
+    {
+        window.native_configure.resize_final =
+            Some(FinalResizeConfigure::pending(window.requested_size));
         configure_scheduler.schedule_final(surface, window.requested_size);
     }
 }
@@ -180,7 +186,10 @@ pub(super) fn flush_resize_configures(
         resizing,
     } in pending
     {
-        let Some(window) = windows.get(&surface) else {
+        let Some(window) = windows
+            .get(&surface)
+            .filter(|window| window.backend == Some(WindowBackend::Wayland))
+        else {
             continue;
         };
         let activated = wayland
@@ -210,7 +219,7 @@ pub(super) fn flush_resize_configures(
         if !resizing {
             if let Some(final_resize) = windows
                 .get_mut(&surface)
-                .and_then(|window| window.resize_final.as_mut())
+                .and_then(|window| window.native_configure.resize_final.as_mut())
             {
                 final_resize.record_sent(size, serial);
             }
@@ -235,8 +244,8 @@ pub(super) fn set_window_maximized(
     let Some(window) = windows.get_mut(&surface) else {
         return Ok(());
     };
-    window.resize_anchor = None;
-    window.resize_final = None;
+    window.native_configure.resize_anchor = None;
+    window.native_configure.resize_final = None;
     if maximized {
         if !window.maximized && !window.fullscreen {
             window.restore_geometry = Some((window.position, window.requested_size));
@@ -269,8 +278,9 @@ pub(super) fn set_window_maximized(
             window.requested_size = size;
         }
     }
-    if maximized {
-        window.resize_final = Some(FinalResizeConfigure::pending(window.requested_size));
+    if maximized && window.backend == Some(WindowBackend::Wayland) {
+        window.native_configure.resize_final =
+            Some(FinalResizeConfigure::pending(window.requested_size));
     }
     configure_scheduler.schedule_final(surface, window.requested_size);
     Ok(())
@@ -287,8 +297,8 @@ pub(super) fn set_window_fullscreen(
     let Some(window) = windows.get_mut(&surface) else {
         return Ok(());
     };
-    window.resize_anchor = None;
-    window.resize_final = None;
+    window.native_configure.resize_anchor = None;
+    window.native_configure.resize_final = None;
     if fullscreen {
         if !window.maximized && !window.fullscreen {
             window.restore_geometry = Some((window.position, window.requested_size));

@@ -25,6 +25,7 @@ pub enum SurfaceRole {
     Cursor,
     DragIcon,
     SessionLock,
+    Xwayland,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +59,9 @@ pub struct SurfaceStateSnapshot {
     pub acknowledged_configure: Option<XdgConfigure>,
     /// Persistent xdg window geometry after applying pending double-buffered state.
     pub window_geometry: Option<RectI>,
+    /// One committed xwayland-shell association serial. Owned by wl_surface,
+    /// independent of the lifetime of its xwayland_surface protocol object.
+    pub xwayland_serial: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +71,7 @@ pub struct SurfaceState {
     role: Option<SurfaceRole>,
     current: SurfaceStateSnapshot,
     pending: SurfaceCommit,
+    pending_xwayland_serial: Option<u64>,
 }
 
 impl SurfaceState {
@@ -83,6 +88,7 @@ impl SurfaceState {
             buffer_transform: BufferTransform::Normal,
             acknowledged_configure: None,
             window_geometry: None,
+            xwayland_serial: None,
         };
         Self {
             surface,
@@ -90,6 +96,7 @@ impl SurfaceState {
             role: None,
             current,
             pending: SurfaceCommit::default(),
+            pending_xwayland_serial: None,
         }
     }
 
@@ -107,6 +114,33 @@ impl SurfaceState {
             Some(current) if current == role => Ok(()),
             Some(_) => Err(SurfaceError::RoleAlreadyAssigned),
         }
+    }
+
+    /// xwayland-shell forbids creating a second role object even if it has the
+    /// same role as an earlier, destroyed object. Native role assignment retains
+    /// its existing idempotence semantics.
+    pub fn assign_xwayland_role(&mut self) -> Result<(), SurfaceError> {
+        if self.role.is_some() {
+            return Err(SurfaceError::RoleAlreadyAssigned);
+        }
+        self.assign_role(SurfaceRole::Xwayland)
+    }
+
+    /// Stage the surface-local half of association. The protocol adapter must
+    /// additionally enforce generation-wide serial uniqueness/monotonicity and
+    /// authenticate the dedicated client before calling this method.
+    pub fn set_xwayland_serial(&mut self, serial: u64) -> Result<(), SurfaceError> {
+        if self.role != Some(SurfaceRole::Xwayland) {
+            return Err(SurfaceError::InvalidXwaylandRole);
+        }
+        if serial == 0 {
+            return Err(SurfaceError::InvalidXwaylandSerial);
+        }
+        if self.current.xwayland_serial.is_some() {
+            return Err(SurfaceError::XwaylandAlreadyAssociated);
+        }
+        self.pending_xwayland_serial = Some(serial);
+        Ok(())
     }
 
     pub fn stage(&mut self, mut commit: SurfaceCommit) -> Result<(), SurfaceError> {
@@ -168,6 +202,9 @@ impl SurfaceState {
             .checked_add(1)
             .ok_or(SurfaceError::RevisionExhausted)?;
         let pending = std::mem::take(&mut self.pending);
+        if let Some(serial) = self.pending_xwayland_serial.take() {
+            self.current.xwayland_serial = Some(serial);
+        }
         let previous_buffer = self.current.attachment.map(|attachment| attachment.buffer);
         if let Some(attachment) = pending.attachment {
             self.current.attachment = attachment;
@@ -229,6 +266,9 @@ pub enum SurfaceError {
     InvalidDamageRectangle,
     TooManyDamageRectangles,
     RevisionExhausted,
+    InvalidXwaylandRole,
+    InvalidXwaylandSerial,
+    XwaylandAlreadyAssociated,
 }
 
 impl fmt::Display for SurfaceError {
@@ -239,6 +279,9 @@ impl fmt::Display for SurfaceError {
             Self::InvalidDamageRectangle => "Wayland surface damage must be positive",
             Self::TooManyDamageRectangles => "Wayland surface damage exceeds its hard bound",
             Self::RevisionExhausted => "Wayland surface revision is exhausted",
+            Self::InvalidXwaylandRole => "surface does not have the Xwayland role",
+            Self::InvalidXwaylandSerial => "Xwayland association serial must be nonzero",
+            Self::XwaylandAlreadyAssociated => "Xwayland surface already committed an association",
         })
     }
 }
@@ -247,6 +290,72 @@ impl std::error::Error for SurfaceError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xwayland_serial_is_committed_once_and_survives_buffer_commits() {
+        let mut state = SurfaceState::new(surface());
+        assert_eq!(
+            state.set_xwayland_serial(1),
+            Err(SurfaceError::InvalidXwaylandRole)
+        );
+        state.assign_xwayland_role().unwrap();
+        assert_eq!(
+            state.assign_xwayland_role(),
+            Err(SurfaceError::RoleAlreadyAssigned)
+        );
+        assert_eq!(
+            state.set_xwayland_serial(0),
+            Err(SurfaceError::InvalidXwaylandSerial)
+        );
+        state.set_xwayland_serial(1u64 << 40).unwrap();
+        assert_eq!(state.snapshot().xwayland_serial, None);
+        // Native pending state staging does not erase the independent role state.
+        state.stage(SurfaceCommit::default()).unwrap();
+        state.commit().unwrap();
+        assert_eq!(state.snapshot().xwayland_serial, Some(1u64 << 40));
+        assert_eq!(
+            state.set_xwayland_serial(2),
+            Err(SurfaceError::XwaylandAlreadyAssociated)
+        );
+        state.attach(None);
+        state.commit().unwrap();
+        assert_eq!(state.snapshot().xwayland_serial, Some(1u64 << 40));
+        assert_eq!(
+            state.assign_role(SurfaceRole::XdgToplevel),
+            Err(SurfaceError::RoleAlreadyAssigned)
+        );
+    }
+
+    #[test]
+    fn failed_commit_does_not_publish_or_consume_pending_xwayland_serial() {
+        let mut state = SurfaceState::new(surface());
+        state.assign_xwayland_role().unwrap();
+        state.set_xwayland_serial(7).unwrap();
+        state.revision = u64::MAX;
+        assert_eq!(state.commit(), Err(SurfaceError::RevisionExhausted));
+        assert_eq!(state.snapshot().xwayland_serial, None);
+        assert_eq!(state.pending_xwayland_serial, Some(7));
+    }
+
+    #[test]
+    fn xwayland_role_does_not_replace_native_roles() {
+        for role in [
+            SurfaceRole::XdgToplevel,
+            SurfaceRole::XdgPopup,
+            SurfaceRole::Subsurface,
+            SurfaceRole::Cursor,
+            SurfaceRole::DragIcon,
+            SurfaceRole::SessionLock,
+        ] {
+            let mut state = SurfaceState::new(surface());
+            state.assign_role(role).unwrap();
+            assert_eq!(
+                state.assign_xwayland_role(),
+                Err(SurfaceError::RoleAlreadyAssigned)
+            );
+            assert_eq!(state.snapshot().role, Some(role));
+            assert_eq!(state.snapshot().xwayland_serial, None);
+        }
+    }
     use std::num::NonZeroU32;
 
     use super::*;

@@ -123,6 +123,28 @@ impl<'seat> LibInputContext<'seat> {
         unsafe { ffi::libinput_get_fd(self.raw.as_ptr()) }
     }
 
+    /// Close input devices and discard all queued pre-suspend/device-removal events.
+    pub fn suspend(&self) {
+        unsafe { ffi::libinput_suspend(self.raw.as_ptr()) };
+        while let Some(event) = NonNull::new(unsafe { ffi::libinput_get_event(self.raw.as_ptr()) })
+        {
+            unsafe { ffi::libinput_event_destroy(event.as_ptr()) };
+        }
+    }
+
+    pub fn resume(&self) -> Result<(), LinuxPlatformError> {
+        let result = unsafe { ffi::libinput_resume(self.raw.as_ptr()) };
+        if result != 0 {
+            Err(LinuxPlatformError::native(
+                LinuxPlatformErrorKind::Input,
+                "libinput resume failed",
+                result,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn dispatch(&self) -> Result<(), LinuxPlatformError> {
         let result = unsafe { ffi::libinput_dispatch(self.raw.as_ptr()) };
         if result != 0 {

@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_long, c_void};
 use std::fmt;
@@ -5,11 +6,12 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 
 use crate::core::{PointI, RectI};
 use crate::wayland_server::ffi;
 use crate::wayland_server::{
-    ClientRef, Display, Global, IncomingRequest, NativeProtocol, ResourceRef,
+    ClientRef, Display, Global, IncomingRequest, NativeProtocol, OwnedClient, ResourceRef,
 };
 
 use crate::compositor_wayland::synchronization::{
@@ -23,6 +25,7 @@ use crate::compositor_wayland::{
 };
 
 const IMPLEMENTED_GLOBALS: &[(&str, ResourceKind, u32)] = &[
+    ("zxdg_output_manager_v1", ResourceKind::XdgOutputManager, 3),
     ("wl_compositor", ResourceKind::Compositor, 6),
     ("wl_shm", ResourceKind::Shm, 1),
     ("wl_subcompositor", ResourceKind::Subcompositor, 1),
@@ -62,6 +65,11 @@ const IMPLEMENTED_GLOBALS: &[(&str, ResourceKind, u32)] = &[
         1,
     ),
     (
+        "zwp_keyboard_shortcuts_inhibit_manager_v1",
+        ResourceKind::ShortcutInhibitManager,
+        1,
+    ),
+    (
         "zwp_idle_inhibit_manager_v1",
         ResourceKind::IdleInhibitManager,
         1,
@@ -88,6 +96,8 @@ enum ResourceKind {
     XdgSurface(WaylandSurfaceId),
     XdgToplevel(WaylandSurfaceId),
     XdgPopup(WaylandSurfaceId),
+    XwaylandShell,
+    XwaylandSurface(WaylandSurfaceId),
     Callback(WaylandSurfaceId),
     Output(u32),
     Seat(u32),
@@ -119,6 +129,12 @@ enum ResourceKind {
     SessionLockSurface(WaylandSurfaceId),
     RelativePointerManager,
     RelativePointer(u32),
+    XdgOutputManager,
+    XdgOutput(u32, ProtocolObjectId),
+    XwaylandKeyboardGrabManager,
+    XwaylandKeyboardGrab(ProtocolObjectId),
+    ShortcutInhibitManager,
+    ShortcutInhibitor(ProtocolObjectId),
     IdleInhibitManager,
     IdleInhibitor(ProtocolObjectId),
     PointerConstraints,
@@ -145,6 +161,8 @@ impl ResourceKind {
             Self::XdgSurface(_) => ProtocolObjectKind::XdgSurface,
             Self::XdgToplevel(_) => ProtocolObjectKind::XdgToplevel,
             Self::XdgPopup(_) => ProtocolObjectKind::XdgPopup,
+            Self::XwaylandShell => ProtocolObjectKind::XwaylandShell,
+            Self::XwaylandSurface(_) => ProtocolObjectKind::XwaylandSurface,
             Self::Callback(_) => ProtocolObjectKind::Callback,
             Self::Output(_) => ProtocolObjectKind::Output,
             Self::Seat(_) => ProtocolObjectKind::Seat,
@@ -176,6 +194,12 @@ impl ResourceKind {
             Self::SessionLockSurface(_) => ProtocolObjectKind::SessionLockSurface,
             Self::RelativePointerManager => ProtocolObjectKind::RelativePointerManager,
             Self::RelativePointer(_) => ProtocolObjectKind::RelativePointer,
+            Self::XdgOutputManager => ProtocolObjectKind::XdgOutputManager,
+            Self::XdgOutput(_, _) => ProtocolObjectKind::XdgOutput,
+            Self::XwaylandKeyboardGrabManager => ProtocolObjectKind::XwaylandKeyboardGrabManager,
+            Self::XwaylandKeyboardGrab(_) => ProtocolObjectKind::XwaylandKeyboardGrab,
+            Self::ShortcutInhibitManager => ProtocolObjectKind::ShortcutInhibitManager,
+            Self::ShortcutInhibitor(_) => ProtocolObjectKind::ShortcutInhibitor,
             Self::IdleInhibitManager => ProtocolObjectKind::IdleInhibitManager,
             Self::IdleInhibitor(_) => ProtocolObjectKind::IdleInhibitor,
             Self::PointerConstraints => ProtocolObjectKind::PointerConstraints,
@@ -450,10 +474,94 @@ impl NativeXdgPositioner {
     }
 }
 
+/// Shared owner-thread authorization across server generations. Replacing a live
+/// client is rejected; the host must explicitly disconnect the old generation.
+#[derive(Default)]
+pub struct XwaylandAccess {
+    display: Cell<usize>,
+    client: RefCell<Option<Rc<OwnedClient>>>,
+    generation: Cell<u64>,
+    last_serial: Cell<u64>,
+}
+impl XwaylandAccess {
+    /// Install the Xwayland registry policy before borrowing the display for
+    /// compositor globals. The returned slot supports bounded server restarts.
+    pub fn configure_display(display: &mut Display) -> Result<Rc<Self>, NativeCompositorError> {
+        let pointer = NativeProtocol::desktop()
+            .interface("xwayland_shell_v1")
+            .ok_or_else(|| NativeCompositorError::new("missing Xwayland shell descriptor"))?
+            as *const ffi::wl_interface;
+        let grab_pointer = NativeProtocol::desktop()
+            .interface("zwp_xwayland_keyboard_grab_manager_v1")
+            .ok_or_else(|| NativeCompositorError::new("missing Xwayland grab descriptor"))?
+            as *const ffi::wl_interface;
+        let access = Rc::new(Self::default());
+        access
+            .display
+            .set(display.native_handle().as_ptr() as usize);
+        let policy = access.clone();
+        display.set_global_filter(move |client, candidate| {
+            (candidate != pointer && candidate != grab_pointer) || policy.allows(client)
+        });
+        Ok(access)
+    }
+    pub fn set_client(
+        &self,
+        client: Rc<OwnedClient>,
+        generation: u64,
+    ) -> Result<(), NativeCompositorError> {
+        if generation <= self.generation.get()
+            || !client.is_alive()
+            || self
+                .client
+                .borrow()
+                .as_ref()
+                .is_some_and(|old| old.is_alive())
+        {
+            return Err(NativeCompositorError::new(
+                "invalid Xwayland generation replacement",
+            ));
+        }
+        *self.client.borrow_mut() = Some(client);
+        self.generation.set(generation);
+        self.last_serial.set(0);
+        Ok(())
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+    fn allows(&self, identity: usize) -> bool {
+        self.client
+            .borrow()
+            .as_ref()
+            .is_some_and(|client| client.identity() == Some(identity))
+    }
+}
+
+fn drag_source_actions(
+    source_version: u32,
+    offer_version: u32,
+    actions: crate::compositor_wayland::DataAction,
+) -> crate::compositor_wayland::DataAction {
+    if source_version < 3 || offer_version < 3 {
+        crate::compositor_wayland::DataAction::COPY
+    } else {
+        actions
+    }
+}
+
+#[derive(Default)]
+struct SuspendedFocus {
+    keyboard: Option<Option<WaylandSurfaceId>>,
+    pointer: Option<(Option<WaylandSurfaceId>, crate::core::PointF)>,
+}
+
 struct NativeState {
+    xwayland: Option<Rc<XwaylandAccess>>,
     display: std::ptr::NonNull<ffi::wl_display>,
     protocol: NativeProtocol,
     core: CompositorCore,
+    output_revision: u64,
     clients: BTreeMap<usize, ClientId>,
     resources: BTreeMap<ProtocolObjectId, usize>,
     mapped_outputs: BTreeSet<WaylandSurfaceId>,
@@ -480,8 +588,14 @@ struct NativeState {
     touch_points: BTreeMap<(u32, i32), NativeTouchPoint>,
     active_drag: Option<NativeDrag>,
     finished_drag_sources: BTreeSet<ProtocolObjectId>,
+    xwayland_keyboard_grabs: BTreeMap<ProtocolObjectId, (u32, WaylandSurfaceId, bool)>,
+    shortcut_inhibitors: BTreeMap<ProtocolObjectId, (u32, WaylandSurfaceId, bool)>,
+    revoked_shortcuts: BTreeSet<(u32, WaylandSurfaceId)>,
     idle_inhibitors: BTreeMap<ProtocolObjectId, WaylandSurfaceId>,
     pointer_constraints: BTreeMap<ProtocolObjectId, NativePointerConstraint>,
+    pointer_capture_releases: BTreeMap<u32, WaylandSurfaceId>,
+    suspended_focus: BTreeMap<u32, SuspendedFocus>,
+    pointer_press_serials: BTreeMap<(u32, u32), (u32, crate::compositor_wayland::PointerFocus)>,
     activation_tokens: BTreeMap<ProtocolObjectId, NativeActivationToken>,
     activation_grants: BTreeMap<String, NativeActivationGrant>,
     activation_order: VecDeque<String>,
@@ -526,15 +640,57 @@ impl Drop for NativeCompositor<'_> {
 }
 
 impl<'display> NativeCompositor<'display> {
+    /// Enable Xwayland shell and keyboard-grab globals with a dedicated-client policy. This
+    /// does not start Xwayland or expose X11 windows to desktop policy/rendering.
+    pub fn new_with_xwayland(
+        display: &'display Display,
+        limits: ClientLimits,
+        access: Rc<XwaylandAccess>,
+    ) -> Result<Self, NativeCompositorError> {
+        let interface = NativeProtocol::desktop()
+            .interface("xwayland_shell_v1")
+            .ok_or_else(|| NativeCompositorError::new("missing Xwayland shell descriptor"))?;
+        if access.display.get() != display.native_handle().as_ptr() as usize {
+            return Err(NativeCompositorError::new(
+                "Xwayland filter was not configured on this display",
+            ));
+        }
+        let mut compositor = Self::new(display, limits)?;
+        compositor.state.xwayland = Some(access);
+        let mut context = Box::new(BindContext {
+            state: &mut *compositor.state,
+            interface: "xwayland_shell_v1",
+            kind: ResourceKind::XwaylandShell,
+        });
+        let global = unsafe {
+            display.create_global(
+                interface,
+                1,
+                (&mut *context as *mut BindContext).cast(),
+                Some(bind_global),
+            )
+        }
+        .map_err(error)?;
+        compositor.bind_contexts.push(context);
+        compositor.globals.push(global);
+        compositor.add_dynamic_global(
+            display,
+            "zwp_xwayland_keyboard_grab_manager_v1",
+            ResourceKind::XwaylandKeyboardGrabManager,
+        )?;
+        Ok(compositor)
+    }
     pub fn new(
         display: &'display Display,
         limits: ClientLimits,
     ) -> Result<Self, NativeCompositorError> {
         let protocol = NativeProtocol::desktop();
         let mut state = Box::new(NativeState {
+            xwayland: None,
             display: display.native_handle(),
             protocol,
             core: CompositorCore::new(limits).map_err(error)?,
+            output_revision: 0,
             clients: BTreeMap::new(),
             resources: BTreeMap::new(),
             mapped_outputs: BTreeSet::new(),
@@ -561,8 +717,14 @@ impl<'display> NativeCompositor<'display> {
             touch_points: BTreeMap::new(),
             active_drag: None,
             finished_drag_sources: BTreeSet::new(),
+            xwayland_keyboard_grabs: BTreeMap::new(),
+            shortcut_inhibitors: BTreeMap::new(),
+            revoked_shortcuts: BTreeSet::new(),
             idle_inhibitors: BTreeMap::new(),
             pointer_constraints: BTreeMap::new(),
+            pointer_capture_releases: BTreeMap::new(),
+            suspended_focus: BTreeMap::new(),
+            pointer_press_serials: BTreeMap::new(),
             activation_tokens: BTreeMap::new(),
             activation_grants: BTreeMap::new(),
             activation_order: VecDeque::new(),
@@ -634,13 +796,178 @@ impl<'display> NativeCompositor<'display> {
         id: u32,
         output: crate::compositor_wayland::OutputState,
     ) -> Result<(), NativeCompositorError> {
-        if id == 0 || self.state.core.outputs.contains_key(&id) {
+        output.description.clone().validate().map_err(error)?;
+        if id == 0
+            || output.current_mode >= output.description.modes.len()
+            || self.state.core.outputs.contains_key(&id)
+            || self
+                .state
+                .core
+                .outputs
+                .values()
+                .any(|existing| existing.description.name == output.description.name)
+        {
             return Err(NativeCompositorError::new(
-                "invalid or duplicate output identity",
+                "invalid or duplicate output identity/name",
             ));
         }
+        let revision = self
+            .state
+            .output_revision
+            .checked_add(1)
+            .ok_or_else(|| NativeCompositorError::new("output layout revision exhausted"))?;
         self.state.core.outputs.insert(id, output);
-        self.add_dynamic_global(display, "wl_output", ResourceKind::Output(id))
+        if let Err(error) = self.add_dynamic_global(display, "wl_output", ResourceKind::Output(id))
+        {
+            self.state.core.outputs.remove(&id);
+            return Err(error);
+        }
+        self.state.output_revision = revision;
+        Ok(())
+    }
+
+    /// Publish a changed registered output as one owner-thread update. Names,
+    /// available modes and enabled state belong to global reconstruction and
+    /// cannot change here. Returns false without events for an identical snapshot.
+    pub fn update_output(
+        &mut self,
+        id: u32,
+        output: crate::compositor_wayland::OutputState,
+    ) -> Result<bool, NativeCompositorError> {
+        self.update_outputs([(id, output)])
+    }
+
+    pub fn output_snapshot(&self) -> crate::compositor_wayland::OutputLayoutSnapshot {
+        crate::compositor_wayland::OutputLayoutSnapshot::new(
+            self.state.output_revision,
+            self.state.core.outputs.clone(),
+        )
+    }
+
+    /// Validate every replacement before changing any output. Successful changed
+    /// batches advance the revision once, even when several outputs move together.
+    /// Callers must use these APIs rather than mutate core.outputs directly.
+    pub fn update_outputs(
+        &mut self,
+        replacements: impl IntoIterator<Item = (u32, crate::compositor_wayland::OutputState)>,
+    ) -> Result<bool, NativeCompositorError> {
+        let mut pending = BTreeMap::new();
+        let mut changed = BTreeSet::new();
+        for (id, output) in replacements {
+            output.description.clone().validate().map_err(error)?;
+            let previous = self
+                .state
+                .core
+                .outputs
+                .get(&id)
+                .ok_or_else(|| NativeCompositorError::new("unknown output"))?;
+            if output.current_mode >= output.description.modes.len()
+                || output.description.name != previous.description.name
+                || output.description.modes != previous.description.modes
+                || output.enabled != previous.enabled
+            {
+                return Err(NativeCompositorError::new(
+                    "output change requires global reconstruction",
+                ));
+            }
+            if previous != &output {
+                changed.insert(id);
+            }
+            if pending.insert(id, output).is_some() {
+                return Err(NativeCompositorError::new(
+                    "duplicate output in layout update",
+                ));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        let revision = self
+            .state
+            .output_revision
+            .checked_add(1)
+            .ok_or_else(|| NativeCompositorError::new("output layout revision exhausted"))?;
+        let previous_scale = self
+            .state
+            .core
+            .outputs
+            .values()
+            .find(|output| output.enabled)
+            .map(|output| output.description.scale);
+        self.state.core.outputs.extend(pending);
+        self.state.output_revision = revision;
+        let current_scale = self
+            .state
+            .core
+            .outputs
+            .values()
+            .find(|output| output.enabled)
+            .map(|output| output.description.scale);
+        let preferred_scale_changed = previous_scale != current_scale;
+        let outputs = self.state.resources_for_kind(
+            |kind| matches!(kind, ResourceKind::Output(candidate) if changed.contains(&candidate)),
+        )?;
+        for resource in &outputs {
+            let ResourceKind::Output(id) = self.state.resource_kind(*resource)? else {
+                unreachable!()
+            };
+            self.state
+                .send_output_description(*resource, id, false, false)?;
+        }
+        for child in self.state.resources_for_kind(
+            |kind| matches!(kind, ResourceKind::XdgOutput(candidate, _) if changed.contains(&candidate)),
+        )? {
+            let ResourceKind::XdgOutput(id, parent) = self.state.resource_kind(child)? else {
+                unreachable!()
+            };
+            let parent_done = self
+                .state
+                .resource_for_object(parent)?
+                .is_some_and(|parent| parent.version() >= 2);
+            self.state
+                .send_xdg_output_description(child, id, false, parent_done)?;
+        }
+        // Complete only after all core and logical events for this snapshot.
+        for resource in outputs {
+            if resource.version() >= 2 {
+                self.state
+                    .post_event(resource, "wl_output", "done", &mut [])?;
+            }
+        }
+        if preferred_scale_changed {
+            // Preserve the current first-enabled-output preference until the host
+            // has per-surface output membership and multi-output scale policy.
+            let scale = current_scale.map_or(1.0, |scale| scale.get());
+            for resource in self
+                .state
+                .resources_for_kind(|kind| matches!(kind, ResourceKind::FractionalScale))?
+            {
+                self.state.post_event(
+                    resource,
+                    "wp_fractional_scale_v1",
+                    "preferred_scale",
+                    &mut [ffi::wl_argument {
+                        u: (scale * 120.0).round() as u32,
+                    }],
+                )?;
+            }
+            for resource in self
+                .state
+                .resources_for_kind(|kind| matches!(kind, ResourceKind::Surface(_)))?
+            {
+                if resource.version() >= 6 {
+                    self.state.post_event(
+                        resource,
+                        "wl_surface",
+                        "preferred_buffer_scale",
+                        &mut [ffi::wl_argument {
+                            i: scale.ceil() as i32,
+                        }],
+                    )?;
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn add_seat(
@@ -1156,8 +1483,161 @@ impl<'display> NativeCompositor<'display> {
             .map(|viewport| viewport.current)
     }
 
+    pub fn shortcuts_inhibited(&self, seat: u32) -> bool {
+        self.state
+            .shortcut_inhibitors
+            .values()
+            .any(|(candidate, _, active)| *candidate == seat && *active)
+            || self
+                .state
+                .xwayland_keyboard_grabs
+                .values()
+                .any(|(candidate, _, active)| *candidate == seat && *active)
+    }
+
+    /// User escape revokes this surface's grant. Recreating its protocol object
+    /// cannot override the decision; revocation lasts for the surface lifetime.
+    pub fn release_shortcut_inhibition(&mut self, seat: u32) -> Result<(), NativeCompositorError> {
+        let focus = self
+            .state
+            .core
+            .seats
+            .get(&seat)
+            .ok_or_else(|| NativeCompositorError::new("unknown seat"))?
+            .keyboard_focus
+            .map(|focus| focus.surface);
+        if let Some(surface) = focus {
+            self.state.revoked_shortcuts.insert((seat, surface));
+            for (candidate, target, active) in self.state.xwayland_keyboard_grabs.values_mut() {
+                if *candidate == seat && *target == surface {
+                    *active = false;
+                }
+            }
+            let objects = self
+                .state
+                .shortcut_inhibitors
+                .iter()
+                .filter_map(|(object, (candidate, target, active))| {
+                    (*candidate == seat && *target == surface && *active).then_some(*object)
+                })
+                .collect::<Vec<_>>();
+            for object in objects {
+                self.state.shortcut_inhibitors.get_mut(&object).unwrap().2 = false;
+                let resource = self
+                    .state
+                    .resource_for_kind(
+                        |kind| matches!(kind, ResourceKind::ShortcutInhibitor(id) if id == object),
+                    )?
+                    .ok_or_else(|| NativeCompositorError::new("shortcut inhibitor is absent"))?;
+                self.state.post_event(
+                    resource,
+                    "zwp_keyboard_shortcuts_inhibitor_v1",
+                    "inactive",
+                    &mut [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn idle_inhibited(&self) -> bool {
         !self.state.idle_inhibitors.is_empty()
+    }
+
+    /// Revoke keyboard delivery at a lock boundary. Normal focus changes retain
+    /// pressed keys; this explicit boundary must not expose them in a later enter.
+    /// The host must suppress the corresponding physical keys until release.
+    pub fn cancel_keyboard_input(&mut self, seat: u32) -> Result<(), NativeCompositorError> {
+        let serial = unsafe { ffi::wl_display_next_serial(self.state.display.as_ptr()) };
+        self.state.set_keyboard_focus(seat, None, serial)?;
+        self.state
+            .core
+            .seats
+            .get_mut(&seat)
+            .expect("seat checked")
+            .cancel_keyboard_keys();
+        Ok(())
+    }
+
+    /// Clear physical input and protocol capture after the owner suspends devices.
+    /// Keyboard leave resets client-side pressed state without inventing key events.
+    pub fn suspend_seat_input(&mut self, seat: u32) -> Result<(), NativeCompositorError> {
+        if !self.state.core.seats.contains_key(&seat) {
+            return Err(NativeCompositorError::new("unknown seat"));
+        }
+        if self.state.suspended_focus.contains_key(&seat) {
+            return Ok(());
+        }
+        if self
+            .state
+            .active_drag
+            .as_ref()
+            .is_some_and(|drag| drag.seat == seat)
+        {
+            self.state.cancel_drag(seat)?;
+        }
+        self.state
+            .pointer_press_serials
+            .retain(|(candidate, _), _| *candidate != seat);
+        self.state.touch_cancel(seat)?;
+        self.state
+            .core
+            .seats
+            .get_mut(&seat)
+            .expect("seat checked")
+            .reset_input();
+        let serial = unsafe { ffi::wl_display_next_serial(self.state.display.as_ptr()) };
+        self.state.set_keyboard_focus(seat, None, serial)?;
+        self.state
+            .set_pointer_focus(seat, None, crate::core::PointF::default(), serial)?;
+        self.state
+            .suspended_focus
+            .insert(seat, SuspendedFocus::default());
+        Ok(())
+    }
+
+    /// Reopen focus delivery after devices resume. Returns whether policy requested
+    /// keyboard focus while suspended, including an explicit request to clear it.
+    pub fn resume_seat_input(&mut self, seat: u32) -> Result<bool, NativeCompositorError> {
+        if !self.state.core.seats.contains_key(&seat) {
+            return Err(NativeCompositorError::new("unknown seat"));
+        }
+        let Some(pending) = self.state.suspended_focus.remove(&seat) else {
+            return Ok(false);
+        };
+        let serial = unsafe { ffi::wl_display_next_serial(self.state.display.as_ptr()) };
+        if let Some(surface) = pending.keyboard {
+            let surface =
+                surface.filter(|surface| self.state.core.world.surface(*surface).is_some());
+            self.state.set_keyboard_focus(seat, surface, serial)?;
+        }
+        if let Some((surface, position)) = pending.pointer {
+            let serial = unsafe { ffi::wl_display_next_serial(self.state.display.as_ptr()) };
+            let surface =
+                surface.filter(|surface| self.state.core.world.surface(*surface).is_some());
+            self.state
+                .set_pointer_focus(seat, surface, position, serial)?;
+        }
+        Ok(pending.keyboard.is_some())
+    }
+
+    /// Revoke this seat's pointer constraints until pointer focus leaves the
+    /// current surface. Persistent objects may activate again on a later enter;
+    /// one-shot objects finish through the normal deactivation path. New objects
+    /// on the released surface cannot immediately recapture the pointer.
+    pub fn release_pointer_capture(&mut self, seat: u32) -> Result<(), NativeCompositorError> {
+        let focus = self
+            .state
+            .core
+            .seats
+            .get(&seat)
+            .ok_or_else(|| NativeCompositorError::new("unknown seat"))?
+            .pointer_focus
+            .map(|focus| focus.surface);
+        if let Some(surface) = focus {
+            self.state.pointer_capture_releases.insert(seat, surface);
+        }
+        self.state.update_pointer_constraints(seat, focus)
     }
 
     pub fn pointer_constraint(&self, seat: u32) -> Option<PointerConstraintState> {
@@ -1572,6 +2052,19 @@ impl NativeState {
         }
         Ok(identities)
     }
+    fn revoke_suspended_focus(&mut self, surface: WaylandSurfaceId) {
+        for pending in self.suspended_focus.values_mut() {
+            if pending.keyboard == Some(Some(surface)) {
+                pending.keyboard = Some(None);
+            }
+            if let Some((target, _)) = &mut pending.pointer
+                && *target == Some(surface)
+            {
+                *target = None;
+            }
+        }
+    }
+
     fn set_pointer_focus(
         &mut self,
         seat_id: u32,
@@ -1579,6 +2072,10 @@ impl NativeState {
         position: crate::core::PointF,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        if let Some(pending) = self.suspended_focus.get_mut(&seat_id) {
+            pending.pointer = Some((surface, position));
+            return Ok(());
+        }
         let previous = self
             .core
             .seats
@@ -1676,6 +2173,11 @@ impl NativeState {
         time: u32,
         position: crate::core::PointF,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let focus = self
             .core
             .seats
@@ -1721,6 +2223,11 @@ impl NativeState {
         delta: crate::core::PointF,
         unaccelerated: crate::core::PointF,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let focus = self
             .core
             .seats
@@ -1765,6 +2272,14 @@ impl NativeState {
         state: crate::compositor_wayland::ButtonState,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
+        if state == crate::compositor_wayland::ButtonState::Released {
+            self.pointer_press_serials.remove(&(seat_id, button));
+        }
         let focus = self
             .core
             .seats
@@ -1783,6 +2298,10 @@ impl NativeState {
                 Some(focus.surface),
             )
             .map_err(error)?;
+        if state == crate::compositor_wayland::ButtonState::Pressed {
+            self.pointer_press_serials
+                .insert((seat_id, button), (serial, focus));
+        }
         let wire_state = u32::from(matches!(
             state,
             crate::compositor_wayland::ButtonState::Pressed
@@ -1816,6 +2335,11 @@ impl NativeState {
         discrete_x: i32,
         discrete_y: i32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let focus = self
             .core
             .seats
@@ -2177,6 +2701,10 @@ impl NativeState {
         surface: Option<WaylandSurfaceId>,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        if let Some(pending) = self.suspended_focus.get_mut(&seat_id) {
+            pending.keyboard = Some(surface);
+            return Ok(());
+        }
         let previous = self
             .core
             .seats
@@ -2270,6 +2798,7 @@ impl NativeState {
             .get_mut(&seat_id)
             .expect("seat checked")
             .keyboard_focus = focus;
+        self.update_shortcut_inhibitors()?;
         if let Some(focus) = focus {
             self.send_selection_to_client(seat_id, focus.client)?;
         }
@@ -2378,13 +2907,22 @@ impl NativeState {
         state: crate::compositor_wayland::ButtonState,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let focus = {
             let seat = self
                 .core
                 .seats
                 .get_mut(&seat_id)
                 .ok_or_else(|| NativeCompositorError::new("unknown seat"))?;
-            seat.set_key(key, state);
+            // Stale releases and duplicate presses are not input evidence. In
+            // particular, do not mint a serial or send them to a new focus.
+            if !seat.set_key(key, state) {
+                return Ok(());
+            }
             seat.keyboard_focus
         };
         let Some(focus) = focus else {
@@ -2432,6 +2970,11 @@ impl NativeState {
         locked: u32,
         group: u32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let focus = {
             let seat = self
                 .core
@@ -2483,6 +3026,11 @@ impl NativeState {
         position: crate::core::PointF,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         if touch_id < 0 || self.touch_points.contains_key(&(seat_id, touch_id)) {
             return Err(NativeCompositorError::new(
                 "invalid or duplicate touch identity",
@@ -2556,6 +3104,11 @@ impl NativeState {
         touch_id: i32,
         position: crate::core::PointF,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let point = self
             .touch_points
             .get(&(seat_id, touch_id))
@@ -2594,6 +3147,11 @@ impl NativeState {
         touch_id: i32,
         serial: u32,
     ) -> Result<(), NativeCompositorError> {
+        // Device queues can contain late events after access has been revoked.
+        if self.suspended_focus.contains_key(&seat_id) {
+            return Ok(());
+        }
+
         let point = self
             .touch_points
             .remove(&(seat_id, touch_id))
@@ -2654,6 +3212,18 @@ impl NativeState {
         version: u32,
         id: u32,
     ) -> Result<(), NativeCompositorError> {
+        if matches!(
+            kind,
+            ResourceKind::XwaylandShell | ResourceKind::XwaylandKeyboardGrabManager
+        ) && !self
+            .xwayland
+            .as_ref()
+            .is_some_and(|access| access.allows(client.identity()))
+        {
+            return Err(NativeCompositorError::new(
+                "unauthorized Xwayland shell bind",
+            ));
+        }
         let client_id = self.ensure_client(client)?;
         let resource =
             self.create_resource(client, client_id, interface, version, id, kind, true)?;
@@ -2687,7 +3257,7 @@ impl NativeState {
             self.post_event(resource, "xdg_toplevel_icon_manager_v1", "done", &mut [])?;
         }
         if let ResourceKind::Output(output) = kind {
-            self.send_output_description(resource, output)?;
+            self.send_output_description(resource, output, true, true)?;
             for surface in self.mapped_outputs.iter().copied().collect::<Vec<_>>() {
                 self.update_surface_output(surface, true)?;
             }
@@ -2727,10 +3297,106 @@ impl NativeState {
         Ok(id)
     }
 
+    fn dispatch_xdg_output(
+        &mut self,
+        resource: ResourceRef<'_>,
+        context: &ResourceContext,
+        request: &IncomingRequest<'_>,
+    ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if request.message().name != "get_xdg_output" {
+            return Err(unsupported_request(request));
+        }
+        let parent = request
+            .object(1)
+            .map_err(error)?
+            .ok_or_else(|| NativeCompositorError::new("missing wl_output"))?;
+        let ResourceKind::Output(output_id) = self.resource_kind(parent)? else {
+            return Err(NativeCompositorError::new(
+                "xdg-output target is not an output",
+            ));
+        };
+        let child = self.create_resource(
+            resource.client(),
+            context.client,
+            "zxdg_output_v1",
+            resource.version(),
+            request.new_id(0).map_err(error)?,
+            ResourceKind::XdgOutput(output_id, self.protocol_object_for_resource(parent)?),
+            true,
+        )?;
+        self.send_xdg_output_description(child, output_id, true, parent.version() >= 2)?;
+        if child.version() >= 3 && parent.version() >= 2 {
+            self.post_event(parent, "wl_output", "done", &mut [])?;
+        }
+        Ok(DispatchOutcome::default())
+    }
+
+    fn send_xdg_output_description(
+        &self,
+        child: ResourceRef<'_>,
+        output_id: u32,
+        initial: bool,
+        parent_done: bool,
+    ) -> Result<(), NativeCompositorError> {
+        let output = self
+            .core
+            .outputs
+            .get(&output_id)
+            .ok_or_else(|| NativeCompositorError::new("unknown output"))?;
+        let position = output.description.logical_position;
+        let size = output.logical_size();
+        self.post_event(
+            child,
+            "zxdg_output_v1",
+            "logical_position",
+            &mut [
+                ffi::wl_argument { i: position.x },
+                ffi::wl_argument { i: position.y },
+            ],
+        )?;
+        self.post_event(
+            child,
+            "zxdg_output_v1",
+            "logical_size",
+            &mut [
+                ffi::wl_argument { i: size.width },
+                ffi::wl_argument { i: size.height },
+            ],
+        )?;
+        if child.version() >= 2 {
+            let name = protocol_string(&output.description.name);
+            let description = protocol_string(&output.description.description);
+            if initial {
+                self.post_event(
+                    child,
+                    "zxdg_output_v1",
+                    "name",
+                    &mut [ffi::wl_argument { s: name.as_ptr() }],
+                )?;
+            }
+            if initial || child.version() >= 3 {
+                self.post_event(
+                    child,
+                    "zxdg_output_v1",
+                    "description",
+                    &mut [ffi::wl_argument {
+                        s: description.as_ptr(),
+                    }],
+                )?;
+            }
+        }
+        if child.version() < 3 || !parent_done {
+            self.post_event(child, "zxdg_output_v1", "done", &mut [])?;
+        }
+        Ok(())
+    }
+
     fn send_output_description(
         &self,
         resource: ResourceRef<'_>,
         output_id: u32,
+        initial: bool,
+        finish: bool,
     ) -> Result<(), NativeCompositorError> {
         let output = self
             .core
@@ -2798,12 +3464,14 @@ impl NativeState {
         if resource.version() >= 4 {
             let name = protocol_string(&description.name);
             let detail = protocol_string(&description.description);
-            self.post_event(
-                resource,
-                "wl_output",
-                "name",
-                &mut [ffi::wl_argument { s: name.as_ptr() }],
-            )?;
+            if initial {
+                self.post_event(
+                    resource,
+                    "wl_output",
+                    "name",
+                    &mut [ffi::wl_argument { s: name.as_ptr() }],
+                )?;
+            }
             self.post_event(
                 resource,
                 "wl_output",
@@ -2811,7 +3479,7 @@ impl NativeState {
                 &mut [ffi::wl_argument { s: detail.as_ptr() }],
             )?;
         }
-        if resource.version() >= 2 {
+        if finish && resource.version() >= 2 {
             self.post_event(resource, "wl_output", "done", &mut [])?;
         }
         Ok(())
@@ -2921,6 +3589,10 @@ impl NativeState {
             });
         }
         match kind {
+            ResourceKind::XwaylandShell => self.dispatch_xwayland_shell(resource, context, request),
+            ResourceKind::XwaylandSurface(surface) => {
+                self.dispatch_xwayland_surface(resource, surface, request)
+            }
             ResourceKind::Compositor => self.dispatch_compositor(resource, context, request),
             ResourceKind::Surface(surface) => {
                 self.dispatch_surface(resource, context, surface, request)
@@ -3001,6 +3673,22 @@ impl NativeState {
             }
             ResourceKind::RelativePointer(_) => Err(NativeCompositorError::new(
                 "relative-pointer object has no non-destructor requests",
+            )),
+            ResourceKind::XdgOutputManager => self.dispatch_xdg_output(resource, context, request),
+            ResourceKind::XdgOutput(_, _) => Err(NativeCompositorError::new(
+                "xdg-output has no non-destructor requests",
+            )),
+            ResourceKind::XwaylandKeyboardGrabManager => {
+                self.dispatch_xwayland_keyboard_grab(resource, context, request)
+            }
+            ResourceKind::XwaylandKeyboardGrab(_) => Err(NativeCompositorError::new(
+                "Xwayland grab has no non-destructor requests",
+            )),
+            ResourceKind::ShortcutInhibitManager => {
+                self.dispatch_shortcut_inhibit(resource, context, request)
+            }
+            ResourceKind::ShortcutInhibitor(_) => Err(NativeCompositorError::new(
+                "shortcut inhibitor has no non-destructor requests",
             )),
             ResourceKind::IdleInhibitManager => {
                 self.dispatch_idle_inhibit_manager(resource, context, request)
@@ -3157,6 +3845,7 @@ impl NativeState {
                         object,
                         mime_types: Vec::new(),
                         actions: crate::compositor_wayland::DataAction::NONE,
+                        actions_set: false,
                         used: false,
                     })
                     .map_err(error)?;
@@ -3200,6 +3889,7 @@ impl NativeState {
         source: ProtocolObjectId,
         request: &IncomingRequest<'_>,
     ) -> Result<DispatchOutcome, NativeCompositorError> {
+        let source_object = source;
         let source = self
             .core
             .data_devices
@@ -3217,12 +3907,11 @@ impl NativeState {
                     request.uint(0).map_err(error)?,
                 )
                 .ok_or_else(|| NativeCompositorError::new("invalid data-source actions"))?;
-                if actions == crate::compositor_wayland::DataAction::NONE {
-                    return Err(NativeCompositorError::new(
-                        "data-source action set must not be empty",
-                    ));
+                if source.set_actions(actions).is_err() {
+                    self.data_source_resource(source_object)?
+                        .post_error(1, "data-source actions are already set or source is used");
+                    return Ok(DispatchOutcome::default());
                 }
-                source.actions = actions;
             }
             _ => return Err(unsupported_request(request)),
         }
@@ -3277,6 +3966,10 @@ impl NativeState {
                 self.send_selection_to_client(seat, context.client)?;
             }
             "start_drag" => {
+                // A serial issued before device revocation cannot restart capture.
+                if self.suspended_focus.contains_key(&seat) {
+                    return Ok(DispatchOutcome::default());
+                }
                 let source = request
                     .object(0)
                     .map_err(error)?
@@ -3297,7 +3990,7 @@ impl NativeState {
                 let grab_serial = self
                     .core
                     .serials
-                    .consume(
+                    .validate(
                         context.client,
                         serial,
                         &[
@@ -3308,7 +4001,37 @@ impl NativeState {
                     )
                     .map_err(error)?;
                 let grab = match grab_serial.kind {
-                    crate::compositor_wayland::SerialKind::PointerButton => NativeDragGrab::Pointer,
+                    crate::compositor_wayland::SerialKind::PointerButton => {
+                        if !self
+                            .core
+                            .seats
+                            .get(&seat)
+                            .and_then(|seat| seat.pointer_grab_focus())
+                            .is_some_and(|focus| {
+                                focus.client == context.client && focus.surface == origin
+                            })
+                        {
+                            return Ok(DispatchOutcome::default());
+                        }
+                        let live_serial = self.pointer_press_serials.iter().any(
+                            |(&(candidate, button), &(issued, focus))| {
+                                candidate == seat
+                                    && issued == serial
+                                    && focus.client == context.client
+                                    && focus.surface == origin
+                                    && self.core.seats.get(&seat).is_some_and(|state| {
+                                        state.pressed_buttons().contains(&button)
+                                            && state.pointer_grab_focus().is_some_and(|current| {
+                                                current.enter_serial == focus.enter_serial
+                                            })
+                                    })
+                            },
+                        );
+                        if !live_serial {
+                            return Ok(DispatchOutcome::default());
+                        }
+                        NativeDragGrab::Pointer
+                    }
                     crate::compositor_wayland::SerialKind::TouchDown => {
                         let slot = self
                             .touch_points
@@ -3329,6 +4052,10 @@ impl NativeState {
                     }
                     _ => unreachable!("serial kind was constrained above"),
                 };
+                self.core
+                    .serials
+                    .consume(context.client, serial, &[grab_serial.kind], Some(origin))
+                    .map_err(error)?;
                 if let Some(source) = source {
                     let source_resource = self.data_source_resource(source)?;
                     let source_state = self
@@ -3336,9 +4063,7 @@ impl NativeState {
                         .data_devices
                         .source(source)
                         .ok_or_else(|| NativeCompositorError::new("unknown drag source"))?;
-                    if source_resource.version() >= 3
-                        && source_state.actions == crate::compositor_wayland::DataAction::NONE
-                    {
+                    if source_resource.version() >= 3 && !source_state.actions_set {
                         return Err(NativeCompositorError::new(
                             "version 3 drag source did not set its actions",
                         ));
@@ -3933,6 +4658,75 @@ impl NativeState {
             descriptor: *descriptor,
             pixels,
         })
+    }
+
+    fn dispatch_xwayland_shell(
+        &mut self,
+        resource: ResourceRef<'_>,
+        context: &ResourceContext,
+        request: &IncomingRequest<'_>,
+    ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if !self
+            .xwayland
+            .as_ref()
+            .is_some_and(|access| access.allows(resource.client().identity()))
+        {
+            return Err(NativeCompositorError::new(
+                "unauthorized Xwayland shell request",
+            ));
+        }
+        if request.message().name != "get_xwayland_surface" {
+            return Err(unsupported_request(request));
+        }
+        let surface = self.surface_from_resource(
+            request
+                .object(1)
+                .map_err(error)?
+                .ok_or_else(|| NativeCompositorError::new("missing Xwayland wl_surface"))?,
+        )?;
+        if self.surface_mut(surface)?.assign_xwayland_role().is_err() {
+            resource.post_error(0, "wl_surface already has a role");
+            return Ok(DispatchOutcome::default());
+        }
+        self.create_resource(
+            resource.client(),
+            context.client,
+            "xwayland_surface_v1",
+            1,
+            request.new_id(0).map_err(error)?,
+            ResourceKind::XwaylandSurface(surface),
+            true,
+        )?;
+        Ok(DispatchOutcome::default())
+    }
+
+    fn dispatch_xwayland_surface(
+        &mut self,
+        resource: ResourceRef<'_>,
+        surface: WaylandSurfaceId,
+        request: &IncomingRequest<'_>,
+    ) -> Result<DispatchOutcome, NativeCompositorError> {
+        let access = self
+            .xwayland
+            .as_ref()
+            .filter(|access| access.allows(resource.client().identity()))
+            .cloned()
+            .ok_or_else(|| NativeCompositorError::new("unauthorized Xwayland surface request"))?;
+        if request.message().name != "set_serial" {
+            return Err(unsupported_request(request));
+        }
+        let serial = u64::from(request.uint(0).map_err(error)?)
+            | (u64::from(request.uint(1).map_err(error)?) << 32);
+        if serial == 0 || serial <= access.last_serial.get() {
+            resource.post_error(1, "Xwayland serial must be nonzero and strictly increasing");
+            return Ok(DispatchOutcome::default());
+        }
+        if let Err(error) = self.surface_mut(surface)?.set_xwayland_serial(serial) {
+            resource.post_error(0, &error.to_string());
+            return Ok(DispatchOutcome::default());
+        }
+        access.last_serial.set(serial);
+        Ok(DispatchOutcome::default())
     }
 
     fn dispatch_fractional_scale_manager(
@@ -4590,6 +5384,164 @@ impl NativeState {
         Ok(DispatchOutcome::default())
     }
 
+    fn dispatch_xwayland_keyboard_grab(
+        &mut self,
+        resource: ResourceRef<'_>,
+        context: &ResourceContext,
+        request: &IncomingRequest<'_>,
+    ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if request.message().name != "grab_keyboard" {
+            return Err(unsupported_request(request));
+        }
+        if !self
+            .xwayland
+            .as_ref()
+            .is_some_and(|access| access.allows(resource.client().identity()))
+        {
+            return Err(NativeCompositorError::new(
+                "unauthorized Xwayland keyboard grab",
+            ));
+        }
+        let surface = self.surface_from_resource(
+            request
+                .object(1)
+                .map_err(error)?
+                .ok_or_else(|| NativeCompositorError::new("missing grab surface"))?,
+        )?;
+        let seat_resource = request
+            .object(2)
+            .map_err(error)?
+            .ok_or_else(|| NativeCompositorError::new("missing grab seat"))?;
+        let ResourceKind::Seat(seat) = self.resource_kind(seat_resource)? else {
+            return Err(NativeCompositorError::new("grab target is not a seat"));
+        };
+        // Honor only an already-focused, mapped modern Xwayland surface. Never
+        // steal focus to satisfy an X11 grab. Cancellation requires a fresh request.
+        let active = !self.revoked_shortcuts.contains(&(seat, surface))
+            && self
+                .core
+                .seats
+                .get(&seat)
+                .and_then(|seat| seat.keyboard_focus)
+                .is_some_and(|focus| focus.surface == surface)
+            && self.core.world.surface(surface).is_some_and(|surface| {
+                let snapshot = surface.snapshot();
+                snapshot.role == Some(SurfaceRole::Xwayland)
+                    && snapshot.xwayland_serial.is_some()
+                    && snapshot.attachment.is_some()
+            });
+        let object = self.peek_next_object()?;
+        self.create_resource(
+            resource.client(),
+            context.client,
+            "zwp_xwayland_keyboard_grab_v1",
+            1,
+            request.new_id(0).map_err(error)?,
+            ResourceKind::XwaylandKeyboardGrab(object),
+            true,
+        )?;
+        self.xwayland_keyboard_grabs
+            .insert(object, (seat, surface, active));
+        Ok(DispatchOutcome::default())
+    }
+
+    fn dispatch_shortcut_inhibit(
+        &mut self,
+        resource: ResourceRef<'_>,
+        context: &ResourceContext,
+        request: &IncomingRequest<'_>,
+    ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if request.message().name != "inhibit_shortcuts" {
+            return Err(unsupported_request(request));
+        }
+        let surface = self.surface_from_resource(
+            request
+                .object(1)
+                .map_err(error)?
+                .ok_or_else(|| NativeCompositorError::new("missing inhibitor surface"))?,
+        )?;
+        let seat_resource = request
+            .object(2)
+            .map_err(error)?
+            .ok_or_else(|| NativeCompositorError::new("missing inhibitor seat"))?;
+        let ResourceKind::Seat(seat) = self.resource_kind(seat_resource)? else {
+            return Err(NativeCompositorError::new("inhibitor target is not a seat"));
+        };
+        if self
+            .shortcut_inhibitors
+            .values()
+            .any(|(candidate, target, _)| *candidate == seat && *target == surface)
+        {
+            return Err(NativeCompositorError::new(
+                "shortcuts already inhibited for this seat and surface",
+            ));
+        }
+        let object = self.peek_next_object()?;
+        self.create_resource(
+            resource.client(),
+            context.client,
+            "zwp_keyboard_shortcuts_inhibitor_v1",
+            1,
+            request.new_id(0).map_err(error)?,
+            ResourceKind::ShortcutInhibitor(object),
+            true,
+        )?;
+        self.shortcut_inhibitors
+            .insert(object, (seat, surface, false));
+        self.update_shortcut_inhibitors()?;
+        Ok(DispatchOutcome::default())
+    }
+
+    fn update_shortcut_inhibitors(&mut self) -> Result<(), NativeCompositorError> {
+        // Unlike native inhibitors, cancelled X11 grab objects never reactivate.
+        for (seat, surface, active) in self.xwayland_keyboard_grabs.values_mut() {
+            *active &= self
+                .core
+                .seats
+                .get(seat)
+                .and_then(|seat| seat.keyboard_focus)
+                .is_some_and(|focus| focus.surface == *surface)
+                && self
+                    .core
+                    .world
+                    .surface(*surface)
+                    .is_some_and(|surface| surface.snapshot().attachment.is_some());
+        }
+        let mut activated = Vec::new();
+        for (object, (seat, surface, active)) in &mut self.shortcut_inhibitors {
+            let eligible = !self.revoked_shortcuts.contains(&(*seat, *surface))
+                && self
+                    .core
+                    .seats
+                    .get(seat)
+                    .and_then(|seat| seat.keyboard_focus)
+                    .is_some_and(|focus| focus.surface == *surface)
+                && self.core.world.surface(*surface).is_some_and(|surface| {
+                    let snapshot = surface.snapshot();
+                    snapshot.attachment.is_some() && snapshot.role != Some(SurfaceRole::SessionLock)
+                });
+            if eligible && !*active {
+                activated.push(*object);
+            }
+            // Focus/unmap deactivation is deliberately silent per the protocol.
+            *active = eligible;
+        }
+        for object in activated {
+            let resource = self
+                .resource_for_kind(
+                    |kind| matches!(kind, ResourceKind::ShortcutInhibitor(id) if id == object),
+                )?
+                .ok_or_else(|| NativeCompositorError::new("shortcut inhibitor is absent"))?;
+            self.post_event(
+                resource,
+                "zwp_keyboard_shortcuts_inhibitor_v1",
+                "active",
+                &mut [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn dispatch_idle_inhibit_manager(
         &mut self,
         resource: ResourceRef<'_>,
@@ -4762,12 +5714,21 @@ impl NativeState {
         seat: u32,
         focus: Option<WaylandSurfaceId>,
     ) -> Result<(), NativeCompositorError> {
+        if self
+            .pointer_capture_releases
+            .get(&seat)
+            .is_some_and(|surface| focus != Some(*surface))
+        {
+            self.pointer_capture_releases.remove(&seat);
+        }
+        let released = self.pointer_capture_releases.contains_key(&seat);
         let mut transitions = Vec::new();
         for (object, constraint) in &mut self.pointer_constraints {
             if constraint.seat != seat || constraint.finished {
                 continue;
             }
-            let activate = focus == Some(constraint.surface)
+            let activate = !released
+                && focus == Some(constraint.surface)
                 && constraint
                     .region
                     .as_ref()
@@ -5964,6 +6925,9 @@ impl NativeState {
             self.committed_releases
                 .insert((surface, outcome.revision), release);
         }
+        if !outcome.mapped {
+            self.revoke_suspended_focus(surface);
+        }
         self.update_surface_output(surface, outcome.mapped)?;
         self.core.queue_action(if outcome.mapped {
             CompositorAction::PublishSurface(surface)
@@ -5981,6 +6945,9 @@ impl NativeState {
             let child_outcome = self.surface_mut(child)?.commit().map_err(error)?;
             self.commit_viewport_state(child)?;
             self.commit_feedback_state(child, child_outcome.revision);
+            if !child_outcome.mapped {
+                self.revoke_suspended_focus(child);
+            }
             self.update_surface_output(child, child_outcome.mapped)?;
             self.core.queue_action(if child_outcome.mapped {
                 CompositorAction::PublishSurface(child)
@@ -5988,6 +6955,7 @@ impl NativeState {
                 CompositorAction::WithdrawSurface(child)
             });
         }
+        self.update_shortcut_inhibitors()?;
         Ok(DispatchOutcome::default())
     }
 
@@ -6396,11 +7364,11 @@ impl NativeState {
             true,
         )?;
         let legacy = offer_resource.version() < 3;
-        let source_actions = if legacy {
-            crate::compositor_wayland::DataAction::COPY
-        } else {
-            source.actions
-        };
+        let source_actions = drag_source_actions(
+            self.data_source_resource(source_object)?.version(),
+            offer_resource.version(),
+            source.actions,
+        );
         if let Err(cause) =
             self.core
                 .data_devices
@@ -6878,6 +7846,9 @@ impl NativeState {
         }
         match context.kind {
             ResourceKind::Surface(surface) => {
+                self.revoke_suspended_focus(surface);
+                self.pointer_press_serials
+                    .retain(|_, (_, focus)| focus.surface != surface);
                 self.callbacks.remove(&surface);
                 self.committed_callbacks
                     .retain(|(candidate, _), _| *candidate != surface);
@@ -6902,8 +7873,16 @@ impl NativeState {
                     .retain(|_, point| point.surface != surface);
                 self.idle_inhibitors
                     .retain(|_, candidate| *candidate != surface);
+                self.xwayland_keyboard_grabs
+                    .retain(|_, (_, target, _)| *target != surface);
+                self.shortcut_inhibitors
+                    .retain(|_, (_, target, _)| *target != surface);
+                self.revoked_shortcuts
+                    .retain(|(_, target)| *target != surface);
                 self.pointer_constraints
                     .retain(|_, constraint| constraint.surface != surface);
+                self.pointer_capture_releases
+                    .retain(|_, released| *released != surface);
                 self.session_lock_surfaces.remove(&surface);
                 let _ = self.core.destroy_surface(context.client, surface);
             }
@@ -7003,6 +7982,12 @@ impl NativeState {
             }
             ResourceKind::SessionLockSurface(surface) => {
                 self.session_lock_surfaces.remove(&surface);
+            }
+            ResourceKind::XwaylandKeyboardGrab(object) => {
+                self.xwayland_keyboard_grabs.remove(&object);
+            }
+            ResourceKind::ShortcutInhibitor(object) => {
+                self.shortcut_inhibitors.remove(&object);
             }
             ResourceKind::IdleInhibitor(object) => {
                 self.idle_inhibitors.remove(&object);
@@ -7317,3 +8302,976 @@ impl fmt::Display for NativeCompositorError {
 }
 
 impl std::error::Error for NativeCompositorError {}
+
+#[cfg(test)]
+mod xwayland_wire_tests {
+    use super::*;
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    fn send(peer: &mut UnixStream, object: u32, opcode: u16, payload: &[u8]) {
+        let mut bytes = object.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(
+            &((((payload.len() + 8) as u32) << 16) | opcode as u32).to_ne_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        peer.write_all(&bytes).unwrap();
+    }
+    fn words(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+    fn registry(display: &Display, peer: &mut UnixStream) -> BTreeMap<String, u32> {
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        send(peer, 1, 1, &words(&[2]));
+        send(peer, 1, 0, &words(&[3]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let mut globals = BTreeMap::new();
+        loop {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let size = u32::from_ne_bytes(header[4..].try_into().unwrap()) >> 16;
+            let mut body = vec![0; size as usize - 8];
+            peer.read_exact(&mut body).unwrap();
+            if object == 3 {
+                return globals;
+            }
+            if object == 2 {
+                let name = u32::from_ne_bytes(body[..4].try_into().unwrap());
+                let length = u32::from_ne_bytes(body[4..8].try_into().unwrap()) as usize;
+                globals.insert(
+                    String::from_utf8(body[8..8 + length - 1].to_vec()).unwrap(),
+                    name,
+                );
+            }
+        }
+    }
+    fn bind(peer: &mut UnixStream, globals: &BTreeMap<String, u32>, interface: &str, id: u32) {
+        bind_version(peer, globals, interface, id, 1);
+    }
+    fn bind_version(
+        peer: &mut UnixStream,
+        globals: &BTreeMap<String, u32>,
+        interface: &str,
+        id: u32,
+        version: u32,
+    ) {
+        let mut data = words(&[globals[interface], interface.len() as u32 + 1]);
+        data.extend_from_slice(interface.as_bytes());
+        data.push(0);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend(words(&[version, id]));
+        send(peer, 2, 0, &data);
+    }
+    #[test]
+    fn output_batches_validate_before_mutation_and_advance_one_revision() {
+        use crate::compositor_wayland::{
+            OutputDescription, OutputMode, OutputState, OutputTransform,
+        };
+        let display = Display::new().unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let make_output = |name: &str| {
+            OutputState::new(
+                OutputDescription {
+                    name: name.into(),
+                    description: name.into(),
+                    make: "Test".into(),
+                    model: "Display".into(),
+                    physical_millimeters: crate::core::SizeI::default(),
+                    logical_position: PointI::default(),
+                    scale: crate::platform::ScaleFactor::new(1.0).unwrap(),
+                    transform: OutputTransform::Normal,
+                    modes: vec![OutputMode {
+                        size: crate::core::SizeI {
+                            width: 800,
+                            height: 600,
+                        },
+                        refresh_millihertz: 60000,
+                        preferred: true,
+                    }],
+                },
+                0,
+            )
+            .unwrap()
+        };
+        native
+            .add_output(&display, 1, make_output("TEST-1"))
+            .unwrap();
+        native
+            .add_output(&display, 2, make_output("TEST-2"))
+            .unwrap();
+        let before = native.output_snapshot();
+        let mut left = before.outputs()[&1].clone();
+        let mut right = before.outputs()[&2].clone();
+        left.description.logical_position.x = -800;
+        right.description.logical_position.x = 800;
+        let mut invalid = right.clone();
+        invalid.current_mode = 99;
+        assert!(
+            native
+                .update_outputs([(1, left.clone()), (2, invalid)])
+                .is_err()
+        );
+        assert_eq!(native.output_snapshot(), before);
+        assert!(
+            native
+                .update_outputs([(1, left.clone()), (1, left.clone())])
+                .is_err()
+        );
+        assert_eq!(native.output_snapshot(), before);
+        assert!(
+            native
+                .update_outputs([(2, right.clone()), (1, left.clone())])
+                .unwrap()
+        );
+        let after = native.output_snapshot();
+        assert_eq!(after.revision(), before.revision() + 1);
+        assert_eq!(after.outputs()[&1], left);
+        assert_eq!(after.outputs()[&2], right);
+        assert_eq!(before.outputs()[&1].description.logical_position.x, 0);
+        assert!(
+            !native
+                .update_outputs([(1, left.clone()), (2, right)])
+                .unwrap()
+        );
+        assert_eq!(native.output_snapshot(), after);
+        native.state.output_revision = u64::MAX;
+        let exhausted = native.output_snapshot();
+        left.description.logical_position.y = 100;
+        assert!(native.update_output(1, left).is_err());
+        assert_eq!(native.output_snapshot(), exhausted);
+    }
+
+    #[test]
+    fn xdg_output_reports_scaled_rotated_geometry_and_versioned_completion() {
+        use crate::compositor_wayland::{
+            OutputDescription, OutputMode, OutputState, OutputTransform,
+        };
+        for (version, output_version) in [(1, 1), (2, 2), (3, 4), (3, 1)] {
+            let display = Display::new().unwrap();
+            let (mut peer, socket) = UnixStream::pair().unwrap();
+            let client = display.create_client(socket).unwrap();
+            let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            native
+                .add_output(
+                    &display,
+                    1,
+                    OutputState::new(
+                        OutputDescription {
+                            name: "TEST-1".into(),
+                            description: "Rotated test output".into(),
+                            make: "Test".into(),
+                            model: "Display".into(),
+                            physical_millimeters: crate::core::SizeI::default(),
+                            logical_position: PointI { x: -800, y: 40 },
+                            scale: crate::platform::ScaleFactor::new(1.5).unwrap(),
+                            transform: OutputTransform::Rotate90,
+                            modes: vec![OutputMode {
+                                size: crate::core::SizeI {
+                                    width: 1920,
+                                    height: 1080,
+                                },
+                                refresh_millihertz: 60000,
+                                preferred: true,
+                            }],
+                        },
+                        0,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let globals = registry(&display, &mut peer);
+            bind_version(&mut peer, &globals, "wl_output", 4, output_version);
+            bind_version(&mut peer, &globals, "zxdg_output_manager_v1", 5, version);
+            send(&mut peer, 5, 1, &words(&[6, 4]));
+            send(&mut peer, 1, 0, &words(&[7]));
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            assert!(client.is_alive());
+            let mut xdg_events = Vec::new();
+            let mut last_event = None;
+            loop {
+                let mut header = [0; 8];
+                peer.read_exact(&mut header).unwrap();
+                let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+                let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+                let opcode = word as u16;
+                let mut body = vec![0; (word >> 16) as usize - 8];
+                peer.read_exact(&mut body).unwrap();
+                if object == 7 {
+                    break;
+                }
+                last_event = Some((object, opcode));
+                if object != 6 {
+                    continue;
+                }
+                xdg_events.push(opcode);
+                if opcode < 2 {
+                    let pair = (
+                        i32::from_ne_bytes(body[..4].try_into().unwrap()),
+                        i32::from_ne_bytes(body[4..8].try_into().unwrap()),
+                    );
+                    assert_eq!(pair, if opcode == 0 { (-800, 40) } else { (720, 1280) });
+                }
+            }
+            let mut expected = vec![0, 1];
+            if version >= 2 {
+                expected.extend([3, 4]);
+            }
+            if version < 3 || output_version < 2 {
+                expected.push(2);
+            }
+            assert_eq!(xdg_events, expected);
+            assert_eq!(
+                last_event,
+                Some(if version >= 3 && output_version >= 2 {
+                    (4, 2)
+                } else {
+                    (6, 2)
+                })
+            );
+            let mut update = native.core().outputs[&1].clone();
+            update.description.logical_position = PointI { x: -12, y: 64 };
+            update.description.scale = crate::platform::ScaleFactor::new(2.0).unwrap();
+            update.description.description = "Updated description".into();
+            assert!(native.update_output(1, update.clone()).unwrap());
+            assert!(!native.update_output(1, update.clone()).unwrap());
+            let mut invalid = update.clone();
+            invalid.description.name = "RENAMED-1".into();
+            assert!(native.update_output(1, invalid).is_err());
+            let mut partial = update.clone();
+            partial.description.logical_position.x = 123;
+            assert!(
+                native
+                    .update_outputs([(1, partial), (99, update.clone())])
+                    .is_err()
+            );
+            assert_eq!(native.core().outputs[&1], update);
+            send(&mut peer, 1, 0, &words(&[8]));
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            let mut logical = Vec::new();
+            let mut last = None;
+            let mut output_done = 0;
+            loop {
+                let mut header = [0; 8];
+                peer.read_exact(&mut header).unwrap();
+                let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+                let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+                let opcode = word as u16;
+                let mut body = vec![0; (word >> 16) as usize - 8];
+                peer.read_exact(&mut body).unwrap();
+                if object == 8 {
+                    break;
+                }
+                last = Some((object, opcode));
+                if object == 4 {
+                    assert_ne!(opcode, 4, "core output name is immutable");
+                    if opcode == 2 {
+                        output_done += 1;
+                    }
+                }
+                if object == 6 {
+                    logical.push(opcode);
+                    if opcode < 2 {
+                        let pair = (
+                            i32::from_ne_bytes(body[..4].try_into().unwrap()),
+                            i32::from_ne_bytes(body[4..8].try_into().unwrap()),
+                        );
+                        assert_eq!(pair, if opcode == 0 { (-12, 64) } else { (540, 960) });
+                    }
+                }
+            }
+            let mut expected = vec![0, 1];
+            if version >= 3 {
+                expected.push(4);
+            }
+            if version < 3 || output_version < 2 {
+                expected.push(2);
+            }
+            assert_eq!(logical, expected); // v2 description and all names are immutable.
+            assert_eq!(output_done, usize::from(output_version >= 2));
+            assert_eq!(
+                last,
+                Some(if output_version >= 2 { (4, 2) } else { (6, 2) })
+            );
+        }
+    }
+
+    #[test]
+    fn xwayland_grab_is_private_focused_and_cancelled_without_automatic_reactivation() {
+        use crate::compositor_wayland::{SeatCapabilities, SeatState, SurfaceCommit};
+        let mut display = Display::new().unwrap();
+        let access = XwaylandAccess::configure_display(&mut display).unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = Rc::new(display.create_client(socket).unwrap());
+        access.set_client(client.clone(), 1).unwrap();
+        let mut native =
+            NativeCompositor::new_with_xwayland(&display, ClientLimits::default(), access).unwrap();
+        native
+            .add_seat(
+                &display,
+                1,
+                SeatState::new(
+                    "test",
+                    SeatCapabilities {
+                        pointer: false,
+                        keyboard: true,
+                        touch: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let globals = registry(&display, &mut peer);
+        let (mut public_peer, socket) = UnixStream::pair().unwrap();
+        let public_client = display.create_client(socket).unwrap();
+        let public_globals = registry(&display, &mut public_peer);
+        assert!(!public_globals.contains_key("zwp_xwayland_keyboard_grab_manager_v1"));
+        bind(
+            &mut public_peer,
+            &globals,
+            "zwp_xwayland_keyboard_grab_manager_v1",
+            4,
+        );
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!public_client.is_alive());
+        assert!(client.is_alive());
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "wl_seat", 5);
+        bind(&mut peer, &globals, "xwayland_shell_v1", 6);
+        bind(
+            &mut peer,
+            &globals,
+            "zwp_xwayland_keyboard_grab_manager_v1",
+            7,
+        );
+        send(&mut peer, 4, 0, &words(&[8]));
+        send(&mut peer, 6, 1, &words(&[9, 8]));
+        send(&mut peer, 9, 0, &words(&[50, 0]));
+        send(&mut peer, 8, 6, &[]);
+        send(&mut peer, 7, 1, &words(&[10, 8, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        assert!(!native.shortcuts_inhibited(1));
+        // Model buffer mapping; role/serial and grab requests use the real wire.
+        let state = native.state.core.world.surface_mut(surface).unwrap();
+        state
+            .stage(SurfaceCommit {
+                attachment: Some(Some(BufferAttachment {
+                    buffer: WaylandBufferId::from_raw(123).unwrap(),
+                    offset: PointI::default(),
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        state.commit().unwrap();
+        native.set_keyboard_focus(1, Some(surface), 1).unwrap();
+        assert!(!native.shortcuts_inhibited(1)); // Initial unfocused request stays denied.
+        send(&mut peer, 7, 1, &words(&[11, 8, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.shortcuts_inhibited(1));
+        native.set_keyboard_focus(1, None, 2).unwrap();
+        native.set_keyboard_focus(1, Some(surface), 3).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        send(&mut peer, 7, 1, &words(&[12, 8, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.shortcuts_inhibited(1));
+        native.release_shortcut_inhibition(1).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        send(&mut peer, 7, 1, &words(&[13, 8, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        send(&mut peer, 8, 0, &[]);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.state.xwayland_keyboard_grabs.is_empty());
+        assert!(native.state.revoked_shortcuts.is_empty());
+        assert!(client.is_alive());
+    }
+
+    #[test]
+    fn shortcut_inhibitor_requires_mapped_focus_and_cannot_override_user_revocation() {
+        use crate::compositor_wayland::{SeatCapabilities, SeatState, SurfaceCommit};
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        native
+            .add_seat(
+                &display,
+                1,
+                SeatState::new(
+                    "test",
+                    SeatCapabilities {
+                        pointer: false,
+                        keyboard: true,
+                        touch: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let globals = registry(&display, &mut peer);
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "wl_seat", 5);
+        bind(
+            &mut peer,
+            &globals,
+            "zwp_keyboard_shortcuts_inhibit_manager_v1",
+            6,
+        );
+        send(&mut peer, 4, 0, &words(&[7]));
+        send(&mut peer, 6, 1, &words(&[8, 7, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        native.set_keyboard_focus(1, Some(surface), 1).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        // Model committed mapping without allocating/rendering a buffer. The
+        // inhibitor requests and active/inactive notifications use actual wire I/O.
+        let state = native.state.core.world.surface_mut(surface).unwrap();
+        state
+            .stage(SurfaceCommit {
+                attachment: Some(Some(BufferAttachment {
+                    buffer: WaylandBufferId::from_raw(123).unwrap(),
+                    offset: PointI::default(),
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        state.commit().unwrap();
+        native.state.update_shortcut_inhibitors().unwrap();
+        assert!(native.shortcuts_inhibited(1));
+        native.set_keyboard_focus(1, None, 2).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        native.set_keyboard_focus(1, Some(surface), 3).unwrap();
+        assert!(native.shortcuts_inhibited(1));
+        native.release_shortcut_inhibition(1).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        send(&mut peer, 8, 0, &[]);
+        send(&mut peer, 6, 1, &words(&[9, 7, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        native.set_keyboard_focus(1, None, 4).unwrap();
+        native.set_keyboard_focus(1, Some(surface), 5).unwrap();
+        assert!(!native.shortcuts_inhibited(1));
+        send(&mut peer, 1, 0, &words(&[10]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let mut events = Vec::new();
+        loop {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let mut body = vec![0; (word >> 16) as usize - 8];
+            peer.read_exact(&mut body).unwrap();
+            if object == 10 {
+                break;
+            }
+            if object == 8 || object == 9 {
+                events.push((object, word as u16));
+            }
+        }
+        assert_eq!(events, [(8, 0), (8, 0), (8, 1)]);
+        send(&mut peer, 6, 1, &words(&[11, 7, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!client.is_alive()); // duplicate seat/surface inhibitor is a protocol error
+        assert!(!native.shortcuts_inhibited(1));
+    }
+
+    #[test]
+    fn keyboard_wire_delivery_ignores_duplicate_and_unmatched_edges() {
+        use crate::compositor_wayland::{ButtonState, SeatCapabilities, SeatState};
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        native
+            .add_seat(
+                &display,
+                1,
+                SeatState::new(
+                    "test",
+                    SeatCapabilities {
+                        pointer: false,
+                        keyboard: true,
+                        touch: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let globals = registry(&display, &mut peer);
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "wl_seat", 5);
+        send(&mut peer, 5, 1, &words(&[6])); // get_keyboard
+        send(&mut peer, 4, 0, &words(&[7]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        native.set_keyboard_focus(1, Some(surface), 1).unwrap();
+        for (serial, state) in [
+            (2, ButtonState::Released),
+            (3, ButtonState::Pressed),
+            (4, ButtonState::Pressed),
+            (5, ButtonState::Released),
+            (6, ButtonState::Released),
+        ] {
+            native.keyboard_key(1, serial, 20, state, serial).unwrap();
+        }
+        send(&mut peer, 1, 0, &words(&[8])); // flush barrier
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let mut delivered = Vec::new();
+        loop {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let mut body = vec![0; (word >> 16) as usize - 8];
+            peer.read_exact(&mut body).unwrap();
+            if object == 8 {
+                break;
+            }
+            if object == 6 && word as u16 == 3 {
+                delivered.push((
+                    u32::from_ne_bytes(body[..4].try_into().unwrap()),
+                    u32::from_ne_bytes(body[12..16].try_into().unwrap()),
+                ));
+            }
+        }
+        assert_eq!(delivered, [(3, 1), (5, 0)]);
+        for serial in [2, 4, 6] {
+            assert!(
+                native
+                    .core()
+                    .serials
+                    .validate(
+                        client_id,
+                        serial,
+                        &[crate::compositor_wayland::SerialKind::KeyboardKey],
+                        Some(surface)
+                    )
+                    .is_err()
+            );
+        }
+        assert!(native.core().seats[&1].pressed_keys().is_empty());
+        native
+            .keyboard_key(1, 20, 30, ButtonState::Pressed, 20)
+            .unwrap();
+        native.cancel_keyboard_input(1).unwrap();
+        assert!(native.core().seats[&1].pressed_keys().is_empty());
+        assert!(native.core().seats[&1].keyboard_focus.is_none());
+        // A subsequent focus enter cannot inherit keys from across the boundary.
+        native.set_keyboard_focus(1, Some(surface), 30).unwrap();
+        native
+            .keyboard_key(1, 31, 30, ButtonState::Released, 31)
+            .unwrap();
+        send(&mut peer, 1, 0, &words(&[9]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let mut entered_keys = None;
+        loop {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let mut body = vec![0; (word >> 16) as usize - 8];
+            peer.read_exact(&mut body).unwrap();
+            if object == 9 {
+                break;
+            }
+            if object == 6 && word as u16 == 1 {
+                entered_keys = Some(u32::from_ne_bytes(body[8..12].try_into().unwrap()));
+            }
+            if object == 6 && word as u16 == 3 {
+                assert_ne!(u32::from_ne_bytes(body[..4].try_into().unwrap()), 31);
+            }
+        }
+        assert_eq!(entered_keys, Some(0));
+    }
+
+    #[test]
+    fn data_source_action_requests_accept_empty_once_and_reject_unknown_bits() {
+        for invalid_mask in [0, 8] {
+            let display = Display::new().unwrap();
+            let (mut peer, socket) = UnixStream::pair().unwrap();
+            let client = display.create_client(socket).unwrap();
+            let native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            let globals = registry(&display, &mut peer);
+            bind_version(&mut peer, &globals, "wl_data_device_manager", 4, 3);
+            send(&mut peer, 4, 0, &words(&[5]));
+            send(&mut peer, 5, 2, &words(&[0])); // Explicit empty action set.
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            assert!(client.is_alive());
+            let resource = native
+                .state
+                .resource_for_kind(|kind| matches!(kind, ResourceKind::DataSource(_)))
+                .unwrap()
+                .unwrap();
+            let ResourceKind::DataSource(object) = native.state.resource_kind(resource).unwrap()
+            else {
+                panic!()
+            };
+            let source = native.core().data_devices.source(object).unwrap();
+            assert!(source.actions_set);
+            assert_eq!(source.actions, crate::compositor_wayland::DataAction::NONE);
+            assert!(!source.used);
+            send(&mut peer, 5, 2, &words(&[invalid_mask]));
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            assert!(!client.is_alive());
+            let body = loop {
+                let mut header = [0; 8];
+                peer.read_exact(&mut header).unwrap();
+                assert_eq!(u32::from_ne_bytes(header[..4].try_into().unwrap()), 1);
+                let size_opcode = u32::from_ne_bytes(header[4..].try_into().unwrap());
+                let mut body = vec![0; (size_opcode >> 16) as usize - 8];
+                peer.read_exact(&mut body).unwrap();
+                if size_opcode as u16 == 0 {
+                    break body;
+                }
+                assert_eq!(size_opcode as u16, 1); // Prior registry callback delete_id.
+            };
+            assert_eq!(u32::from_ne_bytes(body[..4].try_into().unwrap()), 5);
+            assert_eq!(
+                u32::from_ne_bytes(body[4..8].try_into().unwrap()),
+                if invalid_mask == 0 { 1 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn drag_action_versions_preserve_legacy_copy_and_modern_negotiation() {
+        use crate::compositor_wayland::DataAction;
+        assert_eq!(
+            drag_source_actions(1, 3, DataAction::NONE),
+            DataAction::COPY
+        );
+        assert_eq!(
+            drag_source_actions(2, 3, DataAction::NONE),
+            DataAction::COPY
+        );
+        assert_eq!(
+            drag_source_actions(3, 1, DataAction::MOVE),
+            DataAction::COPY
+        );
+        assert_eq!(
+            drag_source_actions(3, 3, DataAction::MOVE),
+            DataAction::MOVE
+        );
+        assert_eq!(
+            drag_source_actions(3, 3, DataAction::NONE),
+            DataAction::NONE
+        );
+    }
+
+    #[test]
+    fn emergency_release_blocks_recapture_until_focus_leaves() {
+        use crate::compositor_wayland::{SeatCapabilities, SeatState};
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        native
+            .add_seat(
+                &display,
+                1,
+                SeatState::new(
+                    "test",
+                    SeatCapabilities {
+                        pointer: true,
+                        keyboard: true,
+                        touch: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let globals = registry(&display, &mut peer);
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "wl_seat", 5);
+        bind(&mut peer, &globals, "zwp_pointer_constraints_v1", 6);
+        send(&mut peer, 4, 0, &words(&[7]));
+        send(&mut peer, 5, 0, &words(&[8]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        let point = crate::core::PointF::default();
+        native
+            .set_pointer_focus(1, Some(surface), point, 1)
+            .unwrap();
+        send(&mut peer, 6, 1, &words(&[9, 7, 8, 0, 2]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.pointer_constraint(1).is_some());
+        native.release_pointer_capture(1).unwrap();
+        assert!(native.pointer_constraint(1).is_none());
+        native
+            .set_pointer_focus(1, Some(surface), point, 2)
+            .unwrap();
+        assert!(native.pointer_constraint(1).is_none());
+        // Replacing a persistent protocol object must not evade the release.
+        send(&mut peer, 9, 0, &[]);
+        send(&mut peer, 6, 1, &words(&[10, 7, 8, 0, 2]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        assert!(native.pointer_constraint(1).is_none());
+        native.set_pointer_focus(1, None, point, 3).unwrap();
+        native
+            .set_pointer_focus(1, Some(surface), point, 4)
+            .unwrap();
+        assert!(native.pointer_constraint(1).is_some());
+        send(&mut peer, 10, 0, &[]);
+        send(&mut peer, 6, 1, &words(&[11, 7, 8, 0, 1]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.pointer_constraint(1).is_some());
+        native.release_pointer_capture(1).unwrap();
+        native.set_pointer_focus(1, None, point, 5).unwrap();
+        native
+            .set_pointer_focus(1, Some(surface), point, 6)
+            .unwrap();
+        assert!(native.pointer_constraint(1).is_none()); // One-shot stays finished.
+        assert!(native.release_pointer_capture(999).is_err());
+        native.set_keyboard_focus(1, Some(surface), 100).unwrap();
+        native
+            .keyboard_key(
+                1,
+                0,
+                20,
+                crate::compositor_wayland::ButtonState::Pressed,
+                101,
+            )
+            .unwrap();
+        native
+            .pointer_button(
+                1,
+                0,
+                272,
+                crate::compositor_wayland::ButtonState::Pressed,
+                102,
+            )
+            .unwrap();
+        bind(&mut peer, &globals, "wl_data_device_manager", 12);
+        send(&mut peer, 12, 1, &words(&[13, 5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert_eq!(native.core().seats[&1].pressed_keys(), &[20]);
+        assert_eq!(native.core().seats[&1].pressed_buttons(), &[272]);
+        native.suspend_seat_input(1).unwrap();
+        send(&mut peer, 13, 0, &words(&[0, 7, 0, 102]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        assert!(!native.drag_active(1));
+        assert!(
+            native
+                .core()
+                .serials
+                .validate(
+                    client_id,
+                    102,
+                    &[crate::compositor_wayland::SerialKind::PointerButton],
+                    Some(surface)
+                )
+                .is_ok()
+        );
+        let seat = &native.core().seats[&1];
+        assert!(seat.pressed_keys().is_empty());
+        assert!(seat.pressed_buttons().is_empty());
+        assert!(seat.keyboard_focus.is_none());
+        assert!(seat.pointer_focus.is_none());
+        assert!(native.pointer_constraint(1).is_none());
+        native
+            .keyboard_key(
+                1,
+                0,
+                21,
+                crate::compositor_wayland::ButtonState::Pressed,
+                103,
+            )
+            .unwrap();
+        native
+            .pointer_button(
+                1,
+                0,
+                273,
+                crate::compositor_wayland::ButtonState::Pressed,
+                104,
+            )
+            .unwrap();
+        native.touch_down(1, surface, 0, 3, point, 105).unwrap();
+        native.touch_motion(1, 0, 3, point).unwrap();
+        native.touch_up(1, 0, 3, 106).unwrap();
+        native.keyboard_modifiers(1, 107, 1, 2, 4, 1).unwrap();
+        assert!(native.core().seats[&1].pressed_keys().is_empty());
+        assert!(native.core().seats[&1].pressed_buttons().is_empty());
+        assert!(native.state.touch_points.is_empty());
+        native.set_keyboard_focus(1, Some(surface), 103).unwrap();
+        native
+            .set_pointer_focus(1, Some(surface), point, 104)
+            .unwrap();
+        assert!(native.core().seats[&1].keyboard_focus.is_none());
+        assert!(native.core().seats[&1].pointer_focus.is_none());
+        native.suspend_seat_input(1).unwrap();
+        // Earlier fixture input used explicit serials; move the display allocator
+        // beyond them before testing generated resume enter serials.
+        for _ in 0..200 {
+            display.next_serial();
+        }
+        assert!(native.resume_seat_input(1).unwrap());
+        assert_eq!(
+            native.core().seats[&1].keyboard_focus.unwrap().surface,
+            surface
+        );
+        assert_eq!(
+            native.core().seats[&1].pointer_focus.unwrap().surface,
+            surface
+        );
+        // The old button serial is still known, but resume did not recreate a grab.
+        send(&mut peer, 13, 0, &words(&[0, 7, 0, 102]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        assert!(!native.drag_active(1));
+        let drag_serial = display.next_serial();
+        native
+            .pointer_button(
+                1,
+                0,
+                272,
+                crate::compositor_wayland::ButtonState::Pressed,
+                drag_serial,
+            )
+            .unwrap();
+        // A fresh grab must not rehabilitate a serial from before suspension.
+        send(&mut peer, 13, 0, &words(&[0, 7, 0, 102]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        assert!(!native.drag_active(1));
+        send(&mut peer, 13, 0, &words(&[0, 7, 0, drag_serial]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        assert!(native.drag_active(1));
+        native
+            .pointer_button(
+                1,
+                0,
+                272,
+                crate::compositor_wayland::ButtonState::Released,
+                display.next_serial(),
+            )
+            .unwrap();
+        assert!(!native.state.pointer_press_serials.contains_key(&(1, 272)));
+        native.suspend_seat_input(1).unwrap();
+        assert!(!native.drag_active(1));
+        native.set_keyboard_focus(1, None, 105).unwrap();
+        assert!(native.resume_seat_input(1).unwrap());
+        assert!(native.core().seats[&1].keyboard_focus.is_none());
+        assert!(!native.resume_seat_input(1).unwrap());
+        for destroy in [false, true] {
+            native.suspend_seat_input(1).unwrap();
+            native
+                .set_keyboard_focus(1, Some(surface), display.next_serial())
+                .unwrap();
+            native
+                .set_pointer_focus(1, Some(surface), point, display.next_serial())
+                .unwrap();
+            // Null-buffer commit withdraws the surface; the next iteration destroys it.
+            send(&mut peer, 7, if destroy { 0 } else { 6 }, &[]);
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            assert!(native.resume_seat_input(1).unwrap());
+            assert!(native.core().seats[&1].keyboard_focus.is_none());
+            assert!(native.core().seats[&1].pointer_focus.is_none());
+        }
+        assert!(native.suspend_seat_input(999).is_err());
+        assert!(native.resume_seat_input(999).is_err());
+    }
+
+    #[test]
+    fn authenticated_shell_latches_serial_and_preserves_it_after_role_object_destroy() {
+        let mut display = Display::new().unwrap();
+        let access = XwaylandAccess::configure_display(&mut display).unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = Rc::new(display.create_client(socket).unwrap());
+        access.set_client(client.clone(), 1).unwrap();
+        let native =
+            NativeCompositor::new_with_xwayland(&display, ClientLimits::default(), access).unwrap();
+        let globals = registry(&display, &mut peer);
+        let (mut stranger_peer, socket) = UnixStream::pair().unwrap();
+        let stranger = display.create_client(socket).unwrap();
+        let public_globals = registry(&display, &mut stranger_peer);
+        assert!(public_globals.contains_key("wl_compositor"));
+        assert!(!public_globals.contains_key("xwayland_shell_v1"));
+        // This peer has identical Unix credentials, but no dedicated identity.
+        bind(&mut stranger_peer, &globals, "xwayland_shell_v1", 4);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!stranger.is_alive());
+        assert!(client.is_alive());
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "xwayland_shell_v1", 5);
+        send(&mut peer, 4, 0, &words(&[6]));
+        send(&mut peer, 5, 1, &words(&[7, 6]));
+        send(&mut peer, 7, 0, &words(&[11, 1]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(client.is_alive());
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        assert_eq!(
+            native
+                .core()
+                .world
+                .surface(surface)
+                .unwrap()
+                .snapshot()
+                .xwayland_serial,
+            None
+        );
+        send(&mut peer, 6, 6, &[]);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+            native
+                .core()
+                .world
+                .surface(surface)
+                .unwrap()
+                .snapshot()
+                .xwayland_serial,
+            Some((1u64 << 32) | 11)
+        );
+        send(&mut peer, 7, 1, &[]);
+        send(&mut peer, 6, 6, &[]);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+            native
+                .core()
+                .world
+                .surface(surface)
+                .unwrap()
+                .snapshot()
+                .xwayland_serial,
+            Some((1u64 << 32) | 11)
+        );
+        send(&mut peer, 5, 1, &words(&[8, 6]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!client.is_alive()); // Destroyed role objects do not permit a new role.
+    }
+    #[test]
+    fn serial_order_is_global_and_restart_resets_only_after_old_client_dies() {
+        let mut display = Display::new().unwrap();
+        let access = XwaylandAccess::configure_display(&mut display).unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = Rc::new(display.create_client(socket).unwrap());
+        access.set_client(client.clone(), 1).unwrap();
+        let _native =
+            NativeCompositor::new_with_xwayland(&display, ClientLimits::default(), access.clone())
+                .unwrap();
+        let globals = registry(&display, &mut peer);
+        bind(&mut peer, &globals, "wl_compositor", 4);
+        bind(&mut peer, &globals, "xwayland_shell_v1", 5);
+        for (surface, role, serial) in [(6, 7, 2), (8, 9, 1)] {
+            send(&mut peer, 4, 0, &words(&[surface]));
+            send(&mut peer, 5, 1, &words(&[role, surface]));
+            send(&mut peer, role, 0, &words(&[serial, 0]));
+        }
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!client.is_alive());
+        assert_eq!(access.last_serial.get(), 2);
+        let (mut replacement_peer, socket) = UnixStream::pair().unwrap();
+        let replacement = Rc::new(display.create_client(socket).unwrap());
+        assert!(access.set_client(replacement.clone(), 1).is_err());
+        access.set_client(replacement.clone(), 2).unwrap();
+        assert_eq!(access.last_serial.get(), 0);
+        assert!(access.set_client(replacement, 3).is_err());
+        let globals = registry(&display, &mut replacement_peer);
+        assert!(globals.contains_key("xwayland_shell_v1"));
+    }
+}

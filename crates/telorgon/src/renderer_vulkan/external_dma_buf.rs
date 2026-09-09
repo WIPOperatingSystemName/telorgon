@@ -1550,14 +1550,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn owning_dma_buf_plane_closes_an_unimported_fd_on_drop() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-        use std::path::PathBuf;
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
 
-        let file = File::open("/dev/null").unwrap();
-        let raw_fd = file.as_raw_fd();
-        let proc_entry = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
-        assert!(proc_entry.exists());
+        let (mut peer, file) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
         let plane = linux::VulkanDmaBufPlane {
             memory: file.into(),
             memory_index: 0,
@@ -1567,7 +1564,9 @@ mod tests {
             allocation_size: 4,
         };
         drop(plane);
-        assert!(!proc_entry.exists());
+        // An unrelated parallel test may immediately reuse a closed FD number.
+        // EOF on its retained peer proves this owned endpoint was closed.
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
     }
 
     #[test]

@@ -75,6 +75,9 @@ HiDPI behavior, boot density selection, configuration migration, and qualificati
 
 24. [Managed sessions and process launching](SESSION_AND_PROCESS_LAUNCHING.md) documents automatic
     entrypoint setup, the global command/application API, shutdown, recovery, and qualification limits.
+25. [X11 compatibility](X11_COMPATIBILITY.md) documents the optional managed integration and
+    remaining gaps; [X11 qualification](X11_QUALIFICATION.md) records actual evidence, and the
+    [manual smoke test](X11_SMOKE_TEST.md) defines the first live acceptance procedure.
 
 ## Document roles
 

@@ -198,6 +198,8 @@ pub struct ManagedChild {
 }
 
 impl ManagedChild {
+    /// Returns zero while startup readiness defers process creation. Never use
+    /// zero as an OS process identifier; wait for a nonzero ID or completion.
     pub fn id(&self) -> u32 {
         self.completion.pid.load(Ordering::Acquire)
     }

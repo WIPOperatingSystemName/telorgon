@@ -9,6 +9,41 @@ runtime and records the remaining qualification work. It is not a claim that eve
 The implementation deliberately uses the official C ABIs and protocol XML. It does not use Winit,
 Smithay, wlroots, an X11 compatibility host, or a Rust compositor framework.
 
+Optional [X11 compatibility components](X11_COMPATIBILITY.md) now connect embedded
+payload preparation, private helper supervision, dedicated Wayland-client access,
+XWM readiness/dispatch, map/configure requests and committed serial association to
+the managed loop. Preparation runs off the owner thread; helper/XWM descriptors
+wake libwayland and errors stop only the compatibility instance. Associated X11 surfaces now enter the retained image/composition path with
+XWM geometry and identity; unassociated/unmapped images and their subsurfaces
+remain hidden. Ordinary pointer-click focus now uses asynchronous X-server timestamps and ICCCM
+focus commands before granting Wayland keyboard focus. Broader focus policy remains
+incomplete. DISPLAY/XAUTHORITY now enter future managed child environments after
+server notification and XWM initialization; helper loss withdraws them and suppresses
+incident retries. Initial managed launches wait asynchronously for startup completion or failure.
+Shared activation-environment updates remain outstanding. The user has reported a working
+xmessage display/input smoke test; this is not full X11 qualification.
+
+The managed desktop uses a shared frame/policy model with a typed `WindowBackend`.
+Frame construction, hit testing, move/resize geometry, maximize/restore and local
+minimize reuse the native implementation. `window_backend.rs` dispatches focus
+and close, while `x11_windows.rs` translates frame-content coordinates into bounded,
+coalesced X11 configure commands. Only native windows use xdg configure/ack state.
+X11 server notifications cannot overwrite an in-progress compositor drag.
+Normal X11 windows receive the configured frame template; override-redirect
+windows remain unmanaged. Title metadata is bounded and encoding-checked.
+There is no Alt-drag special case. Full EWMH state/iconification, decoration hints,
+X11 application icon metadata and the broader compatibility matrix remain separate work.
+
+Reference review for this change reused Telorgon's existing frame, geometry and
+XWM request lifetimes. The adjacent reference library is absent; no independent
+graphics-source review is claimed and no GPU ownership or renderer implementation
+changed. The protocol boundary follows the
+[ICCCM](https://xorg.freedesktop.org/archive/current/doc/xorg-docs/icccm/icccm.html)
+and the repository's xdg-shell protocol contract: X11 root/content geometry and
+checked requests remain separate from xdg configure acknowledgements. Tests cover
+frame-template parity, content/input offsets, stale geometry during dragging,
+native transaction isolation, unmanaged windows, size hints and bounded titles.
+
 ## Public assembly
 
 `Application::desktop_environment` is the only process entrypoint for this mode. Compositor-owned

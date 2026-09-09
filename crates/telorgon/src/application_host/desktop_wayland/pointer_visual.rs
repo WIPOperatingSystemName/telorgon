@@ -138,12 +138,12 @@ pub(super) fn render_cursor_image(
             ) {
                 PointerResolution::ClientSurface => windows
                     .get(&surface)
-                    .filter(|cursor| !cursor.pixels.is_empty())
+                    .filter(|cursor| !cursor.presentation.pixels.is_empty())
                     .map(|cursor| {
                         CursorVisual::Image(RenderedCursor {
                             rgba: client_pixels_rgba(cursor),
-                            size: cursor.image_size,
-                            logical_size: cursor.size,
+                            size: cursor.presentation.image_size,
+                            logical_size: cursor.presentation.size,
                             hotspot: PointI {
                                 x: hotspot_x,
                                 y: hotspot_y,
@@ -165,13 +165,13 @@ pub(super) fn render_cursor_image(
 }
 
 fn client_pixels_rgba(window: &ClientWindow) -> Vec<u8> {
-    let mut rgba = window.pixels.clone();
-    if window.pixel_format == ImagePixelFormat::Bgra8 {
+    let mut rgba = window.presentation.pixels.clone();
+    if window.presentation.pixel_format == ImagePixelFormat::Bgra8 {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
     }
-    if window.alpha_mode == ImageAlphaMode::Opaque {
+    if window.presentation.alpha_mode == ImageAlphaMode::Opaque {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel[3] = 255;
         }

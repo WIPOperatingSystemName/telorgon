@@ -32,10 +32,13 @@ pub use id::{ClientId, ProtocolObjectId, WaylandBufferId, WaylandSurfaceId};
 pub use native::{
     DmaBufFormat, DmaBufImage, NativeCompositor, NativeCompositorError, PointerConstraintKind,
     PointerConstraintState, ShmBufferReader, ShmImage, ShmImageRegion, ToplevelIconImage,
-    ToplevelIconSnapshot, ViewportSource, ViewportState,
+    ToplevelIconSnapshot, ViewportSource, ViewportState, XwaylandAccess,
 };
 pub use object::{ObjectMetadata, ObjectRegistry, ObjectRegistryError, ProtocolObjectKind};
-pub use output::{OutputDescription, OutputError, OutputMode, OutputState, OutputTransform};
+pub use output::{
+    OutputDescription, OutputError, OutputLayoutSnapshot, OutputMode, OutputRootGeometry,
+    OutputState, OutputTransform,
+};
 pub use region::{Region, RegionError};
 pub use seat::{
     ButtonState, CursorImage, KeyboardFocus, PointerFocus, SeatCapabilities, SeatState,

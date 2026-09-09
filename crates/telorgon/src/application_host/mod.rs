@@ -66,9 +66,9 @@ pub use crate::runtime::{
 pub use declaration::{
     Application, Compositor, CompositorVisual, DesktopEnvironment,
     DesktopEnvironmentWithCompositor, DesktopKeyAction, DesktopKeyEvent, GuiApplication,
-    LinuxDesktopConfig, ReadyCompositor, ReadyDesktopEnvironment, ReadyGuiApplication,
-    ReadyShellWidget, ReadyWindow, Renderer, ShellWidget, ShellWidgetAnchor, ShellWidgetExtent,
-    Window, WindowFrameFactory, WindowFrameTemplate,
+    KeyboardConfig, LinuxDesktopConfig, ReadyCompositor, ReadyDesktopEnvironment,
+    ReadyGuiApplication, ReadyShellWidget, ReadyWindow, Renderer, ShellWidget, ShellWidgetAnchor,
+    ShellWidgetExtent, Window, WindowFrameFactory, WindowFrameTemplate,
 };
 pub use delta_queue::SceneDeltaQueue;
 pub use error::{AppError, AppResult};

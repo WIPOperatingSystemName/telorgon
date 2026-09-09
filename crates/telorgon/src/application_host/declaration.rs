@@ -28,11 +28,60 @@ pub enum Renderer {
     Software,
 }
 
+/// XKB rule names for the managed desktop seat. `None` retains libxkbcommon's
+/// existing defaults; an explicit empty options string disables default options.
+/// Comma-separated layouts, variants and options are passed through as XKB names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyboardConfig {
+    /// Exclusive absolute XKB data root; None keeps the existing system search path.
+    pub include_root: Option<PathBuf>,
+    pub rules: Option<String>,
+    pub model: Option<String>,
+    pub layout: Option<String>,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+}
+
+impl KeyboardConfig {
+    fn validate(&self) -> AppResult<()> {
+        if self
+            .include_root
+            .as_ref()
+            .is_some_and(|root| !root.is_absolute())
+        {
+            return Err(AppError::new("XKB include root must be absolute"));
+        }
+        if [
+            &self.rules,
+            &self.model,
+            &self.layout,
+            &self.variant,
+            &self.options,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| name.contains('\0'))
+        {
+            return Err(AppError::new("XKB name contains an interior NUL"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinuxDesktopConfig {
+    /// Enable the embedded compatibility helper. Requires an embedded-payload build.
+    /// Desktop X11 presentation remains under implementation.
+    #[cfg(feature = "desktop-xwayland")]
+    pub xwayland_enabled: bool,
+    /// Explicit private executable cache directory (created and validated securely).
+    #[cfg(feature = "desktop-xwayland")]
+    pub xwayland_cache: Option<PathBuf>,
     /// None selects a seat-accessible KMS device with a connected output.
     pub drm_device: Option<PathBuf>,
     pub seat_name: String,
+    /// Startup keymap published to clients of the managed desktop seat.
+    pub keyboard: KeyboardConfig,
     pub socket_name: Option<String>,
     pub session: crate::session::SessionConfig,
     /// All compositor geometry uses logical units; this selects pixels per logical unit.
@@ -53,8 +102,13 @@ pub struct LinuxDesktopConfig {
 impl Default for LinuxDesktopConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "desktop-xwayland")]
+            xwayland_enabled: cfg!(feature = "desktop-xwayland-embedded"),
+            #[cfg(feature = "desktop-xwayland")]
+            xwayland_cache: None,
             drm_device: None,
             seat_name: "seat0".to_owned(),
+            keyboard: KeyboardConfig::default(),
             socket_name: None,
             session: crate::session::SessionConfig::default(),
             output_scale: super::OutputScale::Auto,
@@ -77,6 +131,7 @@ impl Default for LinuxDesktopConfig {
 impl LinuxDesktopConfig {
     fn validate(&self) -> AppResult<()> {
         self.output_scale.validate()?;
+        self.keyboard.validate()?;
         self.session
             .validate()
             .map_err(|e| AppError::new(e.to_string()))?;
@@ -734,6 +789,8 @@ pub enum DesktopKeyAction {
     Forward,
     /// Consume this key's press, repeats, and release before client delivery.
     Consume,
+    /// Revoke pointer capture and shortcut inhibition without changing focus or lock.
+    ReleaseCapture,
     /// Return normally from the desktop host, releasing its owned resources.
     Quit,
 }
@@ -1454,5 +1511,69 @@ mod tests {
         assert_eq!(options.decorations, WindowDecorationMode::Hidden);
         assert_eq!(options.icon.name(), Some("com.example.studio"));
         assert_eq!(options.icon.preferred(64), Some(crate::Icon::new(icon)));
+    }
+}
+
+#[cfg(test)]
+mod keyboard_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_names_preserve_defaults_and_reject_nul_in_every_field() {
+        let defaults = LinuxDesktopConfig::default();
+        assert_eq!(defaults.keyboard, KeyboardConfig::default());
+        defaults.validate().unwrap();
+        for field in 0..5 {
+            let mut config = LinuxDesktopConfig::default();
+            let names = &mut config.keyboard;
+            let target = match field {
+                0 => &mut names.rules,
+                1 => &mut names.model,
+                2 => &mut names.layout,
+                3 => &mut names.variant,
+                _ => &mut names.options,
+            };
+            *target = Some("invalid\0name".into());
+            assert!(config.validate().is_err());
+        }
+        let config = KeyboardConfig {
+            layout: Some("us,de".into()),
+            variant: Some(",nodeadkeys".into()),
+            options: Some(String::new()),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(config.options.as_deref(), Some(""));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "desktop-wayland-linux"))]
+    #[test]
+    fn explicit_layout_changes_the_compiled_seat_keymap() {
+        use crate::platform_linux::XkbKeyboard;
+        let compile = |layout: &str| {
+            let config = KeyboardConfig {
+                include_root: None,
+                rules: Some("evdev".into()),
+                model: Some("pc105".into()),
+                layout: Some(layout.into()),
+                variant: Some(String::new()),
+                options: Some(String::new()),
+            };
+            config.validate().unwrap();
+            XkbKeyboard::from_names(
+                config.rules.as_deref(),
+                config.model.as_deref(),
+                config.layout.as_deref(),
+                config.variant.as_deref(),
+                config.options.as_deref(),
+            )
+            .unwrap()
+        };
+        let us = compile("us");
+        let de = compile("de");
+        // The same physical evdev key is Y in US and Z in German QWERTZ.
+        assert_eq!(us.utf8(21).unwrap(), "y");
+        assert_eq!(de.utf8(21).unwrap(), "z");
+        assert_ne!(us.keymap_string().unwrap(), de.keymap_string().unwrap());
     }
 }

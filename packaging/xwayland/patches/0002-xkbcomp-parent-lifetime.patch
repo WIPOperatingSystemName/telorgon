@@ -1,0 +1,45 @@
+--- a/xkbcomp.c
++++ b/xkbcomp.c
+@@ -899,6 +899,34 @@
+ extern int yydebug;
+ #endif
+ 
++
++/* Telorgon private payload: bind helper lifetime to the launching process. */
++#include <errno.h>
++#include <limits.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++static void
++telorgon_parent_lifetime(const char *variable)
++{
++    pid_t parent = getppid();
++    const char *value = getenv(variable);
++    if (value) {
++        char *end = NULL;
++        long expected;
++        errno = 0;
++        expected = strtol(value, &end, 10);
++        if (errno || end == value || *end || expected <= 1 ||
++            expected > INT_MAX || expected != parent)
++            _exit(125);
++    }
++    if (parent <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
++        getppid() != parent)
++        _exit(125);
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -909,6 +937,7 @@
+     XkbFileInfo result;
+     Status status;
+ 
++    telorgon_parent_lifetime("TELORGON_XKBCOMP_PARENT_PID");
+     scan_set_file(stdin);
+ #ifdef DEBUG
+     uSetDebugFile(NullString);

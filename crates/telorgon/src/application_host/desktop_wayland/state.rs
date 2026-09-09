@@ -3,6 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::compositor_wayland::{ResizeEdge, WaylandSurfaceId, XdgConfigure};
 use crate::core::{PointF, PointI, RectI, SizeI};
 
+/// Native xdg configure transaction state. Desktop geometry and retained surface
+/// imagery are deliberately outside this record. X11 geometry commands have no
+/// xdg acknowledgement or terminal-configure transaction to store here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct NativeConfigureState {
+    pub(super) resize_anchor: Option<ResizeAnchor>,
+    pub(super) resize_final: Option<FinalResizeConfigure>,
+}
+
 /// Removes the next deferred SHM surface that has neither an in-flight copy nor a resize pause.
 ///
 /// A submitted surface remains in the queue so its latest deferred revision can be retried after

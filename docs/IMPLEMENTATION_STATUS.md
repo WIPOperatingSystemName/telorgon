@@ -1,5 +1,25 @@
 # Telorgon Implementation Status
 
+> X11 compatibility: the optional embedded feature is now connected to managed startup,
+> dedicated Wayland-client access, XWM dispatch, serial association, retained surface
+> composition, ordinary pointer-click focus, keyboard delivery and cooperative shutdown.
+> Initial direct managed launches wait asynchronously for readiness/failure. Ready endpoints
+> enter child environments; helper loss withdraws them and suppresses incident retries.
+> Native, compatibility and downstream embedded builds have compile coverage; state/socket/
+> subprocess fixtures cover components. On 2026-09-09 the real patched payload was rebuilt
+> and embedded in the consuming compositor; the user reported that xmessage displays
+> and accepts interaction. Managed X11 windows now use the same composed frame factory,
+> titlebar hit tests and desktop geometry/state actions as native windows, with backend
+> dispatch for focus/close and a separate X11 geometry adapter. The temporary Alt-drag
+> gesture was removed. X11 titles use bounded UTF-8/legacy property readers; popups remain
+> unframed. Live frame/control validation is pending.
+> This user-reported smoke result does not establish the wider hardware/application matrix.
+> Shared activation-environment updates, explicit X11-required launch errors, restarts,
+> broader desktop policy, accelerated capabilities and application/hardware qualification
+> remain outstanding. See the [manual smoke test](X11_SMOKE_TEST.md),
+> [compatibility details](X11_COMPATIBILITY.md) and [qualification ledger](X11_QUALIFICATION.md).
+> W01–W13 are not closed by this integration milestone.
+
 > Managed session launching: both managed entrypoints initialize the global session API. Literal
 > command execution, bounded pipe capture/input, child supervision, crash retries, and persistent
 > recovery operate in real subprocess unit fixtures. Automatic DE socket selection has native

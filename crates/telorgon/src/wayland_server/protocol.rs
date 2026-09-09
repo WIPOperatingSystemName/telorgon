@@ -94,6 +94,21 @@ pub const POINTER_CONSTRAINTS_INTERFACES: &[InterfaceSpec] = &[
     InterfaceSpec::new("zwp_confined_pointer_v1", 1, 1),
 ];
 
+pub const XDG_OUTPUT_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("zxdg_output_manager_v1", 3, 3),
+    InterfaceSpec::new("zxdg_output_v1", 3, 3),
+];
+
+pub const XWAYLAND_KEYBOARD_GRAB_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("zwp_xwayland_keyboard_grab_manager_v1", 1, 1),
+    InterfaceSpec::new("zwp_xwayland_keyboard_grab_v1", 1, 1),
+];
+
+pub const SHORTCUT_INHIBIT_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("zwp_keyboard_shortcuts_inhibit_manager_v1", 1, 1),
+    InterfaceSpec::new("zwp_keyboard_shortcuts_inhibitor_v1", 1, 1),
+];
+
 pub const IDLE_INHIBIT_INTERFACES: &[InterfaceSpec] = &[
     InterfaceSpec::new("zwp_idle_inhibit_manager_v1", 1, 1),
     InterfaceSpec::new("zwp_idle_inhibitor_v1", 1, 1),
@@ -141,6 +156,15 @@ pub const LINUX_DMABUF_INTERFACES: &[InterfaceSpec] = &[
 ];
 
 pub const DESKTOP_PROTOCOLS: &[ProtocolSpec] = &[
+    ProtocolSpec {
+        name: "xwayland-shell-v1",
+        stage: ProtocolStage::Staging,
+        source: "staging/xwayland-shell/xwayland-shell-v1.xml",
+        interfaces: &[
+            InterfaceSpec::new("xwayland_shell_v1", 1, 1),
+            InterfaceSpec::new("xwayland_surface_v1", 1, 1),
+        ],
+    },
     ProtocolSpec {
         name: "wayland",
         stage: ProtocolStage::Core,
@@ -206,6 +230,24 @@ pub const DESKTOP_PROTOCOLS: &[ProtocolSpec] = &[
         stage: ProtocolStage::Unstable,
         source: "unstable/pointer-constraints/pointer-constraints-unstable-v1.xml",
         interfaces: POINTER_CONSTRAINTS_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "xdg-output-unstable-v1",
+        stage: ProtocolStage::Unstable,
+        source: "unstable/xdg-output/xdg-output-unstable-v1.xml",
+        interfaces: XDG_OUTPUT_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "xwayland-keyboard-grab-unstable-v1",
+        stage: ProtocolStage::Unstable,
+        source: "unstable/xwayland-keyboard-grab/xwayland-keyboard-grab-unstable-v1.xml",
+        interfaces: XWAYLAND_KEYBOARD_GRAB_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "keyboard-shortcuts-inhibit-unstable-v1",
+        stage: ProtocolStage::Unstable,
+        source: "unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml",
+        interfaces: SHORTCUT_INHIBIT_INTERFACES,
     },
     ProtocolSpec {
         name: "idle-inhibit-unstable-v1",

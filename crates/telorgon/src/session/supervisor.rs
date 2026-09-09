@@ -34,6 +34,9 @@ struct Worker {
 }
 
 struct State {
+    x11_startup_pending: bool,
+    deferred: Vec<DeferredLaunch>,
+    x11_environment: Option<(std::ffi::OsString, std::ffi::OsString)>,
     phase: SessionPhase,
     children: Vec<Running>,
     pending: Vec<RecoveryEntry>,
@@ -45,7 +48,47 @@ struct State {
     errors: Vec<Error>,
 }
 
+struct DeferredLaunch {
+    command: Command,
+    completion: Arc<Completion>,
+    entry: RecoveryEntry,
+}
+impl State {
+    fn launch_environment(&self, base: &Environment) -> Environment {
+        let mut environment = base.clone();
+        if let Some((display, authority)) = &self.x11_environment {
+            environment.0.insert("DISPLAY".into(), display.clone());
+            environment.0.insert("XAUTHORITY".into(), authority.clone());
+        }
+        environment
+    }
+    #[cfg(feature = "desktop-xwayland")]
+    fn set_x11_environment(
+        &mut self,
+        environment: Option<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> bool {
+        if self.x11_environment == environment && !self.x11_startup_pending {
+            return false;
+        }
+        self.x11_startup_pending = false;
+        if self.x11_environment.is_some() {
+            // Conservative incident scope: managed children that inherited this
+            // display, regardless of toolkit or untrusted _NET_WM_PID metadata.
+            for child in &mut self.children {
+                if child.inherited_x11 {
+                    child.retry_suppressed = true;
+                    child.restart_at = None;
+                }
+            }
+        }
+        self.x11_environment = environment;
+        true
+    }
+}
+
 struct Running {
+    inherited_x11: bool,
+    retry_suppressed: bool,
     child: Child,
     command: Command,
     completion: Arc<Completion>,
@@ -106,7 +149,11 @@ impl SessionHandle {
     }
     /// Snapshot of the environment supplied to children. Does not expose the global mutable env.
     pub fn environment(&self, key: &str) -> Option<std::ffi::OsString> {
-        self.worker.env.get(key).map(Into::into)
+        let state = self.worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .launch_environment(&self.worker.env)
+            .get(key)
+            .map(Into::into)
     }
     pub fn pending_recovery(&self) -> Result<Vec<RecoveryEntry>> {
         let state = self.worker.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -193,7 +240,7 @@ impl SessionHandle {
         if state.phase != SessionPhase::Ready {
             return Err(Error::Closing);
         }
-        if state.children.len() + state.pending.len() >= 256 {
+        if state.children.len() + state.pending.len() + state.deferred.len() >= 256 {
             return Err(Error::ProcessLimit);
         }
         if command.spec.program.is_empty()
@@ -229,12 +276,41 @@ impl SessionHandle {
         command.session = None;
         let id = state.next_id;
         let next_id = state.next_id.checked_add(1).ok_or(Error::ProcessLimit)?;
-        let child = spawn_native(&command, &self.worker.env)?;
+        if state.x11_startup_pending {
+            let completion = Arc::new(Completion::new(0));
+            let entry = RecoveryEntry {
+                id,
+                spec: command.spec.clone(),
+                pid: 0,
+                process_identity: None,
+                generation: id,
+            };
+            state.deferred.push(DeferredLaunch {
+                command,
+                completion: completion.clone(),
+                entry,
+            });
+            state.next_id = next_id;
+            state.dirty = true;
+            self.worker.notify();
+            return Ok(ManagedChild { completion });
+        }
+        let inherited_x11 = state.x11_environment.as_ref().is_some_and(|(display, _)| {
+            command
+                .env
+                .get(OsStr::new("DISPLAY"))
+                .map_or(true, |value| value.as_ref() == Some(display))
+        });
+        let child = spawn_native(&command, &state.launch_environment(&self.worker.env))?;
         let completion = Arc::new(Completion::new(child.id()));
         state.next_id = next_id;
-        state
-            .children
-            .push(Running::new(child, command, completion.clone(), id));
+        state.children.push(Running::new(
+            child,
+            command,
+            completion.clone(),
+            id,
+            inherited_x11,
+        ));
         state.dirty = true;
         self.worker.notify();
         Ok(ManagedChild { completion })
@@ -281,7 +357,13 @@ fn spawn_native(command: &Command, env: &Environment) -> Result<Child> {
 }
 
 impl Running {
-    fn new(mut child: Child, mut command: Command, completion: Arc<Completion>, id: u64) -> Self {
+    fn new(
+        mut child: Child,
+        mut command: Command,
+        completion: Arc<Completion>,
+        id: u64,
+        inherited_x11: bool,
+    ) -> Self {
         command.activation_token = None; // Single-use; never persist or replay on retry.
         let entry = RecoveryEntry {
             id,
@@ -311,6 +393,8 @@ impl Running {
             }
         };
         Self {
+            inherited_x11,
+            retry_suppressed: false,
             child,
             command,
             completion,
@@ -385,6 +469,7 @@ impl Running {
                 self.command.clone(),
                 self.completion.clone(),
                 self.entry.id,
+                self.inherited_x11,
             );
             self.retries = retries;
         }
@@ -427,6 +512,7 @@ impl Running {
             self.stderr_truncated |= self.child.stderr.take().is_some();
         }
         if phase == SessionPhase::Ready
+            && !self.retry_suppressed
             && !status.success()
             && self.command.spec.restart == RestartPolicy::OnFailure
             && self.retries < 3
@@ -522,12 +608,22 @@ pub(crate) struct SessionOwner {
 
 impl SessionOwner {
     pub(crate) fn start(env: Environment, config: SessionConfig) -> Result<Self> {
-        Self::start_impl(env, config, false)
+        Self::start_impl(env, config, false, false)
     }
     pub(crate) fn start_gui(env: Environment, config: SessionConfig) -> Result<Self> {
-        Self::start_impl(env, config, true)
+        Self::start_impl(env, config, true, false)
     }
-    fn start_impl(env: Environment, config: SessionConfig, gui: bool) -> Result<Self> {
+    #[cfg(feature = "desktop-xwayland")]
+    #[cfg_attr(not(feature = "desktop-xwayland-embedded"), allow(dead_code))]
+    pub(crate) fn start_waiting_for_x11(env: Environment, config: SessionConfig) -> Result<Self> {
+        Self::start_impl(env, config, false, true)
+    }
+    fn start_impl(
+        env: Environment,
+        config: SessionConfig,
+        gui: bool,
+        x11_startup_pending: bool,
+    ) -> Result<Self> {
         config.validate()?;
         let mut registry = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         if registry.is_some() {
@@ -554,6 +650,9 @@ impl SessionOwner {
             .ok_or(Error::ProcessLimit)?;
         let worker = Arc::new(Worker {
             state: Mutex::new(State {
+                x11_startup_pending,
+                deferred: Vec::new(),
+                x11_environment: None,
                 phase: SessionPhase::Ready,
                 children: Vec::new(),
                 pending,
@@ -588,6 +687,22 @@ impl SessionOwner {
             &self.handle.worker.env,
         )?);
         Ok(())
+    }
+    #[cfg(feature = "desktop-xwayland")]
+    pub(crate) fn set_x11_environment(
+        &self,
+        environment: Option<(std::ffi::OsString, std::ffi::OsString)>,
+    ) {
+        let changed = self
+            .handle
+            .worker
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_x11_environment(environment);
+        if changed {
+            self.handle.worker.notify();
+        }
     }
     pub(crate) fn quiesce(&self) {
         self.handle
@@ -674,6 +789,54 @@ fn run_worker(worker: Arc<Worker>) {
                 || state
                     .closing_at
                     .is_some_and(|at| at.elapsed() >= worker.config.shutdown_timeout);
+            let environment = state.launch_environment(&worker.env);
+            if phase == SessionPhase::Closing
+                || (phase == SessionPhase::Ready && !state.x11_startup_pending)
+            {
+                let count = if phase == SessionPhase::Closing {
+                    state.deferred.len()
+                } else {
+                    state.deferred.len().min(4)
+                };
+                let queued: Vec<_> = state.deferred.drain(..count).collect();
+                for launch in queued {
+                    let inherited_x11 =
+                        state.x11_environment.as_ref().is_some_and(|(display, _)| {
+                            launch
+                                .command
+                                .env
+                                .get(OsStr::new("DISPLAY"))
+                                .map_or(true, |value| value.as_ref() == Some(display))
+                        });
+                    let result = if phase == SessionPhase::Closing {
+                        Err(Error::Closing)
+                    } else {
+                        spawn_native(&launch.command, &environment)
+                    };
+                    match result {
+                        Ok(child) => {
+                            launch.completion.pid.store(child.id(), Ordering::Release);
+                            state.children.push(Running::new(
+                                child,
+                                launch.command,
+                                launch.completion,
+                                launch.entry.id,
+                                inherited_x11,
+                            ));
+                        }
+                        Err(error) => {
+                            if phase != SessionPhase::Closing {
+                                record_error(&mut state, error.clone());
+                            }
+                            if launch.command.spec.recover {
+                                state.pending.push(launch.entry);
+                            }
+                            completed.push((launch.completion, Err(error)));
+                        }
+                    }
+                    state.dirty = true;
+                }
+            }
             let mut index = 0;
             while index < state.children.len() {
                 if phase == SessionPhase::Closing && !state.aborting {
@@ -685,7 +848,7 @@ fn run_worker(worker: Arc<Worker>) {
                 let result = state.children[index].poll(
                     &mut Context::from_waker(&waker),
                     phase,
-                    &worker.env,
+                    &environment,
                 );
                 if old_pid != state.children[index].child.id() {
                     state.dirty = true;
@@ -727,6 +890,13 @@ fn run_worker(worker: Arc<Worker>) {
                                 .filter(|child| child.command.spec.recover)
                                 .map(|child| child.entry.clone()),
                         )
+                        .chain(
+                            state
+                                .deferred
+                                .iter()
+                                .filter(|launch| launch.command.spec.recover)
+                                .map(|launch| launch.entry.clone()),
+                        )
                         .collect();
                     if let Err(e) = journal.write(entries) {
                         record_error(&mut state, e);
@@ -734,14 +904,20 @@ fn run_worker(worker: Arc<Worker>) {
                 }
                 state.dirty = false;
             }
-            if phase == SessionPhase::Closing && state.children.is_empty() {
+            if phase == SessionPhase::Closing
+                && state.children.is_empty()
+                && state.deferred.is_empty()
+            {
                 state.phase = SessionPhase::Closed;
                 // Explicit handles may outlive the owner; release the cross-process journal lock.
                 state.journal = None;
             }
             (
                 state.phase == SessionPhase::Closed,
-                state.children.is_empty(),
+                state.children.is_empty()
+                    && (state.deferred.is_empty()
+                        || state.x11_startup_pending
+                        || phase != SessionPhase::Ready),
             )
         };
         // Wakers may reenter session APIs. Never invoke them while holding the session mutex.

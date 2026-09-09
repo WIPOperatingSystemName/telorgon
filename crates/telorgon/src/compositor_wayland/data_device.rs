@@ -61,20 +61,35 @@ pub struct DataSource {
     pub object: ProtocolObjectId,
     pub mime_types: Vec<MimeType>,
     pub actions: DataAction,
+    /// Distinguishes a declared empty action mask from no set_actions request.
+    pub actions_set: bool,
     pub used: bool,
 }
 
 impl DataSource {
+    pub fn set_actions(&mut self, actions: DataAction) -> Result<(), DataDeviceError> {
+        if self.used {
+            return Err(DataDeviceError::SourceAlreadyUsed);
+        }
+        if self.actions_set {
+            return Err(DataDeviceError::InvalidSource);
+        }
+        self.actions = actions;
+        self.actions_set = true;
+        Ok(())
+    }
+
     pub fn offer(&mut self, mime_type: MimeType) -> Result<(), DataDeviceError> {
         if self.used {
             return Err(DataDeviceError::SourceAlreadyUsed);
         }
+        if self.mime_types.contains(&mime_type) {
+            return Ok(());
+        }
         if self.mime_types.len() >= 128 {
             return Err(DataDeviceError::TooManyMimeTypes);
         }
-        if !self.mime_types.contains(&mime_type) {
-            self.mime_types.push(mime_type);
-        }
+        self.mime_types.push(mime_type);
         Ok(())
     }
 }
@@ -105,10 +120,15 @@ pub struct DataDeviceState {
 
 impl DataDeviceState {
     pub fn create_source(&mut self, source: DataSource) -> Result<(), DataDeviceError> {
-        if self.sources.insert(source.object, source).is_some() {
-            return Err(DataDeviceError::DuplicateObject);
+        match self.sources.entry(source.object) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(DataDeviceError::DuplicateObject)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(source);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn source_mut(&mut self, object: ProtocolObjectId) -> Option<&mut DataSource> {
@@ -133,7 +153,7 @@ impl DataDeviceState {
                 .sources
                 .get_mut(&source)
                 .ok_or(DataDeviceError::UnknownSource)?;
-            if source.owner != owner || source.used {
+            if source.owner != owner || source.used || source.actions_set {
                 return Err(DataDeviceError::InvalidSource);
             }
             source.used = true;
@@ -184,10 +204,15 @@ impl DataDeviceState {
         if !self.sources.contains_key(&offer.source) {
             return Err(DataDeviceError::UnknownSource);
         }
-        if self.offers.insert(offer.object, offer).is_some() {
-            return Err(DataDeviceError::DuplicateObject);
+        match self.offers.entry(offer.object) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(DataDeviceError::DuplicateObject)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(offer);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn offer(&self, object: ProtocolObjectId) -> Option<&DataOffer> {
@@ -308,6 +333,122 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_registration_preserves_live_source_and_offer() {
+        let mut state = DataDeviceState::default();
+        let source = DataSource {
+            owner: client(1),
+            object: object(1),
+            mime_types: vec![MimeType::new("text/plain").unwrap()],
+            actions: DataAction::NONE,
+            actions_set: false,
+            used: false,
+        };
+        state.create_source(source.clone()).unwrap();
+        state.set_selection(client(1), Some(object(1))).unwrap();
+        let replacement = DataSource {
+            owner: client(2),
+            ..source
+        };
+        assert_eq!(
+            state.create_source(replacement),
+            Err(DataDeviceError::DuplicateObject)
+        );
+        assert_eq!(state.source(object(1)).unwrap().owner, client(1));
+        assert!(state.source(object(1)).unwrap().used);
+        assert_eq!(state.selection(), Some(object(1)));
+        let offer = DataOffer {
+            object: object(2),
+            source: object(1),
+            target: client(2),
+            drag: false,
+            accepted_mime_type: None,
+            source_actions: DataAction::NONE,
+            target_actions: DataAction::NONE,
+            preferred_action: DataAction::NONE,
+            selected_action: DataAction::NONE,
+            dropped: false,
+            finished: false,
+        };
+        state.create_offer(offer.clone()).unwrap();
+        let replacement = DataOffer {
+            target: client(3),
+            finished: true,
+            ..offer
+        };
+        assert_eq!(
+            state.create_offer(replacement),
+            Err(DataDeviceError::DuplicateObject)
+        );
+        assert_eq!(state.offer(object(2)).unwrap().target, client(2));
+        assert!(!state.offer(object(2)).unwrap().finished);
+        assert!(state.remove_source(object(1)));
+        assert!(state.offer(object(2)).is_none());
+    }
+
+    #[test]
+    fn mime_bound_counts_distinct_offers_and_keeps_used_sources_immutable() {
+        let mut source = DataSource {
+            owner: client(1),
+            object: object(1),
+            mime_types: vec![],
+            actions: DataAction::NONE,
+            actions_set: false,
+            used: false,
+        };
+        for index in 0..128 {
+            source
+                .offer(MimeType::new(format!("application/test-{index}")).unwrap())
+                .unwrap();
+        }
+        let duplicate = source.mime_types[0].clone();
+        source.offer(duplicate.clone()).unwrap();
+        assert_eq!(source.mime_types.len(), 128);
+        assert_eq!(
+            source.offer(MimeType::new("application/overflow").unwrap()),
+            Err(DataDeviceError::TooManyMimeTypes)
+        );
+        assert_eq!(source.mime_types.len(), 128);
+        source.used = true;
+        assert_eq!(
+            source.offer(duplicate),
+            Err(DataDeviceError::SourceAlreadyUsed)
+        );
+    }
+
+    #[test]
+    fn source_actions_are_one_shot_and_reserve_source_for_drag() {
+        let mut source = DataSource {
+            owner: client(1),
+            object: object(1),
+            mime_types: vec![],
+            actions: DataAction::NONE,
+            actions_set: false,
+            used: false,
+        };
+        source.set_actions(DataAction::NONE).unwrap();
+        assert!(source.set_actions(DataAction::MOVE).is_err());
+        assert_eq!(source.actions, DataAction::NONE);
+        let mut state = DataDeviceState::default();
+        state.create_source(source).unwrap();
+        assert!(state.set_selection(client(1), Some(object(1))).is_err());
+        assert_eq!(state.selection(), None);
+        assert!(!state.source(object(1)).unwrap().used);
+        state
+            .start_drag(
+                client(1),
+                Some(object(1)),
+                crate::compositor_wayland::WaylandSurfaceId::from_raw(1).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            state
+                .source_mut(object(1))
+                .unwrap()
+                .set_actions(DataAction::MOVE)
+                .is_err()
+        );
+    }
+    #[test]
     fn removing_the_selected_source_revokes_its_offers() {
         let mut state = DataDeviceState::default();
         state
@@ -315,7 +456,8 @@ mod tests {
                 owner: client(1),
                 object: object(1),
                 mime_types: vec![MimeType::new("text/plain").unwrap()],
-                actions: DataAction::COPY,
+                actions: DataAction::NONE,
+                actions_set: false,
                 used: false,
             })
             .unwrap();
@@ -350,6 +492,7 @@ mod tests {
                 object: object(1),
                 mime_types: Vec::new(),
                 actions: DataAction::COPY.union(DataAction::MOVE),
+                actions_set: true,
                 used: false,
             })
             .unwrap();

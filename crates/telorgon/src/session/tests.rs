@@ -404,3 +404,126 @@ fn journal_does_not_follow_symlink_or_replay_unknown_version() {
     .unwrap();
     assert!(recovery::Journal::open(&fixture.config(), &env).is_err());
 }
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+fn x11_child_environment_withdrawal_suppresses_incident_retries() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let mut env = Environment::inherited();
+    env.0.remove(std::ffi::OsStr::new("DISPLAY"));
+    env.0.remove(std::ffi::OsStr::new("XAUTHORITY"));
+    env.0
+        .insert("WAYLAND_DISPLAY".into(), "wayland-fixture".into());
+    let owner = SessionOwner::start(env, fixture.config()).unwrap();
+    let handle = current().unwrap();
+    assert_eq!(handle.environment("DISPLAY"), None);
+    owner.set_x11_environment(Some((":123".into(), "/private/fixture-auth".into())));
+    let output = wait(
+        command("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s|%s|%s' \"$DISPLAY\" \"$XAUTHORITY\" \"$WAYLAND_DISPLAY\"",
+            ])
+            .output(),
+    )
+    .unwrap();
+    assert_eq!(output.stdout, b":123|/private/fixture-auth|wayland-fixture");
+    let log = fixture.0.join("attempts");
+    let child = command("/bin/sh")
+        .args([
+            OsString::from("-c"),
+            OsString::from("printf x >> \"$1\"; exit 1"),
+            OsString::from("fixture"),
+            log.as_os_str().into(),
+        ])
+        .restart(RestartPolicy::OnFailure)
+        .recover(true)
+        .spawn()
+        .unwrap();
+    wait_until(|| log.exists());
+    owner.set_x11_environment(None);
+    assert!(!wait(child.status()).unwrap().success());
+    assert_eq!(std::fs::read(log).unwrap(), b"x");
+    assert_eq!(handle.environment("DISPLAY"), None);
+    assert_eq!(handle.environment("XAUTHORITY"), None);
+    assert_eq!(
+        handle.environment("WAYLAND_DISPLAY"),
+        Some("wayland-fixture".into())
+    );
+    let output = wait(
+        command("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s|%s' \"${DISPLAY-unset}\" \"$WAYLAND_DISPLAY\"",
+            ])
+            .output(),
+    )
+    .unwrap();
+    assert_eq!(output.stdout, b"unset|wayland-fixture");
+    assert_eq!(pending_recovery().unwrap().len(), 1);
+    owner.close();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+fn initial_launches_wait_for_x11_success_failure_or_session_close() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    for outcome in [0, 1, 2] {
+        let fixture = Fixture::new();
+        let mut env = Environment::inherited();
+        env.0.remove(std::ffi::OsStr::new("DISPLAY"));
+        let owner = SessionOwner::start_waiting_for_x11(env, fixture.config()).unwrap();
+        let child = command("/bin/sh")
+            .args(["-c", "printf '%s' \"${DISPLAY-native}\""])
+            .stdout(Stream::Capture)
+            .spawn()
+            .unwrap();
+        assert_eq!(child.id(), 0);
+        assert!(child.try_status().unwrap().is_none());
+        match outcome {
+            0 => owner.set_x11_environment(Some((":123".into(), "/private/auth".into()))),
+            1 => owner.set_x11_environment(None),
+            _ => owner.close(),
+        }
+        if outcome == 2 {
+            assert!(matches!(wait(child.output()), Err(Error::Closing)));
+            assert_eq!(child.id(), 0);
+        } else {
+            let output = wait(child.output()).unwrap();
+            assert_eq!(
+                output.stdout,
+                if outcome == 0 {
+                    b":123".as_slice()
+                } else {
+                    b"native".as_slice()
+                }
+            );
+            assert_ne!(child.id(), 0);
+        }
+        owner.close();
+        drop(owner);
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+fn deferred_recoverable_launch_survives_shutdown_without_a_process_identity() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let owner =
+        SessionOwner::start_waiting_for_x11(Environment::inherited(), fixture.config()).unwrap();
+    let child = command("/bin/false").recover(true).spawn().unwrap();
+    assert_eq!(child.id(), 0);
+    owner.close();
+    assert!(matches!(wait(child.status()), Err(Error::Closing)));
+    drop(owner);
+    let next = SessionOwner::start(Environment::inherited(), fixture.config()).unwrap();
+    let entries = pending_recovery().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(!entries[0].original_process_alive());
+    let restored = entries[0].restore().unwrap();
+    assert_ne!(restored.id(), 0);
+    assert!(!wait(restored.status()).unwrap().success());
+    next.close();
+}

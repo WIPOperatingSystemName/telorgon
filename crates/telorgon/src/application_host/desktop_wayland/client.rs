@@ -2,20 +2,17 @@ use super::renderer::DmaBufRetirement;
 use super::*;
 
 pub(super) struct ClientWindow {
-    pub(super) revision: u64,
+    pub(super) backend: Option<WindowBackend>,
+    pub(super) frame_title: Option<String>,
+    pub(super) desktop_id: Option<crate::shell::WindowId>,
     pub(super) role: SurfaceRole,
     pub(super) parent: Option<WaylandSurfaceId>,
     pub(super) offset: PointI,
     pub(super) server_decorated: bool,
     pub(super) position: PointI,
-    /// Surface-local logical extent used for window geometry and input.
-    pub(super) size: SizeI,
-    /// Retained image pixel extent, independent of surface geometry.
-    pub(super) image_size: SizeI,
     pub(super) window_geometry: RectI,
     pub(super) requested_size: SizeI,
-    pub(super) resize_anchor: Option<ResizeAnchor>,
-    pub(super) resize_final: Option<FinalResizeConfigure>,
+    pub(super) native_configure: NativeConfigureState,
     pub(super) restore_geometry: Option<(PointI, SizeI)>,
     pub(super) maximized: bool,
     pub(super) fullscreen: bool,
@@ -23,6 +20,17 @@ pub(super) struct ClientWindow {
     pub(super) chrome_outer: Option<SizeI>,
     pub(super) chrome_content_offset: Option<PointI>,
     pub(super) chrome: Option<WindowChromeSnapshot>,
+    pub(super) presentation: SurfacePresentation,
+}
+
+/// Retained surface content, independent of desktop policy and xdg transactions.
+/// GPU ownership remains with the existing renderer retirement paths.
+pub(super) struct SurfacePresentation {
+    pub(super) revision: u64,
+    /// Surface-local logical extent used for window geometry and input.
+    pub(super) size: SizeI,
+    /// Retained image pixel extent, independent of surface geometry.
+    pub(super) image_size: SizeI,
     pub(super) alpha_mode: ImageAlphaMode,
     pub(super) pixel_format: ImagePixelFormat,
     pending_image_update: PendingClientImageUpdate,
@@ -79,7 +87,7 @@ pub(super) fn observe_surface_configure_acknowledgement(
     }
     if let Some(final_resize) = windows
         .get_mut(&snapshot.surface)
-        .and_then(|window| window.resize_final.as_mut())
+        .and_then(|window| window.native_configure.resize_final.as_mut())
     {
         final_resize.observe_acknowledgement(snapshot.acknowledged_configure);
     }
@@ -133,7 +141,8 @@ impl PreparedClientImage {
 
 impl ClientWindow {
     pub(super) fn resizing(&self) -> bool {
-        self.resize_anchor.is_some() && self.resize_final.is_none()
+        self.native_configure.resize_anchor.is_some()
+            && self.native_configure.resize_final.is_none()
     }
 
     pub(super) fn configure_size(&self) -> SizeI {
@@ -146,7 +155,9 @@ impl ClientWindow {
             self.requested_size
         }
     }
+}
 
+impl SurfacePresentation {
     fn apply_image(&mut self, revision: u64, image: PreparedClientImage) {
         self.revision = self.revision.max(revision);
         match image {
@@ -212,8 +223,9 @@ pub(super) fn resize_veil_owner(
     for _ in 0..=windows.len() {
         let window = windows.get(&candidate)?;
         if window.role == SurfaceRole::XdgToplevel {
-            return (window.resize_anchor.is_some() || window.resize_final.is_some())
-                .then_some(candidate);
+            return (window.native_configure.resize_anchor.is_some()
+                || window.native_configure.resize_final.is_some())
+            .then_some(candidate);
         }
         candidate = window.parent?;
     }
@@ -248,6 +260,7 @@ pub(super) fn apply_surface_publication(
     display: &Display,
     wayland: &mut NativeCompositor<'_>,
     windows: &mut BTreeMap<WaylandSurfaceId, ClientWindow>,
+    identities: &mut WindowIdentities,
     configure_scheduler: &mut ConfigureScheduler,
     stacking_order: &mut Vec<WaylandSurfaceId>,
     next_window_offset: &mut i32,
@@ -337,8 +350,10 @@ pub(super) fn apply_surface_publication(
         committed_window_extent,
     );
     let mut reconciled_position = position;
-    let mut resize_anchor = previous_window.and_then(|window| window.resize_anchor);
-    let mut retained_resize_final = previous_window.and_then(|window| window.resize_final);
+    let mut resize_anchor =
+        previous_window.and_then(|window| window.native_configure.resize_anchor);
+    let mut retained_resize_final =
+        previous_window.and_then(|window| window.native_configure.resize_final);
     if let Some(final_resize) = retained_resize_final.as_mut() {
         final_resize.observe_acknowledgement(snapshot.acknowledged_configure);
     }
@@ -359,9 +374,17 @@ pub(super) fn apply_surface_publication(
         chrome_outer,
         chrome_content_offset,
         chrome,
-    ) = windows
-        .get(&surface)
-        .map_or((None, false, false, false, None, None, None), |window| {
+    ) = windows.get(&surface).map_or(
+        (
+            None,
+            false,
+            false,
+            role == SurfaceRole::Xwayland,
+            None,
+            None,
+            None,
+        ),
+        |window| {
             (
                 window.restore_geometry,
                 window.maximized,
@@ -371,19 +394,23 @@ pub(super) fn apply_surface_publication(
                 window.chrome_content_offset,
                 window.chrome.clone(),
             )
-        });
-    let server_decorated = role == SurfaceRole::XdgToplevel
-        && wayland.decoration_mode(surface)
-            != Some(crate::compositor_wayland::DecorationMode::ClientSide);
+        },
+    );
+    let server_decorated = if role == SurfaceRole::XdgToplevel {
+        wayland.decoration_mode(surface)
+            != Some(crate::compositor_wayland::DecorationMode::ClientSide)
+    } else {
+        previous_window.is_some_and(|window| window.server_decorated)
+    };
     let pointer_geometry_changed = !matches!(role, SurfaceRole::Cursor | SurfaceRole::DragIcon)
         && previous_window.is_none_or(|window| {
             window.role != role
                 || window.position != reconciled_position
-                || window.size != image_extent
+                || window.presentation.size != image_extent
                 || window.window_geometry != window_geometry
                 || window.requested_size != requested_size
-                || window.resize_anchor != resize_anchor
-                || window.resize_final != retained_resize_final
+                || window.native_configure.resize_anchor != resize_anchor
+                || window.native_configure.resize_final != retained_resize_final
                 || window.minimized != minimized
                 || window.server_decorated != server_decorated
         });
@@ -402,9 +429,11 @@ pub(super) fn apply_surface_publication(
         window.chrome_outer = chrome_outer;
         window.chrome_content_offset = chrome_content_offset;
         window.chrome = chrome;
-        window.resize_anchor = resize_anchor;
-        window.resize_final = retained_resize_final;
-        window.apply_image(snapshot.revision, prepared_image);
+        window.native_configure.resize_anchor = resize_anchor;
+        window.native_configure.resize_final = retained_resize_final;
+        window
+            .presentation
+            .apply_image(snapshot.revision, prepared_image);
     } else {
         let (pending_image_update, pixels) = match prepared_image {
             PreparedClientImage::Full {
@@ -427,14 +456,18 @@ pub(super) fn apply_surface_publication(
         windows.insert(
             surface,
             ClientWindow {
-                revision: snapshot.revision,
+                backend: (role == SurfaceRole::XdgToplevel).then_some(WindowBackend::Wayland),
+                frame_title: None,
+                desktop_id: if role == SurfaceRole::XdgToplevel {
+                    Some(identities.ensure(surface)?)
+                } else {
+                    None
+                },
                 role,
                 parent,
                 offset,
                 server_decorated,
                 position: reconciled_position,
-                size: image_extent,
-                image_size: raster_extent,
                 window_geometry,
                 requested_size,
                 restore_geometry,
@@ -444,13 +477,26 @@ pub(super) fn apply_surface_publication(
                 chrome_outer,
                 chrome_content_offset,
                 chrome,
-                resize_anchor,
-                resize_final: retained_resize_final,
-                alpha_mode: image_alpha_mode,
-                pixel_format: image_pixel_format,
-                pending_image_update,
-                pixels,
+                native_configure: NativeConfigureState {
+                    resize_anchor,
+                    resize_final: retained_resize_final,
+                },
+                presentation: SurfacePresentation {
+                    revision: snapshot.revision,
+                    size: image_extent,
+                    image_size: raster_extent,
+                    alpha_mode: image_alpha_mode,
+                    pixel_format: image_pixel_format,
+                    pending_image_update,
+                    pixels,
+                },
             },
+        );
+    }
+    if role == SurfaceRole::XdgToplevel {
+        debug_assert_eq!(
+            windows.get(&surface).and_then(|window| window.desktop_id),
+            identities.get(surface)
         );
     }
     if is_new && !matches!(role, SurfaceRole::Cursor | SurfaceRole::DragIcon) {
@@ -479,6 +525,7 @@ pub(super) fn finish_shm_copy(
     display: &Display,
     wayland: &mut NativeCompositor<'_>,
     windows: &mut BTreeMap<WaylandSurfaceId, ClientWindow>,
+    identities: &mut WindowIdentities,
     configure_scheduler: &mut ConfigureScheduler,
     stacking_order: &mut Vec<WaylandSurfaceId>,
     next_window_offset: &mut i32,
@@ -515,6 +562,7 @@ pub(super) fn finish_shm_copy(
             display,
             wayland,
             windows,
+            identities,
             configure_scheduler,
             stacking_order,
             next_window_offset,
@@ -643,7 +691,7 @@ pub(super) fn retire_submitted_dma_buf(
 }
 
 #[cfg(test)]
-mod maximize_preview_tests {
+pub(super) mod maximize_preview_tests {
     use super::*;
 
     #[test]
@@ -687,16 +735,19 @@ mod maximize_preview_tests {
         assert_eq!(order, [ids[0], ids[1], ids[2], ids[3]]);
     }
 
-    fn test_window(size: SizeI, position: PointI) -> ClientWindow {
+    pub(in crate::application_host::desktop_wayland) fn test_window(
+        size: SizeI,
+        position: PointI,
+    ) -> ClientWindow {
         ClientWindow {
-            revision: 1,
+            desktop_id: None,
+            backend: Some(WindowBackend::Wayland),
+            frame_title: None,
             role: SurfaceRole::XdgToplevel,
             parent: None,
             offset: PointI::default(),
             server_decorated: true,
             position,
-            size,
-            image_size: size,
             window_geometry: RectI {
                 x: 0,
                 y: 0,
@@ -704,8 +755,7 @@ mod maximize_preview_tests {
                 height: size.height,
             },
             requested_size: size,
-            resize_anchor: None,
-            resize_final: None,
+            native_configure: NativeConfigureState::default(),
             restore_geometry: None,
             maximized: false,
             fullscreen: false,
@@ -713,10 +763,15 @@ mod maximize_preview_tests {
             chrome_outer: None,
             chrome_content_offset: None,
             chrome: None,
-            alpha_mode: ImageAlphaMode::Opaque,
-            pixel_format: ImagePixelFormat::Rgba8,
-            pending_image_update: PendingClientImageUpdate::Unchanged,
-            pixels: Vec::new(),
+            presentation: SurfacePresentation {
+                revision: 1,
+                size,
+                image_size: size,
+                alpha_mode: ImageAlphaMode::Opaque,
+                pixel_format: ImagePixelFormat::Rgba8,
+                pending_image_update: PendingClientImageUpdate::Unchanged,
+                pixels: Vec::new(),
+            },
         }
     }
 
@@ -752,7 +807,10 @@ mod maximize_preview_tests {
             !window.resizing(),
             "maximize must not advertise an interactive pointer resize"
         );
-        assert_eq!(window.resize_final.unwrap().size, window.requested_size);
+        assert_eq!(
+            window.native_configure.resize_final.unwrap().size,
+            window.requested_size
+        );
         let pending = scheduler.drain().next().unwrap();
         assert!(!pending.resizing);
         assert_eq!(pending.size, window.requested_size);
@@ -830,7 +888,7 @@ mod maximize_preview_tests {
             assert!(!window.maximized);
             assert_eq!(window.requested_size, size);
             assert!(window.restore_geometry.is_none());
-            assert!(window.resize_final.is_none());
+            assert!(window.native_configure.resize_final.is_none());
             assert_eq!(window.position.y, 40);
             assert_eq!(
                 window.position.x,

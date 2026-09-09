@@ -145,10 +145,10 @@ pub(super) fn surface_placement(
 ) -> SurfacePlacement {
     if window.role == SurfaceRole::XdgToplevel {
         return SurfacePlacement::toplevel(
-            window.size,
+            window.presentation.size,
             window.window_geometry,
             window_content_rect(window, position, config),
-            window.resize_anchor,
+            window.native_configure.resize_anchor,
         );
     }
     let offset = window_content_offset(window, config);
@@ -156,7 +156,7 @@ pub(super) fn surface_placement(
         x: position.x.saturating_add(offset.x),
         y: position.y.saturating_add(offset.y),
     };
-    SurfacePlacement::native(window.size, origin)
+    SurfacePlacement::native(window.presentation.size, origin)
 }
 
 pub(super) fn constrain_pointer(

@@ -1,0 +1,358 @@
+--- a/xkb/ddxLoad.c
++++ b/xkb/ddxLoad.c
+@@ -31,6 +31,14 @@
+ #include <xkb-config.h>
+ 
+ #include <stdio.h>
++#include <spawn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <time.h>
+ #include <stdlib.h>
+ #include <ctype.h>
+ #include <X11/X.h>
+@@ -64,36 +72,16 @@
+ static void
+ OutputDirectory(char *outdir, size_t size)
+ {
+-    const char *directory = NULL;
+-    const char *pathsep = "";
+-    int r = -1;
+-
+-#ifndef WIN32
+-    /* Can we write an xkm and then open it too? */
+-    if (access(XKM_OUTPUT_DIR, W_OK | X_OK) == 0) {
+-        directory = XKM_OUTPUT_DIR;
+-    } else {
+-        const char *xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
+-
+-        if (xdg_runtime_dir && xdg_runtime_dir[0] == '/' &&
+-            access(xdg_runtime_dir, W_OK | X_OK) == 0)
+-            directory = xdg_runtime_dir;
+-    }
+-
+-    if (directory && directory[strlen(directory) - 1] != '/')
+-        pathsep = "/";
+-
+-#else
+-    directory = Win32TempDir();
+-    pathsep = "\\";
+-#endif
+-
+-    if (directory)
+-        r = snprintf(outdir, size, "%s%s", directory, pathsep);
+-    if (r < 0 || r >= size) {
+-        assert(strlen("/tmp/") < size);
+-        strcpy(outdir, "/tmp/");
+-    }
++    const char *directory = getenv("TELORGON_XKB_OUTPUT_DIR");
++    struct stat info;
++    int n;
++    if (!directory || directory[0] != '/' ||
++        lstat(directory, &info) != 0 || !S_ISDIR(info.st_mode) ||
++        info.st_uid != geteuid() || (info.st_mode & 07777) != 0700)
++        FatalError("Telorgon XKB scratch directory is missing or unsafe\n");
++    n = snprintf(outdir, size, "%s/", directory);
++    if (n < 0 || (size_t)n >= size)
++        FatalError("Telorgon XKB scratch path is too long\n");
+ }
+ 
+ /**
+@@ -105,112 +93,148 @@
+  * Start xkbcomp, let the callback write into xkbcomp's stdin. When done,
+  * return a strdup'd copy of the file name we've written to.
+  */
++/* The keymap callback cannot grow its input beyond this bound. */
++struct telorgon_xkb_input {
++    int fd;
++    size_t written;
++};
++
++static ssize_t
++telorgon_xkb_write(void *cookie, const char *bytes, size_t length)
++{
++    struct telorgon_xkb_input *input = cookie;
++    size_t done = 0;
++    if (length > 4 * 1024 * 1024 - input->written) {
++        errno = EFBIG;
++        return -1;
++    }
++    while (done < length) {
++        ssize_t n = write(input->fd, bytes + done, length - done);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0)
++            return -1;
++        done += n;
++    }
++    input->written += length;
++    return length;
++}
++
+ static char *
+ RunXkbComp(xkbcomp_buffer_callback callback, void *userdata)
+ {
++    const char *compiler = getenv("TELORGON_XKBCOMP");
++    char keymap[PATH_MAX], directory[PATH_MAX], target[PATH_MAX];
++    char rootflag[PATH_MAX], includeflag[PATH_MAX], parent[32];
++    struct telorgon_xkb_input input = { .fd = -1, .written = 0 };
++    cookie_io_functions_t functions = { .write = telorgon_xkb_write };
++    posix_spawn_file_actions_t actions;
++    posix_spawnattr_t attributes;
++    sigset_t empty, defaults;
++    struct timespec deadline, now, pause = { .tv_nsec = 10000000 };
++    pid_t child;
++    int rc, status, n;
+     FILE *out;
+-    char *buf = NULL, keymap[PATH_MAX], xkm_output_dir[PATH_MAX];
+-
+-    const char *emptystring = "";
+-    char *xkbbasedirflag = NULL;
+-    const char *xkbbindir = emptystring;
+-    const char *xkbbindirsep = emptystring;
+-
+-#ifdef WIN32
+-    /* WIN32 has no popen. The input must be stored in a file which is
+-       used as input for xkbcomp. xkbcomp does not read from stdin. */
+-    char tmpname[PATH_MAX];
+-    const char *xkmfile = tmpname;
+-#else
+-    const char *xkmfile = "-";
+-#endif
+-
+-    snprintf(keymap, sizeof(keymap), "server-%s", display);
+-
+-    OutputDirectory(xkm_output_dir, sizeof(xkm_output_dir));
+-
+-#ifdef WIN32
+-    strcpy(tmpname, Win32TempDir());
+-    strcat(tmpname, "\\xkb_XXXXXX");
+-    (void) mktemp(tmpname);
+-#endif
+-
+-    if (XkbBaseDirectory != NULL) {
+-        if (asprintf(&xkbbasedirflag, "\"-R%s\"", XkbBaseDirectory) == -1)
+-            xkbbasedirflag = NULL;
+-    }
+-
+-    if (XkbBinDirectory != NULL) {
+-        int ld = strlen(XkbBinDirectory);
+-        int lps = strlen(PATHSEPARATOR);
+-
+-        xkbbindir = XkbBinDirectory;
+-
+-        if ((ld >= lps) && (strcmp(xkbbindir + ld - lps, PATHSEPARATOR) != 0)) {
+-            xkbbindirsep = PATHSEPARATOR;
++    const char *argv[10];
++
++    if (!compiler || compiler[0] != '/' || !XkbBaseDirectory ||
++        XkbBaseDirectory[0] != '/')
++        return NULL;
++    OutputDirectory(directory, sizeof(directory));
++    n = snprintf(keymap, sizeof(keymap), "server-%s", display);
++    if (n < 0 || (size_t)n >= sizeof(keymap))
++        return NULL;
++    n = snprintf(target, sizeof(target), "%s%s.xkm", directory, keymap);
++    if (n < 0 || (size_t)n >= sizeof(target))
++        return NULL;
++    n = snprintf(rootflag, sizeof(rootflag), "-R%s", XkbBaseDirectory);
++    if (n < 0 || (size_t)n >= sizeof(rootflag))
++        return NULL;
++    n = snprintf(includeflag, sizeof(includeflag), "-I%s", XkbBaseDirectory);
++    if (n < 0 || (size_t)n >= sizeof(includeflag))
++        return NULL;
++    snprintf(parent, sizeof(parent), "%ld", (long)getpid());
++    if (setenv("TELORGON_XKBCOMP_PARENT_PID", parent, 1) != 0)
++        return NULL;
++    input.fd = memfd_create("telorgon-xkb-input", MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL);
++    /* Older kernels lack MFD_NOEXEC_SEAL. This FD is data, never executed. */
++    if (input.fd < 0 && errno == EINVAL)
++        input.fd = memfd_create("telorgon-xkb-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++    if (input.fd < 0)
++        return NULL;
++    out = fopencookie(&input, "w", functions);
++    if (!out) {
++        close(input.fd);
++        return NULL;
++    }
++    (*callback)(out, userdata);
++    rc = fflush(out);
++    if (ferror(out))
++        rc = -1;
++    if (fclose(out) != 0)
++        rc = -1;
++    if (rc != 0 || lseek(input.fd, 0, SEEK_SET) != 0 ||
++        fcntl(input.fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW |
++              F_SEAL_SHRINK | F_SEAL_SEAL) != 0)
++        goto fail_input;
++
++    /* -I alone clears all implicit includes, including the build-machine path. */
++    argv[0] = compiler;
++    argv[1] = "-w"; argv[2] = "1";
++    argv[3] = "-I"; argv[4] = includeflag; argv[5] = rootflag;
++    argv[6] = "-xkm"; argv[7] = "-"; argv[8] = target; argv[9] = NULL;
++    rc = posix_spawn_file_actions_init(&actions);
++    if (rc != 0)
++        goto fail_input;
++    rc = posix_spawnattr_init(&attributes);
++    if (rc != 0) {
++        posix_spawn_file_actions_destroy(&actions);
++        goto fail_input;
++    }
++    sigemptyset(&empty);
++    sigemptyset(&defaults);
++    sigaddset(&defaults, SIGPIPE);
++    sigaddset(&defaults, SIGCHLD);
++    rc = posix_spawnattr_setsigmask(&attributes, &empty);
++    if (!rc) rc = posix_spawnattr_setsigdefault(&attributes, &defaults);
++    if (!rc) rc = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
++    if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, input.fd, STDIN_FILENO);
++    if (!rc) rc = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
++    if (!rc) rc = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
++    if (!rc) rc = posix_spawn(&child, compiler, &actions, &attributes, (char *const *)argv, environ);
++    posix_spawnattr_destroy(&attributes);
++    posix_spawn_file_actions_destroy(&actions);
++    close(input.fd);
++    if (rc != 0)
++        return NULL;
++    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
++        goto kill_child;
++    deadline.tv_sec += 5;
++    for (;;) {
++        pid_t result = waitpid(child, &status, WNOHANG);
++        if (result == child) {
++            if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
++                return xnfstrdup(keymap);
++            unlink(target);
++            return NULL;
+         }
+-    }
+-
+-    if (asprintf(&buf,
+-                 "\"%s%sxkbcomp\" -w %d %s -xkm \"%s\" "
+-                 "-em1 %s -emp %s -eml %s \"%s%s.xkm\"",
+-                 xkbbindir, xkbbindirsep,
+-                 ((xkbDebugFlags < 2) ? 1 :
+-                  ((xkbDebugFlags > 10) ? 10 : (int) xkbDebugFlags)),
+-                 xkbbasedirflag ? xkbbasedirflag : "", xkmfile,
+-                 PRE_ERROR_MSG, ERROR_PREFIX, POST_ERROR_MSG1,
+-                 xkm_output_dir, keymap) == -1)
+-        buf = NULL;
+-
+-    free(xkbbasedirflag);
+-
+-    if (!buf) {
+-        LogMessage(X_ERROR,
+-                   "XKB: Could not invoke xkbcomp: not enough memory\n");
+-        return NULL;
+-    }
+-
+-#ifndef WIN32
+-    out = Popen(buf, "w");
+-#else
+-    out = fopen(tmpname, "w");
+-#endif
+-
+-    if (out != NULL) {
+-        /* Now write to xkbcomp */
+-        (*callback)(out, userdata);
+-
+-#ifndef WIN32
+-        if (Pclose(out) == 0)
+-#else
+-        if (fclose(out) == 0 && System(buf) >= 0)
+-#endif
+-        {
+-            if (xkbDebugFlags)
+-                DebugF("[xkb] xkb executes: %s\n", buf);
+-            free(buf);
+-#ifdef WIN32
+-            unlink(tmpname);
+-#endif
+-            return xnfstrdup(keymap);
++        if (result < 0 && errno != EINTR) {
++            unlink(target);
++            return NULL;
+         }
+-        else {
+-            LogMessage(X_ERROR, "Error compiling keymap (%s) executing '%s'\n",
+-                       keymap, buf);
+-        }
+-#ifdef WIN32
+-        /* remove the temporary file */
+-        unlink(tmpname);
+-#endif
+-    }
+-    else {
+-#ifndef WIN32
+-        LogMessage(X_ERROR, "XKB: Could not invoke xkbcomp\n");
+-#else
+-        LogMessage(X_ERROR, "Could not open file %s\n", tmpname);
+-#endif
+-    }
+-    free(buf);
++        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
++            now.tv_sec > deadline.tv_sec ||
++            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
++            break;
++        nanosleep(&pause, NULL);
++    }
++kill_child:
++    kill(child, SIGKILL);
++    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
++    unlink(target);
++    return NULL;
++fail_input:
++    close(input.fd);
+     return NULL;
+ }
+ 
+--- a/dix/main.c
++++ b/dix/main.c
+@@ -120,6 +120,34 @@
+ #include "dpmsproc.h"
+ #endif
+ 
++
++/* Telorgon private payload: bind helper lifetime to the launching process. */
++#include <errno.h>
++#include <limits.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++static void
++telorgon_parent_lifetime(const char *variable)
++{
++    pid_t parent = getppid();
++    const char *value = getenv(variable);
++    if (value) {
++        char *end = NULL;
++        long expected;
++        errno = 0;
++        expected = strtol(value, &end, 10);
++        if (errno || end == value || *end || expected <= 1 ||
++            expected > INT_MAX || expected != parent)
++            _exit(125);
++    }
++    if (parent <= 1 || prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
++        getppid() != parent)
++        _exit(125);
++}
++
+ extern void Dispatch(void);
+ 
+ CallbackListPtr RootWindowFinalizeCallback = NULL;
+@@ -139,6 +167,7 @@
+     CheckUserAuthorization();
+ 
+     ProcessCommandLine(argc, argv);
++    telorgon_parent_lifetime("TELORGON_XWAYLAND_PARENT_PID");
+ 
+     alwaysCheckForInput[0] = 0;
+     alwaysCheckForInput[1] = 1;

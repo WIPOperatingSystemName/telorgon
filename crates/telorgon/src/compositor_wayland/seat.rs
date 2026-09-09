@@ -79,6 +79,22 @@ impl SeatState {
         }
     }
 
+    /// Physical state is invalid after input devices have been suspended.
+    /// Protocol owners must send leave/cancel notifications around this reset.
+    pub(crate) fn reset_input(&mut self) {
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+        self.button_owners.clear();
+        self.keyboard_modifiers = (0, 0, 0, 0);
+        self.cursor = CursorImage::TelorgonDefault;
+    }
+
+    /// Security-boundary reset; the host retains physical ownership until release.
+    pub(crate) fn cancel_keyboard_keys(&mut self) {
+        self.pressed_keys.clear();
+        self.keyboard_modifiers = (0, 0, 0, 0);
+    }
+
     pub fn set_key(&mut self, key: u32, state: ButtonState) -> bool {
         update_pressed(&mut self.pressed_keys, key, state)
     }

@@ -248,7 +248,16 @@ pub(super) fn hit_test_decoration(
         let Some(window) = windows.get(surface) else {
             continue;
         };
-        if window.role == SurfaceRole::XdgToplevel && !window.minimized {
+        if window.role == SurfaceRole::Xwayland
+            && window.backend.is_none()
+            && !window.minimized
+            && surface_placement(window, window.position, config).contains(position)
+        {
+            // An unmanaged menu above a frame owns its pixels; do not activate
+            // the underlying titlebar/control through it.
+            return None;
+        }
+        if window.backend.is_some() && !window.minimized {
             let content = window_content_rect(window, window.position, config);
             if position.x >= content.x as f32
                 && position.x < content.right() as f32
@@ -256,7 +265,7 @@ pub(super) fn hit_test_decoration(
                 && position.y < content.bottom() as f32
             {
                 // A veil is compositor content, not a hit target for a lower window's controls.
-                if window.resize_anchor.is_some() {
+                if window.native_configure.resize_anchor.is_some() {
                     return Some((*surface, DecorationHit::Frame));
                 }
                 if !window_is_decorated(window) {
@@ -264,10 +273,7 @@ pub(super) fn hit_test_decoration(
                 }
             }
         }
-        if window.role != SurfaceRole::XdgToplevel
-            || window.minimized
-            || !window_is_decorated(window)
-        {
+        if window.backend.is_none() || window.minimized || !window_is_decorated(window) {
             continue;
         }
         let outer = window

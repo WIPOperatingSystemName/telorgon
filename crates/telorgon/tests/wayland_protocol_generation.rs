@@ -233,7 +233,10 @@ fn malformed_and_incompatible_schemas_are_rejected() {
 
 #[test]
 fn profile_duplicate_and_reference_validation() {
-    let profile = generator::profile::DESKTOP_PROTOCOLS[0];
+    let profile = *generator::profile::DESKTOP_PROTOCOLS
+        .iter()
+        .find(|profile| profile.name == "wayland")
+        .expect("core Wayland profile");
     let mut protocol = parse(&fixture("")).unwrap();
     assert!(generator::validate_profile(&profile, &protocol).is_err());
     protocol.name = "wayland".into();

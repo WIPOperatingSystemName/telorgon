@@ -1,5 +1,10 @@
+use std::cell::{Cell, UnsafeCell};
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::marker::PhantomData;
+use std::os::{
+    fd::{AsRawFd, IntoRawFd},
+    unix::net::UnixStream,
+};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Duration;
@@ -9,12 +14,83 @@ use crate::wayland_server::{WaylandServerError, WaylandServerErrorKind};
 
 type ServerResult<T> = Result<T, WaylandServerError>;
 
+type FilterFn = dyn Fn(usize, *const ffi::wl_interface) -> bool;
+struct GlobalFilter(Box<FilterFn>);
+
+unsafe extern "C" fn filter_global(
+    client: *const ffi::wl_client,
+    global: *const ffi::wl_global,
+    data: *mut c_void,
+) -> bool {
+    let filter = unsafe { &*data.cast::<GlobalFilter>() };
+    let interface = unsafe { ffi::wl_global_get_interface(global) };
+    // A policy panic must not unwind through C or accidentally grant access.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (filter.0)(client as usize, interface)
+    }))
+    .unwrap_or(false)
+}
+
 pub struct Display {
     raw: NonNull<ffi::wl_display>,
+    filter: Option<Box<GlobalFilter>>,
     marker: PhantomData<Rc<()>>,
 }
 
 impl Display {
+    /// Install an owned owner-thread policy before creating protocol globals.
+    /// libwayland applies it both to registry advertisements and bind requests.
+    /// Interface pointers are opaque identities; this function grants no access
+    /// to their storage. Panicking policies deny access. Native clients should
+    /// remain allowed for every unrestricted interface.
+    pub fn set_global_filter(
+        &mut self,
+        filter: impl Fn(usize, *const ffi::wl_interface) -> bool + 'static,
+    ) {
+        let mut filter = Box::new(GlobalFilter(Box::new(filter)));
+        unsafe {
+            ffi::wl_display_set_global_filter(
+                self.raw.as_ptr(),
+                Some(filter_global),
+                (&mut *filter as *mut GlobalFilter).cast(),
+            );
+        }
+        self.filter = Some(filter);
+    }
+    /// Register a compositor-created connection. The returned owner tracks
+    /// libwayland destruction and is safe to retain beyond display teardown.
+    /// Dropping it disconnects only this client. No credentials imply privilege;
+    /// authorization must compare the live identity of this dedicated handle.
+    pub fn create_client(&self, socket: UnixStream) -> ServerResult<OwnedClient> {
+        let lifetime = Box::new(ClientLifetime {
+            listener: UnsafeCell::new(ffi::wl_listener {
+                link: ffi::wl_list {
+                    prev: std::ptr::null_mut(),
+                    next: std::ptr::null_mut(),
+                },
+                notify: Some(client_destroyed),
+            }),
+            raw: Cell::new(None),
+        });
+        let raw = unsafe { ffi::wl_client_create(self.raw.as_ptr(), socket.as_raw_fd()) };
+        let raw = NonNull::new(raw).ok_or_else(|| {
+            WaylandServerError::new(
+                WaylandServerErrorKind::Allocation,
+                "libwayland could not create the private client",
+            )
+        })?;
+        // Official API: ownership transfers only on success. Failure leaves the
+        // Rust socket responsible for closing the endpoint.
+        let _ = socket.into_raw_fd();
+        lifetime.raw.set(Some(raw));
+        unsafe {
+            ffi::wl_client_add_destroy_listener(raw.as_ptr(), lifetime.listener.get());
+        }
+        Ok(OwnedClient {
+            lifetime,
+            marker: PhantomData,
+        })
+    }
     pub fn new() -> ServerResult<Self> {
         let raw = unsafe { ffi::wl_display_create() };
         let raw = NonNull::new(raw).ok_or_else(|| {
@@ -25,6 +101,7 @@ impl Display {
         })?;
         Ok(Self {
             raw,
+            filter: None,
             marker: PhantomData,
         })
     }
@@ -313,6 +390,56 @@ impl Drop for Global<'_> {
     }
 }
 
+// Listener is first so the C callback can recover this stable allocation.
+// UnsafeCell permits libwayland's intrusive-list mutations through a shared owner.
+#[repr(C)]
+struct ClientLifetime {
+    listener: UnsafeCell<ffi::wl_listener>,
+    raw: Cell<Option<NonNull<ffi::wl_client>>>,
+}
+
+unsafe extern "C" fn client_destroyed(listener: *mut ffi::wl_listener, _: *mut c_void) {
+    let lifetime = unsafe { &*listener.cast::<ClientLifetime>() };
+    lifetime.raw.set(None);
+    // Detach while the signal/list still exists; never touch the link later.
+    unsafe {
+        ffi::wl_list_remove(&mut (*listener).link);
+    }
+}
+
+/// Owner-thread client lifetime, distinct from a callback-scoped ClientRef.
+/// identity() becomes None on disconnect, protocol error or display destruction;
+/// an old handle can never authenticate a newly allocated client at the same address.
+pub struct OwnedClient {
+    lifetime: Box<ClientLifetime>,
+    marker: PhantomData<Rc<()>>,
+}
+
+impl OwnedClient {
+    pub fn identity(&self) -> Option<usize> {
+        self.lifetime.raw.get().map(|raw| raw.as_ptr() as usize)
+    }
+    pub fn is_alive(&self) -> bool {
+        self.lifetime.raw.get().is_some()
+    }
+    pub fn matches(&self, client: ClientRef<'_>) -> bool {
+        self.identity() == Some(client.identity())
+    }
+    pub fn disconnect(&self) {
+        if let Some(raw) = self.lifetime.raw.get() {
+            unsafe {
+                ffi::wl_client_destroy(raw.as_ptr());
+            }
+        }
+    }
+}
+
+impl Drop for OwnedClient {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ClientRef<'callback> {
     raw: NonNull<ffi::wl_client>,
@@ -531,10 +658,131 @@ fn native_zero(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restricted_global_is_hidden_and_guessed_bind_is_rejected() {
+        let mut display = Display::new().unwrap();
+        let (mut allowed_peer, socket) = UnixStream::pair().unwrap();
+        let allowed = Rc::new(display.create_client(socket).unwrap());
+        let (mut denied_peer, socket) = UnixStream::pair().unwrap();
+        let denied = display.create_client(socket).unwrap();
+        let interface = unsafe { &ffi::wl_compositor_interface as *const _ };
+        let policy_client = allowed.clone();
+        display.set_global_filter(move |client, candidate| {
+            candidate != interface || policy_client.identity() == Some(client)
+        });
+        let _global = unsafe {
+            display.create_global(
+                &ffi::wl_compositor_interface,
+                1,
+                std::ptr::null_mut(),
+                Some(ignore_global_bind),
+            )
+        }
+        .unwrap();
+        for peer in [&mut allowed_peer, &mut denied_peer] {
+            peer.set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            peer.write_all(&display_request(1, 1, 2)).unwrap();
+            peer.write_all(&display_request(1, 0, 3)).unwrap();
+        }
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let mut visible = [0; 48];
+        allowed_peer.read_exact(&mut visible).unwrap();
+        assert_eq!(u32::from_ne_bytes(visible[..4].try_into().unwrap()), 2);
+        let global_name = u32::from_ne_bytes(visible[8..12].try_into().unwrap());
+        let mut hidden = [0; 12];
+        denied_peer.read_exact(&mut hidden).unwrap();
+        // Only sync completion, with no registry advertisement preceding it.
+        assert_eq!(u32::from_ne_bytes(hidden[..4].try_into().unwrap()), 3);
+        let mut bind = [0u8; 40];
+        bind[..4].copy_from_slice(&2u32.to_ne_bytes());
+        bind[4..8].copy_from_slice(&(40u32 << 16).to_ne_bytes());
+        bind[8..12].copy_from_slice(&global_name.to_ne_bytes());
+        bind[12..16].copy_from_slice(&14u32.to_ne_bytes());
+        bind[16..30].copy_from_slice(b"wl_compositor\0");
+        bind[32..36].copy_from_slice(&1u32.to_ne_bytes());
+        bind[36..40].copy_from_slice(&4u32.to_ne_bytes());
+        denied_peer.write_all(&bind).unwrap();
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(!denied.is_alive());
+        assert!(allowed.is_alive());
+        allowed.disconnect();
+        assert_eq!(allowed.identity(), None);
+        let (mut replacement_peer, socket) = UnixStream::pair().unwrap();
+        let _replacement = display.create_client(socket).unwrap();
+        replacement_peer
+            .write_all(&display_request(1, 1, 2))
+            .unwrap();
+        replacement_peer
+            .write_all(&display_request(1, 0, 3))
+            .unwrap();
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        replacement_peer
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        replacement_peer.read_exact(&mut hidden).unwrap();
+        assert_eq!(u32::from_ne_bytes(hidden[..4].try_into().unwrap()), 3);
+    }
+
+    #[test]
+    fn global_filter_policy_panic_fails_closed() {
+        let mut display = Display::new().unwrap();
+        display.set_global_filter(|_, _| panic!("policy fixture"));
+        let _global = unsafe {
+            display.create_global(
+                &ffi::wl_compositor_interface,
+                1,
+                std::ptr::null_mut(),
+                Some(ignore_global_bind),
+            )
+        }
+        .unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let _client = display.create_client(socket).unwrap();
+        peer.write_all(&display_request(1, 1, 2)).unwrap();
+        peer.write_all(&display_request(1, 0, 3)).unwrap();
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut reply = [0; 12];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(u32::from_ne_bytes(reply[..4].try_into().unwrap()), 3);
+    }
+    #[test]
+    fn owned_client_tracks_peer_and_display_destruction() {
+        let display = Display::new().unwrap();
+        let (peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        assert!(client.identity().is_some());
+        drop(peer);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert_eq!(client.identity(), None);
+        client.disconnect();
+        let (_peer, socket) = UnixStream::pair().unwrap();
+        let replacement = display.create_client(socket).unwrap();
+        assert!(replacement.is_alive());
+        assert!(!client.is_alive());
+        drop(display);
+        assert!(!replacement.is_alive());
+        replacement.disconnect();
+    }
+
+    #[test]
+    fn dropping_owned_client_closes_only_its_connection() {
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let (_other_peer, other_socket) = UnixStream::pair().unwrap();
+        let other = display.create_client(other_socket).unwrap();
+        drop(client);
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert!(other.is_alive());
+    }
     use super::*;
 
     use std::io::{Read, Write};
-    use std::os::fd::IntoRawFd;
     use std::os::unix::net::UnixStream;
 
     fn display_request(object: u32, opcode: u16, new_id: u32) -> [u8; 12] {
@@ -579,9 +827,8 @@ mod tests {
         }
         .unwrap();
         let (mut client_socket, server_socket) = UnixStream::pair().unwrap();
-        let client =
-            unsafe { ffi::wl_client_create(display.raw.as_ptr(), server_socket.into_raw_fd()) };
-        assert!(!client.is_null());
+        let client = display.create_client(server_socket).unwrap();
+        assert!(client.is_alive());
 
         client_socket.write_all(&display_request(1, 1, 2)).unwrap();
         client_socket.write_all(&display_request(1, 0, 3)).unwrap();

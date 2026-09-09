@@ -42,6 +42,13 @@ and `XAUTHORITY` values are removed. If no session-bus address was inherited, an
 Inherited `WAYLAND_SOCKET`, `XDG_ACTIVATION_TOKEN`, and `DESKTOP_STARTUP_ID` are removed so that
 one-shot connection/activation grants are not accidentally reused.
 
+The optional [X11 foundation components](X11_COMPATIBILITY.md) do not yet change
+this environment policy. A separate private-helper supervisor and startup barrier
+controller now have component coverage, but their managed-host/XWM integration
+must be completed before publishing session-owned `DISPLAY`/`XAUTHORITY`. Unlike
+ordinary application handles, dropping the helper handle requests termination and
+asynchronous reaping; it never opts applications into recovery or automatic retry.
+
 This environment applies to launches through the session API. Third-party code calling
 `std::process::Command` directly does not receive these overrides automatically.
 
@@ -179,3 +186,13 @@ and [D-Bus application activation contract](https://specifications.freedesktop.o
 Child-local environments avoid unsafe global mutation; absolute socket binding avoids temporary
 exports; bounded retries avoid crash loops; explicit recovery avoids replaying arbitrary commands
 without a user action. Corresponding invariants are covered by the unit fixtures above.
+
+### Embedded compatibility startup
+
+An embedded-Xwayland desktop queues initial direct managed launches until helper
+startup succeeds or fails. The compositor owner does not wait for those launches.
+Success supplies DISPLAY/XAUTHORITY alongside WAYLAND_DISPLAY; failure resumes
+native launches. A queued `ManagedChild` has `id() == 0` and no OS process yet;
+never pass that value to process-signalling APIs. Its status/output future resolves
+after execution or reports cancellation if the session closes first. Recoverable
+queued commands remain offered for explicit recovery after cancellation.

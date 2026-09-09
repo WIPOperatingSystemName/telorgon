@@ -143,9 +143,9 @@ pub(super) fn refresh_window_frames(
     };
 
     frames.retain(|surface, _| {
-        windows.get(surface).is_some_and(|window| {
-            window.role == SurfaceRole::XdgToplevel && window_is_decorated(window)
-        })
+        windows
+            .get(surface)
+            .is_some_and(|window| window.backend.is_some() && window_is_decorated(window))
     });
 
     let active = wayland
@@ -156,9 +156,7 @@ pub(super) fn refresh_window_frames(
         .map(|focus| focus.surface);
     let surfaces = windows
         .iter()
-        .filter(|(_, window)| {
-            window.role == SurfaceRole::XdgToplevel && window_is_decorated(window)
-        })
+        .filter(|(_, window)| window.backend.is_some() && window_is_decorated(window))
         .map(|(surface, _)| *surface)
         .collect::<Vec<_>>();
     let mut updates = Vec::with_capacity(surfaces.len());
@@ -168,12 +166,14 @@ pub(super) fn refresh_window_frames(
             .get(&surface)
             .expect("frame candidates came from live windows");
         let metadata = wayland.toplevel_metadata(surface);
-        let title = metadata.map_or_else(String::new, |metadata| {
-            if metadata.title.is_empty() {
-                metadata.application_id.clone()
-            } else {
-                metadata.title.clone()
-            }
+        let title = window.frame_title.clone().unwrap_or_else(|| {
+            metadata.map_or_else(String::new, |metadata| {
+                if metadata.title.is_empty() {
+                    metadata.application_id.clone()
+                } else {
+                    metadata.title.clone()
+                }
+            })
         });
         let state = if window.fullscreen {
             WindowChromeState::Fullscreen
@@ -324,7 +324,10 @@ pub(super) fn refresh_window_frames(
                     window.requested_size = content_size;
                     // A measured custom-frame size supersedes the fallback configure. Keep
                     // the placeholder until content for this new transaction is published.
-                    window.resize_final = Some(FinalResizeConfigure::pending(content_size));
+                    if window.backend == Some(WindowBackend::Wayland) {
+                        window.native_configure.resize_final =
+                            Some(FinalResizeConfigure::pending(content_size));
+                    }
                     configure_scheduler.schedule_final(surface, content_size);
                 }
             }
@@ -465,9 +468,16 @@ pub(super) fn prepare_desktop_layers(
             let position = window
                 .parent
                 .and_then(|parent| windows.get(&parent))
-                .map_or(window.position, |parent| PointI {
-                    x: parent.position.x + window.offset.x,
-                    y: parent.position.y + window.offset.y,
+                .map_or(window.position, |parent| {
+                    let content_offset = if parent.role == SurfaceRole::Xwayland {
+                        window_content_offset(parent, config)
+                    } else {
+                        PointI::default()
+                    };
+                    PointI {
+                        x: parent.position.x + content_offset.x + window.offset.x,
+                        y: parent.position.y + content_offset.y + window.offset.y,
+                    }
                 });
             (*surface, position)
         })
@@ -596,7 +606,7 @@ pub(super) fn prepare_desktop_layers(
         if visible
             && window_is_decorated(window)
             && window.chrome.is_none()
-            && window.role == SurfaceRole::XdgToplevel
+            && window.backend.is_some()
         {
             let icon_extent = SizeI {
                 width: config.titlebar_height.clamp(1, 24),
@@ -648,17 +658,17 @@ pub(super) fn prepare_desktop_layers(
         let mut client = DesktopLayer::image(
             DesktopLayerKey::Surface(surface.get()),
             DesktopSceneKey::Surface(surface.get()),
-            window.revision,
+            window.presentation.revision,
             if visible && !veiled {
-                window.take_image_update()
+                window.presentation.take_image_update()
             } else {
                 DesktopImageUpdate::Unchanged
             },
-            window.image_size,
+            window.presentation.image_size,
             placement.target,
             placement.clip,
-            window.alpha_mode,
-            window.pixel_format,
+            window.presentation.alpha_mode,
+            window.presentation.pixel_format,
             visible && !veiled,
         );
         if let Some((bounds, clips)) = inherited_clip {
@@ -677,22 +687,22 @@ pub(super) fn prepare_desktop_layers(
         layers.push(DesktopLayer::image(
             DesktopLayerKey::DragIcon(surface.get()),
             DesktopSceneKey::DragIcon(surface.get()),
-            icon.revision,
+            icon.presentation.revision,
             if visible {
-                icon.take_image_update()
+                icon.presentation.take_image_update()
             } else {
                 DesktopImageUpdate::Unchanged
             },
-            icon.image_size,
+            icon.presentation.image_size,
             RectI {
                 x: drag_position.x.round() as i32,
                 y: drag_position.y.round() as i32,
-                width: icon.size.width,
-                height: icon.size.height,
+                width: icon.presentation.size.width,
+                height: icon.presentation.size.height,
             },
             None,
-            icon.alpha_mode,
-            icon.pixel_format,
+            icon.presentation.alpha_mode,
+            icon.presentation.pixel_format,
             visible,
         ));
     }
@@ -834,6 +844,94 @@ mod maximize_tests {
                 0.0,
             )))
         }
+    }
+
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    #[test]
+    fn native_and_x11_windows_use_the_same_composed_frame_template() {
+        use super::super::client::maximize_preview_tests::test_window;
+        let declaration = crate::application_host::Compositor::new()
+            .window_frame(|_: WindowChromeModel| TestFrame { title_height: 37.0 })
+            .background(TestFrame { title_height: 37.0 });
+        let display = Display::new().unwrap();
+        let wayland = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let mut registry = crate::xwayland::window::Windows::new(1, 16, 1, 2, 100).unwrap();
+        let token = registry.begin_inspection(10).unwrap().unwrap();
+        registry
+            .finish_inspection(
+                token,
+                1,
+                crate::xwayland::window::Geometry {
+                    x: 100,
+                    y: 100,
+                    width: 640,
+                    height: 480,
+                    border: 0,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        let id = registry.get(10).unwrap().id;
+        let native = WaylandSurfaceId::from_raw(20).unwrap();
+        let x11 = WaylandSurfaceId::from_raw(21).unwrap();
+        let popup = WaylandSurfaceId::from_raw(22).unwrap();
+        let mut windows = BTreeMap::new();
+        for (surface, backend, role) in [
+            (
+                native,
+                Some(WindowBackend::Wayland),
+                SurfaceRole::XdgToplevel,
+            ),
+            (x11, Some(WindowBackend::X11(id)), SurfaceRole::Xwayland),
+            (popup, None, SurfaceRole::Xwayland),
+        ] {
+            let mut window = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI { x: 100, y: 100 },
+            );
+            window.backend = backend;
+            window.role = role;
+            window.server_decorated = backend.is_some();
+            window.frame_title = Some("Same application title".into());
+            windows.insert(surface, window);
+        }
+        let mut frames = BTreeMap::new();
+        refresh_window_frames(
+            declaration.window_frame(),
+            &mut frames,
+            &mut windows,
+            &wayland,
+            &LinuxDesktopConfig::default(),
+            AssetBundle::default(),
+            &crate::AppIconProfile::default(),
+            &EventNotifier::new("frame parity").unwrap(),
+            0,
+            crate::platform::ScaleFactor::new(1.5).unwrap(),
+            RectI {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            &mut ConfigureScheduler::default(),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(!frames.contains_key(&popup));
+        assert_eq!(frames[&native].outer, frames[&x11].outer);
+        assert_eq!(
+            windows[&native].chrome_content_offset,
+            windows[&x11].chrome_content_offset
+        );
+        assert_eq!(windows[&x11].chrome_content_offset.unwrap().y, 37);
+        assert_eq!(
+            frames[&native].snapshot.as_ref().unwrap().content.bounds,
+            frames[&x11].snapshot.as_ref().unwrap().content.bounds
+        );
     }
 
     #[test]

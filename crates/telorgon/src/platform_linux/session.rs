@@ -16,6 +16,8 @@ pub enum SeatState {
 
 struct CallbackState {
     enabled: Cell<bool>,
+    defer_disable: bool,
+    disable_pending: Cell<bool>,
 }
 
 unsafe extern "C" fn enable_seat(_seat: *mut ffi::libseat, data: *mut c_void) {
@@ -26,7 +28,11 @@ unsafe extern "C" fn enable_seat(_seat: *mut ffi::libseat, data: *mut c_void) {
 unsafe extern "C" fn disable_seat(seat: *mut ffi::libseat, data: *mut c_void) {
     let state = unsafe { &*(data.cast::<CallbackState>()) };
     state.enabled.set(false);
-    unsafe { ffi::libseat_disable_seat(seat) };
+    if state.defer_disable {
+        state.disable_pending.set(true);
+    } else {
+        unsafe { ffi::libseat_disable_seat(seat) };
+    }
 }
 
 static LISTENER: ffi::libseat_seat_listener = ffi::libseat_seat_listener {
@@ -42,8 +48,20 @@ pub struct LinuxSeat {
 
 impl LinuxSeat {
     pub fn open() -> Result<Self, LinuxPlatformError> {
+        Self::open_inner(false)
+    }
+
+    /// The caller must suspend input/device use and promptly acknowledge each
+    /// pending disable after dispatch. Ordinary `open` retains automatic acknowledgement.
+    pub fn open_with_deferred_disable() -> Result<Self, LinuxPlatformError> {
+        Self::open_inner(true)
+    }
+
+    fn open_inner(defer_disable: bool) -> Result<Self, LinuxPlatformError> {
         let mut callbacks = Box::new(CallbackState {
             enabled: Cell::new(false),
+            defer_disable,
+            disable_pending: Cell::new(false),
         });
         let raw = unsafe {
             ffi::libseat_open_seat(
@@ -62,6 +80,26 @@ impl LinuxSeat {
             callbacks,
             marker: PhantomData,
         })
+    }
+
+    pub fn disable_pending(&self) -> bool {
+        self.callbacks.disable_pending.get()
+    }
+
+    pub fn acknowledge_disable(&self) -> Result<(), LinuxPlatformError> {
+        if !self.disable_pending() {
+            return Ok(());
+        }
+        let result = unsafe { ffi::libseat_disable_seat(self.raw.as_ptr()) };
+        if result < 0 {
+            return Err(LinuxPlatformError::native(
+                LinuxPlatformErrorKind::Session,
+                "libseat disable acknowledgement failed",
+                result,
+            ));
+        }
+        self.callbacks.disable_pending.set(false);
+        Ok(())
     }
 
     pub fn state(&self) -> SeatState {
@@ -180,5 +218,25 @@ impl Drop for SeatDevice<'_> {
     fn drop(&mut self) {
         let result = unsafe { ffi::libseat_close_device(self.seat.raw.as_ptr(), self.id) };
         debug_assert!(result >= 0, "libseat device close failed");
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    #[test]
+    fn deferred_disable_remains_pending_even_if_enable_arrives_before_owner_cleanup() {
+        let mut state = CallbackState {
+            enabled: Cell::new(true),
+            defer_disable: true,
+            disable_pending: Cell::new(false),
+        };
+        let data = (&mut state as *mut CallbackState).cast::<c_void>();
+        unsafe { disable_seat(std::ptr::null_mut(), data) };
+        assert!(!state.enabled.get());
+        assert!(state.disable_pending.get());
+        unsafe { enable_seat(std::ptr::null_mut(), data) };
+        assert!(state.enabled.get());
+        assert!(state.disable_pending.get());
     }
 }

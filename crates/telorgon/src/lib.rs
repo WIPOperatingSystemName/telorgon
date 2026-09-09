@@ -5,6 +5,9 @@
 
 extern crate self as telorgon;
 
+#[cfg(all(feature = "desktop-xwayland", target_os = "linux"))]
+pub mod xwayland;
+
 #[cfg(test)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};

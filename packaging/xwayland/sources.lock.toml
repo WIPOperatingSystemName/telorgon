@@ -1,0 +1,48 @@
+# Archive byte identities from planning inspection. Detached signatures and
+# release provenance are NOT yet verified; this is not a release-complete lock.
+schema = 1
+release_ready = false
+target = "x86_64-unknown-linux-gnu"
+minimum_glibc = "2.39"
+
+# Verified using the installed Ubuntu archive keyring (CD Image Signing Key 2012).
+[build_base]
+url = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz"
+sha256 = "c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58"
+signing_key = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+
+[[source]]
+name = "xwayland"
+version = "24.1.13"
+url = "https://xorg.freedesktop.org/releases/individual/xserver/xwayland-24.1.13.tar.xz"
+sha256 = "173aea3d6f79609164c04528e1c8e4c9b60fcd59391c3c9dad4667297d727fb6"
+
+[[source]]
+name = "xkbcomp"
+version = "1.5.0"
+url = "https://xorg.freedesktop.org/releases/individual/app/xkbcomp-1.5.0.tar.xz"
+sha256 = "2ac31f26600776db6d9cd79b3fcd272263faebac7eb85fb2f33c7141b8486060"
+
+[[source]]
+name = "xkeyboard-config"
+version = "2.46"
+url = "https://xorg.freedesktop.org/releases/individual/data/xkeyboard-config/xkeyboard-config-2.46.tar.xz"
+sha256 = "10c58218fb60d08fb1f7b30304deb3ba47613195aa8a08a81f1972775ccc3640"
+
+[[source]]
+name = "libXfont2"
+version = "2.0.8"
+url = "https://xorg.freedesktop.org/releases/individual/lib/libXfont2-2.0.8.tar.xz"
+sha256 = "f556c0e1093a4e6911cc90bc4b106d201902ee187fd74af206ff162f7e6a24d5"
+
+[[source]]
+name = "wayland-protocols"
+version = "1.47"
+url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.47/downloads/wayland-protocols-1.47.tar.xz"
+sha256 = "5fd4349bcbc9bab9a46f8cf77d1f434296a7a052c87440a094f63fcf62a58e20"
+
+[[source]]
+name = "xorgproto"
+version = "2024.1"
+url = "https://xorg.freedesktop.org/archive/individual/proto/xorgproto-2024.1.tar.xz"
+sha256 = "372225fd40815b8423547f5d890c5debc72e88b91088fbfb13158c20495ccb59"

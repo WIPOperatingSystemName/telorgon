@@ -26,7 +26,8 @@ pub use schema::{
 };
 #[cfg(target_os = "linux")]
 pub use server::{
-    ClientCredentials, ClientRef, Display, EventLoopRef, EventSource, Global, ResourceRef,
+    ClientCredentials, ClientRef, Display, EventLoopRef, EventSource, Global, OwnedClient,
+    ResourceRef,
 };
 
 /// Whether the official native server ABI can exist on this compilation target.

@@ -2688,6 +2688,7 @@ dependencies = [
  "blocking",
  "bytemuck",
  "cosmic-text",
+ "flate2",
  "futures-lite",
  "gpu-allocator",
  "image",
@@ -2712,6 +2713,7 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "winit",
+ "x11rb-protocol",
  "zbus",
 ]
 

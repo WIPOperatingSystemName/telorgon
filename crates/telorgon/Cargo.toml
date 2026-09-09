@@ -39,6 +39,15 @@ desktop-wayland-linux = [
     "dep:gpu-allocator",
     "dep:sha2",
 ]
+# Compatibility components; does not start a server or change native defaults.
+desktop-xwayland = [
+    "desktop-wayland-linux",
+    "dep:x11rb-protocol",
+    "dep:flate2",
+    "dep:serde_json",
+]
+# Distribution builds supply a validated payload; Cargo never downloads it.
+desktop-xwayland-embedded = ["desktop-xwayland", "dep:serde", "dep:sha2"]
 embedded-vulkan = [
     "dep:ash",
     "dep:bytemuck",
@@ -55,6 +64,8 @@ profiler = [
 ]
 
 [dependencies]
+x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "composite", "randr", "shape", "xfixes", "sync"], optional = true }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"], optional = true }
 async-process.workspace = true
 blocking.workspace = true
 futures-lite.workspace = true
@@ -97,6 +108,10 @@ roxmltree = "0.21.1"
 tower.workspace = true
 
 [build-dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"], optional = true }
 roxmltree = { version = "0.21.1", optional = true }
 
 [[test]]

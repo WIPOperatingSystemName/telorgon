@@ -1,6 +1,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::platform_linux::ffi;
@@ -50,6 +52,36 @@ impl XkbKeyboard {
         variant: Option<&str>,
         options: Option<&str>,
     ) -> Result<Self, LinuxPlatformError> {
+        Self::from_names_with_include_root(rules, model, layout, variant, options, None)
+    }
+
+    /// Compile with one exclusive include root when supplied. Default/home/environment
+    /// include paths are disabled; missing private data is an error, not a fallback.
+    /// `None` preserves the ordinary libxkbcommon search path.
+    pub fn from_names_with_include_root(
+        rules: Option<&str>,
+        model: Option<&str>,
+        layout: Option<&str>,
+        variant: Option<&str>,
+        options: Option<&str>,
+        include_root: Option<&Path>,
+    ) -> Result<Self, LinuxPlatformError> {
+        let include_root = include_root
+            .map(|root| {
+                if !root.is_absolute() {
+                    return Err(LinuxPlatformError::new(
+                        LinuxPlatformErrorKind::Keymap,
+                        "XKB include root must be absolute",
+                    ));
+                }
+                CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+                    LinuxPlatformError::new(
+                        LinuxPlatformErrorKind::Keymap,
+                        "XKB include root contains an interior NUL",
+                    )
+                })
+            })
+            .transpose()?;
         let strings = [rules, model, layout, variant, options]
             .map(|value| value.map(CString::new).transpose())
             .into_iter()
@@ -72,12 +104,27 @@ impl XkbKeyboard {
             variant: pointer(3),
             options: pointer(4),
         };
-        let context = NonNull::new(unsafe { ffi::xkb_context_new(0) }).ok_or_else(|| {
+        // XKB_CONTEXT_NO_DEFAULT_INCLUDES, from xkbcommon.h.
+        let flags = if include_root.is_some() { 1 } else { 0 };
+        let context = NonNull::new(unsafe { ffi::xkb_context_new(flags) }).ok_or_else(|| {
             LinuxPlatformError::new(
                 LinuxPlatformErrorKind::Allocation,
                 "XKB context allocation failed",
             )
         })?;
+        if let Some(root) = include_root.as_ref() {
+            if unsafe { ffi::xkb_context_include_path_append(context.as_ptr(), root.as_ptr()) } != 1
+            {
+                unsafe { ffi::xkb_context_unref(context.as_ptr()) };
+                return Err(LinuxPlatformError::new(
+                    LinuxPlatformErrorKind::Keymap,
+                    format!(
+                        "XKB include root is inaccessible: {}",
+                        root.to_string_lossy()
+                    ),
+                ));
+            }
+        }
         let Some(keymap) =
             NonNull::new(unsafe { ffi::xkb_keymap_new_from_names(context.as_ptr(), &names, 0) })
         else {
@@ -243,5 +290,66 @@ impl Drop for XkbKeyboard {
             ffi::xkb_keymap_unref(self.keymap.as_ptr());
             ffi::xkb_context_unref(self.context.as_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod include_root_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "telorgon xkb '$; {}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create keyboard fixture: {error}"),
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn compile(root: &Path) -> Result<XkbKeyboard, LinuxPlatformError> {
+        XkbKeyboard::from_names_with_include_root(
+            Some("evdev"),
+            Some("pc105"),
+            Some("us"),
+            Some(""),
+            Some(""),
+            Some(root),
+        )
+    }
+    #[test]
+    fn explicit_empty_root_cannot_fall_back_to_host_keyboard_data() {
+        let empty = Fixture::new();
+        // Establish that host compilation works, then prove exclusive lookup fails.
+        XkbKeyboard::from_names(Some("evdev"), Some("pc105"), Some("us"), Some(""), Some(""))
+            .unwrap();
+        assert!(compile(&empty.0).is_err());
+        assert!(compile(&empty.0.join("missing")).is_err());
+        assert!(compile(Path::new("relative-root")).is_err());
+    }
+    #[test]
+    fn explicit_root_path_is_passed_literally() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("data ; $(literal)");
+        // This tests compiler path handling, not payload extraction. Host XKB data
+        // are a fixture dependency; no files outside the fixture are modified.
+        std::os::unix::fs::symlink("/usr/share/X11/xkb", &root).unwrap();
+        let keyboard = compile(&root).unwrap();
+        assert_eq!(keyboard.utf8(21).unwrap(), "y");
     }
 }

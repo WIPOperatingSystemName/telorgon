@@ -41,6 +41,12 @@ pub struct wl_list {
 }
 
 #[repr(C)]
+pub struct wl_listener {
+    pub link: wl_list,
+    pub notify: Option<unsafe extern "C" fn(*mut wl_listener, *mut c_void)>,
+}
+
+#[repr(C)]
 pub struct wl_array {
     pub size: usize,
     pub alloc: usize,
@@ -102,6 +108,14 @@ unsafe extern "C" {
     pub fn wl_display_create() -> *mut wl_display;
     pub fn wl_display_destroy(display: *mut wl_display);
     pub fn wl_display_destroy_clients(display: *mut wl_display);
+    pub fn wl_display_set_global_filter(
+        display: *mut wl_display,
+        filter: Option<
+            unsafe extern "C" fn(*const wl_client, *const wl_global, *mut c_void) -> bool,
+        >,
+        data: *mut c_void,
+    );
+    pub fn wl_global_get_interface(global: *const wl_global) -> *const wl_interface;
     pub fn wl_display_get_event_loop(display: *mut wl_display) -> *mut wl_event_loop;
     pub fn wl_display_add_socket(display: *mut wl_display, name: *const c_char) -> c_int;
     pub fn wl_display_add_socket_auto(display: *mut wl_display) -> *const c_char;
@@ -178,6 +192,8 @@ unsafe extern "C" {
     );
     pub fn wl_client_create(display: *mut wl_display, fd: c_int) -> *mut wl_client;
     pub fn wl_client_destroy(client: *mut wl_client);
+    pub fn wl_client_add_destroy_listener(client: *mut wl_client, listener: *mut wl_listener);
+    pub fn wl_list_remove(link: *mut wl_list);
     pub fn wl_client_flush(client: *mut wl_client);
     pub fn wl_client_post_no_memory(client: *mut wl_client);
     pub fn wl_client_get_object(client: *mut wl_client, id: u32) -> *mut wl_resource;

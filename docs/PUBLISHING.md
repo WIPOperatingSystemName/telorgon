@@ -5,6 +5,13 @@ recoverable project states; publish to crates.io only for versions intended for 
 
 No publish command is part of ordinary validation.
 
+The optional Xwayland archive feature is a downstream desktop distribution input,
+not a payload bundled with ordinary GUI applications. Cargo does not download or
+build Xwayland. Embedded builds require an explicitly supplied validated archive;
+the helper build has local evidence, while full notices/SBOM and clean-image release gates remain open.
+See [X11 packaging](../packaging/xwayland/README.md) and
+[qualification](X11_QUALIFICATION.md) before enabling it in a distributed desktop.
+
 ## Registry surface
 
 Telorgon has one user-facing package and one required implementation companion:

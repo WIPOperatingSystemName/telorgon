@@ -10,6 +10,17 @@ pub(super) struct ShortcutKeys {
 }
 
 impl ShortcutKeys {
+    /// A security boundary revokes delivery, but not physical press ownership.
+    pub(super) fn suppress_held(&mut self) {
+        self.consumed.extend(self.pressed.iter().copied());
+    }
+
+    /// Return physical presses for XKB release and clear ownership after seat loss.
+    pub(super) fn reset(&mut self) -> BTreeSet<u32> {
+        self.consumed.clear();
+        std::mem::take(&mut self.pressed)
+    }
+
     pub(super) fn route(
         &mut self,
         event: DesktopKeyEvent,
@@ -32,7 +43,11 @@ impl ShortcutKeys {
                 DesktopKeyAction::Forward
             };
         }
-        let action = if locked {
+        // Reserve physical Escape regardless of the configured XKB layout or
+        // user shortcut handler. A lock never turns this into focus/activation.
+        let action = if event.keycode == 1 && event.control && event.alt && event.shift {
+            DesktopKeyAction::ReleaseCapture
+        } else if locked {
             DesktopKeyAction::Forward
         } else {
             handler.map_or(DesktopKeyAction::Forward, |handler| handler(event))
@@ -50,6 +65,94 @@ mod tests {
     use crate::application_host::{KeyBindings, KeyChord, ShortcutKey};
     use std::cell::Cell;
     use std::rc::Rc;
+
+    #[test]
+    fn lock_boundary_suppresses_held_keys_until_release_without_retriggering_handlers() {
+        let mut keys = ShortcutKeys::default();
+        let event = DesktopKeyEvent {
+            keycode: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys.route(event, true, false, None),
+            DesktopKeyAction::Forward
+        );
+        keys.suppress_held();
+        assert_eq!(
+            keys.route(event, true, true, None),
+            DesktopKeyAction::Consume
+        );
+        keys.suppress_held(); // Unlock before the physical release.
+        let mut forbidden = |_| panic!("held key must not retrigger a shortcut after unlock");
+        assert_eq!(
+            keys.route(event, true, false, Some(&mut forbidden)),
+            DesktopKeyAction::Consume
+        );
+        assert_eq!(
+            keys.route(event, false, false, Some(&mut forbidden)),
+            DesktopKeyAction::Consume
+        );
+        assert_eq!(
+            keys.route(event, true, false, None),
+            DesktopKeyAction::Forward
+        );
+    }
+
+    #[test]
+    fn seat_reset_releases_physical_keys_and_allows_fresh_shortcuts() {
+        let mut keys = ShortcutKeys::default();
+        let event = DesktopKeyEvent {
+            keycode: 20,
+            ..Default::default()
+        };
+        let mut handler = |_| DesktopKeyAction::Consume;
+        assert_eq!(
+            keys.route(event, true, false, Some(&mut handler)),
+            DesktopKeyAction::Consume
+        );
+        assert_eq!(keys.reset(), BTreeSet::from([20]));
+        assert!(keys.reset().is_empty());
+        assert_eq!(
+            keys.route(event, true, false, Some(&mut handler)),
+            DesktopKeyAction::Consume
+        );
+    }
+
+    #[test]
+    fn emergency_chord_preempts_handlers_and_keeps_release_owned_after_lock() {
+        let mut keys = ShortcutKeys::default();
+        let mut handler = |_| panic!("reserved chord must not reach configurable shortcuts");
+        let event = DesktopKeyEvent {
+            keycode: 1,
+            keysym: 0,
+            control: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        for locked in [false, true] {
+            assert_eq!(
+                keys.route(event, true, locked, Some(&mut handler)),
+                DesktopKeyAction::ReleaseCapture
+            );
+            assert_eq!(
+                keys.route(event, true, locked, Some(&mut handler)),
+                DesktopKeyAction::Consume
+            );
+            assert_eq!(
+                keys.route(
+                    DesktopKeyEvent {
+                        control: false,
+                        ..event
+                    },
+                    false,
+                    !locked,
+                    Some(&mut handler)
+                ),
+                DesktopKeyAction::Consume
+            );
+        }
+    }
 
     #[test]
     fn named_bindings_invoke_once_and_preserve_capture_and_lock_isolation() {

@@ -7,6 +7,11 @@ wayland = "/usr/share/wayland/wayland.xml"
 wayland_protocols_root = "/usr/share/wayland-protocols"
 
 [[global]]
+name = "xwayland_shell_v1"
+max_version = 1
+availability = "explicit-new-with-xwayland-dedicated-client-only"
+
+[[global]]
 name = "wl_compositor"
 max_version = 6
 availability = "always"
@@ -165,3 +170,30 @@ path = "staging/ext-session-lock/ext-session-lock-v1.xml"
 [[understood_source]]
 name = "linux-explicit-synchronization-unstable-v1"
 path = "unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml"
+
+[[global]]
+name = "zwp_keyboard_shortcuts_inhibit_manager_v1"
+max_version = 1
+availability = "focused-keyboard-shortcut-policy"
+
+[[understood_source]]
+name = "keyboard-shortcuts-inhibit-unstable-v1"
+path = "unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+
+[[global]]
+name = "zwp_xwayland_keyboard_grab_manager_v1"
+max_version = 1
+availability = "dedicated-xwayland-client-only"
+
+[[understood_source]]
+name = "xwayland-keyboard-grab-unstable-v1"
+path = "unstable/xwayland-keyboard-grab/xwayland-keyboard-grab-unstable-v1.xml"
+
+[[global]]
+name = "zxdg_output_manager_v1"
+max_version = 3
+availability = "logical-output-description"
+
+[[understood_source]]
+name = "xdg-output-unstable-v1"
+path = "unstable/xdg-output/xdg-output-unstable-v1.xml"

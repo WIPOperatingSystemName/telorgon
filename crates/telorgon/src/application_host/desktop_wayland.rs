@@ -1,3 +1,5 @@
+#[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+mod compatibility;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -46,6 +48,12 @@ use crate::application_host::{
 // Keep this root focused on assembling resources and running the single Wayland/KMS owner loop.
 // Each stateful or policy-heavy subsystem below owns its own invariants and focused tests.
 mod client;
+mod window_backend;
+use window_backend::WindowBackend;
+mod window_identity;
+#[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+mod x11_windows;
+use window_identity::WindowIdentities;
 mod cursor_plane;
 mod event_source;
 mod geometry;
@@ -88,8 +96,8 @@ use scene::{
 };
 use shm_copy::{ShmCopyCompletion, ShmCopyRequest, ShmCopyWorker};
 use state::{
-    ConfigureScheduler, FinalResizeConfigure, PendingResizeConfigure, ResizeAnchor,
-    SurfacePlacement, take_ready_deferred_shm_surface,
+    ConfigureScheduler, FinalResizeConfigure, NativeConfigureState, PendingResizeConfigure,
+    ResizeAnchor, SurfacePlacement, take_ready_deferred_shm_surface,
 };
 
 const MAX_DEFERRED_SHM_COPIES: usize = 64;
@@ -119,7 +127,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         mut keyboard_shortcut_handler,
     ) = compositor.into_runtime_parts();
 
-    let seat = LinuxSeat::open().map_err(app_error)?;
+    let seat = LinuxSeat::open_with_deferred_disable().map_err(app_error)?;
     seat.dispatch(0).map_err(app_error)?;
     let input = LibInputContext::new(&seat, &config.seat_name).map_err(app_error)?;
     let (_drm_seat_device, kms, topology, drm_path) = select_drm_device(&seat, &config)?;
@@ -140,7 +148,8 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let output_scale = config
         .output_scale
         .resolve(physical_extent, connector.physical_millimeters)?;
-    let extent = output_scale.logical_size(physical_extent);
+    let selected_output = output_state(connector, mode_index, output_scale)?;
+    let extent = selected_output.logical_size();
     eprintln!(
         "telorgon-kms: {}x{} pixels, {}x{} mm, {:.0}% scale, {}x{} logical units ({:?})",
         physical_extent.width,
@@ -218,15 +227,24 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         "presentation.cursor.composited_fallback"
     });
 
-    let display = Display::new().map_err(app_error)?;
+    #[allow(unused_mut)]
+    let mut display = Display::new().map_err(app_error)?;
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    let xwayland_access =
+        crate::compositor_wayland::XwaylandAccess::configure_display(&mut display)
+            .map_err(app_error)?;
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    let mut wayland = NativeCompositor::new_with_xwayland(
+        &display,
+        ClientLimits::default(),
+        xwayland_access.clone(),
+    )
+    .map_err(app_error)?;
+    #[cfg(not(all(feature = "desktop-xwayland", target_env = "gnu")))]
     let mut wayland =
         NativeCompositor::new(&display, ClientLimits::default()).map_err(app_error)?;
     wayland
-        .add_output(
-            &display,
-            1,
-            output_state(connector, mode_index, output_scale)?,
-        )
+        .add_output(&display, 1, selected_output)
         .map_err(app_error)?;
     wayland
         .add_seat(
@@ -254,11 +272,17 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let socket = display
         .add_socket_in(&runtime_directory, config.socket_name.as_deref())
         .map_err(app_error)?;
-    let mut session = crate::session::SessionOwner::start(
-        launch_environment.desktop(&runtime_directory, &socket, &config.session.identity),
-        config.session.clone(),
-    )
-    .map_err(app_error)?;
+    let environment =
+        launch_environment.desktop(&runtime_directory, &socket, &config.session.identity);
+    #[cfg(all(feature = "desktop-xwayland-embedded", target_env = "gnu"))]
+    let session_start = if config.xwayland_enabled {
+        crate::session::SessionOwner::start_waiting_for_x11
+    } else {
+        crate::session::SessionOwner::start
+    };
+    #[cfg(not(all(feature = "desktop-xwayland-embedded", target_env = "gnu")))]
+    let session_start = crate::session::SessionOwner::start;
+    let mut session = session_start(environment, config.session.clone()).map_err(app_error)?;
     if config.session.publish_user_service_environment {
         session.publish_services().map_err(app_error)?;
     }
@@ -271,6 +295,47 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     // source with it so input, seat changes, DRM flips, and GPU completions wake the same owner
     // thread without a fixed Wayland-only sleep.
     let runtime_wake = EventNotifier::new("desktop runtime wake")?;
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    let mut compatibility: Option<compatibility::Compatibility> = None;
+    #[cfg(all(feature = "desktop-xwayland-embedded", target_env = "gnu"))]
+    if config.xwayland_enabled {
+        let cache = config.xwayland_cache.clone().unwrap_or_else(|| {
+            launch_environment
+                .get("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    launch_environment
+                        .get("HOME")
+                        .map(|home| std::path::PathBuf::from(home).join(".cache"))
+                })
+                .unwrap_or_else(|| runtime_directory.clone())
+                .join("telorgon/xwayland")
+        });
+        match compatibility::Compatibility::prepare(
+            xwayland_access,
+            crate::xwayland::payload::embedded(),
+            cache,
+            runtime_directory.clone(),
+            launch_environment.clone(),
+            runtime_wake.clone(),
+        ) {
+            Ok(host) => compatibility = Some(host),
+            Err(error) => {
+                session.set_x11_environment(None);
+                eprintln!("telorgon-xwayland: {error}; native desktop remains active");
+            }
+        }
+    }
+    #[cfg(all(
+        feature = "desktop-xwayland",
+        not(feature = "desktop-xwayland-embedded"),
+        target_env = "gnu"
+    ))]
+    if config.xwayland_enabled {
+        eprintln!(
+            "telorgon-xwayland: embedded payload is unavailable in this build; native desktop remains active"
+        );
+    }
     let termination_signals = event_source::TerminationSignals::new(runtime_wake.clone())?;
     let exit_request = super::exit::HostExit::register({
         let wake = runtime_wake.clone();
@@ -358,7 +423,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         _ => None,
     };
 
-    let keyboard = XkbKeyboard::from_names(None, None, None, None, None).map_err(app_error)?;
+    let keyboard = XkbKeyboard::from_names_with_include_root(
+        config.keyboard.rules.as_deref(),
+        config.keyboard.model.as_deref(),
+        config.keyboard.layout.as_deref(),
+        config.keyboard.variant.as_deref(),
+        config.keyboard.options.as_deref(),
+        config.keyboard.include_root.as_deref(),
+    )
+    .map_err(app_error)?;
     let keymap = keyboard.keymap_file().map_err(app_error)?;
     wayland
         .keyboard_keymap(1, keymap.fd(), keymap.size())
@@ -430,6 +503,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let mut pointer_focus = None;
     let mut touch_targets = BTreeMap::<i32, WaylandSurfaceId>::new();
     let mut windows = BTreeMap::<WaylandSurfaceId, ClientWindow>::new();
+    let mut window_identities = WindowIdentities::default();
     let mut pending_shm_buffers =
         BTreeMap::<crate::compositor_wayland::WaylandBufferId, usize>::new();
     let mut pending_shm_surfaces = BTreeMap::<WaylandSurfaceId, usize>::new();
@@ -460,6 +534,8 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let mut previous_pointer_batch_us = None::<u64>;
     let mut keyboard = keyboard;
     let mut shortcut_keys = shortcuts::ShortcutKeys::default();
+    let mut input_suspended = false;
+    let mut resume_keyboard_focus = None;
     let mut shutdown_started = None::<Instant>;
     let mut close_requested = std::collections::BTreeSet::new();
 
@@ -473,7 +549,13 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 Instant::now()
             });
             let surfaces = wayland.toplevel_surfaces();
-            if surfaces.is_empty() {
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            let x11_open = compatibility
+                .as_mut()
+                .is_some_and(|host| host.request_close());
+            #[cfg(not(all(feature = "desktop-xwayland", target_env = "gnu")))]
+            let x11_open = false;
+            if surfaces.is_empty() && !x11_open {
                 session.close();
                 return Ok(());
             }
@@ -492,6 +574,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 exit_request.cancel();
                 shutdown_started = None;
                 close_requested.clear();
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                if let Some(host) = &mut compatibility {
+                    host.cancel_close();
+                }
                 session.resume();
             }
         }
@@ -556,10 +642,104 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         } else {
             wait
         };
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        let wait = compatibility.as_ref().map_or(wait, |host| host.wait(wait));
         display.dispatch_and_flush(wait).map_err(app_error)?;
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if let Some(host) = &mut compatibility {
+            host.dispatch(&display);
+            if host.startup_complete() {
+                session.set_x11_environment(host.environment());
+            }
+            let changed = host.sync_presentation(&mut windows, &mut window_identities, &config)?;
+            repaint |= changed;
+            pointer_scene_dirty |= changed;
+            let focus_blocked = session_locked
+                || wayland.session_locked()
+                || input_suspended
+                || seat.disable_pending()
+                || seat.state() != SeatState::Enabled;
+            repaint |= host.apply_focus(
+                &display,
+                &mut wayland,
+                &windows,
+                &mut stacking_order,
+                focus_blocked,
+            )?;
+        }
 
         if seat_ready.swap(false, Ordering::AcqRel) {
             seat.dispatch(0).map_err(app_error)?;
+        }
+        if seat.disable_pending() {
+            // Close input device FDs before acknowledging access revocation.
+            input.suspend();
+            if !input_suspended {
+                resume_keyboard_focus = wayland
+                    .core()
+                    .seats
+                    .get(&1)
+                    .and_then(|seat| seat.keyboard_focus)
+                    .map(|focus| focus.surface);
+            }
+            input_suspended = true;
+            seat.acknowledge_disable().map_err(app_error)?;
+            input_ready.ready.store(false, Ordering::Release);
+            wayland.suspend_seat_input(1).map_err(app_error)?;
+            // Protocol cancellation also revokes the host's cached routing/capture.
+            // A resumed device must start a new touch or decoration interaction.
+            touch_targets.clear();
+            for frame in frame_layers.values_mut() {
+                frame
+                    .layer
+                    .runtime
+                    .cancel_pointer(crate::input::PointerId::PRIMARY);
+            }
+            repaint = true;
+            pointer_focus = None;
+            for key in shortcut_keys.reset() {
+                keyboard.update_key(key, KeyDirection::Up);
+            }
+            if let Some(interaction) = window_interaction.take() {
+                finish_window_interaction(&mut windows, &mut configure_scheduler, interaction);
+            }
+            pointer_scene_dirty = true;
+            display.flush_clients();
+        }
+        if input_suspended && seat.state() == SeatState::Enabled {
+            input.resume().map_err(app_error)?;
+            let deferred_keyboard_focus = wayland.resume_seat_input(1).map_err(app_error)?;
+            input_suspended = false;
+            input_ready.ready.store(true, Ordering::Release);
+            if let Some(surface) = resume_keyboard_focus.take().filter(|surface| {
+                !deferred_keyboard_focus
+                    && !session_locked
+                    && windows.get(surface).is_some_and(|window| !window.minimized)
+                    && wayland.core().world.surface(*surface).is_some()
+            }) {
+                // Preserve focus chosen by lock/desktop policy while we were inactive.
+                if wayland
+                    .core()
+                    .seats
+                    .get(&1)
+                    .is_some_and(|seat| seat.keyboard_focus.is_none())
+                {
+                    wayland
+                        .set_keyboard_focus(1, Some(surface), display.next_serial())
+                        .map_err(app_error)?;
+                }
+            }
+            let modifiers = keyboard.modifiers();
+            wayland
+                .keyboard_modifiers(
+                    1,
+                    display.next_serial(),
+                    modifiers.depressed,
+                    modifiers.latched,
+                    modifiers.locked,
+                    modifiers.group,
+                )
+                .map_err(app_error)?;
         }
         if seat.state() == SeatState::Enabled && input_ready.ready.swap(false, Ordering::AcqRel) {
             #[cfg(feature = "profiler")]
@@ -837,13 +1017,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 &config,
                                 &icon_layers,
                             );
-                            focus_toplevel(
+                            window_backend::focus(
                                 &display,
                                 &mut wayland,
                                 &windows,
                                 &mut configure_scheduler,
                                 &mut stacking_order,
                                 Some(surface),
+                                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                                compatibility.as_mut(),
                             )?;
                             match hit {
                                 DecorationHit::Titlebar => {
@@ -863,7 +1045,16 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                     );
                                 }
                                 DecorationHit::Close => {
-                                    wayland.close_toplevel(surface).map_err(app_error)?;
+                                    window_backend::close(
+                                        surface,
+                                        &windows,
+                                        &mut wayland,
+                                        #[cfg(all(
+                                            feature = "desktop-xwayland",
+                                            target_env = "gnu"
+                                        ))]
+                                        compatibility.as_mut(),
+                                    )?;
                                 }
                                 DecorationHit::Maximize => {
                                     let maximized = windows
@@ -936,13 +1127,19 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 )
                                 .map_err(app_error)?;
                             if pressed && seat_pointer_focus.is_some() {
-                                focus_toplevel(
+                                window_backend::focus(
                                     &display,
                                     &mut wayland,
                                     &windows,
                                     &mut configure_scheduler,
                                     &mut stacking_order,
                                     seat_pointer_focus,
+                                    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                                    if session_locked {
+                                        None
+                                    } else {
+                                        compatibility.as_mut()
+                                    },
                                 )?;
                                 repaint = true;
                             }
@@ -1027,8 +1224,16 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             event,
                             pressed,
                             session_locked,
-                            keyboard_shortcut_handler.as_deref_mut(),
+                            if wayland.shortcuts_inhibited(1) {
+                                None
+                            } else {
+                                keyboard_shortcut_handler.as_deref_mut()
+                            },
                         );
+                        if action == crate::application_host::DesktopKeyAction::ReleaseCapture {
+                            wayland.release_pointer_capture(1).map_err(app_error)?;
+                            wayland.release_shortcut_inhibition(1).map_err(app_error)?;
+                        }
                         if action == crate::application_host::DesktopKeyAction::Quit {
                             crate::request_exit();
                         }
@@ -1226,12 +1431,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             }
         }
 
-        flush_resize_configures(
+        window_backend::flush(
             &display,
             &mut wayland,
             &mut windows,
             &mut configure_scheduler,
             &mut resize_configure_budget,
+            &config,
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            compatibility.as_mut(),
         )?;
 
         if runtime_ready.swap(false, Ordering::AcqRel) {
@@ -1249,6 +1457,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 &display,
                 &mut wayland,
                 &mut windows,
+                &mut window_identities,
                 &mut configure_scheduler,
                 &mut stacking_order,
                 &mut next_window_offset,
@@ -1392,6 +1601,14 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     let Some(role) = snapshot.role else {
                         continue;
                     };
+                    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                    if role == SurfaceRole::Xwayland {
+                        if let (Some(host), Some(serial)) =
+                            (&mut compatibility, snapshot.xwayland_serial)
+                        {
+                            host.committed(surface, serial);
+                        }
+                    }
                     // Configure acknowledgement is commit state, not image-worker state. Observe
                     // it before a newer latest-wins SHM publication can replace these pixels.
                     observe_surface_configure_acknowledgement(&mut windows, &snapshot);
@@ -1403,6 +1620,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             | SurfaceRole::Cursor
                             | SurfaceRole::DragIcon
                             | SurfaceRole::SessionLock
+                            | SurfaceRole::Xwayland
                     ) {
                         continue;
                     }
@@ -1459,6 +1677,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             &display,
                             &mut wayland,
                             &mut windows,
+                            &mut window_identities,
                             &mut configure_scheduler,
                             &mut stacking_order,
                             &mut next_window_offset,
@@ -1515,10 +1734,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         None
                     };
                     let metadata_matches = windows.get(&surface).is_some_and(|window| {
-                        window.size == descriptor.size
-                            && window.pixel_format == native_pixel_format
-                            && window.alpha_mode == native_alpha_mode
-                            && window.pixels.len()
+                        window.presentation.size == descriptor.size
+                            && window.presentation.pixel_format == native_pixel_format
+                            && window.presentation.alpha_mode == native_alpha_mode
+                            && window.presentation.pixels.len()
                                 == descriptor.size.width as usize
                                     * descriptor.size.height as usize
                                     * 4
@@ -1617,6 +1836,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         &display,
                         &mut wayland,
                         &mut windows,
+                        &mut window_identities,
                         &mut configure_scheduler,
                         &mut stacking_order,
                         &mut next_window_offset,
@@ -1635,6 +1855,20 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     repaint = true;
                 }
                 CompositorAction::WithdrawSurface(surface) => {
+                    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                    if let Some(host) = &mut compatibility {
+                        if let Some(state) = wayland.core().world.surface(surface) {
+                            let snapshot = state.snapshot();
+                            if snapshot.role == Some(SurfaceRole::Xwayland) {
+                                if let Some(serial) = snapshot.xwayland_serial {
+                                    host.committed(surface, serial);
+                                }
+                            }
+                        } else {
+                            host.destroyed(surface);
+                        }
+                    }
+
                     if let Some(retirement) = desktop_renderer.cancel_dma_buf_surface(surface) {
                         retire_unsubmitted_dma_buf(
                             &mut wayland,
@@ -1663,6 +1897,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             .map_err(app_error)?;
                     }
                     windows.remove(&surface);
+                    if wayland.core().world.surface(surface).is_none() {
+                        window_identities.destroy(surface);
+                    }
                     configure_scheduler.cancel(surface);
                     frame_layers.remove(&surface);
                     stacking_order.retain(|candidate| *candidate != surface);
@@ -1791,6 +2028,8 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     }
                 }
                 CompositorAction::SessionLockRequested(lock) => {
+                    shortcut_keys.suppress_held();
+                    wayland.cancel_keyboard_input(1).map_err(app_error)?;
                     if wayland.drag_active(1) {
                         wayland.cancel_drag(1).map_err(app_error)?;
                     }
@@ -1819,9 +2058,6 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     wayland
                         .set_pointer_focus(1, None, pointer_position, display.next_serial())
                         .map_err(app_error)?;
-                    wayland
-                        .set_keyboard_focus(1, None, display.next_serial())
-                        .map_err(app_error)?;
                     if !touch_targets.is_empty() {
                         touch_targets.clear();
                         wayland.touch_cancel(1).map_err(app_error)?;
@@ -1831,6 +2067,8 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 }
                 CompositorAction::SessionLockCancelled(lock) => {
                     if pending_session_lock == Some(lock) && !wayland.session_locked() {
+                        shortcut_keys.suppress_held();
+                        wayland.cancel_keyboard_input(1).map_err(app_error)?;
                         pending_session_lock = None;
                         session_locked = false;
                         pointer_scene_dirty = true;
@@ -1838,6 +2076,8 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     }
                 }
                 CompositorAction::SessionUnlockRequested(lock) => {
+                    shortcut_keys.suppress_held();
+                    wayland.cancel_keyboard_input(1).map_err(app_error)?;
                     if pending_session_lock == Some(lock) {
                         pending_session_lock = None;
                     }
@@ -1866,20 +2106,30 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 | CompositorAction::DisconnectClient(_) => {}
             }
         }
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if let Some(host) = &mut compatibility {
+            let changed = host.sync_presentation(&mut windows, &mut window_identities, &config)?;
+            repaint |= changed;
+            pointer_scene_dirty |= changed;
+        }
 
         // Resume frame-callback-paced clients after release even when the veil itself no longer
         // changes (so there may be no new KMS frame). Hidden intermediate images are not presented;
         // do not misreport presentation feedback while asking the client for its final redraw.
         let callback_time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
         for (surface, window) in &windows {
-            if window.revision != 0
+            if window.presentation.revision != 0
                 && !window.minimized
                 && resize_veil_owner(&windows, *surface)
                     .and_then(|owner| windows.get(&owner))
-                    .is_some_and(|owner| owner.resize_final.is_some())
+                    .is_some_and(|owner| owner.native_configure.resize_final.is_some())
             {
                 wayland
-                    .surface_occluded_frame_ready(*surface, window.revision, callback_time)
+                    .surface_occluded_frame_ready(
+                        *surface,
+                        window.presentation.revision,
+                        callback_time,
+                    )
                     .map_err(app_error)?;
             }
         }
@@ -1903,12 +2153,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             )?;
         }
 
-        flush_resize_configures(
+        window_backend::flush(
             &display,
             &mut wayland,
             &mut windows,
             &mut configure_scheduler,
             &mut resize_configure_budget,
+            &config,
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            compatibility.as_mut(),
         )?;
 
         let cursor_image = wayland
@@ -2097,12 +2350,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
 
         if presentation_completed {
             resize_configure_budget = true;
-            flush_resize_configures(
+            window_backend::flush(
                 &display,
                 &mut wayland,
                 &mut windows,
                 &mut configure_scheduler,
                 &mut resize_configure_budget,
+                &config,
+                #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                compatibility.as_mut(),
             )?;
             if let Some(lock) = pending_session_lock.take() {
                 wayland
@@ -2126,9 +2382,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 .iter()
                 .filter(|(_, window)| window.role == SurfaceRole::Cursor)
             {
-                if window.revision != 0 && !session_locked {
+                if window.presentation.revision != 0 && !session_locked {
                     wayland
-                        .surface_presented(*surface, window.revision, time)
+                        .surface_presented(*surface, window.presentation.revision, time)
                         .map_err(app_error)?;
                 }
             }
@@ -2206,12 +2462,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     &mut configure_scheduler,
                 )?;
                 // Publish sizes derived from the actual maximized chrome before presenting it.
-                flush_resize_configures(
+                window_backend::flush(
                     &display,
                     &mut wayland,
                     &mut windows,
                     &mut configure_scheduler,
                     &mut resize_configure_budget,
+                    &config,
+                    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+                    compatibility.as_mut(),
                 )?;
             }
             let cursor_image = wayland

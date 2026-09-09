@@ -84,3 +84,23 @@ mod tests {
         assert_eq!(OutputId::MIN.to_string(), "1");
     }
 }
+
+/// Identity of a desktop policy window, independent of its current client surface.
+/// Slots may be recycled only with a new generation. Identities are scoped to one
+/// desktop host; neither field is an XID or a Wayland protocol object ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId {
+    slot: std::num::NonZeroU32,
+    generation: std::num::NonZeroU32,
+}
+impl WindowId {
+    pub const fn new(slot: std::num::NonZeroU32, generation: std::num::NonZeroU32) -> Self {
+        Self { slot, generation }
+    }
+    pub const fn slot(self) -> u32 {
+        self.slot.get()
+    }
+    pub const fn generation(self) -> u32 {
+        self.generation.get()
+    }
+}
