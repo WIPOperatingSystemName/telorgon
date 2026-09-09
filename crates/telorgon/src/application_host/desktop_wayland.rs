@@ -842,6 +842,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 &mut wayland,
                                 &windows,
                                 &mut configure_scheduler,
+                                &mut stacking_order,
                                 Some(surface),
                             )?;
                             match hit {
@@ -940,8 +941,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                     &mut wayland,
                                     &windows,
                                     &mut configure_scheduler,
+                                    &mut stacking_order,
                                     seat_pointer_focus,
                                 )?;
+                                repaint = true;
                             }
                         }
                         if !pressed
@@ -1692,13 +1695,12 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         if let Some(window) = windows.get_mut(&surface) {
                             window.minimized = false;
                         }
-                        stacking_order.retain(|candidate| *candidate != surface);
-                        stacking_order.push(surface);
                         focus_toplevel(
                             &display,
                             &mut wayland,
                             &windows,
                             &mut configure_scheduler,
+                            &mut stacking_order,
                             Some(surface),
                         )?;
                         pointer_scene_dirty = true;

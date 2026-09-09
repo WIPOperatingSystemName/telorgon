@@ -144,11 +144,15 @@ pub(super) fn focus_toplevel(
     wayland: &mut NativeCompositor<'_>,
     windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
     configure_scheduler: &mut ConfigureScheduler,
+    stacking_order: &mut Vec<WaylandSurfaceId>,
     surface: Option<WaylandSurfaceId>,
 ) -> AppResult<()> {
     let surface = surface
         .and_then(|surface| toplevel_ancestor(windows, surface))
         .filter(|surface| wayland.core().world.surface(*surface).is_some());
+    if let Some(surface) = surface {
+        raise_toplevel(windows, stacking_order, surface);
+    }
     let previous = wayland
         .core()
         .seats
@@ -188,6 +192,29 @@ pub(super) fn focus_toplevel(
         }
     }
     Ok(())
+}
+
+pub(super) fn raise_toplevel(
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+    stacking_order: &mut Vec<WaylandSurfaceId>,
+    surface: WaylandSurfaceId,
+) {
+    let Some(owner) = toplevel_ancestor(windows, surface) else {
+        return;
+    };
+    // Stable partition keeps popups/subsurfaces above their owner and preserves all
+    // unrelated windows. Only explicit activation calls this, never client redraws.
+    let mut family: Vec<_> = stacking_order
+        .iter()
+        .copied()
+        .filter(|candidate| toplevel_ancestor(windows, *candidate) == Some(owner))
+        .collect();
+    // Minimize removes the toplevel from the stack; activation restores its slot.
+    if !family.contains(&owner) {
+        family.insert(0, owner);
+    }
+    stacking_order.retain(|candidate| toplevel_ancestor(windows, *candidate) != Some(owner));
+    stacking_order.extend(family);
 }
 
 fn toplevel_ancestor(

@@ -311,3 +311,37 @@ The adjacent reference library is unavailable in this checkout. This bounded cor
 existing rounded-placement contract and its software/Vulkan implementations; it introduces no new
 GPU mechanism, synchronization, or resource-lifetime changes. Live confirmation of the reported
 artifact remains a user-run check.
+
+### Separate exterior window shadows
+
+The host now extracts the root decoration's shadows into a dedicated `FrameShadow` scene placed
+immediately before that window's frame. Its allocation expands by each shadow's offset, spread,
+and twice its blur, using the same visual-bounds rule as `render/compiler.rs`. The box is translated
+into the expanded source extent without changing window layout, input regions, or client geometry.
+An inverse outer rounded clip excludes the window interior, including transparent client content.
+Border and aperture patches clear their copied shadow lists to avoid duplicate shadow rendering.
+Frames with no visible shadow create no shadow placement, so maximize/fullscreen state styles with
+`shadow: None` remove it through ordinary scene retirement and placement damage.
+
+This supersedes the exterior-shadow limitation above: frame paint remains contained while the
+separate shadow extends outside it. Reusing the clipped frame placement or expanding actual window
+geometry was rejected because those approaches truncate the blur or alter client layout/input.
+
+Reference audit: the adjacent library is still unavailable, and attempted upstream KWin
+`src/scene/shadowitem.cpp` and Flutter `impeller/entity/contents/solid_rrect_blur_contents.cc` reads
+failed. No upstream implementation review is claimed. This bounded composition change reuses the
+existing software analytic shadow (`renderer_software/renderer.rs`) and Vulkan analytic box packing
+(`renderer_vulkan/scene.rs`) with existing inverse rounded placement clips. The official
+[CSS shadow-shape contract](https://www.w3.org/TR/css-backgrounds-3/#shadow-shape) supports rounded
+exterior shadows excluding the border-box interior. No shader, resource-lifetime, or synchronization
+mechanism changes. CPU framebuffer tests verify expanded bounds, visible exterior blur, clear
+interior, and repaint after moving/removing shadows. Hardware appearance remains user-qualified.
+
+### Activation and stacking
+
+Explicit focus changes now raise the owning toplevel and its popup/subsurface family as a stable
+group. Title-bar and client clicks share this path with activation requests and initial mapping.
+Repeated focus of the same window remains order-stable; ordinary client image publications do not
+raise existing windows. Client clicks request repaint so visual stacking agrees with keyboard focus.
+Restoring a minimized window reinserts its removed stack entry. This uses the existing shared draw
+and hit-test order and placement-damage tracking; no rendering or protocol lifetime changes.

@@ -463,6 +463,7 @@ pub(super) fn apply_surface_publication(
             wayland,
             windows,
             configure_scheduler,
+            stacking_order,
             Some(surface),
         )?;
     } else if session_locked && role == SurfaceRole::SessionLock {
@@ -644,6 +645,47 @@ pub(super) fn retire_submitted_dma_buf(
 #[cfg(test)]
 mod maximize_preview_tests {
     use super::*;
+
+    #[test]
+    fn activation_raises_a_window_family_without_reordering_other_windows() {
+        let ids: Vec<_> = (1..=4)
+            .map(|id| WaylandSurfaceId::from_raw(id).unwrap())
+            .collect();
+        let mut windows = BTreeMap::new();
+        for id in &ids {
+            windows.insert(
+                *id,
+                test_window(
+                    SizeI {
+                        width: 100,
+                        height: 80,
+                    },
+                    PointI::default(),
+                ),
+            );
+        }
+        let popup = windows.get_mut(&ids[1]).unwrap();
+        popup.role = SurfaceRole::XdgPopup;
+        popup.parent = Some(ids[0]);
+        let mut order = ids.clone();
+        super::super::input::raise_toplevel(&windows, &mut order, ids[1]);
+        assert_eq!(order, [ids[2], ids[3], ids[0], ids[1]]);
+        super::super::input::raise_toplevel(&windows, &mut order, ids[0]);
+        assert_eq!(
+            order,
+            [ids[2], ids[3], ids[0], ids[1]],
+            "repeated activation is stable"
+        );
+        super::super::input::raise_toplevel(&windows, &mut order, ids[2]);
+        assert_eq!(order, [ids[3], ids[0], ids[1], ids[2]]);
+        windows.get_mut(&ids[3]).unwrap().minimized = true;
+        super::super::input::raise_toplevel(&windows, &mut order, ids[3]);
+        assert_eq!(order, [ids[3], ids[0], ids[1], ids[2]]);
+        order.remove(0);
+        windows.get_mut(&ids[3]).unwrap().minimized = false;
+        super::super::input::raise_toplevel(&windows, &mut order, ids[3]);
+        assert_eq!(order, [ids[0], ids[1], ids[2], ids[3]]);
+    }
 
     fn test_window(size: SizeI, position: PointI) -> ClientWindow {
         ClientWindow {

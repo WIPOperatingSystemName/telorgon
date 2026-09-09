@@ -295,7 +295,7 @@ pub(super) fn refresh_window_frames(
             border: style.decoration.border,
             outline: Default::default(),
             corner_radii: style.decoration.corner_radii,
-            shadows: Default::default(),
+            shadows: style.decoration.shadows,
             opacity: style.opacity,
             clip: ClipId(0),
             spatial: SpatialId(0),
@@ -526,6 +526,13 @@ pub(super) fn prepare_desktop_layers(
         if window_is_decorated(window)
             && let Some(frame) = frames.get_mut(surface)
         {
+            if visible && let Some(border) = &frame.border {
+                layers.extend(DesktopLayer::frame_shadow(
+                    surface.get(),
+                    border.clone(),
+                    position,
+                ));
+            }
             let frame_pieces = DesktopLayer::retained_frame(
                 surface.get(),
                 if visible {

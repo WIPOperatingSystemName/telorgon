@@ -47,6 +47,7 @@ pub(super) fn frame_content_clips(
 pub(super) enum DesktopLayerKey {
     Background,
     Frame(u32, u8),
+    FrameShadow(u32),
     ContentBackground(u32),
     ContentBorder(u32),
     ContentCorners(u32),
@@ -69,6 +70,7 @@ pub(super) enum DesktopLayerKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) enum DesktopSceneKey {
+    FrameShadow(u32),
     Background,
     Frame(u32),
     Surface(u32),
@@ -145,6 +147,75 @@ pub(super) struct DesktopLayer {
 }
 
 impl DesktopLayer {
+    pub(super) fn frame_shadow(
+        surface: u32,
+        mut instance: BoxInstance,
+        position: PointI,
+    ) -> Option<Self> {
+        if !instance
+            .shadows
+            .as_slice()
+            .iter()
+            .any(|shadow| shadow.color.a > 0)
+        {
+            return None;
+        }
+        let outline = RoundedClip::new(
+            RectF {
+                x: instance.rect.x + position.x as f32,
+                y: instance.rect.y + position.y as f32,
+                ..instance.rect
+            },
+            instance.corner_radii,
+        );
+        let mut bounds = instance.rect;
+        for shadow in instance.shadows.as_slice() {
+            let reach = (shadow.spread + shadow.blur * 2.0).max(0.0);
+            bounds = bounds.union(RectF {
+                x: instance.rect.x + shadow.offset.x - reach,
+                y: instance.rect.y + shadow.offset.y - reach,
+                width: instance.rect.width + 2.0 * reach,
+                height: instance.rect.height + 2.0 * reach,
+            });
+        }
+        let left = bounds.x.floor() as i32;
+        let top = bounds.y.floor() as i32;
+        let extent = SizeI {
+            width: (bounds.x + bounds.width).ceil() as i32 - left,
+            height: (bounds.y + bounds.height).ceil() as i32 - top,
+        };
+        instance.node = NodeId::new(0, 1);
+        instance.rect.x -= left as f32;
+        instance.rect.y -= top as f32;
+        instance.view_bounds = RectF {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+        };
+        instance.background = None;
+        instance.border = Default::default();
+        instance.outline = Default::default();
+        let mut layer = Self::retained(
+            DesktopLayerKey::FrameShadow(surface),
+            DesktopSceneKey::FrameShadow(surface),
+            Vec::new(),
+            extent,
+            PointI {
+                x: position.x + left,
+                y: position.y + top,
+            },
+            true,
+        );
+        layer.content = DesktopLayerContent::Decoration {
+            scene: DesktopSceneKey::FrameShadow(surface),
+            instance,
+        };
+        // Keep transparent clients and resize previews free of their own exterior shadow.
+        layer.rounded_clips = [Some(outline.inverse()), None];
+        Some(layer)
+    }
+
     /// Frame scenes are rectangular allocations; their paint must stay inside the chrome
     /// contour even when the scene contains a rectangular backing or a clipped shadow.
     pub(super) fn with_frame_outline(mut self, border: &BoxInstance, position: PointI) -> Self {
@@ -173,6 +244,7 @@ impl DesktopLayer {
         // has its own stable slot; never accumulate obsolete frame nodes behind draw index zero.
         instance.node = NodeId::new(0, 1);
         instance.background = None;
+        instance.shadows = Default::default();
         let mut layer = Self::retained(
             DesktopLayerKey::ContentBorder(surface),
             DesktopSceneKey::ContentBorder(surface),
@@ -201,6 +273,7 @@ impl DesktopLayer {
         clips: [Option<RoundedClip>; 2],
     ) -> Option<Self> {
         let aperture = clips[1]?;
+        instance.shadows = Default::default();
         if instance.background.is_none_or(|color| color.a == 0) {
             return None;
         }

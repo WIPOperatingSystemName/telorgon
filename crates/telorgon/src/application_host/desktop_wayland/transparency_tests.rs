@@ -99,6 +99,65 @@ fn frame_layers(color: ColorRgba8) -> Vec<DesktopLayer> {
 }
 
 #[test]
+fn exterior_shadow_has_expanded_bounds_and_leaves_window_interior_clear() {
+    let rect = crate::core::RectF {
+        x: 0.0,
+        y: 0.0,
+        width: 12.0,
+        height: 10.0,
+    };
+    let mut instance = crate::render::BoxInstance {
+        node: crate::scene::NodeId::new(0, 1),
+        rect,
+        view_bounds: rect,
+        background: Some(ColorRgba8::rgba(0, 0, 255, 255)),
+        border: Default::default(),
+        outline: Default::default(),
+        corner_radii: crate::ui::CornerRadii::all(3.0),
+        shadows: crate::ui::ShadowList::one(crate::ui::Shadow {
+            offset: crate::core::PointF { x: 0.0, y: 2.0 },
+            blur: 3.0,
+            spread: 1.0,
+            color: ColorRgba8::rgba(0, 0, 0, 220),
+        }),
+        opacity: 1.0,
+        clip: crate::render::ClipId(0),
+        spatial: crate::render::SpatialId(0),
+    };
+    let mut raster = Raster::new();
+    let layer = DesktopLayer::frame_shadow(9, instance.clone(), PointI { x: 10, y: 6 }).unwrap();
+    assert_eq!(
+        layer.target,
+        RectI {
+            x: 3,
+            y: 1,
+            width: 26,
+            height: 24
+        }
+    );
+    raster.draw(vec![layer]);
+    assert_eq!(
+        raster.pixel(16, 10),
+        &[0, 255, 0, 255],
+        "shadow must not fill the window interior"
+    );
+    assert!(
+        raster.pixel(16, 18)[1] < 240,
+        "shadow must extend below the frame"
+    );
+    assert_eq!(raster.pixel(0, 0), &[0, 255, 0, 255]);
+    // Moving and then removing the shadow must repaint its former extent.
+    raster.draw(vec![
+        DesktopLayer::frame_shadow(9, instance.clone(), PointI { x: 10, y: -12 }).unwrap(),
+    ]);
+    assert_eq!(raster.pixel(16, 18), &[0, 255, 0, 255]);
+    instance.shadows = Default::default();
+    assert!(DesktopLayer::frame_shadow(9, instance, PointI::default()).is_none());
+    raster.draw(Vec::new());
+    assert_eq!(raster.pixel(16, 0), &[0, 255, 0, 255]);
+}
+
+#[test]
 fn rectangular_frame_backing_cannot_leak_outside_round_corners() {
     let rect = crate::core::RectF {
         x: 0.0,
