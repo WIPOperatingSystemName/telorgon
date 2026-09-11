@@ -470,6 +470,44 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             true,
         )?;
     }
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    if let Some(compatibility) = compatibility.as_mut() {
+        let visual = render_cursor_image(
+            CursorImage::TelorgonDefault,
+            &mut pointer,
+            &mut icon_layers,
+            &BTreeMap::new(),
+            config.pointer_extent,
+            0,
+            &pointer_config,
+            pointer_theme.as_ref(),
+            &mut pointer_media,
+            crate::platform::ScaleFactor::new(1.0).map_err(app_error)?,
+        )?;
+        let cursor = match visual {
+            Some(CursorVisual::Image(image)) => {
+                Some(crate::xwayland::root_cursor::RootCursor::new(
+                    image.size.width,
+                    image.size.height,
+                    image.hotspot.x,
+                    image.hotspot.y,
+                    &image.rgba,
+                    image.premultiplied,
+                ))
+            }
+            None => Some(crate::xwayland::root_cursor::RootCursor::new(
+                1, 1, 0, 0, &[0; 4], true,
+            )),
+            Some(CursorVisual::Composed { .. }) => None,
+        };
+        match cursor {
+            Some(Ok(cursor)) => compatibility.root_cursor = Some(cursor),
+            Some(Err(error)) => eprintln!("telorgon-xwayland: {error}; using built-in root arrow"),
+            None => eprintln!(
+                "telorgon-xwayland: composed default cursor cannot be exported; using built-in root arrow"
+            ),
+        }
+    }
     let mut widgets = widgets
         .into_iter()
         .map(|widget| {
@@ -2122,7 +2160,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 && !window.minimized
                 && resize_veil_owner(&windows, *surface)
                     .and_then(|owner| windows.get(&owner))
-                    .is_some_and(|owner| owner.native_configure.resize_final.is_some())
+                    .is_some_and(ClientWindow::waiting_for_resize_content)
             {
                 wayland
                     .surface_occluded_frame_ready(

@@ -100,6 +100,9 @@ pub(super) fn render_cursor_image(
     pointer_media: &mut AssetMediaCache,
     output_scale: crate::platform::ScaleFactor,
 ) -> AppResult<Option<CursorVisual>> {
+    // A cursor surface request can arrive before its asynchronous SHM publication.
+    // Missing pixels mean "not ready", not an explicit request to hide the pointer.
+    let image = ready_cursor_image(image, windows);
     let rendered =
         match image {
             CursorImage::TelorgonDefault => render_semantic_pointer(
@@ -162,6 +165,22 @@ pub(super) fn render_cursor_image(
             CursorImage::Hidden => None,
         };
     Ok(rendered)
+}
+
+fn ready_cursor_image(
+    image: CursorImage,
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+) -> CursorImage {
+    match image {
+        CursorImage::ClientSurface { surface, .. }
+            if windows
+                .get(&surface)
+                .is_none_or(|w| w.presentation.pixels.is_empty()) =>
+        {
+            CursorImage::TelorgonDefault
+        }
+        _ => image,
+    }
 }
 
 fn client_pixels_rgba(window: &ClientWindow) -> Vec<u8> {
@@ -523,6 +542,41 @@ pub(super) fn pointer_icon_cursor_shape(icon: PointerIcon) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unpublished_cursor_uses_default_but_explicit_hidden_cursor_stays_hidden() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        let requested = CursorImage::ClientSurface {
+            surface,
+            hotspot_x: 1,
+            hotspot_y: 2,
+        };
+        let mut windows = BTreeMap::new();
+        assert_eq!(
+            ready_cursor_image(requested, &windows),
+            CursorImage::TelorgonDefault
+        );
+        assert_eq!(
+            ready_cursor_image(CursorImage::Hidden, &windows),
+            CursorImage::Hidden
+        );
+        let mut window = super::super::client::maximize_preview_tests::test_window(
+            SizeI {
+                width: 1,
+                height: 1,
+            },
+            PointI::default(),
+        );
+        windows.insert(surface, window);
+        assert_eq!(
+            ready_cursor_image(requested, &windows),
+            CursorImage::TelorgonDefault
+        );
+        window = windows.remove(&surface).unwrap();
+        // Transparent pixels are a valid deliberate client cursor, not missing data.
+        window.presentation.pixels = vec![0; 4];
+        windows.insert(surface, window);
+        assert_eq!(ready_cursor_image(requested, &windows), requested);
+    }
     #[test]
     fn cursor_hotspot_and_pixels_follow_output_density_with_bounded_hardware_fallback() {
         let cursor = RenderedCursor {

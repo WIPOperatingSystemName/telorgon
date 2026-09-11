@@ -16,6 +16,7 @@ use x11rb_protocol::{
 pub struct Protocols {
     pub delete_window: bool,
     pub take_focus: bool,
+    pub sync_request: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputHints {
@@ -53,10 +54,12 @@ enum Value {
     Hints(InputHints),
     Normal(super::normal_hints::NormalHints),
     Text(String),
+    Counter(u32),
 }
 #[derive(Clone, Copy)]
 enum PropertyKind {
     Protocols,
+    Counter,
     Input,
     Normal,
     Text { utf8: bool },
@@ -72,6 +75,7 @@ pub(crate) struct PropertyReader {
     kind: PropertyKind,
     delete: u32,
     take_focus: u32,
+    sync_request: u32,
     entries: BTreeMap<XWindow, Entry>,
     pending: BTreeMap<u64, (XWindow, u64)>,
 }
@@ -82,9 +86,42 @@ impl PropertyReader {
             kind: PropertyKind::Protocols,
             delete,
             take_focus,
+            sync_request: 0,
             entries: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
+    }
+    pub fn with_sync_request(mut self, atom: u32) -> Self {
+        self.sync_request = atom;
+        self
+    }
+    pub fn new_counter(property: u32) -> Self {
+        let mut reader = Self::new(property, 0, 0);
+        reader.kind = PropertyKind::Counter;
+        reader
+    }
+    pub fn counter(&self, window: XWindow) -> Option<u32> {
+        match self.entries.get(&window)?.value.as_ref()? {
+            Value::Counter(counter) => Some(*counter),
+            _ => None,
+        }
+    }
+    fn parse_counter(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() != 36 && bytes.len() != 40 {
+            return None;
+        }
+        let (reply, _) = xproto::GetPropertyReply::try_parse(bytes).ok()?;
+        // An optional second counter is the extended frame protocol. Use only
+        // the basic counter and never claim the extended protocol here.
+        if reply.type_ != u32::from(xproto::AtomEnum::CARDINAL)
+            || reply.format != 32
+            || reply.bytes_after != 0
+            || !(1..=2).contains(&reply.value_len)
+        {
+            return None;
+        }
+        let counter = u32::from_ne_bytes(reply.value.get(..4)?.try_into().ok()?);
+        (counter != 0).then_some(counter)
     }
     pub fn new_hints() -> Self {
         let mut reader = Self::new(xproto::AtomEnum::WM_HINTS.into(), 0, 0);
@@ -196,6 +233,7 @@ impl PropertyReader {
                     window: window.xid,
                     property: self.property,
                     type_: match self.kind {
+                        PropertyKind::Counter => xproto::AtomEnum::CARDINAL.into(),
                         PropertyKind::Input => self.property,
                         PropertyKind::Normal => xproto::AtomEnum::WM_SIZE_HINTS.into(),
                         PropertyKind::Protocols => xproto::AtomEnum::ATOM.into(),
@@ -203,6 +241,7 @@ impl PropertyReader {
                     },
                     long_offset: 0,
                     long_length: match self.kind {
+                        PropertyKind::Counter => 2,
                         PropertyKind::Input => 9,
                         PropertyKind::Normal => 18,
                         PropertyKind::Protocols => 256,
@@ -247,6 +286,7 @@ impl PropertyReader {
             let atom = u32::from_ne_bytes(bytes.try_into().ok()?);
             result.delete_window |= atom == self.delete;
             result.take_focus |= atom == self.take_focus;
+            result.sync_request |= self.sync_request != 0 && atom == self.sync_request;
         }
         Some(result)
     }
@@ -294,6 +334,7 @@ impl PropertyReader {
         self.pending.remove(&id.sequence);
         let value = match completion {
             Completion::Reply(_, bytes) => match self.kind {
+                PropertyKind::Counter => Self::parse_counter(bytes).map(Value::Counter),
                 PropertyKind::Input => self.parse_hints(bytes).map(Value::Hints),
                 PropertyKind::Normal => super::normal_hints::parse(bytes).map(Value::Normal),
                 PropertyKind::Protocols => self.parse(bytes).map(Value::Protocols),
@@ -307,6 +348,7 @@ impl PropertyReader {
             {
                 entry.value = value;
                 actions.push(match self.kind {
+                    PropertyKind::Counter => Action::Changed(window),
                     PropertyKind::Input => Action::HintsChanged(window),
                     PropertyKind::Normal => Action::NormalHintsChanged(window),
                     PropertyKind::Protocols => Action::ProtocolsChanged(window),
@@ -357,6 +399,35 @@ mod tests {
             }
             .serialize(),
         )
+    }
+    #[test]
+    fn basic_sync_counter_requires_bounded_cardinal_and_advertised_protocol() {
+        let p = PropertyReader::new(104, 105, 106).with_sync_request(120);
+        let Completion::Reply(_, bytes) = reply(1, &[120]) else {
+            unreachable!()
+        };
+        assert!(p.parse(&bytes).unwrap().sync_request);
+        let make = |values: &[u32]| {
+            xproto::GetPropertyReply {
+                format: 32,
+                length: values.len() as u32,
+                type_: xproto::AtomEnum::CARDINAL.into(),
+                value_len: values.len() as u32,
+                value: values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+                ..Default::default()
+            }
+            .serialize()
+        };
+        assert_eq!(PropertyReader::parse_counter(&make(&[42])), Some(42));
+        assert_eq!(PropertyReader::parse_counter(&make(&[42, 43])), Some(42));
+        assert_eq!(PropertyReader::parse_counter(&make(&[0])), None);
+        assert_eq!(PropertyReader::parse_counter(&make(&[42, 43, 44])), None);
+        let mut malformed = make(&[42]);
+        malformed[8..12].copy_from_slice(&u32::from(xproto::AtomEnum::ATOM).to_ne_bytes());
+        assert_eq!(PropertyReader::parse_counter(&malformed), None);
+        let mut partial = make(&[42]);
+        partial[12..16].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(PropertyReader::parse_counter(&partial), None);
     }
     #[test]
     fn frame_titles_are_bounded_and_encoding_checked() {
@@ -459,7 +530,7 @@ mod tests {
         reader.refresh(id).unwrap();
         let mut actions = Vec::new();
         reader
-            .completion(&response(29), &windows, &mut actions)
+            .completion(&response(33), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -472,7 +543,7 @@ mod tests {
             )
             .unwrap();
         reader
-            .completion(&response(30), &windows, &mut actions)
+            .completion(&response(34), &windows, &mut actions)
             .unwrap();
         assert!(
             matches!(actions.as_slice(), [Action::NormalHintsChanged(window)] if *window == id)
@@ -497,7 +568,7 @@ mod tests {
         reader.forget(id);
         actions.clear();
         reader
-            .completion(&response(31), &windows, &mut actions)
+            .completion(&response(35), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -532,7 +603,7 @@ mod tests {
         );
         assert!(reader.pending.is_empty());
         let mut response = xproto::GetInputFocusReply {
-            sequence: 29,
+            sequence: 33,
             ..Default::default()
         }
         .serialize()
@@ -611,7 +682,8 @@ mod tests {
                     },
                     Protocols {
                         delete_window: false,
-                        take_focus: take
+                        take_focus: take,
+                        sync_request: false
                     }
                 ),
                 expected
@@ -643,7 +715,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.pending.len(), 1);
         let mut actions = vec![];
-        p.completion(&reply(29, &[105, 106]), &w, &mut actions)
+        p.completion(&reply(33, &[105, 106]), &w, &mut actions)
             .unwrap();
         assert_eq!(p.get(id), None);
         assert!(actions.is_empty());
@@ -654,21 +726,22 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
-        p.completion(&reply(30, &[]), &w, &mut actions).unwrap();
+        p.completion(&reply(34, &[]), &w, &mut actions).unwrap();
         assert_eq!(p.get(id), Some(Protocols::default()));
         assert_eq!(actions, vec![Action::ProtocolsChanged(id)]);
     }
     #[test]
     fn invalid_or_incomplete_properties_grant_no_capabilities() {
         let p = PropertyReader::new(104, 105, 106);
-        let Completion::Reply(_, mut bytes) = reply(29, &[105]) else {
+        let Completion::Reply(_, mut bytes) = reply(33, &[105]) else {
             unreachable!()
         };
         assert_eq!(
             p.parse(&bytes),
             Some(Protocols {
                 delete_window: true,
-                take_focus: false
+                take_focus: false,
+                sync_request: false
             })
         );
         bytes[12..16].copy_from_slice(&4u32.to_ne_bytes());
@@ -687,7 +760,7 @@ mod tests {
             .unwrap();
         p.forget(id);
         let mut actions = vec![];
-        assert!(p.completion(&reply(29, &[105]), &w, &mut actions).unwrap());
+        assert!(p.completion(&reply(33, &[105]), &w, &mut actions).unwrap());
         assert!(actions.is_empty());
         assert_eq!(p.get(id), None);
     }

@@ -2,8 +2,8 @@
 //! Managed integration and qualification are tracked in X11_QUALIFICATION.md.
 //! Enabling this module does not advertise X11 support to applications.
 
-pub mod association;
 pub mod acquisition;
+pub mod association;
 mod commands;
 pub mod conversion;
 pub mod discovery;
@@ -21,6 +21,7 @@ pub mod properties;
 pub mod property_read;
 pub mod readiness;
 pub mod requests;
+pub mod resize_sync;
 pub mod resources;
 pub mod selection;
 pub mod transfer;
@@ -46,3 +47,5 @@ impl From<std::io::Error> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub mod root_cursor;

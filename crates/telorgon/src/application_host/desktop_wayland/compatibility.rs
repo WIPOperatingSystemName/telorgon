@@ -16,6 +16,7 @@ use std::{
 };
 
 pub(super) struct Compatibility {
+    pub(super) root_cursor: Option<crate::xwayland::root_cursor::RootCursor>,
     // Remove callbacks before dropping their data and owned descriptors.
     sources: Vec<EventSource>,
     ready: Box<AtomicBool>,
@@ -79,6 +80,7 @@ impl Compatibility {
             })
             .map_err(app_error)?;
         Ok(Self {
+            root_cursor: None,
             sources: Vec::new(),
             ready: Box::new(AtomicBool::new(true)),
             preparation: Some(receive),
@@ -307,6 +309,13 @@ impl Compatibility {
         }) else {
             return;
         };
+        if xwm.protocols(window).is_some_and(|p| !p.delete_window) {
+            match xwm.close_legacy_window(window, Instant::now()) {
+                Ok(()) => self.ready.store(true, Ordering::Release),
+                Err(error) => eprintln!("telorgon-xwayland: legacy close failed: {error}"),
+            }
+            return;
+        }
         match xwm.request_focus_timestamp(window, Instant::now()) {
             Ok(sequence) => {
                 self.closing.insert(window, Some(sequence));
@@ -504,6 +513,7 @@ impl Compatibility {
             .deadline
             .into_iter()
             .chain(self.xwm.as_ref().and_then(Xwm::deadline))
+            .chain(self.desktop.preview_deadline())
             .chain(self.pending_focus.map(|(_, _, _, deadline, _)| deadline))
             .chain(self.focus_result.map(|(_, _, deadline)| deadline))
             .min();
@@ -549,7 +559,11 @@ impl Compatibility {
                         .set_client(client.clone(), 1)
                         .map_err(app_error)?;
                     self.client = Some(client);
-                    self.xwm = Some(Xwm::new(xwm, 1, Instant::now()).map_err(app_error)?);
+                    let mut xwm = Xwm::new(xwm, 1, Instant::now()).map_err(app_error)?;
+                    if let Some(cursor) = self.root_cursor.take() {
+                        xwm.set_root_cursor(cursor).map_err(app_error)?;
+                    }
+                    self.xwm = Some(xwm);
                     self.notification = Some(readiness);
                     self.helper = Some(Supervisor::spawn(command).map_err(app_error)?);
                 }
@@ -789,6 +803,7 @@ mod tests {
             .unwrap();
             let now = Instant::now();
             let mut host = Compatibility {
+                root_cursor: None,
                 sources: Vec::new(),
                 ready: Box::new(AtomicBool::new(true)),
                 preparation: Some(receive),

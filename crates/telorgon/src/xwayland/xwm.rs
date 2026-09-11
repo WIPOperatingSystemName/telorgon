@@ -25,6 +25,9 @@ use x11rb_protocol::{
 };
 const CAPACITY: usize = 4096;
 const BUDGET: Duration = Duration::from_millis(1);
+#[cfg(test)]
+#[path = "xwm_sync_tests.rs"]
+mod resize_sync_tests;
 enum Phase {
     Discovery(Discovery),
     Manager(Manager),
@@ -41,6 +44,9 @@ struct Tracking {
     incoming: VecDeque<Vec<u8>>,
     commands: Commands,
     protocols: PropertyReader,
+    sync_counter: PropertyReader,
+    resize_sync: super::resize_sync::ResizeSync,
+    server_time: u32,
     hints: PropertyReader,
     normal_hints: PropertyReader,
     title: PropertyReader,
@@ -83,6 +89,7 @@ pub struct Turn {
     pub enumerated: bool,
 }
 pub struct Xwm {
+    pub(crate) root_cursor: Option<super::root_cursor::RootCursor>,
     phase: Option<Phase>,
     windows: Option<Windows>,
     inspector: Inspector,
@@ -94,12 +101,22 @@ impl Xwm {
         let discovery = Discovery::new(socket, generation, now)?;
         let deadline = discovery.deadline();
         Ok(Self {
+            root_cursor: None,
             phase: Some(Phase::Discovery(discovery)),
             windows: None,
             inspector: Inspector::new(),
             early_events: VecDeque::new(),
             deadline,
         })
+    }
+    pub fn set_root_cursor(&mut self, cursor: super::root_cursor::RootCursor) -> Result<()> {
+        if !matches!(self.phase, Some(Phase::Discovery(_))) {
+            return Err(Error(
+                "root cursor must be configured before manager initialization".into(),
+            ));
+        }
+        self.root_cursor = Some(cursor);
+        Ok(())
     }
     pub fn fd(&self) -> Option<RawFd> {
         self.phase.as_ref().map(|p| match p {
@@ -118,7 +135,12 @@ impl Xwm {
     }
     pub fn deadline(&self) -> Option<Instant> {
         match self.phase.as_ref()? {
-            Phase::Tracking(p) => p.requests.deadline(),
+            Phase::Tracking(p) => p
+                .requests
+                .deadline()
+                .into_iter()
+                .chain(p.resize_sync.deadline())
+                .min(),
             _ => Some(self.deadline),
         }
     }
@@ -275,6 +297,78 @@ impl Xwm {
                 value_list: Cow::Owned(values),
             },
             now,
+        )
+    }
+    /// Configure with optional client repaint acknowledgement. False means the
+    /// previous resize/initialization is still pending; retry on the XWM deadline.
+    pub fn configure_window_synced(
+        &mut self,
+        window: XWindow,
+        geometry: Geometry,
+        now: Instant,
+    ) -> Result<bool> {
+        let actual = self
+            .windows
+            .as_ref()
+            .and_then(|w| w.get(window.xid))
+            .filter(|w| w.id == window)
+            .ok_or_else(|| Error("stale resize sync window".into()))?
+            .geometry;
+        let resized = actual.width != geometry.width || actual.height != geometry.height;
+        if resized {
+            let Some(Phase::Tracking(t)) = self.phase.as_mut() else {
+                return Err(Error("resize requires tracking".into()));
+            };
+            if t.resize_sync.waiting(window) {
+                return Ok(false);
+            }
+            // Reserve room for both checked commands before changing the sync target.
+            if t.requests.available_slots() < 4 || t.commands.available_groups() < 2 {
+                return Ok(false);
+            }
+            if let Some(value) = t.resize_sync.begin(window, now) {
+                let event: [u8; 32] = xproto::ClientMessageEvent {
+                    response_type: xproto::CLIENT_MESSAGE_EVENT,
+                    format: 32,
+                    sequence: 0,
+                    window: window.xid,
+                    type_: t.discovered.atoms["WM_PROTOCOLS"],
+                    data: [
+                        t.discovered.atoms["_NET_WM_SYNC_REQUEST"],
+                        t.server_time,
+                        value as u32,
+                        (value >> 32) as u32,
+                        0,
+                    ]
+                    .into(),
+                }
+                .into();
+                self.command(
+                    window,
+                    xproto::SendEventRequest {
+                        propagate: false,
+                        destination: window.xid,
+                        event_mask: 0u32.into(),
+                        event: Cow::Owned(event),
+                    },
+                    now,
+                )?;
+            }
+        }
+        // Same X connection: SendEvent precedes the real ConfigureNotify generated here.
+        self.configure_window(window, geometry, now)?;
+        Ok(true)
+    }
+    pub fn resize_sync_status(&self, window: XWindow) -> super::resize_sync::ResizeSyncStatus {
+        match &self.phase {
+            Some(Phase::Tracking(t)) => t.resize_sync.status(window),
+            _ => super::resize_sync::ResizeSyncStatus::Unsupported,
+        }
+    }
+    pub fn repaint_pending(&self, window: XWindow) -> bool {
+        matches!(
+            self.resize_sync_status(window),
+            super::resize_sync::ResizeSyncStatus::Waiting
         )
     }
     pub fn raise_window(&mut self, window: XWindow, now: Instant) -> Result<()> {
@@ -652,6 +746,28 @@ impl Xwm {
             now,
         )
     }
+    /// Legacy fallback for an explicit user close, never session shutdown or timeout.
+    /// KillClient closes the X connection owning this live window, not an OS PID.
+    pub fn close_legacy_window(&mut self, window: XWindow, now: Instant) -> Result<()> {
+        if !self
+            .windows
+            .as_ref()
+            .and_then(|w| w.get(window.xid))
+            .is_some_and(|w| w.id == window && w.mapped && !w.override_redirect)
+            || !self.protocols(window).is_some_and(|p| !p.delete_window)
+        {
+            return Err(Error(
+                "legacy close requires a live managed window with known protocols".into(),
+            ));
+        }
+        self.command(
+            window,
+            xproto::KillClientRequest {
+                resource: window.xid,
+            },
+            now,
+        )
+    }
     /// The caller must authenticate the dedicated Wayland client and pass only a
     /// newly committed serial. This does not authorize arbitrary Wayland clients.
     pub fn committed_surface(
@@ -680,7 +796,8 @@ impl Xwm {
         let generation = requests.generation();
         let root = discovered.setup.roots[0].root;
         let serial = discovered.atoms["WL_SURFACE_SERIAL"];
-        let manager = Manager::new(transport, requests, discovered, self.deadline)?;
+        let mut manager = Manager::new(transport, requests, discovered, self.deadline)?;
+        manager.root_cursor = self.root_cursor.take();
         self.windows = Some(Windows::new(
             generation,
             CAPACITY,
@@ -774,6 +891,10 @@ impl Xwm {
                             discovered.atoms["WM_PROTOCOLS"],
                             discovered.atoms["WM_DELETE_WINDOW"],
                             discovered.atoms["WM_TAKE_FOCUS"],
+                        )
+                        .with_sync_request(discovered.atoms["_NET_WM_SYNC_REQUEST"]);
+                        let sync_counter = PropertyReader::new_counter(
+                            discovered.atoms["_NET_WM_SYNC_REQUEST_COUNTER"],
                         );
                         let title = PropertyReader::new_text(
                             discovered.atoms["_NET_WM_NAME"],
@@ -791,6 +912,9 @@ impl Xwm {
                             incoming: VecDeque::new(),
                             commands: Commands::new(),
                             protocols,
+                            sync_counter,
+                            resize_sync: Default::default(),
+                            server_time: 0,
                             hints: PropertyReader::new_hints(),
                             normal_hints: PropertyReader::new_normal_hints(),
                             title,
@@ -808,7 +932,13 @@ impl Xwm {
                 }
                 Phase::Tracking(mut tracking) => {
                     for completion in tracking.requests.expire(now)? {
-                        if !tracking.selection_completion(&completion)?
+                        if !tracking.resize_sync.completion(&completion, now)
+                            && !tracking.sync_counter.completion(
+                                &completion,
+                                self.windows.as_ref().unwrap(),
+                                &mut actions,
+                            )?
+                            && !tracking.selection_completion(&completion)?
                             && !tracking.commands.completion(
                                 &completion,
                                 self.windows.as_ref().unwrap(),
@@ -870,6 +1000,16 @@ impl Xwm {
                                         .map_err(|_| {
                                             Error("malformed XWM property event".into())
                                         })?;
+                                    tracking.server_time = e.time;
+                                    if let Some(w) = self.windows.as_ref().unwrap().get(e.window) {
+                                        if e.atom == tracking.sync_counter.property() {
+                                            tracking.resize_sync.forget(w.id);
+                                            tracking.sync_counter.refresh(w.id)?;
+                                        }
+                                        if e.atom == tracking.protocols.property() {
+                                            tracking.resize_sync.forget(w.id);
+                                        }
+                                    }
                                     if e.atom == tracking.protocols.property()
                                         && let Some(w) =
                                             self.windows.as_ref().unwrap().get(e.window)
@@ -915,7 +1055,13 @@ impl Xwm {
                                     }
                                 }
                                 self.event(bytes, &mut actions, &mut events)?;
-                            } else if !tracking.selection_completion(&completion)?
+                            } else if !tracking.resize_sync.completion(&completion, now)
+                                && !tracking.sync_counter.completion(
+                                    &completion,
+                                    self.windows.as_ref().unwrap(),
+                                    &mut actions,
+                                )?
+                                && !tracking.selection_completion(&completion)?
                                 && !tracking.commands.completion(
                                     &completion,
                                     self.windows.as_ref().unwrap(),
@@ -958,6 +1104,8 @@ impl Xwm {
                     }
                     for action in &actions {
                         if let Action::Destroyed(window) = action {
+                            tracking.resize_sync.forget(*window);
+                            tracking.sync_counter.forget(*window);
                             tracking.protocols.forget(*window);
                             tracking.hints.forget(*window);
                             tracking.normal_hints.forget(*window);
@@ -965,6 +1113,59 @@ impl Xwm {
                             tracking.legacy_title.forget(*window);
                         }
                     }
+                    if let Some(extension) = tracking.discovered.extensions.get("SYNC") {
+                        for action in &actions {
+                            let window = match action {
+                                Action::Changed(w) | Action::ProtocolsChanged(w) => *w,
+                                _ => continue,
+                            };
+                            if self
+                                .windows
+                                .as_ref()
+                                .unwrap()
+                                .get(window.xid)
+                                .is_some_and(|w| w.id == window && !w.override_redirect)
+                            {
+                                if matches!(action, Action::ProtocolsChanged(_))
+                                    && tracking
+                                        .protocols
+                                        .get(window)
+                                        .is_some_and(|p| p.sync_request)
+                                {
+                                    tracking.sync_counter.refresh(window)?;
+                                }
+                                if !self
+                                    .windows
+                                    .as_ref()
+                                    .unwrap()
+                                    .get(window.xid)
+                                    .unwrap()
+                                    .mapped
+                                {
+                                    tracking.resize_sync.cancel(window);
+                                }
+                                let counter = tracking
+                                    .protocols
+                                    .get(window)
+                                    .filter(|p| p.sync_request)
+                                    .and_then(|_| tracking.sync_counter.counter(window));
+                                tracking.resize_sync.capability(window, counter, now)?;
+                            }
+                        }
+                        reschedule |= tracking.resize_sync.schedule(
+                            extension.major_opcode,
+                            &mut tracking.transport,
+                            &mut tracking.requests,
+                            now,
+                            started + BUDGET,
+                        )?;
+                    }
+                    reschedule |= tracking.sync_counter.schedule(
+                        &mut tracking.transport,
+                        &mut tracking.requests,
+                        now + Duration::from_secs(1),
+                        started + BUDGET,
+                    )?;
                     reschedule |= tracking.protocols.schedule(
                         &mut tracking.transport,
                         &mut tracking.requests,
@@ -1101,6 +1302,7 @@ mod tests {
         let wm_atom = discovered.atoms["WM_S0"];
         let clipboard_atom = discovered.atoms["CLIPBOARD"];
         let mut xwm = Xwm {
+            root_cursor: None,
             phase: None,
             windows: None,
             inspector: Inspector::new(),
@@ -1117,7 +1319,7 @@ mod tests {
                 manager = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
             }
         }
-        for sequence in [31, 32] {
+        for sequence in [35, 36] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -1131,14 +1333,14 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 34,
+                sequence: 38,
                 ..Default::default()
             }
             .serialize(),
         );
         let create: [u8; 32] = xproto::CreateNotifyEvent {
             response_type: xproto::CREATE_NOTIFY_EVENT,
-            sequence: 34,
+            sequence: 38,
             parent: 1,
             window: 10,
             width: 640,
@@ -1149,7 +1351,7 @@ mod tests {
         peer.write_all(&create).unwrap();
         let timestamp: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 34,
+            sequence: 38,
             window: manager,
             atom: 110,
             time: 123,
@@ -1166,7 +1368,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 35 + index as u16,
+                        sequence: 39 + index as u16,
                         owner: manager,
                         ..Default::default()
                     }
@@ -1175,13 +1377,13 @@ mod tests {
             }
         }
         drive(&mut xwm, now);
-        for opcode in [18, 18, 18, 25, 25, 43] {
+        for opcode in [18, 18, 18, 25, 25, 45, 94, 2, 95, 46, 43] {
             assert_eq!(request(&mut peer)[0], opcode);
         }
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 44,
+                sequence: 53,
                 ..Default::default()
             }
             .serialize(),
@@ -1191,7 +1393,7 @@ mod tests {
         assert_eq!(query[0], 15);
         assert_eq!(u32::from_ne_bytes(query[4..8].try_into().unwrap()), 1);
         let mut tree = xproto::QueryTreeReply {
-            sequence: 45,
+            sequence: 54,
             root: 1,
             parent: 0,
             children: vec![manager, 10],
@@ -1224,7 +1426,7 @@ mod tests {
                 assert_eq!(u32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 800);
             }
         }
-        for sequence in [47, 49] {
+        for sequence in [56, 58] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1239,7 +1441,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(10).unwrap().geometry.width, 640);
         let map: [u8; 32] = xproto::MapNotifyEvent {
             response_type: xproto::MAP_NOTIFY_EVENT,
-            sequence: 49,
+            sequence: 58,
             event: 1,
             window: 10,
             ..Default::default()
@@ -1248,7 +1450,7 @@ mod tests {
         peer.write_all(&map).unwrap();
         let configured: [u8; 32] = xproto::ConfigureNotifyEvent {
             response_type: xproto::CONFIGURE_NOTIFY_EVENT,
-            sequence: 49,
+            sequence: 58,
             event: 1,
             window: 10,
             x: -20,
@@ -1261,7 +1463,7 @@ mod tests {
         peer.write_all(&configured).unwrap();
         let serial: [u8; 32] = xproto::ClientMessageEvent {
             response_type: xproto::CLIENT_MESSAGE_EVENT | 128,
-            sequence: 49,
+            sequence: 58,
             format: 32,
             window: 10,
             type_: serial_atom,
@@ -1315,7 +1517,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 51,
+                sequence: 60,
                 ..Default::default()
             }
             .serialize(),
@@ -1336,7 +1538,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 53,
+                sequence: 62,
                 ..Default::default()
             }
             .serialize(),
@@ -1354,7 +1556,7 @@ mod tests {
             .flat_map(u32::to_ne_bytes)
             .collect();
         let protocol_reply = xproto::GetPropertyReply {
-            sequence: 54,
+            sequence: 63,
             format: 32,
             length: 2,
             type_: 4,
@@ -1369,7 +1571,8 @@ mod tests {
             xwm.protocols(id),
             Some(Protocols {
                 delete_window: true,
-                take_focus: true
+                take_focus: true,
+                sync_request: false
             })
         );
         xwm.close_window(id, 123, now).unwrap();
@@ -1388,7 +1591,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 56,
+                sequence: 65,
                 ..Default::default()
             }
             .serialize(),
@@ -1424,7 +1627,7 @@ mod tests {
             }
             .serialize()
         };
-        peer.write_all(&hints_reply(57, 1)).unwrap();
+        peer.write_all(&hints_reply(66, 1)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         // Leave capacity for one checked command, but not the complete focus pair.
         let (mut blocked_transport, mut blocked_requests, _, _blocked_peer, _) = ready();
@@ -1469,7 +1672,7 @@ mod tests {
         let (message, _) = xproto::ClientMessageEvent::try_parse(&take[12..]).unwrap();
         assert_eq!(message.data.as_data32(), [106, 124, 0, 0, 0]);
         assert_eq!(request(&mut peer)[0], 43);
-        for sequence in [59, 61] {
+        for sequence in [68, 70] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1482,7 +1685,7 @@ mod tests {
         assert!(drive(&mut xwm, now).is_empty());
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 61,
+            sequence: 70,
             window: 10,
             atom: 35,
             time: 125,
@@ -1494,7 +1697,7 @@ mod tests {
         assert_eq!(xwm.input_hints(id), None);
         assert!(xwm.focus_window(id, 125, now).is_err());
         assert_eq!(request(&mut peer)[0], 20);
-        peer.write_all(&hints_reply(62, 0)).unwrap();
+        peer.write_all(&hints_reply(71, 0)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         assert_eq!(
             xwm.focus_window(id, 125, now).unwrap(),
@@ -1506,7 +1709,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 64,
+                sequence: 73,
                 ..Default::default()
             }
             .serialize(),
@@ -1520,7 +1723,7 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(normal[8..12].try_into().unwrap()), 40);
         assert_eq!(u32::from_ne_bytes(normal[12..16].try_into().unwrap()), 41);
         let normal_reply = xproto::GetPropertyReply {
-            sequence: 65,
+            sequence: 74,
             format: 32,
             type_: 41,
             length: 18,
@@ -1593,7 +1796,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 67,
+                sequence: 76,
                 ..Default::default()
             }
             .serialize(),
@@ -1602,7 +1805,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(id.xid).unwrap().geometry, before);
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 67,
+            sequence: 76,
             window: id.xid,
             atom: 40,
             ..Default::default()
@@ -1615,7 +1818,7 @@ mod tests {
         assert_eq!(request(&mut peer)[0], 20);
         peer.write_all(
             &xproto::GetPropertyReply {
-                sequence: 68,
+                sequence: 77,
                 ..Default::default()
             }
             .serialize(),
@@ -1640,7 +1843,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 70,
+                sequence: 79,
                 ..Default::default()
             }
             .serialize(),
@@ -1684,7 +1887,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let notification: [u8; 32] = x11rb_protocol::protocol::xfixes::SelectionNotifyEvent {
             response_type: subscription.first_event,
-            sequence: 70,
+            sequence: 79,
             window: manager,
             owner: 77,
             selection: 1,
@@ -1748,7 +1951,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 72,
+                sequence: 81,
                 ..Default::default()
             }
             .serialize(),
@@ -1757,7 +1960,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let clock_sequence = xwm.request_focus_timestamp(id, now).unwrap();
         assert!(xwm.commands_pending(id));
-        assert_eq!(clock_sequence, 73);
+        assert_eq!(clock_sequence, 82);
         drive(&mut xwm, now);
         let marker = request(&mut peer);
         assert_eq!(marker[0], 18);
@@ -1784,7 +1987,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 74,
+                sequence: 83,
                 ..Default::default()
             }
             .serialize(),
@@ -1801,7 +2004,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 76,
+                sequence: 85,
                 ..Default::default()
             }
             .serialize(),
@@ -1810,7 +2013,7 @@ mod tests {
         assert!(!xwm.commands_pending(id));
         let clear: [u8; 32] = xproto::SelectionClearEvent {
             response_type: xproto::SELECTION_CLEAR_EVENT,
-            sequence: 76,
+            sequence: 85,
             time: 124,
             owner: manager,
             selection: wm_atom,

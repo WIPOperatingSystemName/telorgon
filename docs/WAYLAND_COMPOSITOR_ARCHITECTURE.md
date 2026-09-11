@@ -610,6 +610,71 @@ raster work and distinguish worker-full from owner-regional SHM copies.
 
 ### Live-resize scheduling audit
 
+The inherited X11 root cursor now accepts a bounded static snapshot from the same
+`render_cursor_image(TelorgonDefault)` asset/theme path used by native pointer rendering.
+It is rasterized at logical resolution, preserving tint, alpha and hotspot. Animated
+assets use their first frame; live theme changes and arbitrary composed pointer components
+are not exported. Composed components or oversized images retain a diagnosed built-in
+arrow fallback. An explicitly hidden default exports a transparent cursor.
+
+`xwayland/root_cursor.rs` owns protocol-neutral RGBA-to-premultiplied-ARGB conversion
+and a 128x128 bound. Manager startup asynchronously discovers RENDER 0.5 and an exact
+ARGB32 picture format, checks the server pixmap layout/byte order, splits PutImage by
+the negotiated request size, creates the cursor and assigns only the root attribute.
+Temporary pixmap/GC/picture/cursor resources are freed in request order; the root retains
+its cursor reference. Readiness waits for the checked upload/assignment barrier. Client
+cursor overrides and intentional hiding are not intercepted.
+
+Review used the official [RENDER protocol](https://www.x.org/releases/current/doc/renderproto/renderproto.txt),
+the pinned Xwayland `render/render.c:ProcRenderCreateCursor` implementation and existing
+Telorgon cursor rasterization/request accounting. The adjacent reference-library tree
+remains unavailable. No GPU submission or retirement contract changes. Rejected approaches
+were replacing every Xwayland cursor, monochrome conversion, and a runtime xsetroot/helper
+dependency. Tests cover alpha, byte order, invalid bounds/hotspots, upload ordering and
+checked failure; exact visual matching remains a user-run test.
+
+Hidden final-size content receives pacing callbacks through the shared window predicate
+for both native and X11 adapters. Otherwise Xwayland Present can wait for a callback
+behind the very veil waiting for its replacement image. These callbacks do not report
+hidden content as presented or release GPU ownership. The pinned Xwayland 24.1.13
+`xwayland-present.c` frame-callback path and Telorgon's occluded-frame path were inspected;
+state tests cover settling, stale revisions and completion. Live GLX validation remains
+separate from these tests.
+
+Explicit user close uses WM_DELETE_WINDOW where supported. For a live managed window
+whose known protocols omit it, the XWM sends KillClient for that window resource, as
+permitted by ICCCM deletion policy. This disconnects the owning X connection, potentially
+closing its other windows; it never uses a claimed PID. Session shutdown remains
+cooperative. Unknown protocols and stale window generations cannot trigger this fallback.
+
+The optional X11 adapter also uses the EWMH basic
+[`_NET_WM_SYNC_REQUEST` protocol](https://specifications.freedesktop.org/wm/latest-single/#idm45446104416128).
+Bounded property readers require both protocol advertisement and a CARDINAL/32 counter
+property. SYNC 3.1 is negotiated when present. The XWM initializes the basic counter to
+zero, then sends a nonzero, monotonically increasing request before the real configure on
+the same connection. It does not request the extended frame-counter protocol. Shared
+resize, maximize and restore previews require the client counter acknowledgement as
+well as the existing checked geometry and published-buffer conditions. Acknowledgement
+is client-reported repaint progress, not a replacement for GPU acquire/retirement rules.
+
+Counter queries use the existing sans-I/O request tracker, with one current query per
+window (superseded queries retain bounded sequence accounting), 16 queries per turn,
+128 tracked sync requests, and a 16 ms polling
+interval. The owner-loop deadline includes polling and the one-second acknowledgement
+deadline; no thread or XSync Await request blocks dispatch. Timeout or invalid-counter
+states explicitly fall back to buffer checks and disable further handshakes for that
+capability instance. Property replacement/removal and window destruction invalidate
+epochs; cancellation and subsequent requests cannot accept an older request number.
+Diagnostics contain window/generation IDs and failure reasons, never application content.
+
+This change reuses Telorgon's request accounting and existing presentation gate without
+changing GPU resource ownership. The adjacent `other-rendering-libs` tree was unavailable;
+the EWMH contract and local wire/state code were inspected instead. Rejected alternatives
+were blocking XSync Await, an arbitrary repaint delay, and treating a server barrier or
+timeout as application acknowledgement. Tests cover ordered client-message/configure
+traffic, counter initialization, delayed/stale replies, property bounds and explicit
+fallback; real-client visual qualification remains user-run.
+
 Android platform/base commit `1cdfff555f4a21f71ccc978290e2e212e2f8b168` was inspected at
 `FluidResizeTaskPositioner`, `VeiledResizeTaskPositioner`, `ResizeVeil`, and `SurfaceControl` for the
 separation between pointer-driven container geometry and application buffer production. Flutter

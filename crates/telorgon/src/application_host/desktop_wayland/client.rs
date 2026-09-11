@@ -142,6 +142,16 @@ impl PreparedClientImage {
 }
 
 impl ClientWindow {
+    /// Hidden final-size content still needs frame callbacks to produce its replacement.
+    /// These callbacks are pacing hints, not claims that the hidden image was displayed.
+    pub(super) fn waiting_for_resize_content(&self) -> bool {
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if self.resize_preview.active() && !self.resize_preview.dragging() {
+            return true;
+        }
+        self.native_configure.resize_final.is_some()
+    }
+
     pub(super) fn resize_veil_active(&self) -> bool {
         #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
         if self.resize_preview.active() {

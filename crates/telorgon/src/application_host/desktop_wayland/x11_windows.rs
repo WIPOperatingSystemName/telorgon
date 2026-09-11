@@ -7,6 +7,19 @@ use crate::xwayland::{
     xwm::Xwm,
 };
 
+/// Visual diagnostic only: never replaces client acknowledgement or buffer checks.
+fn diagnostic_preview_hold() -> Duration {
+    static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        let milliseconds = std::env::var("TELORGON_X11_PREVIEW_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(2000);
+        Duration::from_millis(milliseconds)
+    })
+}
+
 /// X11 completion evidence for the shared resize veil. X11 has no xdg ack:
 /// a changed size needs both a checked server configure and newly published
 /// content at that size. No-op resizes can reuse already matching content.
@@ -20,6 +33,7 @@ pub(super) enum ResizePreview {
     Settling {
         anchor: Option<ResizeAnchor>,
         target: Option<ResizeTarget>,
+        not_before: Option<Instant>,
     },
 }
 
@@ -43,10 +57,27 @@ impl ResizePreview {
     }
     pub(super) fn finish(&mut self) {
         let anchor = self.anchor();
+        let hold = diagnostic_preview_hold();
         *self = Self::Settling {
             anchor,
             target: None,
+            not_before: (!hold.is_zero()).then(|| Instant::now() + hold),
         };
+        if !hold.is_zero() {
+            eprintln!(
+                "telorgon-xwayland: resize veil started; diagnostic minimum={}ms",
+                hold.as_millis()
+            );
+        }
+    }
+    fn hold_deadline(self, now: Instant) -> Option<Instant> {
+        match self {
+            Self::Settling {
+                not_before: Some(deadline),
+                ..
+            } if deadline > now => Some(deadline),
+            _ => None,
+        }
     }
     fn anchor(self) -> Option<ResizeAnchor> {
         match self {
@@ -66,6 +97,9 @@ impl ResizePreview {
         }
     }
     fn settle(&mut self, server: SizeI, content: SizeI, revision: u64, pending: bool) -> bool {
+        if self.hold_deadline(Instant::now()).is_some() {
+            return false;
+        }
         let Self::Settling {
             target: Some(target),
             ..
@@ -83,6 +117,9 @@ impl ResizePreview {
             return false;
         }
         *self = Self::Idle;
+        if !diagnostic_preview_hold().is_zero() {
+            eprintln!("telorgon-xwayland: resize veil cleared; completion checks passed");
+        }
         true
     }
 }
@@ -91,6 +128,7 @@ impl ResizePreview {
 pub(super) struct X11Windows {
     entries: BTreeMap<XWindow, Entry>,
     requests: BTreeMap<XWindow, RequestedConfigure>,
+    preview_deadline: Option<Instant>,
 }
 struct Entry {
     surface: WaylandSurfaceId,
@@ -98,6 +136,9 @@ struct Entry {
 }
 
 impl X11Windows {
+    pub(super) fn preview_deadline(&self) -> Option<Instant> {
+        self.preview_deadline
+    }
     pub(super) fn retain(&mut self, live: &BTreeSet<XWindow>) {
         self.entries.retain(|id, _| live.contains(id));
         self.requests.retain(|id, _| live.contains(id));
@@ -201,6 +242,10 @@ impl X11Windows {
     ) -> crate::xwayland::Result<bool> {
         let mut changed = false;
         let started = Instant::now();
+        self.preview_deadline = windows
+            .values()
+            .filter_map(|window| window.resize_preview.hold_deadline(started))
+            .min();
         let mut submitted = 0;
         for (id, entry) in &mut self.entries {
             if submitted == 16 || started.elapsed() >= Duration::from_millis(1) {
@@ -261,13 +306,15 @@ impl X11Windows {
             };
             let pending = xwm.commands_pending(*id);
             if !pending && entry.sent != Some(desired) {
-                // Register the image revision before issuing the resize request.
+                if !xwm.configure_window_synced(*id, desired, Instant::now())? {
+                    continue;
+                }
+                // Snapshot before dispatch can publish content for the queued request.
                 window.resize_preview.submitted(
                     target_size,
                     window.presentation.revision,
                     server_size == target_size && window.presentation.size == target_size,
                 );
-                xwm.configure_window(*id, desired, Instant::now())?;
                 entry.sent = Some(desired);
                 submitted += 1;
             } else if !pending && entry.sent == Some(desired) {
@@ -283,7 +330,7 @@ impl X11Windows {
                 server_size,
                 window.presentation.size,
                 window.presentation.revision,
-                xwm.commands_pending(*id),
+                xwm.commands_pending(*id) || xwm.repaint_pending(*id),
             );
         }
         Ok(changed)
@@ -478,6 +525,73 @@ mod tests {
         preview.submitted(size, 7, true);
         assert!(!preview.settle(size, size, 7, true));
         assert!(preview.settle(size, size, 7, false));
+    }
+
+    #[test]
+    fn x11_final_resize_keeps_frame_paced_clients_running_behind_the_veil() {
+        let mut window = test_window(
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+            PointI::default(),
+        );
+        window.backend = Some(WindowBackend::X11(id()));
+        window.role = SurfaceRole::Xwayland;
+        assert!(!window.waiting_for_resize_content());
+        window.resize_preview.begin(
+            window.position,
+            window.requested_size,
+            ResizeEdge::BottomRight,
+        );
+        assert!(!window.waiting_for_resize_content());
+        window.resize_preview.finish();
+        assert!(window.waiting_for_resize_content());
+        assert!(window.native_configure.resize_final.is_none());
+        window
+            .resize_preview
+            .submitted(window.requested_size, 7, false);
+        assert!(!window.resize_preview.settle(
+            window.requested_size,
+            window.requested_size,
+            7,
+            false
+        ));
+        assert!(window.waiting_for_resize_content());
+        assert!(window.resize_preview.settle(
+            window.requested_size,
+            window.requested_size,
+            8,
+            false
+        ));
+        assert!(!window.waiting_for_resize_content());
+    }
+
+    #[test]
+    fn diagnostic_hold_preserves_completion_checks_and_has_a_wakeup_deadline() {
+        let now = Instant::now();
+        let size = SizeI {
+            width: 800,
+            height: 600,
+        };
+        let deadline = now + Duration::from_secs(60);
+        let mut preview = ResizePreview::Settling {
+            anchor: None,
+            target: Some(ResizeTarget {
+                size,
+                revision_after: Some(7),
+            }),
+            not_before: Some(deadline),
+        };
+        assert_eq!(preview.hold_deadline(now), Some(deadline));
+        assert!(!preview.settle(size, size, 8, false));
+        if let ResizePreview::Settling { not_before, .. } = &mut preview {
+            *not_before = Some(now - Duration::from_secs(1));
+        }
+        assert_eq!(preview.hold_deadline(now), None);
+        assert!(!preview.settle(size, size, 8, true));
+        assert!(!preview.settle(size, size, 7, false));
+        assert!(preview.settle(size, size, 8, false));
     }
 
     #[test]

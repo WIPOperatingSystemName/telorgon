@@ -61,6 +61,12 @@ Repository guidance reserves interactive and hardware-presenting runs for the us
    X11 maximize and restore (including titlebar-drag restore) must show the RGBA
    veil until matching content arrives; late maximized content must not reveal a
    restoring window early.
+   For a client advertising `_NET_WM_SYNC_REQUEST` in `WM_PROTOCOLS`, the veil also
+   waits for its basic XSync repaint acknowledgement. The xmessage fixture need not
+   implement this protocol and therefore cannot validate that handshake. A deliberately
+   delayed acknowledgement should keep the veil visible; an absent acknowledgement
+   should produce a content-free timeout diagnostic after one second and use the
+   existing buffer-only checks. Verify Foot remains responsive throughout.
    Check minimize in a separate run (the existing desktop's local visibility policy
    applies; a complete X11 task-switcher/iconification contract is still outstanding).
    Alt+left-drag is no longer a compositor gesture. Override-redirect menus and
@@ -71,6 +77,42 @@ Repository guidance reserves interactive and hardware-presenting runs for the us
    hover a foreground resize border, then move into the exposed background window
    without clicking. Its client cursor must replace the resize cursor. Repeat with
    both Foot and the X11 fixture in front; keyboard focus must not move on hover.
+
+## Making a fast X11 resize veil visible
+
+The user confirmed that fresh-start root-cursor initialization restores cursor visibility
+in glxgears. Temporary cursor tracing and the inheritance probe have been removed.
+The XWM retains the checked root arrow initialization; application cursor overrides and
+intentional hiding remain supported. Retest visibility after a fresh start without probes.
+
+The inherited arrow now uses the configured Telorgon asset cursor (including tint and
+hotspot), captured at startup. Restart and launch glxgears without a probe; compare the
+arrow over content with the default arrow outside the window. Check click position and
+leave/re-enter behavior. Application-specific cursors remain unchanged. This exports a
+static first frame; composed component cursors and images larger than 128x128 use a
+logged built-in fallback. Live X11 visual validation is still outstanding.
+
+For an accelerated client regression, launch `glxgears` from the compositor's terminal.
+Check the pointer stays visible over content, then resize from every edge and verify
+animation resumes after the veil clears. Repeat maximize/restore and rapid consecutive
+resizes while Foot remains usable. Close using the frame button: legacy clients without
+WM_DELETE_WINDOW are disconnected, so a nonzero process exit is acceptable here.
+Retest the disappearing cursor specifically; the pending-image fallback is covered by
+unit tests but has not yet been confirmed to explain the reported glxgears symptom.
+
+For visual diagnosis, restart the consuming compositor with:
+
+```sh
+TELORGON_X11_PREVIEW_HOLD_MS=750 ./start.sh
+```
+
+This opt-in diagnostic holds each final resize/maximize/restore veil for at least
+750 ms and logs its start/clear transitions. Client acknowledgement and buffer
+checks still apply after the hold. The normal default is zero; values are capped
+at 2,000 ms. Run `./start.sh` without this variable to return to normal timing.
+If maximize/restore still show no veil with the diagnostic enabled, report the
+matching `resize veil` lines from `compositor.log`; a fast client alone would no
+longer explain the absence. This does not prove that xmessage supports resize sync.
 
 ## Shutdown and failure containment
 

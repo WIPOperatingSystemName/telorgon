@@ -16,7 +16,34 @@
 > shared RGBA veil and subtree suppression. X11 defers resizing until release and settles
 > against checked server geometry plus matching published content, without xdg acknowledgements.
 > No-op resizes reuse matching content; delayed content and new grabs cannot settle stale targets.
-> The resize-veil change awaits live validation.
+> Clients advertising `_NET_WM_SYNC_REQUEST` and a valid basic XSync counter now add
+> a repaint-acknowledgement gate to resize/maximize/restore previews. Counter polling is
+> asynchronous and bounded; unsupported clients retain the buffer-only path. One-second
+> timeouts and invalid counters are reported as fallback, never successful acknowledgement.
+> Validation on 2026-09-09: embedded-feature library suite passed 1,181 tests (one ignored);
+> native-only all-target compilation and the consuming compositor's real-payload dev build
+> passed. These are automated/build results, not live client repaint qualification.
+> User-run temporary fixture logs on 2026-09-09 showed maximize/restore repaint
+> acknowledgements at 541/512 ms before veil clearing, with no artificial compositor
+> hold. A separate withheld-acknowledgement run reported timeout and buffer-only
+> fallback without a false acknowledgement. The temporary fixture/tracing were removed
+> after testing. These runs do not qualify other applications, rapid-resize races,
+> or unrelated-client responsiveness.
+> A subsequent glxgears run exposed a stuck resize veil, ignored frame close, and
+> disappearing content cursor. The final-resize pacing path now includes X11 windows;
+> explicit user close disconnects a legacy X client when its known protocols omit
+> WM_DELETE_WINDOW. Pending cursor pixels use the default pointer while explicit hiding
+> remains respected. Regression coverage passed 1,184 tests (one ignored). Live glxgears
+> retesting subsequently confirmed resize and close work. Temporary cursor diagnostics
+> showed Xwayland explicitly requesting a hidden cursor before root initialization.
+> User-run root and window cursor overrides both restored visibility. XWM startup now
+> assigns a built-in arrow cursor to the root before the checked readiness barrier;
+> application overrides and intentional hiding remain unchanged. The user confirmed fresh-start
+> cursor visibility in glxgears. Temporary cursor tracing and probes have been removed.
+> The inherited root cursor now exports the configured Telorgon asset arrow through
+> checked RENDER startup requests, preserving color/alpha/hotspot. This is a static
+> startup snapshot; application cursor choices are preserved. Xwayland tests passed
+> 153 cases and native-only compilation passed; themed-arrow live validation is pending.
 > This user-reported smoke result does not establish the wider hardware/application matrix.
 > Shared activation-environment updates, explicit X11-required launch errors, restarts,
 > broader desktop policy, accelerated capabilities and application/hardware qualification

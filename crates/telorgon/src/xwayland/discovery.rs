@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use x11rb_protocol::{
-    protocol::{composite, randr, shape, xfixes, xproto},
+    protocol::{composite, randr, shape, sync, xfixes, xproto},
     x11_utils::{Request, TryParse},
 };
 
@@ -36,8 +36,10 @@ const ATOMS: &[&str] = &[
     "INCR",
     "TEXT",
     "COMPOUND_TEXT",
+    "_NET_WM_SYNC_REQUEST",
+    "_NET_WM_SYNC_REQUEST_COUNTER",
 ];
-const EXTENSIONS: &[&str] = &["Composite", "XFIXES", "SHAPE", "RANDR"];
+const EXTENSIONS: &[&str] = &["Composite", "XFIXES", "SHAPE", "RANDR", "SYNC"];
 const DEADLINE: Duration = Duration::from_secs(10);
 const TURN: Duration = Duration::from_millis(1);
 
@@ -48,6 +50,7 @@ fn required_version(name: &str) -> (u32, u32) {
         "XFIXES" => (2, 0),
         "SHAPE" => (1, 1),
         "RANDR" => (1, 5),
+        "SYNC" => (3, 1),
         _ => (0, 0),
     }
 }
@@ -174,6 +177,15 @@ impl Discovery {
                 ReplyKind::Reply,
                 Pending::Version(name),
             ),
+            "SYNC" => self.send_at(
+                sync::InitializeRequest {
+                    desired_major_version: 3,
+                    desired_minor_version: 1,
+                },
+                opcode,
+                ReplyKind::Reply,
+                Pending::Version(name),
+            ),
             "RANDR" => self.send_at(
                 randr::QueryVersionRequest {
                     major_version: major,
@@ -265,6 +277,9 @@ impl Discovery {
                     Pending::Extension(name) => {
                         let (reply, _) = xproto::QueryExtensionReply::try_parse(&bytes)
                             .map_err(|_| Error("invalid discovery extension reply".into()))?;
+                        if name == "SYNC" && !reply.present {
+                            return Ok(());
+                        }
                         if !reply.present
                             || reply.major_opcode < 128
                             || discovered
@@ -302,6 +317,11 @@ impl Discovery {
                             }
                             "SHAPE" => {
                                 let (r, _) = shape::QueryVersionReply::try_parse(&bytes)
+                                    .map_err(parse_error)?;
+                                (u32::from(r.major_version), u32::from(r.minor_version))
+                            }
+                            "SYNC" => {
+                                let (r, _) = sync::InitializeReply::try_parse(&bytes)
                                     .map_err(parse_error)?;
                                 (u32::from(r.major_version), u32::from(r.minor_version))
                             }
@@ -517,7 +537,9 @@ pub(super) mod tests {
             assert_eq!(bytes[0], 128 + index as u8);
             assert_eq!(bytes[1], 0);
             let (major, minor) = required_version(name);
-            if *name != "SHAPE" {
+            if *name == "SYNC" {
+                assert_eq!(&bytes[4..6], &[3, 1]);
+            } else if *name != "SHAPE" {
                 assert_eq!(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()), major);
                 assert_eq!(u32::from_ne_bytes(bytes[8..12].try_into().unwrap()), minor);
             } else {
@@ -551,6 +573,16 @@ pub(super) mod tests {
                         sequence,
                         major_version: major as u16,
                         minor_version: minor as u16,
+                        ..Default::default()
+                    }
+                    .serialize(),
+                ),
+                "SYNC" => write_reply(
+                    peer,
+                    &sync::InitializeReply {
+                        sequence,
+                        major_version: 3,
+                        minor_version: 1,
                         ..Default::default()
                     }
                     .serialize(),

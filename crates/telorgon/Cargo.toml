@@ -64,7 +64,7 @@ profiler = [
 ]
 
 [dependencies]
-x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "composite", "randr", "shape", "xfixes", "sync"], optional = true }
+x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "composite", "randr", "shape", "xfixes", "sync", "render"], optional = true }
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"], optional = true }
 async-process.workspace = true
 blocking.workspace = true
