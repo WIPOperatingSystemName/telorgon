@@ -52,6 +52,8 @@ fn sync_message_precedes_configure_and_server_barrier_does_not_ack_repaint() {
         normal_hints: PropertyReader::new_normal_hints(),
         title: PropertyReader::new_text(110, 111, true),
         legacy_title: PropertyReader::new_text(39, 31, false),
+        app_class: PropertyReader::new_text(67, 31, false),
+        app_icon: PropertyReader::new_icon(112),
         last_focus_request: None,
     };
     t.resize_sync.capability(id, Some(100), now).unwrap();

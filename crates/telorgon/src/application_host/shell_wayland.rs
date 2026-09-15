@@ -537,7 +537,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             ),
         }
     }
-    let widget_services = crate::compose::shell_services::ShellServiceHost::with_registry(services);
+    let widget_services = crate::compose::shell_services::ShellServiceHost::with_registry_and_scale(
+        services,
+        (32.0 * output_scale.get()).ceil() as u32,
+    );
     let mut widgets = widgets
         .into_iter()
         .enumerate()
@@ -690,9 +693,42 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             windows
                 .iter()
                 .filter_map(|(surface, w)| {
+                    w.backend?;
                     let id = w.desktop_id?;
                     Some(crate::compose::ShellWindow {
                         id,
+                        application_id: None,
+                        application_identity: wayland
+                            .toplevel_metadata(*surface)
+                            .map(|m| m.application_id.clone())
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| w.application_identity.clone()),
+                        icon_name: wayland.toplevel_icon(*surface).and_then(|i| i.name.clone()),
+                        icon: wayland
+                            .toplevel_icon(*surface)
+                            .and_then(|icon| {
+                                icon.images
+                                    .iter()
+                                    .min_by_key(|i| {
+                                        i.image
+                                            .descriptor
+                                            .size
+                                            .width
+                                            .abs_diff((32.0 * output_scale.get()).ceil() as i32)
+                                    })
+                                    .and_then(|image| {
+                                        let mut resource = shm_image_resource(
+                                            image.buffer,
+                                            icon.revision.max(1),
+                                            image.image.clone(),
+                                        )
+                                        .ok()?;
+                                        resource.image =
+                                            layers::toplevel_icon_image_id(*surface, icon.revision);
+                                        Some(resource)
+                                    })
+                            })
+                            .or_else(|| w.application_icon.clone()),
                         title: w.frame_title.clone().unwrap_or_else(|| {
                             wayland
                                 .toplevel_metadata(*surface)

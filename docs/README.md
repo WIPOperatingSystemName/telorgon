@@ -1,5 +1,8 @@
 # Telorgon Documentation
 
+See [Shell application catalog](APPLICATION_CATALOG.md) for inherited shell context, installed-app
+metadata/search, asynchronous icons, and the test taskbar.
+
 See [Resize-preview glass](RESIZE_GLASS.md) for the color/glass API, Vulkan cache, and qualification
 limits, and the [liquid-glass optimization audit](LIQUID_GLASS.md) for the shader mathematics.
 

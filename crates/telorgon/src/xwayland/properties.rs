@@ -54,11 +54,13 @@ enum Value {
     Hints(InputHints),
     Normal(super::normal_hints::NormalHints),
     Text(String),
+    Icon(crate::render::ImageResource),
     Counter(u32),
     Decorations(bool),
 }
 #[derive(Clone, Copy)]
 enum PropertyKind {
+    Icon,
     Protocols,
     Counter,
     Input,
@@ -165,6 +167,82 @@ impl PropertyReader {
         };
         Some(mask != 0)
     }
+    pub fn new_icon(property: u32) -> Self {
+        let mut reader = Self::new(property, 0, 0);
+        reader.kind = PropertyKind::Icon;
+        reader
+    }
+    pub fn icon(&self, window: XWindow) -> Option<&crate::render::ImageResource> {
+        match self.entries.get(&window)?.value.as_ref()? {
+            Value::Icon(icon) => Some(icon),
+            _ => None,
+        }
+    }
+    fn parse_icon(bytes: &[u8]) -> Option<crate::render::ImageResource> {
+        if bytes.len() > 32 + 1024 * 1024 {
+            return None;
+        }
+        let (reply, _) = xproto::GetPropertyReply::try_parse(bytes).ok()?;
+        if reply.format != 32
+            || reply.type_ != u32::from(xproto::AtomEnum::CARDINAL)
+            || reply.bytes_after != 0
+        {
+            return None;
+        }
+        let words: Vec<u32> = reply
+            .value
+            .chunks_exact(4)
+            .map(|v| u32::from_ne_bytes(v.try_into().unwrap()))
+            .collect();
+        let mut offset = 0usize;
+        let mut best: Option<(u32, u32, usize)> = None;
+        while offset < words.len() {
+            let width = *words.get(offset)?;
+            let height = *words.get(offset + 1)?;
+            offset += 2;
+            if width == 0 || height == 0 || width > 4096 || height > 4096 {
+                return None;
+            }
+            let count = (width as usize).checked_mul(height as usize)?;
+            let end = offset.checked_add(count)?;
+            if end > words.len() {
+                return None;
+            }
+            if best.is_none_or(|(w, h, _)| {
+                width.abs_diff(32) + height.abs_diff(32) < w.abs_diff(32) + h.abs_diff(32)
+            }) {
+                best = Some((width, height, offset));
+            }
+            offset = end;
+        }
+        let (width, height, start) = best?;
+        let pixels: Vec<u8> = words[start..start + (width * height) as usize]
+            .iter()
+            .flat_map(|argb| {
+                [
+                    (argb >> 16) as u8,
+                    (argb >> 8) as u8,
+                    *argb as u8,
+                    (argb >> 24) as u8,
+                ]
+            })
+            .collect();
+        Some(crate::render::ImageResource {
+            image: crate::ui::ImageId(
+                crate::compose::applications::NEXT_ICON
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
+            content_version: 1,
+            extent: crate::SizeI {
+                width: width as i32,
+                height: height as i32,
+            },
+            pixels: pixels.into(),
+            color_encoding: crate::render::ImageColorEncoding::Srgb,
+            alpha_mode: crate::render::ImageAlphaMode::Straight,
+            pixel_format: crate::render::ImagePixelFormat::Rgba8,
+        })
+    }
     pub fn new_hints() -> Self {
         let mut reader = Self::new(xproto::AtomEnum::WM_HINTS.into(), 0, 0);
         reader.kind = PropertyKind::Input;
@@ -197,6 +275,19 @@ impl PropertyReader {
             || reply.value.len() > 4096
         {
             return None;
+        }
+        if self.property == u32::from(xproto::AtomEnum::WM_CLASS) {
+            let mut parts = reply.value.split(|b| *b == 0);
+            let instance = parts.next()?;
+            let class = parts.next()?;
+            let value = if class.is_empty() { instance } else { class };
+            return Some(
+                value
+                    .iter()
+                    .map(|b| char::from(*b))
+                    .filter(|c| !c.is_control())
+                    .collect(),
+            );
         }
         let value = if utf8 {
             std::str::from_utf8(&reply.value).ok()?.to_owned()
@@ -277,7 +368,9 @@ impl PropertyReader {
                     window: window.xid,
                     property: self.property,
                     type_: match self.kind {
-                        PropertyKind::Counter => xproto::AtomEnum::CARDINAL.into(),
+                        PropertyKind::Counter | PropertyKind::Icon => {
+                            xproto::AtomEnum::CARDINAL.into()
+                        }
                         PropertyKind::Input | PropertyKind::Decorations => self.property,
                         PropertyKind::Normal => xproto::AtomEnum::WM_SIZE_HINTS.into(),
                         PropertyKind::Protocols => xproto::AtomEnum::ATOM.into(),
@@ -285,6 +378,7 @@ impl PropertyReader {
                     },
                     long_offset: 0,
                     long_length: match self.kind {
+                        PropertyKind::Icon => 262144,
                         PropertyKind::Counter => 2,
                         PropertyKind::Input => 9,
                         PropertyKind::Decorations => 5,
@@ -379,6 +473,7 @@ impl PropertyReader {
         self.pending.remove(&id.sequence);
         let value = match completion {
             Completion::Reply(_, bytes) => match self.kind {
+                PropertyKind::Icon => Self::parse_icon(bytes).map(Value::Icon),
                 PropertyKind::Counter => Self::parse_counter(bytes).map(Value::Counter),
                 PropertyKind::Input => self.parse_hints(bytes).map(Value::Hints),
                 PropertyKind::Decorations => Some(Value::Decorations(
@@ -396,7 +491,9 @@ impl PropertyReader {
             {
                 entry.value = value;
                 actions.push(match self.kind {
-                    PropertyKind::Counter | PropertyKind::Decorations => Action::Changed(window),
+                    PropertyKind::Icon | PropertyKind::Counter | PropertyKind::Decorations => {
+                        Action::Changed(window)
+                    }
                     PropertyKind::Input => Action::HintsChanged(window),
                     PropertyKind::Normal => Action::NormalHintsChanged(window),
                     PropertyKind::Protocols => Action::ProtocolsChanged(window),
@@ -454,6 +551,51 @@ mod tests {
             bytes[8..12].copy_from_slice(&200u32.to_ne_bytes());
         }
         result
+    }
+    #[test]
+    fn application_icons_and_classes_validate_payloads() {
+        let icon_reply = |words: &[u32]| {
+            xproto::GetPropertyReply {
+                format: 32,
+                type_: xproto::AtomEnum::CARDINAL.into(),
+                length: words.len() as u32,
+                value_len: words.len() as u32,
+                value: words.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+                ..Default::default()
+            }
+            .serialize()
+        };
+        let icon = PropertyReader::parse_icon(&icon_reply(&[1, 1, 0x80402010])).unwrap();
+        assert_eq!(icon.pixels.as_ref(), &[0x40, 0x20, 0x10, 0x80]);
+        assert!(PropertyReader::parse_icon(&icon_reply(&[4096, 4096, 0])).is_none());
+        assert!(PropertyReader::parse_icon(&icon_reply(&[0, 1])).is_none());
+        let class = PropertyReader::new_text(
+            xproto::AtomEnum::WM_CLASS.into(),
+            xproto::AtomEnum::STRING.into(),
+            false,
+        );
+        let reply = |value: &[u8]| {
+            xproto::GetPropertyReply {
+                format: 8,
+                type_: xproto::AtomEnum::STRING.into(),
+                length: value.len().div_ceil(4) as u32,
+                value_len: value.len() as u32,
+                value: value.to_vec(),
+                ..Default::default()
+            }
+            .serialize()
+        };
+        assert_eq!(
+            class
+                .parse_text(&reply(b"firefox\0Firefox\0"), false)
+                .as_deref(),
+            Some("Firefox")
+        );
+        assert!(
+            class
+                .parse_text(&reply(b"missing-delimiter"), false)
+                .is_none()
+        );
     }
     #[test]
     fn motif_decorations_validate_flags_masks_and_wire_shape() {
@@ -675,7 +817,7 @@ mod tests {
         reader.refresh(id).unwrap();
         let mut actions = Vec::new();
         reader
-            .completion(&response(40), &windows, &mut actions)
+            .completion(&response(41), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -688,7 +830,7 @@ mod tests {
             )
             .unwrap();
         reader
-            .completion(&response(41), &windows, &mut actions)
+            .completion(&response(42), &windows, &mut actions)
             .unwrap();
         assert!(
             matches!(actions.as_slice(), [Action::NormalHintsChanged(window)] if *window == id)
@@ -713,7 +855,7 @@ mod tests {
         reader.forget(id);
         actions.clear();
         reader
-            .completion(&response(42), &windows, &mut actions)
+            .completion(&response(43), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -748,7 +890,7 @@ mod tests {
         );
         assert!(reader.pending.is_empty());
         let mut response = xproto::GetInputFocusReply {
-            sequence: 40,
+            sequence: 41,
             ..Default::default()
         }
         .serialize()
@@ -860,7 +1002,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.pending.len(), 1);
         let mut actions = vec![];
-        p.completion(&reply(40, &[105, 106]), &w, &mut actions)
+        p.completion(&reply(41, &[105, 106]), &w, &mut actions)
             .unwrap();
         assert_eq!(p.get(id), None);
         assert!(actions.is_empty());
@@ -871,14 +1013,14 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
-        p.completion(&reply(41, &[]), &w, &mut actions).unwrap();
+        p.completion(&reply(42, &[]), &w, &mut actions).unwrap();
         assert_eq!(p.get(id), Some(Protocols::default()));
         assert_eq!(actions, vec![Action::ProtocolsChanged(id)]);
     }
     #[test]
     fn invalid_or_incomplete_properties_grant_no_capabilities() {
         let p = PropertyReader::new(104, 105, 106);
-        let Completion::Reply(_, mut bytes) = reply(40, &[105]) else {
+        let Completion::Reply(_, mut bytes) = reply(41, &[105]) else {
             unreachable!()
         };
         assert_eq!(
@@ -905,7 +1047,7 @@ mod tests {
             .unwrap();
         p.forget(id);
         let mut actions = vec![];
-        assert!(p.completion(&reply(40, &[105]), &w, &mut actions).unwrap());
+        assert!(p.completion(&reply(41, &[105]), &w, &mut actions).unwrap());
         assert!(actions.is_empty());
         assert_eq!(p.get(id), None);
     }

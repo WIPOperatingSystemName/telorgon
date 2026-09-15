@@ -222,7 +222,10 @@ impl SceneCompiler {
                 };
                 let old = scene.images.get(*node).copied();
                 if scene.images.upsert(*node, image) {
-                    rebuild_order |= old.is_none();
+                    // The draw batch carries the texture and clip identities. Replacing
+                    // an image on the same mounted node must update that batch too.
+                    rebuild_order |=
+                        old.is_none_or(|old| old.image != image.image || old.clip != image.clip);
                     if let Some(old) = old {
                         scene.damage.add(old.view_bounds, extent);
                     }

@@ -5,7 +5,7 @@
 
 mod component;
 mod components;
-mod context;
+pub(crate) mod context;
 mod element;
 mod event;
 mod key;
@@ -73,3 +73,10 @@ pub mod __private {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod applications;
+pub use applications::{
+    ApplicationCatalog, ApplicationCatalogHandle, ApplicationCatalogStatus, ApplicationIcon,
+    ApplicationId, ApplicationMetadata, ApplicationQuery, ApplicationVisibility, IconRequest,
+};
+pub use shell_services::{ShellContext, ShellWindows};

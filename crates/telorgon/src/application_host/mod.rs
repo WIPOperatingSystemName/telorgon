@@ -94,6 +94,8 @@ pub use crate::compose::{
 };
 
 pub use crate::compose::{
-    ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
-    ShellWindowAction,
+    ApplicationCatalog, ApplicationCatalogHandle, ApplicationCatalogStatus, ApplicationIcon,
+    ApplicationId, ApplicationMetadata, ApplicationQuery, ApplicationVisibility, IconRequest,
+    ShellContext, ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices,
+    ShellWindow, ShellWindowAction, ShellWindows,
 };

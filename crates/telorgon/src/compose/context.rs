@@ -236,3 +236,141 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+// The driver owns providers. This stack only scopes access while executing its
+// components, including nested views, lifecycle hooks, and input handlers.
+thread_local! {
+    static IMAGE_PROVIDERS: RefCell<Vec<Option<ImageBindings>>> = const { RefCell::new(Vec::new()) };
+    static PROVIDERS: RefCell<Vec<Option<super::ShellServices>>> = const { RefCell::new(Vec::new()) };
+}
+pub(crate) type ImageBindings = std::rc::Rc<
+    RefCell<std::collections::BTreeMap<crate::ui::ImageId, crate::render::ImageResource>>,
+>;
+pub(crate) struct ProviderGuard;
+impl ProviderGuard {
+    pub(crate) fn enter(services: Option<super::ShellServices>) -> Self {
+        PROVIDERS.with_borrow_mut(|stack| stack.push(services));
+        IMAGE_PROVIDERS.with_borrow_mut(|stack| stack.push(None));
+        Self
+    }
+    pub(crate) fn enter_with_images(
+        services: Option<super::ShellServices>,
+        images: ImageBindings,
+    ) -> Self {
+        let guard = Self::enter(services);
+        IMAGE_PROVIDERS.with_borrow_mut(|stack| *stack.last_mut().unwrap() = Some(images));
+        guard
+    }
+}
+impl Drop for ProviderGuard {
+    fn drop(&mut self) {
+        IMAGE_PROVIDERS.with_borrow_mut(|stack| {
+            stack.pop();
+        });
+        PROVIDERS.with_borrow_mut(|stack| {
+            stack.pop();
+        });
+    }
+}
+pub(crate) fn provided<T: 'static>() -> Option<std::rc::Rc<T>> {
+    PROVIDERS.with_borrow(|stack| {
+        let services = stack.last()?.as_ref()?;
+        if TypeId::of::<T>() == TypeId::of::<super::ShellContext>() {
+            let value: std::rc::Rc<dyn std::any::Any> =
+                std::rc::Rc::new(super::ShellContext::new(services.clone()));
+            value.downcast().ok()
+        } else {
+            services.service::<T>().ok()
+        }
+    })
+}
+pub(crate) fn observe<T: Send + Sync + 'static>(signal: &Signal<T>) -> SignalSnapshot<T> {
+    let snapshot = signal.snapshot();
+    EVALUATION_STACK.with_borrow_mut(|stack| {
+        if let Some(frame) = stack.last_mut() {
+            let dependency = signal.dependency(snapshot.revision);
+            if let Some(existing) = frame
+                .dependencies
+                .iter_mut()
+                .find(|d| d.identity() == dependency.identity())
+            {
+                *existing = dependency;
+            } else {
+                frame.dependencies.push(dependency);
+            }
+        }
+    });
+    snapshot
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use crate::compose::{
+        ApplicationCatalog, ComponentFields, ShellContext, View,
+        shell_services::{ShellServiceHost, ShellServiceRegistry},
+        text,
+    };
+    struct Reader;
+    impl ComponentFields for Reader {
+        type InputSnapshot = ();
+        fn capture_inputs(&self) {}
+        fn restore_inputs(&mut self, _: ()) -> bool {
+            false
+        }
+        fn update_inputs(&mut self, _: Self) -> bool {
+            false
+        }
+    }
+    impl Component for Reader {
+        fn view(&self) -> impl View {
+            text("reader")
+        }
+    }
+    #[test]
+    fn providers_are_scoped_inherited_isolated_and_panic_safe() {
+        let mut first = ShellServiceRegistry::default();
+        first.insert(11u32);
+        first.insert(ApplicationCatalog::in_memory(Vec::new()));
+        let first = ShellServiceHost::with_registry(first);
+        let mut second = ShellServiceRegistry::default();
+        second.insert(22u32);
+        second.insert(ApplicationCatalog::in_memory(Vec::new()));
+        let second = ShellServiceHost::with_registry(second);
+        assert!(Reader.try_context::<ShellContext>().is_none());
+        let _outer = ProviderGuard::enter(Some(first.services.clone()));
+        assert_eq!(*Reader.context::<u32>(), 11);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = ProviderGuard::enter(Some(second.services.clone()));
+            assert_eq!(*Reader.context::<u32>(), 22);
+            panic!("unwind inner provider");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(*Reader.context::<u32>(), 11);
+        {
+            let _application = ProviderGuard::enter(None);
+            assert!(Reader.try_context::<ShellContext>().is_none());
+        }
+        let (_, dependencies) = evaluate::<Reader, _>(
+            ComponentInstanceId::new(5, 1),
+            RuntimeTarget::ShellWidget,
+            || {
+                Reader.context::<ShellContext>().windows().open();
+                Reader.context::<ShellContext>().applications().installed();
+            },
+        );
+        assert_eq!(dependencies.len(), 2);
+    }
+}
+
+/// Retain exactly the image observed by the view, even if its asynchronous cache
+/// entry changes before this frame is compiled. The runtime admits it with the draw.
+pub(crate) fn bind_image(resource: crate::render::ImageResource) -> crate::assets::ImageSource {
+    let id = resource.image;
+    IMAGE_PROVIDERS.with_borrow(|stack| {
+        if let Some(Some(images)) = stack.last() {
+            images.borrow_mut().insert(id, resource);
+        }
+    });
+    id.into()
+}

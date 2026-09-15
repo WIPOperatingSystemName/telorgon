@@ -31,6 +31,14 @@ impl ComponentInstanceId {
 pub trait Component: ComponentFields + Sized + 'static {
     fn view(&self) -> impl View;
 
+    /// Access an environment-owned provider while the runtime executes this component.
+    fn context<T: 'static>(&self) -> std::rc::Rc<T> {
+        self.try_context::<T>()
+            .unwrap_or_else(|| panic!("missing component context: {}", std::any::type_name::<T>()))
+    }
+    fn try_context<T: 'static>(&self) -> Option<std::rc::Rc<T>> {
+        crate::compose::context::provided::<T>()
+    }
     fn watch<T>(&self, signal: &Signal<T>) -> SignalSnapshot<T>
     where
         T: Send + Sync + 'static,

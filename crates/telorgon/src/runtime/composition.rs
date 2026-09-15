@@ -198,6 +198,8 @@ pub struct CompositionDriver {
     signal_scratch: Vec<ComponentInstanceId>,
     wake: Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>,
     target: RuntimeTarget,
+    shell_services: Option<crate::compose::ShellServices>,
+    pub(crate) image_bindings: crate::compose::context::ImageBindings,
 }
 
 #[derive(Clone)]
@@ -249,12 +251,19 @@ impl CompositionDriver {
             signal_scratch: Vec::new(),
             wake: Arc::new(RwLock::new(None)),
             target,
+            shell_services: None,
+            image_bindings: Default::default(),
         }
     }
 
     /// Installs the host-turn wake used by external signals. Replacing it is safe because signal
     /// subscriptions consult this shared slot at publication time.
     pub(crate) fn connect_shell(&mut self, services: crate::compose::ShellServices) {
+        self.shell_services = Some(services.clone());
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         if let Some(root) = self.pending_root.as_mut() {
             root.shell_connected(services);
         }
@@ -269,6 +278,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         event: crate::input::InputEvent,
     ) {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let Some(root) = self.root_component else {
             return;
         };
@@ -290,6 +303,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         reason: crate::compose::ShellDismissReason,
     ) {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let Some(root) = self.root_component else {
             return;
         };
@@ -326,6 +343,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         candidate: Box<dyn ErasedComponent>,
     ) -> bool {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let Some(root) = self.root_component else {
             self.record_error("composition root is not mounted");
             return false;
@@ -430,6 +451,10 @@ impl CompositionDriver {
     }
 
     fn render_component(&mut self, id: ComponentInstanceId) -> Result<RenderedView, ViewError> {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let component = self
             .arena
             .get(id)
@@ -538,6 +563,10 @@ impl CompositionDriver {
         writer: &mut MountWriter<'_, ()>,
         component: Box<dyn ErasedComponent>,
     ) -> Result<MountedElement, ViewError> {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let type_id = component.component_type_id();
         let id = self.arena.insert(component);
         let rendered = match self.render_component(id) {
@@ -1501,6 +1530,10 @@ impl CompositionDriver {
     }
 
     fn teardown_metadata(&mut self, mut mounted: MountedElement) {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         match &mut mounted.kind {
             MountedKind::Container { children, .. } => {
                 for child in std::mem::take(children) {
@@ -1545,6 +1578,10 @@ impl CompositionDriver {
         source: ChangeSource,
         context: &mut DriverContext<'_>,
     ) -> bool {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let Some(route) = self.handlers.get(&target).cloned() else {
             return false;
         };
@@ -1603,6 +1640,10 @@ impl CompositionDriver {
         source: ChangeSource,
         context: &mut DriverContext<'_>,
     ) -> bool {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let Some(HandlerRoute::Value(handler)) = self.handlers.get(&target).cloned() else {
             return false;
         };
@@ -1634,6 +1675,10 @@ impl ComponentDriver for CompositionDriver {
     type Action = ();
 
     fn mount(&mut self, writer: &mut MountWriter<'_, Self::Action>) -> UiRoot {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         let component = self
             .pending_root
             .take()
@@ -1702,6 +1747,10 @@ impl ComponentDriver for CompositionDriver {
     }
 
     fn initialize(&mut self, context: &mut DriverContext<'_>) {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         self.process_signal_updates(context);
     }
 
@@ -1743,10 +1792,18 @@ impl ComponentDriver for CompositionDriver {
     }
 
     fn process_external_updates(&mut self, context: &mut DriverContext<'_>) -> usize {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         self.process_signal_updates(context)
     }
 
     fn close(&mut self, context: &mut DriverContext<'_>) {
+        let _scope = crate::compose::context::ProviderGuard::enter_with_images(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+        );
         if let Some(root_component) = self.root_component.take() {
             if let Some(child) = self
                 .arena

@@ -87,6 +87,8 @@ pub struct AppRuntimeCore<D: ComponentDriver> {
     layout: LayoutEngine,
     text: RetainedTextSystem,
     scene: RenderScene,
+    image_bindings: Option<crate::compose::context::ImageBindings>,
+    bound_image_versions: std::collections::BTreeMap<ImageId, u64>,
     compiler: SceneCompiler,
     deltas: SceneDeltaQueue,
     input: InputCoalescer,
@@ -201,13 +203,16 @@ impl AppRuntimeCore<CompositionDriver> {
         driver: CompositionDriver,
         extent: SizeI,
     ) -> AppResult<Self> {
+        let images = driver.image_bindings.clone();
         let view = ViewRuntime::new(driver)?;
-        Self::from_view(
+        let mut runtime = Self::from_view(
             view,
             extent,
             ThemeRuntime::default(),
             ThemeDomain::Application,
-        )
+        )?;
+        runtime.image_bindings = Some(images);
+        Ok(runtime)
     }
 
     pub fn composition_diagnostics(&self) -> CompositionDiagnostics {
@@ -261,6 +266,8 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             text: RetainedTextSystem::new(100_000)
                 .map_err(|error| AppError::new(error.to_string()))?,
             scene: RenderScene::default(),
+            image_bindings: None,
+            bound_image_versions: Default::default(),
             compiler: SceneCompiler::default(),
             deltas: SceneDeltaQueue::new(3),
             input: InputCoalescer::default(),
@@ -674,6 +681,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                 crate::core::ColorRgba8::default(),
             )
         };
+        self.sync_bound_images()?;
         let delta = {
             #[cfg(feature = "profiler")]
             let _span = crate::profiler::span!("scene.delta.take");
@@ -703,6 +711,44 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                 delta_queue_high_water: self.deltas.high_water(),
             },
         })
+    }
+
+    fn sync_bound_images(&mut self) -> AppResult<()> {
+        let Some(bindings) = &self.image_bindings else {
+            return Ok(());
+        };
+        // Keep bindings for mounted hidden nodes as well as currently drawn nodes.
+        let referenced: std::collections::BTreeSet<_> = self
+            .view
+            .ui()
+            .images
+            .values()
+            .iter()
+            .map(|v| v.image)
+            .chain(self.scene.images.values().iter().map(|v| v.image))
+            .collect();
+        let mut bindings = bindings.borrow_mut();
+        bindings.retain(|id, _| referenced.contains(id));
+        let retired: Vec<_> = self
+            .bound_image_versions
+            .keys()
+            .filter(|id| !bindings.contains_key(id))
+            .copied()
+            .collect();
+        for id in retired {
+            self.scene.remove_image_resource(id);
+            self.bound_image_versions.remove(&id);
+        }
+        for (id, resource) in bindings.iter() {
+            if self.bound_image_versions.get(id) != Some(&resource.content_version) {
+                self.scene
+                    .set_image_resource(resource.clone())
+                    .map_err(|e| AppError::new(e.to_string()))?;
+                self.bound_image_versions
+                    .insert(*id, resource.content_version);
+            }
+        }
+        Ok(())
     }
 
     pub fn pop_scene_delta(&mut self) -> Option<RenderSceneDelta> {

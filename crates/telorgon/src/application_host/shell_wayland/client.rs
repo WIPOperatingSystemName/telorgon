@@ -11,6 +11,8 @@ pub(super) struct ClientWindow {
     pub(super) surface_scale: i32,
     pub(super) backend: Option<WindowBackend>,
     pub(super) frame_title: Option<String>,
+    pub(super) application_identity: String,
+    pub(super) application_icon: Option<crate::render::ImageResource>,
     pub(super) desktop_id: Option<crate::shell::WindowId>,
     pub(super) role: SurfaceRole,
     pub(super) parent: Option<WaylandSurfaceId>,
@@ -543,6 +545,8 @@ pub(super) fn apply_surface_publication(
                 surface_scale,
                 backend: (role == SurfaceRole::XdgToplevel).then_some(WindowBackend::Wayland),
                 frame_title: None,
+                application_identity: String::new(),
+                application_icon: None,
                 desktop_id: if role == SurfaceRole::XdgToplevel {
                     Some(identities.ensure(surface)?)
                 } else {
@@ -854,6 +858,8 @@ pub(super) mod maximize_preview_tests {
             desktop_id: None,
             backend: Some(WindowBackend::Wayland),
             frame_title: None,
+            application_identity: String::new(),
+            application_icon: None,
             role: SurfaceRole::XdgToplevel,
             parent: None,
             offset: PointI::default(),

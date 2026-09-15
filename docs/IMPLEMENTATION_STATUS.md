@@ -3837,3 +3837,14 @@ Portable/headless tests and Linux compilation provide evidence; native input/KMS
 user-qualified work. Automatic retained-element anchors, multi-output hosting, native IME/touch
 widget routing, audio/brightness adapters, tray/notification daemons, and screenshot readback are not
 claimed. See [Shell widgets](SHELL_WIDGETS.md) for the exact scope and reference audit.
+
+
+## Shell application catalog and contextual window services
+
+The shell environment now owns an optional configurable application catalog (system discovery by
+ default), exposed through inherited `ShellContext` alongside reactive cached window services.
+Desktop-entry discovery/search and PNG/SVG icon lookup/decoding run on a bounded worker, with two-second
+change polling. X11 WM_CLASS/_NET_WM_ICON use the asynchronous property reader; Wayland uses app IDs and
+xdg toplevel icons. The test taskbar renders reactive per-window icon buttons with activation/minimizing.
+Headless and compile evidence is documented in [Application catalog](APPLICATION_CATALOG.md); live
+appearance, automatic desktop-theme selection, XPM, and multi-output policy are not qualified.

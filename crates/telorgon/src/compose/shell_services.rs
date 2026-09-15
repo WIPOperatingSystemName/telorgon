@@ -13,6 +13,11 @@ impl ShellServiceRegistry {
 pub struct ShellWindow {
     pub id: WindowId,
     pub title: String,
+    pub application_id: Option<super::ApplicationId>,
+    /// Raw Wayland app ID or X11 WM_CLASS, used for late metadata association.
+    pub application_identity: String,
+    pub(crate) icon: Option<crate::render::ImageResource>,
+    pub(crate) icon_name: Option<String>,
     pub active: bool,
     pub minimized: bool,
     pub maximized: bool,
@@ -48,6 +53,7 @@ pub struct ShellServices {
     completions: Signal<Vec<ShellRequestCompletion>>,
     queue: Rc<RefCell<ServiceQueue>>,
     extensions: ShellServiceRegistry,
+    applications: super::ApplicationCatalogHandle,
 }
 struct ServiceQueue {
     alive: bool,
@@ -62,6 +68,7 @@ pub(crate) struct WindowCommand {
 }
 pub(crate) struct ShellServiceHost {
     pub services: ShellServices,
+    _catalog_worker: super::applications::CatalogWorker,
     windows: SignalWriter<Vec<ShellWindow>>,
     completions: SignalWriter<Vec<ShellRequestCompletion>>,
 }
@@ -109,13 +116,27 @@ impl ShellServices {
 impl ShellServiceHost {
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_registry(ShellServiceRegistry::default())
+        let mut registry = ShellServiceRegistry::default();
+        registry.insert(super::ApplicationCatalog::in_memory(Vec::new()));
+        Self::with_registry(registry)
     }
     pub fn with_registry(extensions: ShellServiceRegistry) -> Self {
+        Self::with_registry_and_scale(extensions, 32)
+    }
+    pub fn with_registry_and_scale(extensions: ShellServiceRegistry, size: u32) -> Self {
+        let config = extensions
+            .0
+            .get(&std::any::TypeId::of::<super::ApplicationCatalog>())
+            .and_then(|v| v.downcast_ref::<super::ApplicationCatalog>())
+            .cloned()
+            .unwrap_or_default();
+        let (applications, worker) = super::applications::start(config, size);
         let (windows, writer) = Signal::new(Vec::new());
         let (completions, cwriter) = Signal::new(Vec::new());
         Self {
+            _catalog_worker: worker,
             services: ShellServices {
+                applications,
                 windows,
                 completions,
                 extensions,
@@ -129,7 +150,13 @@ impl ShellServiceHost {
             completions: cwriter,
         }
     }
-    pub fn publish(&self, windows: Vec<ShellWindow>) {
+    pub fn publish(&self, mut windows: Vec<ShellWindow>) {
+        for window in &mut windows {
+            window.application_id = self
+                .services
+                .applications
+                .identify(&window.application_identity);
+        }
         self.windows.publish_if_changed(windows);
     }
     pub fn drain(&self) -> Vec<WindowCommand> {
@@ -168,6 +195,10 @@ mod tests {
                 NonZeroU32::new(generation).unwrap(),
             ),
             title: "A".into(),
+            application_id: None,
+            application_identity: String::new(),
+            icon: None,
+            icon_name: None,
             active: false,
             minimized: false,
             maximized: false,
@@ -202,5 +233,65 @@ impl std::fmt::Debug for ShellServiceRegistry {
         f.debug_struct("ShellServiceRegistry")
             .field("count", &self.0.len())
             .finish()
+    }
+}
+
+/// Services owned by the enclosing shell environment, inherited by its components.
+#[derive(Clone)]
+pub struct ShellContext {
+    services: ShellServices,
+}
+impl ShellContext {
+    pub(crate) fn new(services: ShellServices) -> Self {
+        Self { services }
+    }
+    pub fn windows(&self) -> ShellWindows {
+        ShellWindows(self.services.clone())
+    }
+    pub fn applications(&self) -> super::ApplicationCatalogHandle {
+        self.services.applications.clone()
+    }
+}
+#[derive(Clone)]
+pub struct ShellWindows(ShellServices);
+impl ShellWindows {
+    /// Cached managed windows, including minimized windows. Reads in view are reactive.
+    pub fn open(&self) -> Vec<ShellWindow> {
+        super::context::observe(&self.0.windows)
+            .iter()
+            .cloned()
+            .map(|mut w| {
+                w.application_id = self.0.applications.identify(&w.application_identity);
+                w
+            })
+            .collect()
+    }
+    pub fn icon(&self, id: WindowId) -> crate::assets::ImageSource {
+        let windows = super::context::observe(&self.0.windows);
+        if let Some(w) = windows.iter().find(|w| w.id == id) {
+            if let Some(icon) = &w.icon {
+                return super::context::bind_image(icon.clone());
+            }
+            if let Some(name) = &w.icon_name {
+                let icon = self.0.applications.icon_named(name);
+                if icon.image_id() != super::applications::fallback_image().image {
+                    return icon;
+                }
+            }
+            if let Some(app) = self.0.applications.identify(&w.application_identity) {
+                return self.0.applications.icon(&app);
+            }
+        }
+        super::context::bind_image(super::applications::fallback_image())
+    }
+    pub fn activate(&self, id: WindowId) -> Result<u64, ShellServiceError> {
+        self.0.request(id, ShellWindowAction::Activate)
+    }
+    pub fn set_minimized(&self, id: WindowId, minimized: bool) -> Result<u64, ShellServiceError> {
+        self.0
+            .request(id, ShellWindowAction::SetMinimized(minimized))
+    }
+    pub fn close(&self, id: WindowId) -> Result<u64, ShellServiceError> {
+        self.0.request(id, ShellWindowAction::Close)
     }
 }

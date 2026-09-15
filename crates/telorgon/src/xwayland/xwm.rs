@@ -59,6 +59,8 @@ struct Tracking {
     maximized: BTreeMap<XWindow, bool>,
     title: PropertyReader,
     legacy_title: PropertyReader,
+    app_class: PropertyReader,
+    app_icon: PropertyReader,
     last_focus_request: Option<(u32, Instant)>,
 }
 impl Tracking {
@@ -541,6 +543,18 @@ impl Xwm {
         }
         tracking.hints.refresh(window)
     }
+    pub fn window_icon(&self, window: XWindow) -> Option<&crate::render::ImageResource> {
+        let Some(Phase::Tracking(tracking)) = &self.phase else {
+            return None;
+        };
+        tracking.app_icon.icon(window)
+    }
+    pub fn window_application_class(&self, window: XWindow) -> Option<&str> {
+        let Some(Phase::Tracking(tracking)) = &self.phase else {
+            return None;
+        };
+        tracking.app_class.text(window)
+    }
     pub fn window_title(&self, window: XWindow) -> Option<&str> {
         let Some(Phase::Tracking(tracking)) = &self.phase else {
             return None;
@@ -563,6 +577,8 @@ impl Xwm {
         let Some(Phase::Tracking(tracking)) = &mut self.phase else {
             return Err(Error("XWM not initialized".into()));
         };
+        tracking.app_icon.refresh(window)?;
+        tracking.app_class.refresh(window)?;
         tracking.title.refresh(window)?;
         tracking.legacy_title.refresh(window)
     }
@@ -1086,6 +1102,7 @@ impl Xwm {
                         );
                         let decorations =
                             PropertyReader::new_decorations(discovered.atoms["_MOTIF_WM_HINTS"]);
+                        let app_icon = PropertyReader::new_icon(discovered.atoms["_NET_WM_ICON"]);
                         Phase::Tracking(Tracking {
                             selection_checks: BTreeMap::new(),
                             selection_watches: Vec::new(),
@@ -1108,6 +1125,12 @@ impl Xwm {
                             maximize_requests: Vec::new(),
                             maximized: BTreeMap::new(),
                             title,
+                            app_icon,
+                            app_class: PropertyReader::new_text(
+                                xproto::AtomEnum::WM_CLASS.into(),
+                                xproto::AtomEnum::STRING.into(),
+                                false,
+                            ),
                             legacy_title: PropertyReader::new_text(
                                 xproto::AtomEnum::WM_NAME.into(),
                                 xproto::AtomEnum::STRING.into(),
@@ -1160,6 +1183,16 @@ impl Xwm {
                                 &mut actions,
                             )?
                             && !tracking.legacy_title.completion(
+                                &completion,
+                                self.windows.as_ref().unwrap(),
+                                &mut actions,
+                            )?
+                            && !tracking.app_class.completion(
+                                &completion,
+                                self.windows.as_ref().unwrap(),
+                                &mut actions,
+                            )?
+                            && !tracking.app_icon.completion(
                                 &completion,
                                 self.windows.as_ref().unwrap(),
                                 &mut actions,
@@ -1226,6 +1259,12 @@ impl Xwm {
                                         }
                                         if e.atom == tracking.legacy_title.property() {
                                             tracking.legacy_title.refresh(w.id)?;
+                                        }
+                                        if e.atom == tracking.app_class.property() {
+                                            tracking.app_class.refresh(w.id)?;
+                                        }
+                                        if e.atom == tracking.app_icon.property() {
+                                            tracking.app_icon.refresh(w.id)?;
                                         }
                                     }
                                     if e.atom == tracking.normal_hints.property()
@@ -1358,6 +1397,16 @@ impl Xwm {
                                     self.windows.as_ref().unwrap(),
                                     &mut actions,
                                 )?
+                                && !tracking.app_class.completion(
+                                    &completion,
+                                    self.windows.as_ref().unwrap(),
+                                    &mut actions,
+                                )?
+                                && !tracking.app_icon.completion(
+                                    &completion,
+                                    self.windows.as_ref().unwrap(),
+                                    &mut actions,
+                                )?
                                 && !self.inspector.completion(
                                     &completion,
                                     self.windows.as_mut().unwrap(),
@@ -1384,6 +1433,8 @@ impl Xwm {
                             tracking.maximized.remove(window);
                             tracking.title.forget(*window);
                             tracking.legacy_title.forget(*window);
+                            tracking.app_class.forget(*window);
+                            tracking.app_icon.forget(*window);
                         }
                     }
                     if let Some(extension) = tracking.discovered.extensions.get("SYNC") {
@@ -1470,6 +1521,18 @@ impl Xwm {
                         started + BUDGET,
                     )?;
                     reschedule |= tracking.legacy_title.schedule(
+                        &mut tracking.transport,
+                        &mut tracking.requests,
+                        now + Duration::from_secs(10),
+                        started + BUDGET,
+                    )?;
+                    reschedule |= tracking.app_class.schedule(
+                        &mut tracking.transport,
+                        &mut tracking.requests,
+                        now + Duration::from_secs(10),
+                        started + BUDGET,
+                    )?;
+                    reschedule |= tracking.app_icon.schedule(
                         &mut tracking.transport,
                         &mut tracking.requests,
                         now + Duration::from_secs(10),
@@ -1598,7 +1661,7 @@ mod tests {
                 manager = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
             }
         }
-        for sequence in [42, 43] {
+        for sequence in [43, 44] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -1612,14 +1675,14 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 45,
+                sequence: 46,
                 ..Default::default()
             }
             .serialize(),
         );
         let create: [u8; 32] = xproto::CreateNotifyEvent {
             response_type: xproto::CREATE_NOTIFY_EVENT,
-            sequence: 45,
+            sequence: 46,
             parent: 1,
             window: 10,
             width: 640,
@@ -1630,7 +1693,7 @@ mod tests {
         peer.write_all(&create).unwrap();
         let timestamp: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 45,
+            sequence: 46,
             window: manager,
             atom: 110,
             time: 123,
@@ -1647,7 +1710,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 46 + index as u16,
+                        sequence: 47 + index as u16,
                         owner: manager,
                         ..Default::default()
                     }
@@ -1662,7 +1725,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 60,
+                sequence: 61,
                 ..Default::default()
             }
             .serialize(),
@@ -1672,7 +1735,7 @@ mod tests {
         assert_eq!(query[0], 15);
         assert_eq!(u32::from_ne_bytes(query[4..8].try_into().unwrap()), 1);
         let mut tree = xproto::QueryTreeReply {
-            sequence: 61,
+            sequence: 62,
             root: 1,
             parent: 0,
             children: vec![manager, 10],
@@ -1705,7 +1768,7 @@ mod tests {
                 assert_eq!(u32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 800);
             }
         }
-        for sequence in [63, 65] {
+        for sequence in [64, 66] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1720,7 +1783,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(10).unwrap().geometry.width, 640);
         let map: [u8; 32] = xproto::MapNotifyEvent {
             response_type: xproto::MAP_NOTIFY_EVENT,
-            sequence: 65,
+            sequence: 66,
             event: 1,
             window: 10,
             ..Default::default()
@@ -1729,7 +1792,7 @@ mod tests {
         peer.write_all(&map).unwrap();
         let configured: [u8; 32] = xproto::ConfigureNotifyEvent {
             response_type: xproto::CONFIGURE_NOTIFY_EVENT,
-            sequence: 65,
+            sequence: 66,
             event: 1,
             window: 10,
             x: -20,
@@ -1742,7 +1805,7 @@ mod tests {
         peer.write_all(&configured).unwrap();
         let serial: [u8; 32] = xproto::ClientMessageEvent {
             response_type: xproto::CLIENT_MESSAGE_EVENT | 128,
-            sequence: 65,
+            sequence: 66,
             format: 32,
             window: 10,
             type_: serial_atom,
@@ -1796,7 +1859,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 67,
+                sequence: 68,
                 ..Default::default()
             }
             .serialize(),
@@ -1817,7 +1880,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 69,
+                sequence: 70,
                 ..Default::default()
             }
             .serialize(),
@@ -1835,7 +1898,7 @@ mod tests {
             .flat_map(u32::to_ne_bytes)
             .collect();
         let protocol_reply = xproto::GetPropertyReply {
-            sequence: 70,
+            sequence: 71,
             format: 32,
             length: 2,
             type_: 4,
@@ -1870,7 +1933,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 72,
+                sequence: 73,
                 ..Default::default()
             }
             .serialize(),
@@ -1906,7 +1969,7 @@ mod tests {
             }
             .serialize()
         };
-        peer.write_all(&hints_reply(73, 1)).unwrap();
+        peer.write_all(&hints_reply(74, 1)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         // Leave capacity for one checked command, but not the complete focus pair.
         let (mut blocked_transport, mut blocked_requests, _, _blocked_peer, _) = ready();
@@ -1951,7 +2014,7 @@ mod tests {
         let (message, _) = xproto::ClientMessageEvent::try_parse(&take[12..]).unwrap();
         assert_eq!(message.data.as_data32(), [106, 124, 0, 0, 0]);
         assert_eq!(request(&mut peer)[0], 43);
-        for sequence in [75, 77] {
+        for sequence in [76, 78] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1964,7 +2027,7 @@ mod tests {
         assert!(drive(&mut xwm, now).is_empty());
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 77,
+            sequence: 78,
             window: 10,
             atom: 35,
             time: 125,
@@ -1976,7 +2039,7 @@ mod tests {
         assert_eq!(xwm.input_hints(id), None);
         assert!(xwm.focus_window(id, 125, now).is_err());
         assert_eq!(request(&mut peer)[0], 20);
-        peer.write_all(&hints_reply(78, 0)).unwrap();
+        peer.write_all(&hints_reply(79, 0)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         assert_eq!(
             xwm.focus_window(id, 125, now).unwrap(),
@@ -1988,7 +2051,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 80,
+                sequence: 81,
                 ..Default::default()
             }
             .serialize(),
@@ -2002,7 +2065,7 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(normal[8..12].try_into().unwrap()), 40);
         assert_eq!(u32::from_ne_bytes(normal[12..16].try_into().unwrap()), 41);
         let normal_reply = xproto::GetPropertyReply {
-            sequence: 81,
+            sequence: 82,
             format: 32,
             type_: 41,
             length: 18,
@@ -2075,7 +2138,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 83,
+                sequence: 84,
                 ..Default::default()
             }
             .serialize(),
@@ -2084,7 +2147,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(id.xid).unwrap().geometry, before);
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 83,
+            sequence: 84,
             window: id.xid,
             atom: 40,
             ..Default::default()
@@ -2097,7 +2160,7 @@ mod tests {
         assert_eq!(request(&mut peer)[0], 20);
         peer.write_all(
             &xproto::GetPropertyReply {
-                sequence: 84,
+                sequence: 85,
                 ..Default::default()
             }
             .serialize(),
@@ -2122,7 +2185,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 86,
+                sequence: 87,
                 ..Default::default()
             }
             .serialize(),
@@ -2166,7 +2229,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let notification: [u8; 32] = x11rb_protocol::protocol::xfixes::SelectionNotifyEvent {
             response_type: subscription.first_event,
-            sequence: 86,
+            sequence: 87,
             window: manager,
             owner: 77,
             selection: 1,
@@ -2230,7 +2293,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 88,
+                sequence: 89,
                 ..Default::default()
             }
             .serialize(),
@@ -2239,7 +2302,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let clock_sequence = xwm.request_focus_timestamp(id, now).unwrap();
         assert!(xwm.commands_pending(id));
-        assert_eq!(clock_sequence, 89);
+        assert_eq!(clock_sequence, 90);
         drive(&mut xwm, now);
         let marker = request(&mut peer);
         assert_eq!(marker[0], 18);
@@ -2266,7 +2329,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 90,
+                sequence: 91,
                 ..Default::default()
             }
             .serialize(),
@@ -2283,7 +2346,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 92,
+                sequence: 93,
                 ..Default::default()
             }
             .serialize(),
@@ -2292,7 +2355,7 @@ mod tests {
         assert!(!xwm.commands_pending(id));
         let clear: [u8; 32] = xproto::SelectionClearEvent {
             response_type: xproto::SELECTION_CLEAR_EVENT,
-            sequence: 92,
+            sequence: 93,
             time: 124,
             owner: manager,
             selection: wm_atom,

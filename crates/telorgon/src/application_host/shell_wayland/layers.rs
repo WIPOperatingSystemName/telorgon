@@ -438,7 +438,7 @@ fn layout_window_frame(
     Ok(snapshot)
 }
 
-fn toplevel_icon_image_id(surface: WaylandSurfaceId, revision: u64) -> ImageId {
+pub(super) fn toplevel_icon_image_id(surface: WaylandSurfaceId, revision: u64) -> ImageId {
     let folded = revision as u32 ^ (revision >> 32) as u32;
     ImageId(0x6000_0000_u32 ^ surface.get().rotate_left(11) ^ folded.rotate_left(3))
 }

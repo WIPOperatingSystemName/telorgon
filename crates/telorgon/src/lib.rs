@@ -197,13 +197,15 @@ pub mod app {
         WindowFrameFactory, WindowFrameTemplate,
     };
     pub use crate::compose::{
+        ApplicationCatalog, ApplicationCatalogHandle, ApplicationCatalogStatus, ApplicationIcon,
+        ApplicationId, ApplicationMetadata, ApplicationQuery, ApplicationVisibility, IconRequest,
+        ShellContext, ShellRequestCompletion, ShellRequestOutcome, ShellServiceError,
+        ShellServices, ShellWindow, ShellWindowAction, ShellWindows,
+    };
+    pub use crate::compose::{
         ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
         ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
         ShellWidget, WidgetPlacement,
-    };
-    pub use crate::compose::{
-        ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
-        ShellWindowAction,
     };
     pub use crate::session;
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
@@ -597,6 +599,8 @@ pub use crate::compose::{
 };
 
 pub use crate::compose::{
-    ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
-    ShellWindowAction,
+    ApplicationCatalog, ApplicationCatalogHandle, ApplicationCatalogStatus, ApplicationIcon,
+    ApplicationId, ApplicationMetadata, ApplicationQuery, ApplicationVisibility, IconRequest,
+    ShellContext, ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices,
+    ShellWindow, ShellWindowAction, ShellWindows,
 };

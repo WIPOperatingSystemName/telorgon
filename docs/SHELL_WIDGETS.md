@@ -6,6 +6,9 @@ This document describes the implemented component API and Linux host integration
 reactivity, lifecycle, service-admission, and headless host tests provide automated evidence. Native
 KMS/input behavior still needs user-run qualification. This is not a production qualification claim.
 
+See [Application catalog and taskbar icons](APPLICATION_CATALOG.md) for environment-owned
+application discovery and `self.context::<ShellContext>()` access from widgets and descendants.
+
 ## Ownership and migration
 
 `ShellEnvironment` owns widgets. `Compositor` owns windowing/rendering configuration and window-frame

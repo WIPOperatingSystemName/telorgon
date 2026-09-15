@@ -203,6 +203,16 @@ impl Compatibility {
                 super::x11_windows::apply_decorations(window, decorated, config);
                 window.desktop_id = Some(*id);
                 if let Some(xwm) = &self.xwm {
+                    let icon = xwm.window_icon(*xwindow);
+                    if window.application_icon.as_ref() != icon {
+                        window.application_icon = icon.cloned();
+                        changed = true;
+                    }
+                    let identity = xwm.window_application_class(*xwindow).unwrap_or_default();
+                    if window.application_identity != identity {
+                        window.application_identity = identity.to_owned();
+                        changed = true;
+                    }
                     let title = xwm.window_title(*xwindow);
                     if window.frame_title.as_deref() != title {
                         window.frame_title = title.map(str::to_owned);
@@ -992,35 +1002,23 @@ mod tests {
             let mut windows = BTreeMap::from([(root, image), (child, sub)]);
             let mut identities = WindowIdentities::default();
             assert!(
-                host.sync_presentation(
-                    &mut windows,
-                    &mut identities,
-                    &LinuxShellConfig::default()
-                )
-                .unwrap()
+                host.sync_presentation(&mut windows, &mut identities, &LinuxShellConfig::default())
+                    .unwrap()
             );
             assert!(windows[&root].minimized);
             assert!(windows[&child].minimized);
             assert_eq!(windows[&child].position, PointI { x: 12, y: 13 });
             assert!(
                 !host
-                    .sync_presentation(
-                        &mut windows,
-                        &mut identities,
-                        &LinuxShellConfig::default()
-                    )
+                    .sync_presentation(&mut windows, &mut identities, &LinuxShellConfig::default())
                     .unwrap()
             );
 
             windows.remove(&root);
             windows.get_mut(&child).unwrap().minimized = false;
             assert!(
-                host.sync_presentation(
-                    &mut windows,
-                    &mut identities,
-                    &LinuxShellConfig::default()
-                )
-                .unwrap()
+                host.sync_presentation(&mut windows, &mut identities, &LinuxShellConfig::default())
+                    .unwrap()
             );
             assert!(windows[&child].minimized);
             assert!(host.preparation.is_none());

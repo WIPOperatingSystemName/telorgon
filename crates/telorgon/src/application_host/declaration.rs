@@ -884,6 +884,11 @@ pub struct ShellEnvironment {
 }
 
 impl ShellEnvironment {
+    /// Configures the environment-owned installed application catalog.
+    pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
+        self.services.insert(catalog);
+        self
+    }
     /// Installs an owner-thread service available to shell widget components.
     pub fn service<T: 'static>(mut self, service: T) -> Self {
         self.services.insert(service);
@@ -949,6 +954,11 @@ pub struct ShellEnvironmentWithCompositor {
 }
 
 impl ShellEnvironmentWithCompositor {
+    /// Configures the environment-owned installed application catalog.
+    pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
+        self.services.insert(catalog);
+        self
+    }
     /// Installs an owner-thread service available to shell widget components.
     pub fn service<T: 'static>(mut self, service: T) -> Self {
         self.services.insert(service);
@@ -1024,6 +1034,11 @@ pub struct ReadyShellEnvironment {
 }
 
 impl ReadyShellEnvironment {
+    /// Configures the environment-owned installed application catalog.
+    pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
+        self.services.insert(catalog);
+        self
+    }
     /// Installs an owner-thread service available to shell widget components.
     pub fn service<T: 'static>(mut self, service: T) -> Self {
         self.services.insert(service);

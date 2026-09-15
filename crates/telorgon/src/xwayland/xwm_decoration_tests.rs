@@ -47,6 +47,8 @@ pub(crate) fn fixture() -> (Xwm, UnixStream, Instant, XWindow) {
         normal_hints: PropertyReader::new_normal_hints(),
         title: PropertyReader::new_text(110, 111, true),
         legacy_title: PropertyReader::new_text(39, 31, false),
+        app_class: PropertyReader::new_text(67, 31, false),
+        app_icon: PropertyReader::new_icon(112),
         last_focus_request: None,
     };
 
