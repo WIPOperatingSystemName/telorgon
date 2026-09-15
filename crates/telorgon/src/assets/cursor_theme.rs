@@ -45,19 +45,21 @@ impl PointerFrame {
 
 /// One semantic pointer graphic. Size is optional; theme and output defaults can supply it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PointerGraphic {
+pub struct CursorGraphic {
     frames: Arc<[PointerFrame]>,
     hotspot: PointerHotspot,
     size: Option<u16>,
+    logical_size_bits: Option<u32>,
     tint: Option<ColorRgba8>,
 }
 
-impl PointerGraphic {
+impl CursorGraphic {
     pub fn new(asset: CursorAsset) -> Self {
         Self {
             frames: Arc::from([PointerFrame::still(asset)]),
             hotspot: PointerHotspot::default(),
             size: None,
+            logical_size_bits: None,
             tint: None,
         }
     }
@@ -88,6 +90,7 @@ impl PointerGraphic {
             frames: frames.into(),
             hotspot: PointerHotspot::default(),
             size: None,
+            logical_size_bits: None,
             tint: None,
         })
     }
@@ -99,8 +102,10 @@ impl PointerGraphic {
 
     /// Nominal size at 100%. The Linux desktop treats this as logical units and rasterizes
     /// at its output density; managed hosts retain their existing pixel-size behavior.
-    pub const fn size(mut self, logical_units: u16) -> Self {
-        self.size = Some(logical_units);
+    pub fn size(mut self, logical_units: impl Into<f64>) -> Self {
+        let logical_units = logical_units.into() as f32;
+        self.logical_size_bits = Some(logical_units.to_bits());
+        self.size = Some(logical_units.round() as u16);
         self
     }
 
@@ -128,12 +133,18 @@ impl PointerGraphic {
         self.size
     }
 
+    pub fn exact_logical_size(&self) -> Option<f32> {
+        self.logical_size_bits
+            .map(f32::from_bits)
+            .or(self.size.map(f32::from))
+    }
+
     pub const fn tint_color(&self) -> Option<ColorRgba8> {
         self.tint
     }
 }
 
-impl From<CursorAsset> for PointerGraphic {
+impl From<CursorAsset> for CursorGraphic {
     fn from(value: CursorAsset) -> Self {
         Self::new(value)
     }
@@ -148,7 +159,7 @@ pub enum PointerThemeFallback {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointerTheme {
-    graphics: BTreeMap<PointerIcon, PointerGraphic>,
+    graphics: BTreeMap<PointerIcon, CursorGraphic>,
     default_size: Option<u16>,
     fallback: PointerThemeFallback,
 }
@@ -167,7 +178,7 @@ impl PointerTheme {
         Self::from_table(&value, bundle)
     }
 
-    pub fn set(mut self, icon: PointerIcon, graphic: impl Into<PointerGraphic>) -> Self {
+    pub fn set(mut self, icon: PointerIcon, graphic: impl Into<CursorGraphic>) -> Self {
         self.graphics.insert(icon, graphic.into());
         self
     }
@@ -183,7 +194,7 @@ impl PointerTheme {
         self
     }
 
-    pub fn graphic(&self, icon: PointerIcon) -> Option<&PointerGraphic> {
+    pub fn graphic(&self, icon: PointerIcon) -> Option<&CursorGraphic> {
         self.graphics.get(&icon).or_else(|| {
             (self.fallback == PointerThemeFallback::ThemeDefault)
                 .then(|| self.graphics.get(&PointerIcon::Default))
@@ -227,7 +238,7 @@ impl PointerTheme {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointerThemeOverrides {
-    graphics: BTreeMap<PointerIcon, PointerGraphic>,
+    graphics: BTreeMap<PointerIcon, CursorGraphic>,
 }
 
 impl PointerThemeOverrides {
@@ -235,25 +246,377 @@ impl PointerThemeOverrides {
         Self::default()
     }
 
-    pub fn set(mut self, icon: PointerIcon, graphic: impl Into<PointerGraphic>) -> Self {
+    pub fn set(mut self, icon: PointerIcon, graphic: impl Into<CursorGraphic>) -> Self {
         self.graphics.insert(icon, graphic.into());
         self
     }
 
-    pub fn pointer(self, graphic: impl Into<PointerGraphic>) -> Self {
+    pub fn pointer(self, graphic: impl Into<CursorGraphic>) -> Self {
         self.set(PointerIcon::Pointer, graphic)
     }
 
-    pub fn text(self, graphic: impl Into<PointerGraphic>) -> Self {
+    pub fn text(self, graphic: impl Into<CursorGraphic>) -> Self {
         self.set(PointerIcon::Text, graphic)
     }
 
-    pub fn default_pointer(self, graphic: impl Into<PointerGraphic>) -> Self {
+    pub fn default_pointer(self, graphic: impl Into<CursorGraphic>) -> Self {
         self.set(PointerIcon::Default, graphic)
     }
 
-    pub fn graphic(&self, icon: PointerIcon) -> Option<&PointerGraphic> {
+    pub fn graphic(&self, icon: PointerIcon) -> Option<&CursorGraphic> {
         self.graphics.get(&icon)
+    }
+}
+
+/// Constructs a cursor graphic. Hotspots are in the source artwork's coordinates.
+pub fn cursor(asset: CursorAsset) -> CursorGraphic {
+    CursorGraphic::new(asset)
+}
+
+/// Required desktop cursor roles. Every role must be explicitly assigned.
+pub const REQUIRED_CURSOR_ROLES: [PointerIcon; 36] = [
+    PointerIcon::Default,
+    PointerIcon::ContextMenu,
+    PointerIcon::Help,
+    PointerIcon::Pointer,
+    PointerIcon::Progress,
+    PointerIcon::Wait,
+    PointerIcon::Cell,
+    PointerIcon::Crosshair,
+    PointerIcon::Text,
+    PointerIcon::VerticalText,
+    PointerIcon::Alias,
+    PointerIcon::Copy,
+    PointerIcon::Move,
+    PointerIcon::NoDrop,
+    PointerIcon::NotAllowed,
+    PointerIcon::Grab,
+    PointerIcon::Grabbing,
+    PointerIcon::EResize,
+    PointerIcon::NResize,
+    PointerIcon::NeResize,
+    PointerIcon::NwResize,
+    PointerIcon::SResize,
+    PointerIcon::SeResize,
+    PointerIcon::SwResize,
+    PointerIcon::WResize,
+    PointerIcon::EwResize,
+    PointerIcon::NsResize,
+    PointerIcon::NeswResize,
+    PointerIcon::NwseResize,
+    PointerIcon::ColResize,
+    PointerIcon::RowResize,
+    PointerIcon::AllScroll,
+    PointerIcon::ZoomIn,
+    PointerIcon::ZoomOut,
+    PointerIcon::DndAsk,
+    PointerIcon::AllResize,
+];
+
+/// Complete desktop cursor design declaration, validated by the compositor at startup.
+/// There is no implicit size or missing-role fallback. Compositor startup validates
+/// every role and resolves the assets. Explicitly assigning the same graphic to several
+/// roles is supported; no assignments are inferred.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorTheme {
+    graphics: BTreeMap<PointerIcon, CursorGraphic>,
+    size: Option<f32>,
+    effective_size: Option<f32>,
+    asset: Option<CursorThemeAsset>,
+}
+
+impl CursorTheme {
+    pub fn new() -> Self {
+        Self {
+            graphics: BTreeMap::new(),
+            size: None,
+            effective_size: None,
+            asset: None,
+        }
+    }
+
+    /// Declares a manifest to load and validate against the desktop asset catalog at startup.
+    pub fn from_asset(asset: CursorThemeAsset) -> Self {
+        Self {
+            asset: Some(asset),
+            ..Self::new()
+        }
+    }
+
+    /// Base nominal size in logical units, required for code-defined themes.
+    pub fn size(mut self, size: f32) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    /// Changes the effective base size, preserving per-role size proportions.
+    pub fn cursor_size(mut self, size: f32) -> Self {
+        self.effective_size = Some(size);
+        self
+    }
+
+    pub fn default_pointer(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Default, graphic.into());
+        self
+    }
+    pub fn context_menu(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics
+            .insert(PointerIcon::ContextMenu, graphic.into());
+        self
+    }
+    pub fn help(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Help, graphic.into());
+        self
+    }
+    pub fn pointer(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Pointer, graphic.into());
+        self
+    }
+    pub fn progress(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Progress, graphic.into());
+        self
+    }
+    pub fn wait(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Wait, graphic.into());
+        self
+    }
+    pub fn cell(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Cell, graphic.into());
+        self
+    }
+    pub fn crosshair(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Crosshair, graphic.into());
+        self
+    }
+    pub fn text(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Text, graphic.into());
+        self
+    }
+    pub fn vertical_text(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics
+            .insert(PointerIcon::VerticalText, graphic.into());
+        self
+    }
+    pub fn alias(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Alias, graphic.into());
+        self
+    }
+    pub fn copy(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Copy, graphic.into());
+        self
+    }
+    pub fn move_cursor(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Move, graphic.into());
+        self
+    }
+    pub fn no_drop(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::NoDrop, graphic.into());
+        self
+    }
+    pub fn not_allowed(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics
+            .insert(PointerIcon::NotAllowed, graphic.into());
+        self
+    }
+    pub fn grab(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Grab, graphic.into());
+        self
+    }
+    pub fn grabbing(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::Grabbing, graphic.into());
+        self
+    }
+    pub fn e_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::EResize, graphic.into());
+        self
+    }
+    pub fn n_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::NResize, graphic.into());
+        self
+    }
+    pub fn ne_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::NeResize, graphic.into());
+        self
+    }
+    pub fn nw_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::NwResize, graphic.into());
+        self
+    }
+    pub fn s_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::SResize, graphic.into());
+        self
+    }
+    pub fn se_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::SeResize, graphic.into());
+        self
+    }
+    pub fn sw_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::SwResize, graphic.into());
+        self
+    }
+    pub fn w_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::WResize, graphic.into());
+        self
+    }
+    pub fn ew_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::EwResize, graphic.into());
+        self
+    }
+    pub fn ns_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::NsResize, graphic.into());
+        self
+    }
+    pub fn nesw_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics
+            .insert(PointerIcon::NeswResize, graphic.into());
+        self
+    }
+    pub fn nwse_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics
+            .insert(PointerIcon::NwseResize, graphic.into());
+        self
+    }
+    pub fn col_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::ColResize, graphic.into());
+        self
+    }
+    pub fn row_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::RowResize, graphic.into());
+        self
+    }
+    pub fn all_scroll(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::AllScroll, graphic.into());
+        self
+    }
+    pub fn zoom_in(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::ZoomIn, graphic.into());
+        self
+    }
+    pub fn zoom_out(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::ZoomOut, graphic.into());
+        self
+    }
+    pub fn dnd_ask(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::DndAsk, graphic.into());
+        self
+    }
+    pub fn all_resize(mut self, graphic: impl Into<CursorGraphic>) -> Self {
+        self.graphics.insert(PointerIcon::AllResize, graphic.into());
+        self
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        assets: AssetBundle,
+        mode: ClientCursorMode,
+    ) -> Result<PointerConfiguration, CursorThemeError> {
+        let mut graphics = BTreeMap::new();
+        let mut base = self.size;
+        if let Some(asset) = self.asset {
+            let entry = asset.resolve(assets)?;
+            let source = std::str::from_utf8(entry.bytes)
+                .map_err(|_| CursorThemeError::ManifestNotUtf8(asset.key()))?;
+            let table = source
+                .parse::<toml::Table>()
+                .map_err(|e| CursorThemeError::Manifest(e.to_string()))?;
+            base = base.or_else(|| {
+                table
+                    .get("size")
+                    .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|v| v as f64)))
+                    .map(|v| v as f32)
+            });
+            for (name, value) in &table {
+                if name == "size" {
+                    continue;
+                }
+                let role = PointerIcon::from_name(name)
+                    .ok_or_else(|| CursorThemeError::UnknownPointerIcon(name.clone()))?;
+                let definition = value
+                    .as_table()
+                    .ok_or_else(|| CursorThemeError::InvalidEntry(name.clone()))?;
+                graphics.insert(role, parse_graphic(name, definition, assets, None)?);
+            }
+        }
+        graphics.extend(self.graphics.clone());
+        let mut errors = Vec::new();
+        for role in REQUIRED_CURSOR_ROLES {
+            if !graphics.contains_key(&role) {
+                errors.push(format!("missing cursor `{}`", role.name()));
+            }
+        }
+        let valid_size = |v: f32| v.is_finite() && v > 0.0 && v <= u16::MAX as f32;
+        if !base.is_some_and(valid_size) {
+            errors.push(
+                "cursor theme requires a finite positive logical size (at most 65535)".into(),
+            );
+        }
+        if self.effective_size.is_some_and(|v| !valid_size(v)) {
+            errors.push("effective cursor size must be finite and positive (at most 65535)".into());
+        }
+        if !errors.is_empty() {
+            return Err(CursorThemeError::InvalidDesign(errors.join("; ")));
+        }
+        let base = base.unwrap();
+        let effective = self.effective_size.unwrap_or(base);
+        let mut media = crate::assets::AssetMediaCache::new(assets)
+            .map_err(|e| CursorThemeError::InvalidDesign(e.to_string()))?;
+        for (role, graphic) in &mut graphics {
+            let size = graphic.exact_logical_size().unwrap_or(base) * effective / base;
+            if !valid_size(size) {
+                errors.push(format!(
+                    "cursor `{}` has an invalid logical size",
+                    role.name()
+                ));
+                continue;
+            }
+            let requested = crate::assets::AssetRasterSize::new(
+                size.round().max(1.0) as u32,
+                size.round().max(1.0) as u32,
+            )
+            .map_err(|e| CursorThemeError::InvalidDesign(e.to_string()))?;
+            let mut source_extent = None;
+            for frame in graphic.frames.iter() {
+                let checked = (|| {
+                    let source = media.cursor(frame.asset, None).map_err(|e| e.to_string())?;
+                    if graphic.hotspot.x as i32 >= source.extent.width
+                        || graphic.hotspot.y as i32 >= source.extent.height
+                    {
+                        return Err("hotspot is outside source artwork".to_owned());
+                    }
+                    if source_extent.is_some_and(|extent| extent != source.extent) {
+                        return Err("animation frames must have equal source dimensions".into());
+                    }
+                    source_extent = Some(source.extent);
+                    media
+                        .cursor(frame.asset, Some(requested))
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(())
+                })();
+                if let Err(e) = checked {
+                    errors.push(format!(
+                        "cursor `{}`, asset `{}`: {e}",
+                        role.name(),
+                        frame.asset.key()
+                    ));
+                }
+            }
+            if let Some(extent) = source_extent {
+                graphic.hotspot.x = (graphic.hotspot.x as f32 * size / extent.width as f32)
+                    .round()
+                    .min(size.ceil() - 1.0) as u16;
+                graphic.hotspot.y = (graphic.hotspot.y as f32 * size / extent.height as f32)
+                    .round()
+                    .min(size.ceil() - 1.0) as u16;
+            }
+            graphic.size = Some(size.round().max(1.0) as u16);
+            graphic.logical_size_bits = Some(size.to_bits());
+        }
+        if !errors.is_empty() {
+            return Err(CursorThemeError::InvalidDesign(errors.join("; ")));
+        }
+        Ok(PointerConfiguration::new()
+            .client_mode(mode)
+            .overrides(PointerThemeOverrides { graphics }))
     }
 }
 
@@ -326,7 +689,7 @@ pub enum PointerRequest {
 pub enum PointerResolution<'a> {
     Hidden,
     ClientSurface,
-    Graphic(&'a PointerGraphic),
+    Graphic(&'a CursorGraphic),
     System(PointerIcon),
 }
 
@@ -363,7 +726,7 @@ fn parse_graphic(
     definition: &toml::Table,
     bundle: AssetBundle,
     default_size: Option<u16>,
-) -> Result<PointerGraphic, CursorThemeError> {
+) -> Result<CursorGraphic, CursorThemeError> {
     let hotspot = definition
         .get("hotspot")
         .and_then(toml::Value::as_array)
@@ -378,12 +741,19 @@ fn parse_graphic(
         })
         .transpose()?
         .unwrap_or_default();
-    let size = definition
-        .get("size")
-        .and_then(toml::Value::as_integer)
-        .map(valid_size)
-        .transpose()?
-        .or(default_size);
+    let size = match definition.get("size") {
+        Some(value) => {
+            let size = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|v| v as f64))
+                .ok_or(CursorThemeError::InvalidSize)?;
+            if !size.is_finite() || size <= 0.0 || size > u16::MAX as f64 {
+                return Err(CursorThemeError::InvalidSize);
+            }
+            Some(size)
+        }
+        None => default_size.map(f64::from),
+    };
     let mut graphic = if let Some(frames) = definition.get("frames") {
         let frames = frames
             .as_array()
@@ -403,16 +773,13 @@ fn parse_graphic(
                 Ok(PointerFrame::animated(asset, duration))
             })
             .collect::<Result<Vec<_>, CursorThemeError>>()?;
-        PointerGraphic::animated(frames)?
+        CursorGraphic::animated(frames)?
     } else {
-        PointerGraphic::new(cursor_asset(definition.get("asset"), name, bundle)?)
+        CursorGraphic::new(cursor_asset(definition.get("asset"), name, bundle)?)
     };
     graphic.hotspot = hotspot;
-    graphic.size = size;
-    if let Some(size) = size
-        && (u32::from(hotspot.x) >= u32::from(size) || u32::from(hotspot.y) >= u32::from(size))
-    {
-        return Err(CursorThemeError::HotspotOutOfBounds(name.to_owned()));
+    if let Some(size) = size {
+        graphic = graphic.size(size);
     }
     Ok(graphic)
 }
@@ -455,6 +822,8 @@ fn valid_size(value: i64) -> Result<u16, CursorThemeError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CursorThemeError {
+    #[error("invalid cursor design: {0}")]
+    InvalidDesign(String),
     #[error(transparent)]
     Asset(#[from] AssetError),
     #[error("cursor theme `{0}` is not UTF-8")]
@@ -473,7 +842,7 @@ pub enum CursorThemeError {
     InvalidHotspot(String),
     #[error("cursor entry `{0}` has a hotspot outside its declared size")]
     HotspotOutOfBounds(String),
-    #[error("cursor size must be a positive u16")]
+    #[error("cursor size must be finite, positive, and at most 65535")]
     InvalidSize,
     #[error("cursor animation must contain 2..={MAX_CUSTOM_CURSOR_FRAMES} frames")]
     InvalidFrameCount,
@@ -512,7 +881,7 @@ mod tests {
     #[test]
     fn pointer_graphics_retain_code_defined_tint() {
         let white = ColorRgba8::rgba(255, 255, 255, 255);
-        let graphic = PointerGraphic::new(POINTER)
+        let graphic = CursorGraphic::new(POINTER)
             .size(32)
             .hotspot(3, 2)
             .tint(white);
@@ -525,7 +894,7 @@ mod tests {
     fn manifest_and_override_use_fixed_precedence() {
         let bundle = AssetBundle::new(&ENTRIES);
         let theme = PointerTheme::from_asset(THEME, bundle).unwrap();
-        let override_graphic = PointerGraphic::new(POINTER).hotspot(1, 1);
+        let override_graphic = CursorGraphic::new(POINTER).hotspot(1, 1);
         let overrides = PointerThemeOverrides::new().pointer(override_graphic.clone());
         assert_eq!(
             resolve_pointer(
@@ -542,6 +911,216 @@ mod tests {
                 .unwrap()
                 .pointer_hotspot(),
             PointerHotspot::new(3, 2)
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_test_bundle() -> AssetBundle {
+    use crate::assets::AssetEntry;
+    static ENTRIES: &[AssetEntry] = &[AssetEntry::embedded(
+        AssetKey::new("cursor.svg"), AssetKind::Cursor, "image/svg+xml",
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M0 0h32v32H0z"/></svg>"#,
+    )];
+    AssetBundle::new(ENTRIES)
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_test_theme() -> CursorTheme {
+    let graphic = cursor(CursorAsset::new(AssetKey::new("cursor.svg"))).hotspot(16, 16);
+    CursorTheme::new()
+        .size(24.0)
+        .default_pointer(graphic.clone())
+        .context_menu(graphic.clone())
+        .help(graphic.clone())
+        .pointer(graphic.clone())
+        .progress(graphic.clone())
+        .wait(graphic.clone())
+        .cell(graphic.clone())
+        .crosshair(graphic.clone())
+        .text(graphic.clone())
+        .vertical_text(graphic.clone())
+        .alias(graphic.clone())
+        .copy(graphic.clone())
+        .move_cursor(graphic.clone())
+        .no_drop(graphic.clone())
+        .not_allowed(graphic.clone())
+        .grab(graphic.clone())
+        .grabbing(graphic.clone())
+        .e_resize(graphic.clone())
+        .n_resize(graphic.clone())
+        .ne_resize(graphic.clone())
+        .nw_resize(graphic.clone())
+        .s_resize(graphic.clone())
+        .se_resize(graphic.clone())
+        .sw_resize(graphic.clone())
+        .w_resize(graphic.clone())
+        .ew_resize(graphic.clone())
+        .ns_resize(graphic.clone())
+        .nesw_resize(graphic.clone())
+        .nwse_resize(graphic.clone())
+        .col_resize(graphic.clone())
+        .row_resize(graphic.clone())
+        .all_scroll(graphic.clone())
+        .zoom_in(graphic.clone())
+        .zoom_out(graphic.clone())
+        .dnd_ask(graphic.clone())
+        .all_resize(graphic.clone())
+}
+
+#[cfg(test)]
+mod complete_theme_tests {
+    use super::*;
+
+    #[test]
+    fn missing_roles_and_size_are_reported_together() {
+        let error = CursorTheme::new()
+            .prepare(AssetBundle::EMPTY, ClientCursorMode::Allow)
+            .unwrap_err()
+            .to_string();
+        for role in REQUIRED_CURSOR_ROLES {
+            assert!(error.contains(role.name()), "{error}");
+        }
+        assert!(error.contains("logical size"));
+    }
+
+    #[test]
+    fn every_role_is_required_without_implicit_aliasing() {
+        for missing in REQUIRED_CURSOR_ROLES {
+            let mut theme = cursor_test_theme();
+            theme.graphics.remove(&missing);
+            let error = theme
+                .prepare(cursor_test_bundle(), ClientCursorMode::Allow)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("missing cursor `{}`", missing.name())));
+        }
+    }
+
+    #[test]
+    fn complete_theme_scales_artwork_and_preserves_explicit_proportions() {
+        let theme = cursor_test_theme()
+            .text(
+                cursor(CursorAsset::new(AssetKey::new("cursor.svg")))
+                    .size(30.0)
+                    .hotspot(16, 16),
+            )
+            .cursor_size(32.0);
+        let prepared = theme
+            .prepare(cursor_test_bundle(), ClientCursorMode::ThemeOnly)
+            .unwrap();
+        for role in REQUIRED_CURSOR_ROLES {
+            let graphic = prepared.pointer_overrides().graphic(role).unwrap();
+            let expected = if role == PointerIcon::Text { 40 } else { 32 };
+            assert_eq!(graphic.logical_size(), Some(expected));
+            assert_eq!(
+                graphic.pointer_hotspot(),
+                PointerHotspot::new(expected / 2, expected / 2)
+            );
+        }
+        assert!(matches!(
+            resolve_pointer(
+                PointerRequest::ClientSurface,
+                prepared.client_cursor_mode(),
+                prepared.pointer_overrides(),
+                None
+            ),
+            PointerResolution::Graphic(_)
+        ));
+        assert_eq!(
+            resolve_pointer(
+                PointerRequest::Hidden,
+                ClientCursorMode::Allow,
+                prepared.pointer_overrides(),
+                None
+            ),
+            PointerResolution::Hidden
+        );
+        assert_eq!(
+            resolve_pointer(
+                PointerRequest::ClientSurface,
+                ClientCursorMode::Allow,
+                prepared.pointer_overrides(),
+                None
+            ),
+            PointerResolution::ClientSurface
+        );
+    }
+
+    #[test]
+    fn asset_themes_require_every_role_and_keep_fractional_sizes() {
+        use crate::assets::AssetEntry;
+        let manifest =
+            REQUIRED_CURSOR_ROLES
+                .iter()
+                .fold(String::from("size = 24.5\n"), |mut text, role| {
+                    text.push_str(&format!(
+                        "[{}]\nasset = \"cursor.svg\"\nhotspot = [16, 16]\n",
+                        role.name()
+                    ));
+                    text
+                });
+        let source = Box::leak(manifest.into_bytes().into_boxed_slice());
+        let mut entries = cursor_test_bundle().iter().copied().collect::<Vec<_>>();
+        let key = AssetKey::new("theme.toml");
+        entries.push(AssetEntry::embedded(
+            key,
+            AssetKind::CursorTheme,
+            "application/toml",
+            source,
+        ));
+        let bundle = AssetBundle::new(Box::leak(entries.into_boxed_slice()));
+        let theme = CursorTheme::from_asset(CursorThemeAsset::new(key));
+        let prepared = theme.prepare(bundle, ClientCursorMode::Allow).unwrap();
+        assert_eq!(
+            prepared
+                .pointer_overrides()
+                .graphic(PointerIcon::Default)
+                .unwrap()
+                .exact_logical_size(),
+            Some(24.5)
+        );
+        let prepared = theme
+            .size(32.0)
+            .prepare(bundle, ClientCursorMode::Allow)
+            .unwrap();
+        assert_eq!(
+            prepared
+                .pointer_overrides()
+                .graphic(PointerIcon::Default)
+                .unwrap()
+                .exact_logical_size(),
+            Some(32.0)
+        );
+    }
+
+    #[test]
+    fn invalid_metadata_and_assets_fail_preparation() {
+        for size in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                cursor_test_theme()
+                    .size(size)
+                    .prepare(cursor_test_bundle(), ClientCursorMode::Allow)
+                    .is_err()
+            );
+        }
+        let invalid =
+            cursor_test_theme().text(cursor(CursorAsset::new(AssetKey::new("missing.svg"))));
+        assert!(
+            invalid
+                .prepare(cursor_test_bundle(), ClientCursorMode::Allow)
+                .unwrap_err()
+                .to_string()
+                .contains("missing.svg")
+        );
+        let invalid = cursor_test_theme()
+            .text(cursor(CursorAsset::new(AssetKey::new("cursor.svg"))).hotspot(32, 0));
+        assert!(
+            invalid
+                .prepare(cursor_test_bundle(), ClientCursorMode::Allow)
+                .unwrap_err()
+                .to_string()
+                .contains("hotspot")
         );
     }
 }

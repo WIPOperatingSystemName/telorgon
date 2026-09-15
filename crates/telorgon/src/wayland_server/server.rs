@@ -180,6 +180,9 @@ impl Display {
         }
     }
 
+    /// Attempts nonblocking delivery of queued events without dispatching incoming requests.
+    /// Hosts should also flush after input and before expensive frame preparation: flushing only
+    /// at the polling boundary prevents a deadlock but still adds owner work to client latency.
     pub fn flush_clients(&self) {
         unsafe { ffi::wl_display_flush_clients(self.raw.as_ptr()) };
     }
@@ -602,6 +605,16 @@ impl<'callback> ResourceRef<'callback> {
     }
 
     pub fn post_error(self, code: u32, message: &str) {
+        if std::env::var("TELORGON_WAYLAND_ERROR_LOG").as_deref() == Ok("1") {
+            eprintln!(
+                "telorgon-wayland-error: pid={} object={} version={} code={} message={:?}",
+                self.client().credentials().pid,
+                self.id(),
+                self.version(),
+                code,
+                message
+            );
+        }
         let message = CString::new(message).unwrap_or_else(|_| {
             CString::new("Telorgon rejected a malformed Wayland request").unwrap()
         });
@@ -812,6 +825,41 @@ mod tests {
         fn assert_not_copy<T>() {}
         assert_not_copy::<Display>();
         assert_not_copy::<EventSource>();
+    }
+
+    #[test]
+    fn owner_events_flush_without_waiting_for_or_dispatching_client_requests() {
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let client_ref = unsafe {
+            ClientRef::from_raw(client.identity().unwrap() as *mut ffi::wl_client).unwrap()
+        };
+        // Model an owner-generated frame callback after the event loop has already returned.
+        let callback =
+            unsafe { client_ref.create_resource(&ffi::wl_callback_interface, 1, 2) }.unwrap();
+        unsafe { callback.post_event(0, &mut [ffi::wl_argument { u: 123 }]) };
+        peer.set_nonblocking(true).unwrap();
+        let mut reply = [0_u8; 12];
+        assert_eq!(
+            peer.read(&mut reply).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        peer.write_all(&display_request(1, 0, 3)).unwrap();
+
+        // No render, presentation, event-loop turn, or roundtrip is needed to deliver this event.
+        display.flush_clients();
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, display_request(2, 0, 123));
+        // The incoming sync remains undispatched: flush does not re-enter protocol/host state.
+        assert_eq!(
+            peer.read(&mut reply).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(u32::from_ne_bytes(reply[..4].try_into().unwrap()), 3);
+        assert!(client.is_alive());
     }
 
     #[test]

@@ -1,5 +1,8 @@
 # Telorgon Documentation
 
+See [Resize-preview glass](RESIZE_GLASS.md) for the color/glass API, Vulkan cache, and qualification
+limits, and the [liquid-glass optimization audit](LIQUID_GLASS.md) for the shader mathematics.
+
 Telorgon's documentation deliberately separates the intended product from the code that exists today.
 Start here so architectural proposals are not mistaken for implemented or production-qualified
 features.
@@ -12,6 +15,10 @@ features.
 
 See [Logical units and output scaling](LOGICAL_UNITS_AND_OUTPUT_SCALING.md) for Linux desktop
 HiDPI behavior, boot density selection, configuration migration, and qualification limits.
+
+See [Desktop window motion](WINDOW_MOTION.md) for chrome motion presets, maximize/minimize and
+resize-content transitions, implementation limits, and user-run qualification. The
+[original API plan](WINDOW_MOTION_API_PLAN.md) records the design rationale.
 
 ## Reading order
 

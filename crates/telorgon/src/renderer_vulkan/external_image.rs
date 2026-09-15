@@ -126,6 +126,58 @@ pub struct VulkanExternalImageLease {
     _linear: PhantomData<Rc<()>>,
 }
 
+/// Keeps one immutable native import alive independently of its per-commit use token.
+#[cfg(target_os = "linux")]
+pub(crate) struct CachedDmaBufImage(Arc<ExternalImageInner>);
+
+#[cfg(target_os = "linux")]
+impl CachedDmaBufImage {
+    pub(crate) fn matches_device(&self, device: &VulkanDevice) -> bool {
+        self.0.device_id == device.inner.id
+    }
+    pub(crate) fn can_reuse(&self) -> bool {
+        cache_reusable(
+            Arc::strong_count(&self.0),
+            self.0.state.load(Ordering::Acquire),
+            self.0.submitted_release_is_resolved(),
+        )
+    }
+
+    /// The caller must match the immutable allocation identity/descriptor and acquire contract.
+    pub(crate) unsafe fn reuse(
+        &mut self,
+        content_version: u64,
+        lease_generation: u64,
+        acquire: Option<std::os::fd::OwnedFd>,
+        damage: Vec<RectI>,
+    ) -> RenderResult<VulkanExternalImageLease> {
+        if !self.can_reuse() || content_version == 0 || lease_generation == 0 {
+            return Err(unsupported(
+                "DMA-BUF cache entry is still in use or has an invalid generation",
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.0)
+            .ok_or_else(|| unsupported("DMA-BUF cache entry is shared"))?;
+        let ExternalImageOwnership::DmaBuf(resources) = &mut inner.ownership else {
+            return Err(unsupported("only owned DMA-BUF imports can be rearmed"));
+        };
+        inner.acquire = resources.rearm(acquire)?;
+        inner.content_version = content_version;
+        inner.lease_generation = lease_generation;
+        inner.damage = damage;
+        inner.state.store(UNUSED, Ordering::Release);
+        Ok(VulkanExternalImageLease {
+            inner: Some(Arc::clone(&self.0)),
+            _linear: PhantomData,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cache_reusable(references: usize, state: u64, release_resolved: bool) -> bool {
+    references == 1 && state == COMPLETED && release_resolved
+}
+
 pub(crate) struct ExternalImageInner {
     pub(crate) device_id: u64,
     pub(crate) image: vk::Image,
@@ -212,6 +264,12 @@ impl VulkanDevice {
 }
 
 impl VulkanExternalImageLease {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cache_dma_buf(&self) -> CachedDmaBufImage {
+        CachedDmaBufImage(Arc::clone(
+            self.inner.as_ref().expect("unconsumed DMA-BUF lease"),
+        ))
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn from_inner(inner: ExternalImageInner) -> Self {
         Self {
@@ -433,6 +491,18 @@ fn host_contract(message: impl Into<String>) -> RenderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_import_waits_for_gpu_release_and_all_pins() {
+        assert!(cache_reusable(1, COMPLETED, true));
+        for state in [UNUSED, 1, 24] {
+            assert!(!cache_reusable(1, state, true));
+        }
+        assert!(!cache_reusable(1, COMPLETED, false));
+        for references in [0, 2, 3, 10] {
+            assert!(!cache_reusable(references, COMPLETED, true));
+        }
+    }
 
     #[test]
     fn unavailable_dma_buf_capability_returns_structured_unsupported() {

@@ -2,6 +2,7 @@
 use super::{Error, Result};
 
 pub struct RootCursor {
+    pub(crate) density: u16,
     pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) x: u16,
@@ -9,7 +10,7 @@ pub struct RootCursor {
     pub(crate) argb: Vec<u32>,
 }
 impl RootCursor {
-    /// RGBA pixels at logical desktop resolution. Xwayland/composition apply output scale.
+    /// RGBA pixels at X11 density; the host maps surface size/hotspot back to logical units.
     pub fn new(
         width: i32,
         height: i32,
@@ -18,14 +19,14 @@ impl RootCursor {
         rgba: &[u8],
         premultiplied: bool,
     ) -> Result<Self> {
-        if !(1..=128).contains(&width)
-            || !(1..=128).contains(&height)
+        if !(1..=256).contains(&width)
+            || !(1..=256).contains(&height)
             || !(0..width).contains(&x)
             || !(0..height).contains(&y)
             || rgba.len() != width as usize * height as usize * 4
         {
             return Err(Error(
-                "invalid X11 root cursor image or hotspot (maximum 128x128)".into(),
+                "invalid X11 root cursor image or hotspot (maximum 256x256)".into(),
             ));
         }
         let argb = rgba
@@ -43,6 +44,7 @@ impl RootCursor {
             })
             .collect();
         Ok(Self {
+            density: 1,
             width: width as u16,
             height: height as u16,
             x: x as u16,
@@ -73,7 +75,7 @@ mod tests {
         assert_eq!(image.bytes(true), [25, 50, 100, 128]);
         assert_eq!(image.bytes(false), [128, 100, 50, 25]);
         assert!(RootCursor::new(1, 1, 1, 0, &[0; 4], true).is_err());
-        assert!(RootCursor::new(129, 1, 0, 0, &[], true).is_err());
+        assert!(RootCursor::new(257, 1, 0, 0, &[], true).is_err());
         assert!(RootCursor::new(1, 1, 0, 0, &[], true).is_err());
     }
 }

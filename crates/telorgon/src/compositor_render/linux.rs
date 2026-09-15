@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -363,7 +362,16 @@ fn transformed_coordinate(
 
 pub struct DmaBufImporter {
     capabilities: Vec<crate::renderer_vulkan::VulkanDmaBufFormatCapability>,
-    next_generation: BTreeMap<WaylandBufferId, u64>,
+    next_generation: u64,
+    cached: std::collections::VecDeque<CachedImport>,
+    cache_counts: [u64; 2],
+}
+
+struct CachedImport {
+    buffer: WaylandBufferId,
+    descriptor: crate::compositor_wayland::DmaBufDescriptor,
+    identity: (u64, u64, u64), // device, inode, allocation bytes; never a reusable raw FD number
+    image: crate::renderer_vulkan::CachedDmaBufImage,
 }
 
 impl DmaBufImporter {
@@ -371,10 +379,35 @@ impl DmaBufImporter {
         let capabilities = device
             .dma_buf_import_capabilities(vk::ImageUsageFlags::SAMPLED)
             .map_err(render_error)?;
-        Ok(Self {
+        Ok(Self::legacy_sdr(capabilities))
+    }
+
+    fn legacy_sdr(
+        mut capabilities: Vec<crate::renderer_vulkan::VulkanDmaBufFormatCapability>,
+    ) -> Self {
+        // This compositor has no per-surface color-management protocol yet. Like wl_shm,
+        // its legacy SDR client pixels are sRGB encoded. A DRM fourcc describes byte layout,
+        // not the transfer function: never select the first UNORM/Linear candidate just because
+        // it shares the same fourcc/modifier. Sampling must decode before linear composition.
+        capabilities.retain(|capability| {
+            capability.color_encoding == ImageColorEncoding::Srgb
+                && matches!(
+                    capability.format,
+                    vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+                )
+                && capability.importable()
+                && capability.plane_count == 1
+        });
+        Self {
             capabilities,
-            next_generation: BTreeMap::new(),
-        })
+            next_generation: 0,
+            cached: std::collections::VecDeque::new(),
+            cache_counts: [0; 2],
+        }
+    }
+
+    pub(crate) fn take_cache_counts(&mut self) -> [u64; 2] {
+        std::mem::take(&mut self.cache_counts)
     }
 
     pub fn advertised_formats(&self) -> Vec<DmaBufFormat> {
@@ -456,7 +489,8 @@ impl DmaBufImporter {
             .ok_or_else(|| {
                 CompositorRenderError::new("DMA-BUF tuple was not advertised by this Vulkan device")
             })?;
-        let allocation_size = fd_allocation_size(&image.planes[0])?;
+        let identity = fd_allocation_identity(&image.planes[0])?;
+        let allocation_size = identity.2;
         let minimum_size = u64::from(plane_descriptor.stride)
             .checked_mul(image.descriptor.size.height as u64)
             .ok_or_else(|| CompositorRenderError::new("DMA-BUF extent overflow"))?;
@@ -465,10 +499,55 @@ impl DmaBufImporter {
                 "DMA-BUF allocation is smaller than its declared rows",
             ));
         }
-        let generation = self.next_generation.entry(buffer).or_insert(0);
-        *generation = generation
+        self.next_generation = self
+            .next_generation
             .checked_add(1)
             .ok_or_else(|| CompositorRenderError::new("DMA-BUF lease generation exhausted"))?;
+        let generation = self.next_generation;
+        for rect in &damage {
+            if rect.x < 0
+                || rect.y < 0
+                || rect.width <= 0
+                || rect.height <= 0
+                || rect
+                    .x
+                    .checked_add(rect.width)
+                    .is_none_or(|right| right > image.descriptor.size.width)
+                || rect
+                    .y
+                    .checked_add(rect.height)
+                    .is_none_or(|bottom| bottom > image.descriptor.size.height)
+            {
+                return Err(CompositorRenderError::new(
+                    "DMA-BUF damage lies outside its physical extent",
+                ));
+            }
+        }
+        if let Some(index) = self.cached.iter().position(|entry| {
+            entry.buffer == buffer
+                && entry.descriptor == image.descriptor
+                && entry.identity == identity
+                && identity.1 != 0
+                && entry.image.matches_device(device)
+                && entry.image.can_reuse()
+        }) {
+            let mut entry = self.cached.remove(index).expect("cached index exists");
+            // Immutable layout and kernel allocation identity match; can_reuse proves completion,
+            // one-shot release resolution and absence of scene/submission pins.
+            let lease = unsafe {
+                entry
+                    .image
+                    .reuse(content_version, generation, acquire, damage)
+            }
+            .map_err(render_error)?;
+            self.cached.push_back(entry);
+            scene
+                .bind_external_image(dma_buf_image_id(), lease)
+                .map_err(render_error)?;
+            self.cache_counts[0] += 1;
+            return Ok(generation);
+        }
+        let descriptor = image.descriptor.clone();
         let plane = image.planes.into_iter().next().expect("one plane checked");
         let import = VulkanDmaBufImport {
             planes: vec![VulkanDmaBufPlane {
@@ -488,7 +567,7 @@ impl DmaBufImporter {
             },
             usage: vk::ImageUsageFlags::SAMPLED,
             content_version,
-            lease_generation: *generation,
+            lease_generation: generation,
             color_encoding: capability.color_encoding,
             alpha_mode: capability.alpha_mode,
             // The desktop materialization scene applies the DMA-BUF Y_INVERT flag together with
@@ -502,22 +581,44 @@ impl DmaBufImporter {
         };
         let lease: VulkanExternalImageLease =
             unsafe { device.import_dma_buf(import) }.map_err(render_error)?;
+        self.cache_counts[1] += 1;
+        if allocation_size <= 512 * 1024 * 1024 {
+            while self.cached.len() >= 64
+                || self
+                    .cached
+                    .iter()
+                    .map(|entry| entry.identity.2)
+                    .sum::<u64>()
+                    + allocation_size
+                    > 512 * 1024 * 1024
+            {
+                self.cached.pop_front();
+            }
+            self.cached.push_back(CachedImport {
+                buffer,
+                descriptor,
+                identity,
+                image: lease.cache_dma_buf(),
+            });
+        }
         scene
             .bind_external_image(dma_buf_image_id(), lease)
             .map_err(render_error)?;
-        Ok(*generation)
+        Ok(generation)
     }
 }
 
-fn fd_allocation_size(fd: &OwnedFd) -> Result<u64, CompositorRenderError> {
+fn fd_allocation_identity(fd: &OwnedFd) -> Result<(u64, u64, u64), CompositorRenderError> {
+    use std::os::unix::fs::MetadataExt;
     let file = std::fs::File::from(fd.try_clone().map_err(io_error)?);
-    let size = file.metadata().map_err(io_error)?.len();
+    let metadata = file.metadata().map_err(io_error)?;
+    let size = metadata.len();
     if size == 0 {
         Err(CompositorRenderError::new(
             "DMA-BUF did not expose a nonzero allocation size",
         ))
     } else {
-        Ok(size)
+        Ok((metadata.dev(), metadata.ino(), size))
     }
 }
 
@@ -534,6 +635,165 @@ mod tests {
     use super::*;
     use crate::compositor_wayland::{ShmBuffer, ShmFormat};
     use crate::core::SizeI;
+
+    fn dma_buf_capability(
+        srgb: bool,
+        modifier: u64,
+    ) -> crate::renderer_vulkan::VulkanDmaBufFormatCapability {
+        crate::renderer_vulkan::VulkanDmaBufFormatCapability {
+            drm_fourcc: u32::from_le_bytes(*b"XR24"),
+            drm_modifier: modifier,
+            format: if srgb {
+                vk::Format::B8G8R8A8_SRGB
+            } else {
+                vk::Format::B8G8R8A8_UNORM
+            },
+            usage: vk::ImageUsageFlags::SAMPLED,
+            color_encoding: if srgb {
+                ImageColorEncoding::Srgb
+            } else {
+                ImageColorEncoding::Linear
+            },
+            alpha_mode: ImageAlphaMode::Opaque,
+            plane_count: 1,
+            tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            external_memory_features: vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+            max_extent: vk::Extent3D {
+                width: 8192,
+                height: 8192,
+                depth: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_sdr_never_selects_linear_for_an_identical_drm_tuple() {
+        for mut capabilities in [
+            vec![dma_buf_capability(false, 17), dma_buf_capability(true, 17)],
+            vec![dma_buf_capability(true, 17), dma_buf_capability(false, 17)],
+        ] {
+            // This modifier is supported only as linear: do not advertise it as sRGB.
+            capabilities.push(dma_buf_capability(false, 21));
+            let importer = DmaBufImporter::legacy_sdr(capabilities);
+            assert_eq!(
+                importer.advertised_formats(),
+                vec![DmaBufFormat {
+                    fourcc: u32::from_le_bytes(*b"XR24"),
+                    modifier: 17,
+                }]
+            );
+            let selected = importer.capabilities[0];
+            assert_eq!(selected.format, vk::Format::B8G8R8A8_SRGB);
+            assert_eq!(selected.color_encoding, ImageColorEncoding::Srgb);
+            assert_eq!(selected.alpha_mode, ImageAlphaMode::Opaque);
+        }
+    }
+
+    #[test]
+    fn sdr_advertisement_excludes_nonimportable_multiplane_and_mislabeled_formats() {
+        let valid = dma_buf_capability(true, 0);
+        let mut unimportable = valid;
+        unimportable.external_memory_features = vk::ExternalMemoryFeatureFlags::EXPORTABLE;
+        let mut multiplane = valid;
+        multiplane.plane_count = 2;
+        let mut mislabeled = valid;
+        mislabeled.format = vk::Format::B8G8R8A8_UNORM;
+        let importer = DmaBufImporter::legacy_sdr(vec![unimportable, multiplane, mislabeled]);
+        assert!(importer.advertised_formats().is_empty());
+    }
+
+    #[test]
+    fn sdr_rgba_and_bgra_keep_opaque_and_premultiplied_alpha_contracts() {
+        for (fourcc, format, alpha) in [
+            (*b"XR24", vk::Format::B8G8R8A8_SRGB, ImageAlphaMode::Opaque),
+            (
+                *b"AR24",
+                vk::Format::B8G8R8A8_SRGB,
+                ImageAlphaMode::Premultiplied,
+            ),
+            (*b"XB24", vk::Format::R8G8B8A8_SRGB, ImageAlphaMode::Opaque),
+            (
+                *b"AB24",
+                vk::Format::R8G8B8A8_SRGB,
+                ImageAlphaMode::Premultiplied,
+            ),
+        ] {
+            let mut capability = dma_buf_capability(true, 0);
+            capability.drm_fourcc = u32::from_le_bytes(fourcc);
+            capability.format = format;
+            capability.alpha_mode = alpha;
+            let importer = DmaBufImporter::legacy_sdr(vec![capability]);
+            assert_eq!(importer.capabilities, [capability]);
+        }
+    }
+
+    #[test]
+    fn opaque_sdr_ramp_survives_import_materialization_and_presentation() {
+        use crate::renderer_vulkan::VulkanMaterializationTarget;
+        fn decode(value: f64) -> f64 {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn encode(value: f64) -> f64 {
+            if value <= 0.0031308 {
+                value * 12.92
+            } else {
+                1.055 * value.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        fn srgb(format: vk::Format) -> bool {
+            matches!(
+                format,
+                vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+            )
+        }
+        let importer = DmaBufImporter::legacy_sdr(vec![
+            dma_buf_capability(false, 0),
+            dma_buf_capability(true, 0),
+        ]);
+        let selected = importer.capabilities[0];
+        assert_eq!(
+            VulkanMaterializationTarget::COLOR_SPACE,
+            crate::render::ColorSpace::Srgb
+        );
+        assert_eq!(
+            VulkanMaterializationTarget::COLOR_ENCODING,
+            ImageColorEncoding::Srgb
+        );
+        // CPU reference for the specified Vulkan format conversions, not a GPU execution test.
+        // Both the previous UNORM import (bright midtones) and an 8-bit linear intermediate
+        // (lost dark shades) break this full 8-bit ramp round trip.
+        for byte in 0..=255 {
+            let source = f64::from(byte) / 255.0;
+            let linear = if srgb(selected.format) {
+                decode(source)
+            } else {
+                source
+            };
+            let stored = if srgb(VulkanMaterializationTarget::FORMAT) {
+                encode(linear)
+            } else {
+                linear
+            };
+            let quantized = (stored * 255.0).round() / 255.0;
+            let resampled = if srgb(VulkanMaterializationTarget::FORMAT) {
+                decode(quantized)
+            } else {
+                quantized
+            };
+            let presented = (encode(resampled) * 255.0).round() as i32;
+            assert!(
+                (presented - byte).abs() <= 1,
+                "input={byte}, displayed={presented}"
+            );
+        }
+        // The original mismatch maps a middle-gray encoded channel (~128) to ~188.
+        assert!((encode(128.0 / 255.0) * 255.0 - 188.0).abs() < 1.0);
+    }
 
     #[test]
     #[ignore = "CPU-only timing probe; run explicitly with --ignored --nocapture"]

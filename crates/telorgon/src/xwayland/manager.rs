@@ -443,11 +443,41 @@ impl Manager {
     /// this list alongside implemented handlers, never from a desired feature list.
     fn publish_metadata(&mut self) -> Result<()> {
         let root = self.discovered.setup.roots[0].root;
+        if let Some(image) = &self.root_cursor {
+            let resources = format!(
+                "Xft.dpi: {}\nXcursor.size: {}\n",
+                96 * u32::from(image.density),
+                24 * u32::from(image.density)
+            );
+            self.send(
+                xproto::ChangePropertyRequest {
+                    mode: xproto::PropMode::REPLACE,
+                    window: root,
+                    property: xproto::AtomEnum::RESOURCE_MANAGER.into(),
+                    type_: xproto::AtomEnum::STRING.into(),
+                    format: 8,
+                    data_len: resources.len() as u32,
+                    data: Cow::Owned(resources.into_bytes()),
+                },
+                ReplyKind::Void,
+                Pending::Checked,
+            )?;
+        }
         let check = self.discovered.atoms["_NET_SUPPORTING_WM_CHECK"];
         let supported = self.discovered.atoms["_NET_SUPPORTED"];
         self.property32(self.window, check, xproto::AtomEnum::WINDOW, &[self.window])?;
         self.property32(root, check, xproto::AtomEnum::WINDOW, &[self.window])?;
-        let mut capabilities = vec![supported, check, self.discovered.atoms["_NET_WM_NAME"]];
+        let mut capabilities = vec![
+            supported,
+            check,
+            self.discovered.atoms["_NET_WM_NAME"],
+            self.discovered.atoms["_NET_FRAME_EXTENTS"],
+            self.discovered.atoms["_NET_REQUEST_FRAME_EXTENTS"],
+            self.discovered.atoms["_NET_WM_MOVERESIZE"],
+            self.discovered.atoms["_NET_WM_STATE"],
+            self.discovered.atoms["_NET_WM_STATE_MAXIMIZED_VERT"],
+            self.discovered.atoms["_NET_WM_STATE_MAXIMIZED_HORZ"],
+        ];
         if self.discovered.extensions.contains_key("SYNC") {
             capabilities.extend([
                 self.discovered.atoms["_NET_WM_SYNC_REQUEST"],
@@ -728,7 +758,7 @@ mod tests {
         write_reply(
             peer,
             &xproto::GetInputFocusReply {
-                sequence: 38,
+                sequence: 45,
                 ..Default::default()
             }
             .serialize(),
@@ -739,7 +769,7 @@ mod tests {
             peer,
             &xproto::PropertyNotifyEvent {
                 response_type: xproto::PROPERTY_NOTIFY_EVENT | if synthetic { 128 } else { 0 },
-                sequence: 38,
+                sequence: 45,
                 window: manager.window,
                 atom: manager.discovered.atoms["_NET_WM_NAME"],
                 time: 123,
@@ -767,6 +797,12 @@ mod tests {
                     supported,
                     check,
                     manager.discovered.atoms["_NET_WM_NAME"],
+                    manager.discovered.atoms["_NET_FRAME_EXTENTS"],
+                    manager.discovered.atoms["_NET_REQUEST_FRAME_EXTENTS"],
+                    manager.discovered.atoms["_NET_WM_MOVERESIZE"],
+                    manager.discovered.atoms["_NET_WM_STATE"],
+                    manager.discovered.atoms["_NET_WM_STATE_MAXIMIZED_VERT"],
+                    manager.discovered.atoms["_NET_WM_STATE_MAXIMIZED_HORZ"],
                     manager.discovered.atoms["_NET_WM_SYNC_REQUEST"],
                     manager.discovered.atoms["_NET_WM_SYNC_REQUEST_COUNTER"],
                 ],
@@ -850,7 +886,7 @@ mod tests {
     #[test]
     fn composite_barrier_is_required_even_with_timestamp_and_free_selections() {
         let (mut manager, mut peer, now) = start();
-        for sequence in [35, 36] {
+        for sequence in [42, 43] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -871,7 +907,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 38,
+                sequence: 45,
                 ..Default::default()
             }
             .serialize(),
@@ -884,7 +920,7 @@ mod tests {
     #[test]
     fn composite_conflict_fails_before_selection_acquisition() {
         let (mut manager, mut peer, now) = start();
-        for sequence in [35, 36] {
+        for sequence in [42, 43] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -897,7 +933,7 @@ mod tests {
         }
         let mut error = [0u8; 32];
         error[1] = 10; // BadAccess: another client owns manual redirection.
-        error[2..4].copy_from_slice(&37u16.to_ne_bytes());
+        error[2..4].copy_from_slice(&44u16.to_ne_bytes());
         error[8..10].copy_from_slice(&2u16.to_ne_bytes());
         error[10] = 128;
         write_reply(&mut peer, &error);
@@ -910,7 +946,7 @@ mod tests {
     #[test]
     fn metadata_error_prevents_completion() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 35, 0);
+        owners(&mut peer, 42, 0);
         timestamp(&manager, &mut peer, false);
         pump(&mut manager, now);
         for (index, opcode) in [22, 23, 22, 23].into_iter().enumerate() {
@@ -919,7 +955,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 39 + index as u16,
+                        sequence: 46 + index as u16,
                         owner: manager.window,
                         ..Default::default()
                     }
@@ -932,7 +968,7 @@ mod tests {
         assert!(!manager.is_complete());
         let mut error = [0u8; 32];
         error[1] = 3; // BadWindow on the first metadata write.
-        error[2..4].copy_from_slice(&43u16.to_ne_bytes());
+        error[2..4].copy_from_slice(&50u16.to_ne_bytes());
         error[10] = 18;
         write_reply(&mut peer, &error);
         assert!(manager.dispatch(now).is_err());
@@ -941,7 +977,7 @@ mod tests {
     #[test]
     fn ownership_requires_timestamp_verification_and_checked_announcements() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 35, 0);
+        owners(&mut peer, 42, 0);
         pump(&mut manager, now);
         assert!(!manager.claiming);
         timestamp(&manager, &mut peer, true);
@@ -965,7 +1001,7 @@ mod tests {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
-                    sequence: 40 + index as u16 * 2,
+                    sequence: 47 + index as u16 * 2,
                     owner: manager.window,
                     ..Default::default()
                 }
@@ -1008,7 +1044,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 53,
+                sequence: 60,
                 ..Default::default()
             }
             .serialize(),
@@ -1020,7 +1056,7 @@ mod tests {
             &mut peer,
             &xproto::SelectionClearEvent {
                 response_type: xproto::SELECTION_CLEAR_EVENT,
-                sequence: 53,
+                sequence: 60,
                 time: 124,
                 owner: manager.window,
                 selection: manager.selections[0],
@@ -1040,7 +1076,7 @@ mod tests {
     #[test]
     fn existing_owner_is_not_replaced_and_failure_is_terminal() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 35, 999);
+        owners(&mut peer, 42, 999);
         assert!(manager.dispatch(now).is_err());
         assert!(!manager.claiming);
         assert!(manager.dispatch(now).is_err());
@@ -1049,7 +1085,7 @@ mod tests {
     #[test]
     fn missing_timestamp_hits_original_startup_deadline() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 35, 0);
+        owners(&mut peer, 42, 0);
         pump(&mut manager, now);
         assert!(manager.dispatch(manager.deadline()).is_err());
         assert!(!manager.is_complete());
@@ -1057,7 +1093,7 @@ mod tests {
     #[test]
     fn lost_claim_cannot_reach_announcements() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 35, 0);
+        owners(&mut peer, 42, 0);
         timestamp(&manager, &mut peer, false);
         pump(&mut manager, now);
         for opcode in [22, 23, 22, 23] {
@@ -1066,7 +1102,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetSelectionOwnerReply {
-                sequence: 40,
+                sequence: 47,
                 owner: 999,
                 ..Default::default()
             }

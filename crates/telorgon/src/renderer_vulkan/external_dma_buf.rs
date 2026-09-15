@@ -747,6 +747,48 @@ mod linux {
     }
 
     impl DmaBufOwnedResources {
+        // Called only with exclusive ownership after completion and release export. The old
+        // temporary acquire payload was consumed by its wait; export consumed the release payload.
+        pub(crate) fn rearm(
+            &mut self,
+            acquire: Option<OwnedFd>,
+        ) -> RenderResult<VulkanExternalAcquire> {
+            let result = if let Some(fd) = acquire {
+                if self.acquire.is_null() {
+                    self.acquire = unsafe {
+                        self.device
+                            .raw
+                            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    }
+                    .map_err(|e| {
+                        vk_error("failed to create cached DMA-BUF acquire semaphore", e)
+                    })?;
+                }
+                let loader = ash::khr::external_semaphore_fd::Device::new(
+                    &self.device.instance.inner.raw,
+                    &self.device.raw,
+                );
+                let raw_fd = fd.into_raw_fd();
+                let info = vk::ImportSemaphoreFdInfoKHR::default()
+                    .semaphore(self.acquire)
+                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                    .fd(raw_fd);
+                if let Err(e) = unsafe { loader.import_semaphore_fd(&info) } {
+                    drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                    return Err(vk_error(
+                        "failed to rearm cached DMA-BUF acquire payload",
+                        e,
+                    ));
+                }
+                VulkanExternalAcquire::BinarySemaphore(self.acquire)
+            } else {
+                VulkanExternalAcquire::CommandStream
+            };
+            self.release_state = ReleaseExportState::new();
+            Ok(result)
+        }
+
         pub(crate) fn release_is_resolved(&self) -> bool {
             self.release_state.is_resolved()
         }

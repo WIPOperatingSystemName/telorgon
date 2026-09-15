@@ -64,25 +64,14 @@ impl RenderedCursor {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum ComposedCursorSource {
-    Pointer,
-    Icon(usize),
-}
-
 pub(super) enum CursorVisual {
     Image(RenderedCursor),
-    Composed {
-        source: ComposedCursorSource,
-        size: SizeI,
-    },
 }
 
 impl CursorVisual {
     pub(super) fn image(&self) -> Option<&RenderedCursor> {
         match self {
             Self::Image(image) => Some(image),
-            Self::Composed { .. } => None,
         }
     }
 }
@@ -143,22 +132,15 @@ pub(super) fn render_cursor_image(
                     .get(&surface)
                     .filter(|cursor| !cursor.presentation.pixels.is_empty())
                     .map(|cursor| {
-                        CursorVisual::Image(RenderedCursor {
-                            rgba: client_pixels_rgba(cursor),
-                            size: cursor.presentation.image_size,
-                            logical_size: cursor.presentation.size,
-                            hotspot: PointI {
-                                x: hotspot_x,
-                                y: hotspot_y,
-                            },
-                            premultiplied: true,
-                        })
+                        CursorVisual::Image(client_cursor_image(cursor, hotspot_x, hotspot_y))
                     }),
                 PointerResolution::Graphic(graphic) => Some(CursorVisual::Image(
                     render_asset_pointer(graphic, extent, now, pointer_media, output_scale)?,
                 )),
                 PointerResolution::System(_) => {
-                    render_composed_pointer(None, pointer, icons, extent)
+                    return Err(AppError::new(
+                        "validated cursor theme is missing the normal pointer",
+                    ));
                 }
                 PointerResolution::Hidden => None,
             },
@@ -183,6 +165,23 @@ fn ready_cursor_image(
     }
 }
 
+fn client_cursor_image(cursor: &ClientWindow, hotspot_x: i32, hotspot_y: i32) -> RenderedCursor {
+    let density = cursor.surface_scale.max(1);
+    RenderedCursor {
+        rgba: client_pixels_rgba(cursor),
+        size: cursor.presentation.image_size,
+        logical_size: SizeI {
+            width: (cursor.presentation.size.width / density).max(1),
+            height: (cursor.presentation.size.height / density).max(1),
+        },
+        hotspot: PointI {
+            x: hotspot_x / density,
+            y: hotspot_y / density,
+        },
+        premultiplied: true,
+    }
+}
+
 fn client_pixels_rgba(window: &ClientWindow) -> Vec<u8> {
     let mut rgba = window.presentation.pixels.clone();
     if window.presentation.pixel_format == ImagePixelFormat::Bgra8 {
@@ -201,9 +200,9 @@ fn client_pixels_rgba(window: &ClientWindow) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 fn render_semantic_pointer(
     icon: PointerIcon,
-    composed_icon_name: Option<&str>,
-    pointer: &mut Option<Layer>,
-    icons: &mut [(String, Layer)],
+    _composed_icon_name: Option<&str>,
+    _pointer: &mut Option<Layer>,
+    _icons: &mut [(String, Layer)],
     extent: SizeI,
     now: u64,
     pointer_config: &PointerConfiguration,
@@ -224,27 +223,10 @@ fn render_semantic_pointer(
             pointer_media,
             output_scale,
         )?))),
-        PointerResolution::System(icon) => {
-            let rendered = render_composed_pointer(composed_icon_name, pointer, icons, extent);
-            if rendered.is_some() {
-                return Ok(rendered);
-            }
-            let Some(fallback) = semantic_pointer_fallback(icon) else {
-                return Ok(None);
-            };
-            render_semantic_pointer(
-                fallback,
-                cursor_shape_icon_name(pointer_icon_cursor_shape(fallback)),
-                pointer,
-                icons,
-                extent,
-                now,
-                pointer_config,
-                pointer_theme,
-                pointer_media,
-                output_scale,
-            )
-        }
+        PointerResolution::System(icon) => Err(AppError::new(format!(
+            "validated cursor theme is missing `{}`",
+            icon.name()
+        ))),
         PointerResolution::Hidden => Ok(None),
         PointerResolution::ClientSurface => {
             unreachable!("semantic requests cannot resolve to a client surface")
@@ -252,29 +234,8 @@ fn render_semantic_pointer(
     }
 }
 
-pub(super) fn semantic_pointer_fallback(icon: PointerIcon) -> Option<PointerIcon> {
-    match icon {
-        PointerIcon::EResize
-        | PointerIcon::NResize
-        | PointerIcon::NeResize
-        | PointerIcon::NwResize
-        | PointerIcon::SResize
-        | PointerIcon::SeResize
-        | PointerIcon::SwResize
-        | PointerIcon::WResize
-        | PointerIcon::EwResize
-        | PointerIcon::NsResize
-        | PointerIcon::NeswResize
-        | PointerIcon::NwseResize
-        | PointerIcon::ColResize
-        | PointerIcon::RowResize => Some(PointerIcon::AllResize),
-        PointerIcon::Default => None,
-        _ => Some(PointerIcon::Default),
-    }
-}
-
 fn render_asset_pointer(
-    graphic: &PointerGraphic,
+    graphic: &CursorGraphic,
     fallback_extent: SizeI,
     now_nanoseconds: u64,
     media: &mut AssetMediaCache,
@@ -320,13 +281,12 @@ fn render_asset_pointer(
             width: i32::from(size),
             height: i32::from(size),
         });
+    let exact_size = graphic
+        .exact_logical_size()
+        .unwrap_or(logical_size.width as f32);
     let requested = AssetRasterSize::new(
-        (logical_size.width as f32 * output_scale.get())
-            .round()
-            .max(1.0) as u32,
-        (logical_size.height as f32 * output_scale.get())
-            .round()
-            .max(1.0) as u32,
+        (exact_size * output_scale.get()).round().max(1.0) as u32,
+        (exact_size * output_scale.get()).round().max(1.0) as u32,
     )
     .map_err(app_error)?;
     let decoded = match graphic.tint_color() {
@@ -349,26 +309,6 @@ fn render_asset_pointer(
             y: i32::from(hotspot.y),
         },
         premultiplied: decoded.alpha_mode == ImageAlphaMode::Premultiplied,
-    })
-}
-
-fn render_composed_pointer(
-    composed_icon_name: Option<&str>,
-    pointer: &mut Option<Layer>,
-    icons: &mut [(String, Layer)],
-    extent: SizeI,
-) -> Option<CursorVisual> {
-    if let Some(index) = composed_icon_name
-        .and_then(|name| icons.iter().position(|(candidate, _)| candidate == name))
-    {
-        return Some(CursorVisual::Composed {
-            source: ComposedCursorSource::Icon(index),
-            size: extent,
-        });
-    }
-    pointer.as_ref().map(|_| CursorVisual::Composed {
-        source: ComposedCursorSource::Pointer,
-        size: extent,
     })
 }
 
@@ -543,6 +483,51 @@ pub(super) fn pointer_icon_cursor_shape(icon: PointerIcon) -> u32 {
 mod tests {
     use super::*;
     #[test]
+    fn x11_dense_cursor_keeps_native_pixels_and_logical_hotspot() {
+        let mut window = super::super::client::maximize_preview_tests::test_window(
+            SizeI {
+                width: 72,
+                height: 72,
+            },
+            PointI::default(),
+        );
+        window.surface_scale = 3;
+        window.presentation.image_size = SizeI {
+            width: 72,
+            height: 72,
+        };
+        window.presentation.pixels = vec![255; 72 * 72 * 4];
+        // One-pixel detail must not be lost to a 24x24 intermediate.
+        window.presentation.pixels[0] = 0;
+        let cursor = client_cursor_image(&window, 15, 9);
+        assert_eq!(
+            cursor.logical_size,
+            SizeI {
+                width: 24,
+                height: 24
+            }
+        );
+        assert_eq!(cursor.hotspot, PointI { x: 5, y: 3 });
+        let physical = cursor
+            .for_hardware(
+                crate::platform::ScaleFactor::new(3.0).unwrap(),
+                SizeI {
+                    width: 256,
+                    height: 256,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            physical.size,
+            SizeI {
+                width: 72,
+                height: 72
+            }
+        );
+        assert_eq!(physical.hotspot, PointI { x: 15, y: 9 });
+        assert_eq!(physical.rgba, cursor.rgba);
+    }
+    #[test]
     fn unpublished_cursor_uses_default_but_explicit_hidden_cursor_stays_hidden() {
         let surface = WaylandSurfaceId::from_raw(42).unwrap();
         let requested = CursorImage::ClientSurface {
@@ -637,5 +622,60 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod theme_render_tests {
+    use super::*;
+
+    #[test]
+    fn theme_cursor_raster_and_hotspot_follow_output_density() {
+        let assets = crate::assets::cursor_test_bundle();
+        let config = crate::assets::cursor_test_theme()
+            .prepare(assets, crate::ClientCursorMode::Allow)
+            .unwrap();
+        let graphic = config
+            .pointer_overrides()
+            .graphic(PointerIcon::Default)
+            .unwrap();
+        let mut media = AssetMediaCache::new(assets).unwrap();
+        let scale = crate::platform::ScaleFactor::new(2.0).unwrap();
+        let rendered = render_asset_pointer(
+            graphic,
+            SizeI {
+                width: 99,
+                height: 99,
+            },
+            0,
+            &mut media,
+            scale,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.logical_size,
+            SizeI {
+                width: 24,
+                height: 24
+            }
+        );
+        assert_eq!(
+            rendered.size,
+            SizeI {
+                width: 48,
+                height: 48
+            }
+        );
+        assert_eq!(rendered.hotspot, PointI { x: 12, y: 12 });
+        let hardware = rendered
+            .for_hardware(
+                scale,
+                SizeI {
+                    width: 64,
+                    height: 64,
+                },
+            )
+            .unwrap();
+        assert_eq!(hardware.hotspot, PointI { x: 24, y: 24 });
     }
 }

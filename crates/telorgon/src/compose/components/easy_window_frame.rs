@@ -96,6 +96,8 @@ pub struct WindowControlsDesign {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowChromeDesign {
+    /// Desktop window transitions, independent of state appearance.
+    pub motion: crate::WindowMotion,
     pub active: WindowChromePalette,
     pub inactive: WindowChromePalette,
     pub normal: WindowChromeStateStyle,
@@ -107,9 +109,10 @@ pub struct WindowChromeDesign {
     /// Backing beneath the application's pixels. Set alpha to zero to let client transparency
     /// reveal lower desktop layers. Opaque client buffers remain opaque.
     pub content_background: ColorRgba8,
-    /// Resize placeholder RGBA, independent of the normal content backing. `None` inherits
-    /// `LinuxDesktopConfig::resize_preview_color`; alpha zero gives a frame-only preview.
-    pub resize_preview_color: Option<ColorRgba8>,
+    /// Resize placeholder appearance, independent of the normal content backing. `None`
+    /// inherits `LinuxDesktopConfig::resize_preview`. Color alpha zero is frame-only;
+    /// glass tint alpha zero keeps the opaque blurred backdrop.
+    pub resize_preview: Option<crate::ResizePreview>,
 }
 
 impl WindowChromeDesign {
@@ -288,7 +291,8 @@ impl Component for EasyWindowFrameComponent {
         ) {
             palette.frame_border_width = 0.0;
         }
-        let state = design.state(self.model.state);
+        let mut state = design.state(self.model.state);
+        state.title_bar_visible &= self.model.title_bar_visible;
         let inner_radius = (state.frame_radius - palette.frame_border_width).max(0.0);
         let mut frame_decoration = BoxDecoration::new()
             .background(Background::Color(palette.frame_background))
@@ -329,7 +333,9 @@ impl Component for EasyWindowFrameComponent {
                     .overflow(crate::ui::Overflow::Clip)
                     .decoration(
                         BoxDecoration::new()
-                            .background(Background::Color(design.content_background))
+                            // The host paints content_style() inside the integer client bounds.
+                            // A second fill here starts at fractional layout coordinates and can
+                            // escape the host's cutout as a dark strip beside the client.
                             .corner_radii(crate::ui::CornerRadii {
                                 top_left: if state.title_bar_visible {
                                     0.0
@@ -359,12 +365,16 @@ impl WindowFrameTemplate for EasyWindowFrame {
         }
     }
 
+    fn motion(&self, _model: &WindowChromeModel) -> Option<crate::WindowMotion> {
+        Some(self.design.motion)
+    }
+
     fn content_style(&self, _model: &WindowChromeModel) -> Option<WindowContentStyle> {
         Some(WindowContentStyle {
             background: self.design.content_background,
             // The full-window inner border clip owns rounding; no second aperture is needed.
             corner_radius: 0.0,
-            resize_preview_color: self.design.resize_preview_color,
+            resize_preview: self.design.resize_preview,
         })
     }
 }
@@ -773,6 +783,7 @@ mod tests {
         resize_hit_slop: Insets::all(2.0),
     };
     const DESIGN: WindowChromeDesign = WindowChromeDesign {
+        motion: crate::WindowMotion::none(),
         active: WindowChromePalette {
             frame_background: ColorRgba8::rgba(20, 24, 32, 255),
             frame_border: ColorRgba8::rgba(80, 90, 120, 255),
@@ -836,7 +847,7 @@ mod tests {
             gap: 6.0,
         },
         content_background: ColorRgba8::rgba(10, 12, 18, 255),
-        resize_preview_color: None,
+        resize_preview: None,
     };
 
     #[test]
@@ -847,10 +858,20 @@ mod tests {
     #[test]
     fn content_style_preserves_alpha_preview_inheritance_and_state_radius() {
         for alpha in [0, 128, 255] {
-            for preview in [None, Some(ColorRgba8::rgba(30, 40, 50, alpha))] {
+            for preview in [
+                None,
+                Some(crate::ResizePreview::Color(ColorRgba8::rgba(
+                    30, 40, 50, alpha,
+                ))),
+                Some(crate::ResizePreview::Glass(crate::GlassStyle {
+                    tint: ColorRgba8::rgba(30, 40, 50, alpha),
+                    blur_radius: 24.0,
+                    ..crate::GlassStyle::liquid()
+                })),
+            ] {
                 let design = WindowChromeDesign {
                     content_background: ColorRgba8::rgba(0, 0, 0, alpha),
-                    resize_preview_color: preview,
+                    resize_preview: preview,
                     ..DESIGN
                 };
                 assert_eq!(design.validate(), Ok(design));
@@ -864,7 +885,7 @@ mod tests {
                         .content_style(&WindowChromeModel::new(7, "Editor").state(state))
                         .unwrap();
                     assert_eq!(style.background, design.content_background);
-                    assert_eq!(style.resize_preview_color, preview);
+                    assert_eq!(style.resize_preview, preview);
                     assert_eq!(style.corner_radius, 0.0);
                 }
             }
@@ -877,6 +898,160 @@ mod tests {
         let component = easy_window_frame(DESIGN).compose(model.clone());
         assert_eq!(component.model, model);
         assert_eq!(component.design, DESIGN);
+    }
+
+    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[test]
+    fn fractional_content_background_does_not_leak_into_frame_strips() {
+        use crate::application_host::AppRuntimeCore;
+        use crate::core::{MonotonicInstant, RectI, SizeI};
+        use crate::render::RenderBackend;
+        use crate::renderer_software::{SoftwareCompositeLayer, SoftwareRenderer, SoftwareSurface};
+        use crate::window_chrome::WindowChromeSnapshot;
+
+        let extent = SizeI {
+            width: 240,
+            height: 120,
+        };
+        for border in [1.0, 1.25, 1.5, 1.75, 2.5] {
+            for title_height in [32.0, 32.5] {
+                for title_bar_visible in [true, false] {
+                    let mut reference = None;
+                    for color in [
+                        ColorRgba8::rgba(0, 0, 0, 255),
+                        ColorRgba8::rgba(255, 255, 255, 255),
+                    ] {
+                        let mut design = DESIGN;
+                        design.active.frame_border_width = border;
+                        design.title_bar.height = title_height;
+                        design.content_background = color;
+                        let mut runtime = AppRuntimeCore::from_composed_with_extent(
+                            easy_window_frame(design).compose(
+                                WindowChromeModel::new(7, "")
+                                    .active(true)
+                                    .title_bar_visible(title_bar_visible),
+                            ),
+                            extent,
+                        )
+                        .unwrap();
+                        runtime
+                            .prepare_frame(MonotonicInstant::from_nanos(0), true)
+                            .unwrap();
+                        let snapshot =
+                            WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+                        let content = snapshot.content.bounds;
+                        // Match the host's integer client placement and measured size.
+                        let cutout = RectI {
+                            x: content.x.round() as i32,
+                            y: content.y.round() as i32,
+                            width: content.width.round() as i32,
+                            height: content.height.round() as i32,
+                        };
+                        let target = RectI {
+                            x: 0,
+                            y: 0,
+                            width: extent.width,
+                            height: extent.height,
+                        };
+                        let mut scene = SoftwareRenderer.create_scene().unwrap();
+                        SoftwareRenderer
+                            .apply_scene_delta(&mut scene, &runtime.scene_snapshot())
+                            .unwrap();
+                        let mut surface = SoftwareSurface::default();
+                        SoftwareRenderer
+                            .render_composite(
+                                &mut surface,
+                                &[SoftwareCompositeLayer {
+                                    scene: &scene,
+                                    target,
+                                    clip: None,
+                                    rounded_clips: [None; 2],
+                                }],
+                                SizeI {
+                                    width: target.width,
+                                    height: target.height,
+                                },
+                                Some(target),
+                                ColorRgba8::rgba(0, 255, 0, 255),
+                            )
+                            .unwrap();
+                        let mut strips = Vec::new();
+                        for y in 0..target.height {
+                            for x in 0..target.width {
+                                if x < cutout.x
+                                    || x >= cutout.right()
+                                    || y < cutout.y
+                                    || y >= cutout.bottom()
+                                {
+                                    let offset = ((y * target.width + x) * 4) as usize;
+                                    strips.extend_from_slice(
+                                        &surface.pixels_rgba8()[offset..offset + 4],
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(expected) = &reference {
+                            assert!(
+                                expected == &strips,
+                                "content backing leaked outside client bounds: border={border}, title={title_height}, title_bar_visible={title_bar_visible}"
+                            );
+                        } else {
+                            reference = Some(strips);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[test]
+    fn client_header_keeps_outer_style_and_resize_regions_without_title_controls() {
+        use crate::application_host::AppRuntimeCore;
+        use crate::core::{MonotonicInstant, SizeI};
+        use crate::window_chrome::{WindowAction, WindowChromeRole, WindowChromeSnapshot};
+        for active in [false, true] {
+            let mut runtime = AppRuntimeCore::from_composed_with_extent(
+                easy_window_frame(DESIGN).compose(
+                    WindowChromeModel::new(42, "Firefox")
+                        .active(active)
+                        .title_bar_visible(false),
+                ),
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap();
+            runtime
+                .prepare_frame(MonotonicInstant::from_nanos(0), true)
+                .unwrap();
+            let snapshot = WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+            assert_eq!(snapshot.content.bounds.x, 1.0);
+            assert_eq!(snapshot.content.bounds.y, 1.0);
+            assert_eq!(snapshot.content.bounds.width, 638.0);
+            assert_eq!(snapshot.content.bounds.height, 478.0);
+            assert!(snapshot.regions.iter().any(|region| matches!(
+                region.role,
+                WindowChromeRole::Action(WindowAction::BeginResize(_))
+            )));
+            assert!(!snapshot.regions.iter().any(|region| matches!(
+                region.role,
+                WindowChromeRole::Title
+                    | WindowChromeRole::DragRegion
+                    | WindowChromeRole::Action(
+                        WindowAction::Close
+                            | WindowAction::Minimize
+                            | WindowAction::ToggleMaximize
+                            | WindowAction::BeginMove
+                    )
+            )));
+            let style = runtime.ui().box_styles.get(snapshot.frame.node).unwrap();
+            assert_eq!(
+                style.decoration.corner_radii,
+                crate::ui::CornerRadii::all(12.0)
+            );
+        }
     }
 
     #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]

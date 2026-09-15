@@ -28,27 +28,40 @@ Neither variant specifies a fixed physical-pixel size.
 mode, the host reads the physical width and height reported by KMS (usually derived from EDID):
 
 ```text
-horizontal DPI = pixel width  × 25.4 / width in millimeters
-vertical DPI   = pixel height × 25.4 / height in millimeters
-scale = round(sqrt(horizontal DPI × vertical DPI) / 96 × 4) / 4
+physical DPI = hypot(pixel width, pixel height) / diagonal size in inches
+target DPI = 110 for displays at least 20 inches, otherwise 135
+preferred scale = round(physical DPI / target DPI × 4) / 4
 ```
 
-The policy rounds to the nearest 25%, clamped to 100–400%. Halfway values round upward.
-Both physical dimensions must be 50–3000 mm, both densities 50–500 DPI, and the horizontal/vertical
-DPI ratio 0.9–1.1. Unknown or implausible dimensions select 100%. The startup diagnostic prints
-physical pixels, reported millimeters, chosen percentage, logical extent, and policy.
+The policy selects 25% steps within 100–400%, with halfway values rounding upward. Automatic
+scale is capped at the largest step that leaves at least 960 logical units on the longer axis and
+720 on the shorter axis. Modes smaller than that at 100% stay at 100%; scaling cannot create missing
+workspace. This safeguard avoids excessively cramped layouts on small, dense panels and treats
+portrait and landscape equivalently. It does not guarantee that every application's minimum size fits.
 
-| Example monitor | Approximate density | Automatic scale |
+Both physical dimensions must be 50–3000 mm, both axis densities 50–500 DPI, and the larger density
+must not exceed the smaller by more than 10%. Common EDID aspect-ratio placeholders (16:9/16:10
+encoded as 160×90/100 or 1600×900/1000 mm, including transposes) are rejected. Unknown or implausible
+metadata selects 100%, rather than guessing a physical size from resolution. The startup diagnostic
+prints physical pixels, reported millimeters, chosen percentage, logical extent, and policy.
+
+| Example monitor | Automatic scale | Approximate logical workspace |
 | --- | --- | --- |
-| 24-inch 1920×1080 | 92 DPI | 100% |
-| 24-inch 3840×2160 | 184 DPI | 200% |
-| 27-inch 3840×2160 | 163 DPI | 175% |
-| 43-inch 3840×2160 | 104 DPI | 100% |
+| 24-inch 1920×1080 | 100% | 1920×1080 |
+| 24-inch 3840×2160 | 175% | 2195×1235 |
+| 27-inch 3840×2160 | 150% | 2560×1440 |
+| 32-inch 3840×2160 | 125% | 3072×1728 |
+| 43-inch 3840×2160 | 100% | 3840×2160 |
+| 15.6-inch 3840×2160 | 200% | 1920×1080 |
+| 27-inch 5120×2880 | 200% | 2560×1440 |
+| 32-inch 7680×4320 | 250% | 3072×1728 |
 
-96 DPI is a desktop policy baseline, not a measurement of the user's preferred text size or viewing
-distance. Physical display metadata can be incorrect even when it passes these checks. In
-particular, resolution alone cannot establish the right scale for a TV versus a laptop. An explicit
-preference takes precedence and also works when physical dimensions are absent:
+These are policy defaults, not measurements of viewing distance or personal preference. Larger
+screens use a lower target density because they are generally viewed farther away. This replaces
+the former universal 96-DPI baseline: typical 27-inch UHD displays now default to 150% instead of
+175%, and 24-inch UHD displays to 175% instead of 200%. Existing logical UI dimensions need no edits.
+Physical metadata may still be wrong despite passing validation. Explicit preferences bypass both
+automatic selection and the workspace cap, including when physical dimensions are absent:
 
 ```rust
 use telorgon::app::{LinuxDesktopConfig, OutputScale};
@@ -69,7 +82,7 @@ changes, monitor hotplug, and moving surfaces between differently scaled outputs
 - Desktop window geometry, decorations, widget placement, reservations, hit tests, Wayland configure
   sizes, pointer focus, and cursor hotspots are logical. Historical text layout names such as
   `font_size_px` denote logical dimensions in this desktop host. Cursor builders accept
-  `logical_units`, and `PointerGraphic::logical_size()` / `PointerTheme::logical_size()` expose
+  `logical_units`, and `CursorGraphic::logical_size()` / `PointerTheme::logical_size()` expose
   the nominal logical size (replacing the former `physical_size()` names). `pointer_extent`,
   title-bar height, and border width are logical.
 - `platform::ScaleFactor` is the validated conversion boundary. Floating-point points preserve
@@ -112,6 +125,32 @@ Fractional-scale clients receive the actual factor in 1/120 units. Clients suppo
 can submit density-sized buffers with buffer scale 1 and a logical viewporter destination. Older
 integer-scale clients render at the next integer scale and are resampled to the selected density.
 A client that ignores scaling can still appear blurry when enlarged.
+
+## Automatic policy refactor audit
+
+The adjacent reference library was unavailable. Reviewed upstream sources:
+
+- [Mutter `src/backends/meta-monitor.c`](https://raw.githubusercontent.com/GNOME/mutter/main/src/backends/meta-monitor.c),
+  `calculate_scale`: physical diagonal density, 110/135 target DPI with a 20-inch boundary, and
+  nearest supported scale selection. Telorgon retains its own quarter-step scale set and uses an
+  axis-based workspace floor rather than Mutter's minimum-area rule.
+- [Sway `sway/config/output.c`](https://raw.githubusercontent.com/swaywm/sway/master/sway/config/output.c),
+  `compute_default_scale` and `phys_size_is_aspect_ratio`: reject missing/placeholder metadata and
+  avoid HiDPI enlargement on modes with insufficient space. Its integer-only 1x/2x automatic
+  policy was not adopted because Telorgon already supports fractional output density.
+- [Official fractional-scale protocol](https://raw.githubusercontent.com/wayland-mirror/wayland-protocols/main/staging/fractional-scale/fractional-scale-v1.xml):
+  preferred scale is expressed in 1/120 units. Quarter steps are exactly representable; fixed
+  values retain their existing 1/120 quantization. Client announcements and physical rendering
+  continue to consume the same resolved `ScaleFactor`.
+
+No reference code was copied. Resolution-only selection, unbounded DPI enlargement, silently
+changing explicit preferences, and separate UI/client scale calculations were rejected. CPU tests
+cover FHD through 8K, laptop/desktop/TV sizes, rotation invariance, proportional-resolution logical
+workspace, cramped panels, invalid modes/metadata, and fixed override precedence. Selection remains
+a boot-time, single-output policy; this refactor adds no runtime hotplug or multi-monitor support.
+Validation: all seven scale-policy unit tests passed with `desktop-wayland-linux`; the consuming
+`test-compositor` release build with embedded XWayland passed, as did formatting and whitespace
+checks. Live visual qualification remains user-run under `AGENTS.md`.
 
 ## Reference review and derived checks
 

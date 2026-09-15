@@ -4,8 +4,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::assets::{
-    AppIconProfile, AssetBundle, ClientCursorMode, CursorThemeAsset, PointerConfiguration,
-    PointerThemeOverrides,
+    AppIconProfile, AssetBundle, ClientCursorMode, CursorTheme, CursorThemeAsset,
+    PointerConfiguration, PointerThemeOverrides,
 };
 use crate::compose::{Component, ErasedComponent, RuntimeTarget};
 use crate::core::{ColorRgba8, SizeI};
@@ -70,6 +70,10 @@ impl KeyboardConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinuxDesktopConfig {
+    /// Fallback for templates without an explicit motion style.
+    pub window_motion: crate::WindowMotion,
+    /// Applies centrally to all desktop window motion.
+    pub motion_preference: crate::theme::MotionPreference,
     /// Enable the embedded compatibility helper. Requires an embedded-payload build.
     /// Desktop X11 presentation remains under implementation.
     #[cfg(feature = "desktop-xwayland")]
@@ -88,13 +92,18 @@ pub struct LinuxDesktopConfig {
     pub output_scale: super::OutputScale,
     /// Window border thickness in logical units.
     pub window_border: i32,
+    /// Preferred ordinary-window content minimum in logical units, excluding borders and title bar.
+    /// Applies to both Wayland and X11 windows independently of output scale. Defaults to 300 × 200;
+    /// both dimensions must be positive. Client constraints (including fixed sizes and resize
+    /// increments) and available work area can override this preference.
+    pub preferred_window_minimum: SizeI,
     /// Title-bar height in logical units.
     pub titlebar_height: i32,
-    /// Fallback content veil during interactive resize and while awaiting the final client image.
+    /// Fallback whole-window placeholder during resize and while awaiting the final client image.
     /// Only the preview geometry changes during the drag; the client receives its final size on
-    /// release. Alpha reveals lower desktop layers, not stale client content. Frame templates
-    /// can override this through [`WindowFrameTemplate::content_style`].
-    pub resize_preview_color: ColorRgba8,
+    /// release. Color alpha reveals lower desktop layers; glass alpha controls tint strength.
+    /// Frame templates can override this through [`WindowFrameTemplate::content_style`].
+    pub resize_preview: crate::ResizePreview,
     /// Default pointer size in logical units.
     pub pointer_extent: SizeI,
 }
@@ -102,6 +111,8 @@ pub struct LinuxDesktopConfig {
 impl Default for LinuxDesktopConfig {
     fn default() -> Self {
         Self {
+            window_motion: crate::WindowMotion::none(),
+            motion_preference: crate::theme::MotionPreference::Full,
             #[cfg(feature = "desktop-xwayland")]
             xwayland_enabled: cfg!(feature = "desktop-xwayland-embedded"),
             #[cfg(feature = "desktop-xwayland")]
@@ -113,13 +124,12 @@ impl Default for LinuxDesktopConfig {
             session: crate::session::SessionConfig::default(),
             output_scale: super::OutputScale::Auto,
             window_border: 4,
-            titlebar_height: 32,
-            resize_preview_color: ColorRgba8 {
-                r: 38,
-                g: 42,
-                b: 48,
-                a: 255,
+            preferred_window_minimum: SizeI {
+                width: 300,
+                height: 200,
             },
+            titlebar_height: 32,
+            resize_preview: crate::ResizePreview::Color(ColorRgba8::rgba(38, 42, 48, 255)),
             pointer_extent: SizeI {
                 width: 32,
                 height: 32,
@@ -143,6 +153,8 @@ impl LinuxDesktopConfig {
             || self.socket_name.as_ref().is_some_and(|name| {
                 name.trim().is_empty() || name.contains(['/', '\\']) || name == "." || name == ".."
             })
+            || self.preferred_window_minimum.width <= 0
+            || self.preferred_window_minimum.height <= 0
             || self.window_border < 0
             || self.titlebar_height < 0
             || self.pointer_extent.width <= 0
@@ -179,7 +191,6 @@ impl Application {
             renderer: Renderer::Auto,
             linux: LinuxDesktopConfig::default(),
             assets: AssetBundle::EMPTY,
-            pointer: PointerConfiguration::default(),
             app_icon: AppIconProfile::new(),
         }
     }
@@ -670,6 +681,10 @@ impl fmt::Debug for ShellActionHandler {
 /// [`WindowChromeModel`] for each frame instance, while the template owns any shared visual
 /// configuration needed to construct that instance.
 pub trait WindowFrameTemplate: 'static {
+    /// None inherits desktop motion; Some(none()) explicitly disables it.
+    fn motion(&self, _model: &WindowChromeModel) -> Option<crate::WindowMotion> {
+        None
+    }
     type Component: Component;
 
     fn compose(&self, model: WindowChromeModel) -> Self::Component;
@@ -704,6 +719,11 @@ pub struct WindowFrameFactory {
         not(all(feature = "desktop-wayland-linux", target_os = "linux")),
         allow(dead_code)
     )]
+    motion: Box<dyn Fn(&WindowChromeModel) -> Option<crate::WindowMotion>>,
+    #[cfg_attr(
+        not(all(feature = "desktop-wayland-linux", target_os = "linux")),
+        allow(dead_code)
+    )]
     compose: Box<dyn Fn(WindowChromeModel) -> Box<dyn ErasedComponent>>,
     #[cfg_attr(
         not(all(feature = "desktop-wayland-linux", target_os = "linux")),
@@ -713,14 +733,20 @@ pub struct WindowFrameFactory {
 }
 
 impl WindowFrameFactory {
+    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    pub(crate) fn motion(&self, model: &WindowChromeModel) -> Option<crate::WindowMotion> {
+        (self.motion)(model)
+    }
     fn new<T>(template: T) -> Self
     where
         T: WindowFrameTemplate,
     {
         let template = std::rc::Rc::new(template);
         let style_template = std::rc::Rc::clone(&template);
+        let motion_template = std::rc::Rc::clone(&template);
         Self {
             compose: Box::new(move |model| Box::new(template.compose(model))),
+            motion: Box::new(move |model| motion_template.motion(model)),
             content_style: Box::new(move |model| style_template.content_style(model)),
         }
     }
@@ -798,9 +824,24 @@ pub enum DesktopKeyAction {
 pub(crate) type DesktopKeyHandler = Box<dyn FnMut(DesktopKeyEvent) -> DesktopKeyAction>;
 
 /// Incomplete compositor declaration.
-pub struct Compositor {
+pub struct MissingCursorTheme;
+
+/// Compositor declaration; cursor_theme is required before desktop admission.
+///
+/// ```compile_fail
+/// use telorgon::app::*;
+/// #[component]
+/// struct Background {}
+/// impl Component for Background {
+///     fn view(&self) -> impl View { text("desktop") }
+/// }
+/// let compositor = Compositor::new().background(Background::default());
+/// Application::desktop_environment("desktop").compositor(compositor);
+/// ```
+pub struct Compositor<C = MissingCursorTheme> {
+    cursor_theme: C,
+    client_cursor_mode: ClientCursorMode,
     window_frame: Option<WindowFrameFactory>,
-    pointer: Option<CompositorVisual>,
     icons: Vec<CompositorVisual>,
     shell_actions: Vec<ShellActionHandler>,
     keyboard_shortcut_handler: Option<DesktopKeyHandler>,
@@ -815,14 +856,17 @@ impl Default for Compositor {
 impl Compositor {
     pub const fn new() -> Self {
         Self {
+            cursor_theme: MissingCursorTheme,
+            client_cursor_mode: ClientCursorMode::Allow,
             window_frame: None,
-            pointer: None,
             icons: Vec::new(),
             shell_actions: Vec::new(),
             keyboard_shortcut_handler: None,
         }
     }
+}
 
+impl<C> Compositor<C> {
     /// Supplies the composed server-side frame for each window and each relevant model change.
     pub fn window_frame<T>(mut self, template: T) -> Self
     where
@@ -832,14 +876,8 @@ impl Compositor {
         self
     }
 
-    /// Uses an ordinary Telorgon component for the default compositor-owned pointer image.
-    pub fn pointer<C: Component>(mut self, component: C) -> Self {
-        self.pointer = Some(CompositorVisual::new("default", component));
-        self
-    }
-
     /// Adds a semantic shell icon. Names are stable compositor keys such as `window.close`.
-    pub fn icon<C: Component>(mut self, name: impl Into<String>, component: C) -> Self {
+    pub fn icon<B: Component>(mut self, name: impl Into<String>, component: B) -> Self {
         self.icons.push(CompositorVisual::new(name, component));
         self
     }
@@ -878,11 +916,12 @@ impl Compositor {
     }
 
     /// Completes the compositor with its full-output visual rendered behind client windows.
-    pub fn background<C: Component>(self, background: C) -> ReadyCompositor {
+    pub fn background<B: Component>(self, background: B) -> ReadyCompositor<C> {
         ReadyCompositor {
+            cursor_theme: self.cursor_theme,
+            client_cursor_mode: self.client_cursor_mode,
             background: CompositionDriver::for_target(background, RuntimeTarget::Compositor),
             window_frame: self.window_frame,
-            pointer: self.pointer,
             icons: self.icons,
             shell_actions: self.shell_actions,
             keyboard_shortcut_handler: self.keyboard_shortcut_handler,
@@ -894,18 +933,17 @@ impl Compositor {
         since = "0.1.15",
         note = "the component is a compositor background visual; use `background`"
     )]
-    pub fn policy<C: Component>(self, background: C) -> ReadyCompositor {
+    pub fn policy<B: Component>(self, background: B) -> ReadyCompositor<C> {
         self.background(background)
     }
 }
 
-impl fmt::Debug for Compositor {
+impl<C> fmt::Debug for Compositor<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Compositor")
             .field("has_background", &false)
             .field("has_window_frame", &self.window_frame.is_some())
-            .field("has_pointer", &self.pointer.is_some())
             .field("icons", &self.icons.len())
             .field("shell_actions", &self.shell_actions.len())
             .field(
@@ -917,10 +955,11 @@ impl fmt::Debug for Compositor {
 }
 
 /// Complete compositor declaration.
-pub struct ReadyCompositor {
+pub struct ReadyCompositor<C = CursorTheme> {
+    cursor_theme: C,
+    client_cursor_mode: ClientCursorMode,
     background: CompositionDriver,
     window_frame: Option<WindowFrameFactory>,
-    pointer: Option<CompositorVisual>,
     icons: Vec<CompositorVisual>,
     shell_actions: Vec<ShellActionHandler>,
     keyboard_shortcut_handler: Option<DesktopKeyHandler>,
@@ -937,9 +976,15 @@ type CompositorRuntimeParts = (
 );
 
 impl ReadyCompositor {
+    fn prepare_cursors(&self, assets: AssetBundle) -> AppResult<PointerConfiguration> {
+        self.cursor_theme
+            .prepare(assets, self.client_cursor_mode)
+            .map_err(|error| AppError::new(error.to_string()))
+    }
+
     fn validate(&self) -> AppResult<()> {
         debug_assert_eq!(self.background.target(), RuntimeTarget::Compositor);
-        for visual in self.pointer.iter().chain(self.icons.iter()) {
+        for visual in &self.icons {
             debug_assert_eq!(visual.content.target(), RuntimeTarget::Compositor);
         }
         if self.icons.iter().any(|icon| icon.name.trim().is_empty()) {
@@ -968,10 +1013,6 @@ impl ReadyCompositor {
         self.window_frame.as_ref()
     }
 
-    pub fn pointer(&self) -> Option<&CompositorVisual> {
-        self.pointer.as_ref()
-    }
-
     pub fn icons(&self) -> &[CompositorVisual] {
         &self.icons
     }
@@ -985,7 +1026,7 @@ impl ReadyCompositor {
         (
             self.background,
             self.window_frame,
-            self.pointer.map(|visual| visual.content),
+            None,
             self.icons
                 .into_iter()
                 .map(|visual| (visual.name, visual.content))
@@ -996,13 +1037,12 @@ impl ReadyCompositor {
     }
 }
 
-impl fmt::Debug for ReadyCompositor {
+impl<C> fmt::Debug for ReadyCompositor<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Compositor")
             .field("has_background", &true)
             .field("has_window_frame", &self.window_frame.is_some())
-            .field("has_pointer", &self.pointer.is_some())
             .field("icons", &self.icons.len())
             .field("shell_actions", &self.shell_actions.len())
             .field(
@@ -1019,7 +1059,6 @@ pub struct DesktopEnvironment {
     renderer: Renderer,
     linux: LinuxDesktopConfig,
     assets: AssetBundle,
-    pointer: PointerConfiguration,
     app_icon: AppIconProfile,
 }
 
@@ -1040,21 +1079,6 @@ impl DesktopEnvironment {
         self
     }
 
-    pub fn cursor_theme(mut self, theme: CursorThemeAsset) -> Self {
-        self.pointer = self.pointer.cursor_theme(theme);
-        self
-    }
-
-    pub fn pointer_overrides(mut self, overrides: PointerThemeOverrides) -> Self {
-        self.pointer = self.pointer.overrides(overrides);
-        self
-    }
-
-    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
-        self.pointer = self.pointer.client_mode(mode);
-        self
-    }
-
     /// Sets the desktop environment's fallback icon profile for client toplevels.
     pub fn app_icon(mut self, profile: AppIconProfile) -> Self {
         self.app_icon = profile;
@@ -1067,7 +1091,6 @@ impl DesktopEnvironment {
             renderer: self.renderer,
             linux: self.linux,
             assets: self.assets,
-            pointer: self.pointer,
             app_icon: self.app_icon,
             compositor,
         }
@@ -1092,7 +1115,6 @@ pub struct DesktopEnvironmentWithCompositor {
     renderer: Renderer,
     linux: LinuxDesktopConfig,
     assets: AssetBundle,
-    pointer: PointerConfiguration,
     app_icon: AppIconProfile,
     compositor: ReadyCompositor,
 }
@@ -1110,21 +1132,6 @@ impl DesktopEnvironmentWithCompositor {
 
     pub fn assets(mut self, assets: AssetBundle) -> Self {
         self.assets = assets;
-        self
-    }
-
-    pub fn cursor_theme(mut self, theme: CursorThemeAsset) -> Self {
-        self.pointer = self.pointer.cursor_theme(theme);
-        self
-    }
-
-    pub fn pointer_overrides(mut self, overrides: PointerThemeOverrides) -> Self {
-        self.pointer = self.pointer.overrides(overrides);
-        self
-    }
-
-    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
-        self.pointer = self.pointer.client_mode(mode);
         self
     }
 
@@ -1148,7 +1155,6 @@ impl DesktopEnvironmentWithCompositor {
             renderer: self.renderer,
             linux: self.linux,
             assets: self.assets,
-            pointer: self.pointer,
             app_icon: self.app_icon,
             compositor: self.compositor,
             shell_widgets: Vec::new(),
@@ -1175,7 +1181,6 @@ pub struct ReadyDesktopEnvironment {
     renderer: Renderer,
     linux: LinuxDesktopConfig,
     assets: AssetBundle,
-    pointer: PointerConfiguration,
     app_icon: AppIconProfile,
     compositor: ReadyCompositor,
     shell_widgets: Vec<ReadyShellWidget>,
@@ -1194,21 +1199,6 @@ impl ReadyDesktopEnvironment {
 
     pub fn assets(mut self, assets: AssetBundle) -> Self {
         self.assets = assets;
-        self
-    }
-
-    pub fn cursor_theme(mut self, theme: CursorThemeAsset) -> Self {
-        self.pointer = self.pointer.cursor_theme(theme);
-        self
-    }
-
-    pub fn pointer_overrides(mut self, overrides: PointerThemeOverrides) -> Self {
-        self.pointer = self.pointer.overrides(overrides);
-        self
-    }
-
-    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
-        self.pointer = self.pointer.client_mode(mode);
         self
     }
 
@@ -1253,13 +1243,11 @@ impl ReadyDesktopEnvironment {
         self.assets
             .validate()
             .map_err(|error| AppError::new(error.to_string()))?;
-        self.pointer
-            .load_theme(self.assets)
-            .map_err(|error| AppError::new(error.to_string()))?;
         self.app_icon
             .validate()
             .map_err(|error| AppError::new(error.to_string()))?;
         self.compositor.validate()?;
+        let pointer = self.compositor.prepare_cursors(self.assets)?;
         for widget in &self.shell_widgets {
             widget.validate()?;
         }
@@ -1271,7 +1259,7 @@ impl ReadyDesktopEnvironment {
             self.renderer,
             self.linux,
             self.assets,
-            self.pointer,
+            pointer,
             self.app_icon,
         ))
     }
@@ -1304,21 +1292,46 @@ mod tests {
     use crate::compose::{ComponentFields, View, text};
 
     #[test]
-    fn resize_preview_color_accepts_the_full_alpha_range() {
+    fn cursor_validation_propagates_through_desktop_startup() {
+        let error = Application::desktop_environment("Invalid cursors")
+            .compositor(
+                Compositor::new()
+                    .background(Root)
+                    .cursor_theme(CursorTheme::new()),
+            )
+            .into_ready()
+            .into_parts()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing cursor"));
+        assert!(error.contains("logical size"));
+    }
+
+    #[test]
+    fn background_before_theme_is_a_complete_declaration() {
+        Application::desktop_environment("Cursor order")
+            .assets(crate::assets::cursor_test_bundle())
+            .compositor(
+                Compositor::new()
+                    .background(Root)
+                    .cursor_theme(crate::assets::cursor_test_theme())
+                    .cursor_size(32.0),
+            )
+            .into_ready()
+            .into_parts()
+            .unwrap();
+    }
+
+    #[test]
+    fn resize_preview_accepts_the_full_alpha_range() {
         let mut config = LinuxDesktopConfig::default();
         config.drm_device = Some(std::env::current_dir().unwrap().join("card0"));
-        assert_eq!(config.resize_preview_color.a, 255);
-        config.resize_preview_color = ColorRgba8 {
-            r: 20,
-            g: 40,
-            b: 60,
-            a: 255,
-        };
-        assert!(config.validate().is_ok());
-        config.resize_preview_color.a = 128;
-        assert!(config.validate().is_ok());
-        config.resize_preview_color.a = 0;
-        assert!(config.validate().is_ok());
+        assert_eq!(config.resize_preview.color().a, 255);
+        for alpha in [0, 128, 255] {
+            config.resize_preview =
+                crate::ResizePreview::Color(ColorRgba8::rgba(20, 40, 60, alpha));
+            assert!(config.validate().is_ok());
+        }
     }
 
     struct Root;
@@ -1351,14 +1364,18 @@ mod tests {
         let widget = ShellWidget::new("Panel").content(Root);
         assert_eq!(widget.content.target(), RuntimeTarget::ShellWidget);
 
-        let compositor = Compositor::new().background(Root);
+        let compositor = Compositor::new()
+            .cursor_theme(CursorTheme::new())
+            .background(Root);
         assert_eq!(compositor.background.target(), RuntimeTarget::Compositor);
     }
 
     #[test]
     fn deprecated_policy_alias_still_completes_the_background_visual() {
         #[allow(deprecated)]
-        let compositor = Compositor::new().policy(Root);
+        let compositor = Compositor::new()
+            .cursor_theme(CursorTheme::new())
+            .policy(Root);
         assert_eq!(compositor.background.target(), RuntimeTarget::Compositor);
     }
 
@@ -1368,7 +1385,10 @@ mod tests {
             Root
         }
 
-        let compositor = Compositor::new().window_frame(compose).background(Root);
+        let compositor = Compositor::new()
+            .cursor_theme(CursorTheme::new())
+            .window_frame(compose)
+            .background(Root);
         assert!(compositor.window_frame().is_some());
         assert_eq!(
             (compositor.window_frame().unwrap().content_style)(&WindowChromeModel::new(
@@ -1390,7 +1410,9 @@ mod tests {
                 Some(WindowContentStyle {
                     background: ColorRgba8::rgba(0, 0, 0, 0),
                     corner_radius: 4.0,
-                    resize_preview_color: model.active.then_some(ColorRgba8::rgba(40, 50, 60, 128)),
+                    resize_preview: model.active.then_some(crate::ResizePreview::Color(
+                        ColorRgba8::rgba(40, 50, 60, 128),
+                    )),
                 })
             }
         }
@@ -1408,6 +1430,7 @@ mod tests {
     fn custom_shell_actions_require_unique_declaration_authorization() {
         let action = ShellActionId::named("window.pin");
         let compositor = Compositor::new()
+            .cursor_theme(CursorTheme::new())
             .shell_action(action, |_| {})
             .shell_action(action, |_| {})
             .background(Root);
@@ -1418,7 +1441,12 @@ mod tests {
     #[test]
     fn desktop_without_widgets_validates_and_has_no_reserved_widget_space() {
         let desktop = Application::desktop_environment("Bare desktop")
-            .compositor(Compositor::new().background(Root))
+            .assets(crate::assets::cursor_test_bundle())
+            .compositor(
+                Compositor::new()
+                    .cursor_theme(crate::assets::cursor_test_theme())
+                    .background(Root),
+            )
             .into_ready();
         let (_, _, widgets, _, _, _, _, _) = desktop.into_parts().unwrap();
         assert!(widgets.is_empty());
@@ -1428,7 +1456,11 @@ mod tests {
             DesktopEnvironmentWithCompositor::run;
         assert!(
             Application::desktop_environment("")
-                .compositor(Compositor::new().background(Root))
+                .compositor(
+                    Compositor::new()
+                        .cursor_theme(CursorTheme::new())
+                        .background(Root)
+                )
                 .into_ready()
                 .into_parts()
                 .is_err()
@@ -1438,7 +1470,11 @@ mod tests {
     #[test]
     fn shell_widget_validation_happens_before_host_selection() {
         let result = Application::desktop_environment("Telorgon")
-            .compositor(Compositor::new().background(Root))
+            .compositor(
+                Compositor::new()
+                    .cursor_theme(CursorTheme::new())
+                    .background(Root),
+            )
             .shell_widget(ShellWidget::new("").reserve_space(-1.0).content(Root))
             .into_parts();
         assert!(result.is_err());
@@ -1453,7 +1489,11 @@ mod tests {
 
         let desktop = Application::desktop_environment("Telorgon")
             .renderer(Renderer::Vulkan)
-            .compositor(Compositor::new().background(Root))
+            .compositor(
+                Compositor::new()
+                    .cursor_theme(CursorTheme::new())
+                    .background(Root),
+            )
             .shell_widget(ShellWidget::new("Panel").content(Root));
         assert_eq!(desktop.renderer, Renderer::Vulkan);
     }
@@ -1477,6 +1517,7 @@ mod tests {
             ..Default::default()
         };
         let mut ready = Compositor::new()
+            .cursor_theme(CursorTheme::new())
             .keyboard_shortcut_handler(|_| DesktopKeyAction::Quit)
             .keybindings(bindings.clone())
             .background(Root);
@@ -1485,6 +1526,7 @@ mod tests {
             DesktopKeyAction::Consume
         );
         let mut raw = Compositor::new()
+            .cursor_theme(CursorTheme::new())
             .keybindings(bindings)
             .keyboard_shortcut_handler(|_| DesktopKeyAction::Quit);
         assert_eq!(
@@ -1575,5 +1617,60 @@ mod keyboard_configuration_tests {
         assert_eq!(us.utf8(21).unwrap(), "y");
         assert_eq!(de.utf8(21).unwrap(), "z");
         assert_ne!(us.keymap_string().unwrap(), de.keymap_string().unwrap());
+    }
+}
+
+impl<C> Compositor<C> {
+    /// Supplies the required cursor design; validated automatically by desktop startup.
+    pub fn cursor_theme(self, theme: CursorTheme) -> Compositor<CursorTheme> {
+        Compositor {
+            cursor_theme: theme,
+            client_cursor_mode: self.client_cursor_mode,
+            window_frame: self.window_frame,
+            icons: self.icons,
+            shell_actions: self.shell_actions,
+            keyboard_shortcut_handler: self.keyboard_shortcut_handler,
+        }
+    }
+
+    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
+        self.client_cursor_mode = mode;
+        self
+    }
+}
+
+impl<C> ReadyCompositor<C> {
+    /// Supplies the required cursor design; validated automatically by desktop startup.
+    pub fn cursor_theme(self, theme: CursorTheme) -> ReadyCompositor<CursorTheme> {
+        ReadyCompositor {
+            cursor_theme: theme,
+            client_cursor_mode: self.client_cursor_mode,
+            background: self.background,
+            window_frame: self.window_frame,
+            icons: self.icons,
+            shell_actions: self.shell_actions,
+            keyboard_shortcut_handler: self.keyboard_shortcut_handler,
+        }
+    }
+
+    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
+        self.client_cursor_mode = mode;
+        self
+    }
+}
+
+impl Compositor<CursorTheme> {
+    /// Sets the effective logical cursor size, preserving the theme's proportions.
+    pub fn cursor_size(mut self, size: f32) -> Self {
+        self.cursor_theme = self.cursor_theme.cursor_size(size);
+        self
+    }
+}
+
+impl ReadyCompositor<CursorTheme> {
+    /// Sets the effective logical cursor size, preserving the theme's proportions.
+    pub fn cursor_size(mut self, size: f32) -> Self {
+        self.cursor_theme = self.cursor_theme.cursor_size(size);
+        self
     }
 }

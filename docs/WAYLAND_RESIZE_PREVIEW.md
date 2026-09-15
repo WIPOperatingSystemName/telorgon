@@ -1,9 +1,22 @@
 # Wayland solid resize preview
 
+See [Resize-preview glass](RESIZE_GLASS.md) for the color/glass API, Vulkan cache, and qualification limits.
+The color-specific rendering details below describe `ResizePreview::Color`; glass adds the documented GPU backdrop passes.
+
 Status: implemented with CPU regression and compile-time verification; interactive Linux visual and
 performance qualification remains user-run. This replaces the earlier stretched live-client preview.
 
 ## Behavior and configuration
+
+Current behavior supersedes the content-only description below: the preview now fills the entire
+outer window, including the title bar and border area, using the existing outer rounded clip.
+Chrome, controls, backing and client pixels are hidden beneath it; the exterior shadow remains.
+Alpha zero makes the window silhouette transparent. Final-configure submission and image-readiness
+gates are unchanged. With window motion enabled, the complete window fades to and from this
+placeholder; see [Desktop window motion](WINDOW_MOTION.md). This is a neutral placement change,
+reusing existing solid scenes and rounded clips without changing GPU synchronization or resources.
+The following content-only frame-strip details describe the earlier implementation and normal
+unveiled composition.
 
 By default, interactive resize shows an opaque dark slate content veil (`#262a30`) while the composed server frame
 and veil follow the pointer. This is a solid fill, not a blur or a scaled screenshot. The client image,
@@ -11,9 +24,9 @@ including client-drawn decoration, popups, and subsurfaces, is hidden until the 
 Server-drawn title text and controls remain ordinary composed chrome. The first version switches
 directly; it does not add a fade, blur pass, readback, image resampling, or intermediate render target.
 
-Set `LinuxDesktopConfig::resize_preview_color` to a `ColorRgba8` and pass the configuration via
+Set `LinuxDesktopConfig::resize_preview` to `ResizePreview::Color(ColorRgba8::rgba(...))` and pass the configuration via
 the desktop declaration's `.linux(config)` method. All alpha values are supported. Easy frames can
-override it with `WindowChromeDesign::resize_preview_color: Some(color)`; `None` inherits the host
+override it with `WindowChromeDesign::resize_preview: Some(ResizePreview::Color(color))`; `None` inherits the host
 setting. `content_background` independently configures normal backing beneath the app. Set that
 backing's alpha to zero to let app-supplied transparency reveal lower desktop layers; opaque app
 pixels and XRGB buffers remain opaque. See the [easy-frame example](CUSTOM_WINDOWS_ASSETS_AND_POINTERS.md).
@@ -208,6 +221,69 @@ blending, client/preview alpha 0/128/255, title-bar-height independence, empty/a
 coverage, inversion-only placement damage without image uploads, and per-placement GPU flag reset.
 
 ### Border-derived easy-frame follow-up
+
+#### Shared border/backing coverage repair (2026-09-14)
+
+The standard content cutout previously restored a border-only box, then drew a separately rounded
+content background over it. Even identical inner contours leave desktop contribution
+`C * (1 - C)` when their complementary coverages are source-over blended (25% at half coverage).
+The border patch now includes the declared content background whenever there is no independent
+aperture and chrome opacity is one. The existing analytic box path sums fill and ring coverage
+before blending; the separate background placement is omitted. It retains the declared background
+alpha, the rectangular content cutout, and client/subsurface clipping. Custom apertures and
+independently faded chrome keep their separate composition path.
+
+Audit: inspected `desktop_wayland/{layers,scene}.rs`, `render/rounded_clip.rs`,
+`renderer_software/renderer.rs`, and `telorgon-shader-build/shaders/vulkan/box/{box,image}.frag`.
+The adjacent `../other-rendering-libs` library is absent in this checkout; the routed Qt scenegraph
+and egui-wgpu renderer sources could not be inspected, so no new reference comparison is claimed.
+The bounded change uses Telorgon's existing box coverage contract and the official
+[Vulkan blend equations and factors](https://docs.vulkan.org/spec/latest/chapters/framebuffer.html#framebuffer-blending).
+Invariant: adjacent fill and border coverage must be summed before source-over. Rejected: changing
+radii, expanding borders to hide the seam, and replacing intentional transparency with opaque fill.
+There are no shader ABI, image lifetime, synchronization, or buffer changes.
+
+CPU framebuffer regression reproduces the separate-draw leak and checks all four repaired inner
+corners with 1/2/2.5-pixel logical borders at 1/1.25/1.5/2 geometry scales. Additional checks retain
+background alpha 0/128/255, the opaque rim, and the exterior cutout. The desktop unit suite passed
+(135 passed, 2 ignored), `test-compositor` passed `cargo check --offline`, and the Vulkan hardware
+test target compiled with `--no-run`. Live Vulkan visual
+qualification remains user-run; this evidence does not claim a hardware-rendered result.
+
+#### Rounded-border thickness repair (2026-09-14)
+
+The composed frame's outer placement clip repeated the box's own rounded antialias coverage.
+Multiplication reduced a half-covered outer edge to quarter coverage while leaving straight,
+fully covered border pixels unchanged. Analytic box bodies now intersect geometric coverages
+before computing fill and ring contributions. Material alpha and opacity are applied afterwards;
+blurred shadows and separate outline effects retain their existing masking. Software uses the
+same body rule and bypasses the second placement multiplication only for that already clipped body.
+
+The Vulkan box and rounded scene-clip shaders also used an L1 derivative width (`fwidth`), whose
+antialias band grows at diagonal angles. They now transform the analytic contour normal through
+coordinate derivatives and use its Euclidean length. This matches the placement clip's one-pixel
+band under uniform scale and handles transformed edges without differentiating the curved distance
+over a neighboring fragment quad. Coordinate derivatives remain outside divergent control flow.
+All four fragment stages use the same rounded scene-clip rule; square-box pixel integration stays
+intact. The offline SPIR-V bundle was regenerated, validated, and reflected with no ABI change.
+
+Audit paths: `renderer_software/renderer.rs`, `desktop_wayland/{scene,transparency_tests}.rs`, and
+`telorgon-shader-build/shaders/vulkan/box/{box,image,glyph,material}.frag`. The adjacent reference
+library remains unavailable; no new Qt/egui source comparison is claimed. Official checks:
+[GLSL derivatives and fwidth](https://docs.vulkan.org/glsl/latest/chapters/builtinfunctions.html#derivative-functions)
+and [Vulkan blending](https://docs.vulkan.org/spec/latest/chapters/framebuffer.html#framebuffer-blending).
+Invariants: a matching contour clip is idempotent for box geometry; color alpha is not geometric
+coverage; the edge filter has a consistent width in screen pixels. Rejected: inflating corner
+border widths, moving radii, disabling the frame clip, and sharpening material opacity.
+
+The new CPU framebuffer test fails before the fix and checks clipped/unclipped equality across
+all corners, radii 4/8/10, borders 1/2/2.5, and opacity 0.5/1. The unit suite with software and
+Wayland features passed (1,142 passed, 4 ignored). A hardware-gated regression compares every
+Vulkan border pixel against the physical contour at scales 1/1.25/1.5/2, including fractional
+origins and translucent borders. It is compile-only here; live appearance and GPU execution
+remain user-run qualification.
+
+#### Geometry and input contract
 
 Easy frames now derive content bounds from `title_bar.height` and the root border, removing the
 redundant `WindowChromeStateStyle::content_margin` and `content_radius` fields. They publish

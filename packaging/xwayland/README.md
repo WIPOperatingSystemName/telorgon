@@ -58,6 +58,30 @@ share/X11/xkb/<keyboard data files>
 licenses/<notices and source references>
 ```
 
+`libwayland-client.so.0` is a **host runtime dependency**, alongside EGL/GL/GBM. Host Mesa's EGL
+vendor uses this same SONAME in Xwayland's process. Bundling the build root's older Wayland client
+can shadow the host copy and prevent Mesa from loading: the September 13 capture exposed
+`undefined symbol: wl_fixes_interface` with host Mesa 26.0.8. The staged helper can link while
+Glamor silently falls back to software, so DT_NEEDED closure alone is insufficient evidence.
+The deployment host must supply a Wayland client ABI compatible with both the helper and its
+graphics stack. The staging inventory now includes the runtime-policy hash and its text; the
+packer rejects files that shadow declared host runtime SONAMEs, including stale older stages.
+No driver is bundled, forced, or substituted by this change.
+
+After staging, run this loader-only check on each intended deployment host (Mesa example):
+
+```sh
+python3 packaging/xwayland/check_egl_linkage.py --stage /absolute/stage \
+  --vendor-library libEGL_mesa.so.0
+```
+
+This loads the helper's direct ELF dependencies with its staged library choices, then links the
+selected EGL vendor in a fresh process with eager symbol resolution. It does not execute Xwayland,
+connect to a display, open a DRM device or initialize EGL. The old stage fails on the reported host;
+the corrected stage passes. This is a specific ABI compatibility check, not GPU qualification,
+an exact simulation of every dynamic-loader environment, or a check of every vendor. Real Glamor
+initialization and DMA-BUF commits must still be checked with the latency harness/smoke test.
+
 Staging must be quiescent and private to the build owner. Symlinks, hardlinks and
 special files are rejected; private SONAME aliases must be ordinary files. A
 components JSON array records each component's `name`, `version`,

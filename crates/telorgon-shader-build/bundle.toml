@@ -1,6 +1,6 @@
 schema_version = 1
 interface_major = 4
-interface_minor = 0
+interface_minor = 2
 target = "vulkan1.3-spirv1.6"
 
 [[shader]]
@@ -49,4 +49,16 @@ stage = "vertex"
 name = "material_fragment"
 source = "shaders/vulkan/box/material.frag"
 artifact = "material.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "liquid_vertex"
+source = "shaders/vulkan/box/liquid.vert"
+artifact = "liquid.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "liquid_fragment"
+source = "shaders/vulkan/box/liquid.frag"
+artifact = "liquid.frag.spv"
 stage = "fragment"

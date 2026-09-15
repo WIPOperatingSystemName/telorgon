@@ -293,7 +293,7 @@ The following offsets and sizes are normative. All offsets are bytes.
 
 ### 6.1 Frame/view record
 
-`GpuView`, alignment 16, size 192 in the implemented GPU ABI 4.0:
+`GpuView`, alignment 16, size 192 in the implemented GPU ABI 4.2:
 
 | Offset | Field | Meaning |
 |---:|---|---|
@@ -317,8 +317,13 @@ ABI 4 assigns flags bits 1/2 to invert coverage for clip slots 0/1 respectively,
 outside an aperture without painting behind transparent clients. A zero-extent normal clip rejects
 everything; its inverse accepts everything. Ordinary non-composite views explicitly disable both slots. Composite
 fragment stages use output-space signed-distance coverage with a one-pixel antialias band and
-multiply both premultiplied RGB and alpha; opaque batches select source-over when these clips are
-enabled. Existing scene clips and scissors still apply. Clip metadata is placement-owned, preserving
+apply coverage to both premultiplied RGB and alpha; opaque batches select source-over when these
+clips are enabled. Analytic box bodies intersect their outer/inner coverage with scene and placement
+coverage before assigning material alpha, so a matching rounded clip cannot attenuate an already
+antialiased edge twice. Other sampled content retains multiplicative masking. Box edges and rounded
+scene clips derive their pixel width from the analytic edge normal and coordinate derivatives,
+using Euclidean gradient length to keep the antialias band independent of edge angle. Existing
+scene clips and scissors still apply. Clip metadata is placement-owned, preserving
 shared scene resources and per-frame lifetime; there is no client image rewrite or mask attachment.
 See [rounded-frame audit](WAYLAND_RESIZE_PREVIEW.md#rounded-frame-clipping-audit).
 
@@ -412,6 +417,14 @@ premultiplication.
 | 44 | `reserved: u32` |
 | 48 | `resource_range_reserved: [u32; 4]` | resource base/count, two reserved words |
 
+Implemented ABI 4.2 retains liquid-glass material variant 3 (`PipelineKind::LiquidGlass`). Its parameter
+range is 17 float-bit words (68 bytes): four radii; inverse output size, inverse bevel and refraction;
+dispersion/rim/Fresnel/specular; premultiplied linear tint RGB and transmission; inner blend softness.
+The appended scalar occupies byte 64 in the raw uint array, with a four-byte word stride. The vertex stage
+loads set 2 binding 1 and forwards flat optics; set 3 binding 0 samples one owned backdrop. Geometry
+and optics retain separate dirty ranges. The existing material instance layout remains unchanged.
+See [Liquid-glass analysis](LIQUID_GLASS.md) for validation and ownership details.
+
 The draw-index buffer is a base-aligned storage-buffer array of `u32`. It has no wrapper stride
 beyond four bytes. Shaders must bounds-check indirectly through validated batch ranges; production
 shaders do not add divergent per-vertex recovery for an invalid plan.
@@ -473,7 +486,7 @@ frequently changing data first.
 | 1 | 1 | readonly `GpuClip[]` storage buffer | fragment | per scene upload |
 | 1 | 2 | readonly `u32 draw_indices[]` storage buffer | vertex | paint-order change |
 | 2 | 0 | pipeline-specific readonly instance storage buffer | vertex, fragment | primitive table/buffer change |
-| 2 | 1 | readonly material parameter words | fragment | material use only |
+| 2 | 1 | readonly material parameter words | vertex/fragment | material use only |
 | 3 | 0 | primary combined image/sampler | fragment | adjacent binding batch |
 | 3 | 1 | clip-mask combined image/sampler | fragment | masked clip batch |
 

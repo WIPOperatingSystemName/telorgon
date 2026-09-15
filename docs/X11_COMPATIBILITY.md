@@ -9,9 +9,86 @@ the separate X11 adapter owns root-coordinate conversion and bounded request
 coalescing. Native xdg configure/ack state stays in the native adapter. Alt-drag was
 removed. Popups remain unframed and cannot click through to underlying controls.
 The shared frame/control integration awaits a live retest; full EWMH state,
-iconification, application icon/decoration hints and release qualification remain
+iconification, application icon hints and release qualification remain
 outstanding. Minimize currently uses the same local visibility policy as native
 windows. See [the smoke test](X11_SMOKE_TEST.md).
+
+The managed Vulkan host now advertises linux-dmabuf v4 allocation feedback, including its matched
+DRM device and exact importable format/modifier table. Xwayland 24.1.13 requires this device discovery
+when `wl_drm` is absent; the previous v3-only advertisement forced its Glamor/DRI3 initialization to
+fall back to software. Default and per-surface feedback share the existing Vulkan sampling policy;
+the buffer import, materialization, and acquire/release synchronization paths are unchanged.
+Wire tests cover feedback transactions and FD lifetimes. Actual Glamor/Firefox acceleration awaits
+the hardware check in [the smoke test](X11_SMOKE_TEST.md#gpu-acceleration).
+
+### Host EGL linkage failure found by the latency capture (2026-09-13)
+
+The user-run release capture `20260913-015221-6aw3tras` reached a 60 Hz Vulkan desktop but recorded
+566 X11 SHM publications and **zero** X11 DMA-BUF publications. Xwayland stderr explicitly reported
+`glamor_egl_get_display() failed` and a Glamor software fallback. Across captured clients, observed
+publication-to-first-flip p95 was 80.86 ms (maximum 97.98 ms); the oldest event-to-flush age per input
+batch reached 39.15 ms. Long input ages overlapped surface processing, Vulkan scene updates and
+command recording. These measurements are evidence from the pre-fix run, not proof that input
+dispatch itself, the GPU, or every other app independently causes those delays.
+
+The payload's private build-root `libwayland-client.so.0` was loaded before the host Mesa EGL
+vendor. Host `libEGL_mesa.so.0` (Mesa 26.0.8) requires `wl_fixes_interface`, absent from the private
+copy. A loader-only regression reproduced that unresolved symbol with the old stage, while the
+same host vendor linked successfully after the corrected stage's complete direct Xwayland
+dependencies. The runtime policy now leaves the Wayland client with the host graphics stack.
+The packer rejects stale stages shadowing host runtime dependencies, and a dedicated
+`packaging/xwayland/check_egl_linkage.py` checks selected vendor linkage without a GUI or GPU.
+The local real payload was restaged, repacked and embedded again; the old artifact was preserved.
+
+Audit: inspected `packaging/xwayland/{runtime-policy.toml,stage.py,pack.py}`,
+`xwayland/process.rs::server_environment`, staged helper/library ELF DT_NEEDED and symbol tables,
+host Mesa's symbol table and GLVND vendor JSON. Independent upstream paths inspected were bundled
+Xwayland 24.1.13 `hw/xwayland/xwayland-glamor-gbm.c::xwl_glamor_gbm_init_egl`,
+`glamor/glamor_egl.h::glamor_egl_get_display`, and upstream
+[libglvnd vendor loading](https://github.com/NVIDIA/libglvnd/blob/master/src/EGL/libeglvendor.c)
+and its [ICD enumeration contract](https://github.com/NVIDIA/libglvnd/blob/master/src/EGL/icd_enumeration.md).
+The [official Wayland client API](https://wayland.freedesktop.org/docs/html/apb.html) documents the
+library interfaces; current host vendor requirements cannot be inferred just from the helper's
+older link-time symbol floor. The adjacent reference library is absent; this narrow loader-policy
+fix changes no GPU synchronization, import ownership or compositor protocol implementation.
+
+Invariants: keep host driver dependencies ABI-compatible in the helper's process; do not substitute
+a fixed older Wayland client ahead of the host vendor; reject stale stages before packing; preserve
+literal child-local environments and content-addressed extraction. Rejected alternatives: forcing
+software rendering, bundling a replacement Mesa driver, adding global `LD_PRELOAD` overrides, or
+changing input scheduling without first resolving the confirmed fallback. Tests cover stale-stage
+rejection and policy separation, old-failure/new-success vendor linkage, relocated keymap helpers,
+and the real embedded release build. The latency harness now surfaces the startup failure and
+offers `--require-x11-dmabuf` (no X11 samples means inconclusive). Actual post-fix acceleration and
+latency still require the next user-run capture; remaining SHM/native-app costs are not declared fixed.
+
+Decoration ownership now follows bounded `_MOTIF_WM_HINTS` reads on creation and property changes.
+A valid decoration flag with no requested decorations removes Telorgon's title bar and controls
+while retaining the outer frame styling and normal window management. Missing, deleted, malformed or failed properties select normal chrome;
+refreshes retain the last resolved policy until the new reply arrives, and stale replies are ignored.
+Motif ALL/exclusion masks are decoded. The shell exposes a complete-frame policy: a nonempty
+standard decoration mask selects Telorgon's title bar and controls, rather than separate Motif-style
+menu/button combinations. Outer border/radius/colors are independently supplied by the frame template. Motif function restrictions are not implemented by this hint.
+
+`_NET_FRAME_EXTENTS` and `_NET_REQUEST_FRAME_EXTENTS` are advertised. Unmapped windows receive a
+configuration-based estimate; associated windows report measured chrome margins in X11 pixels,
+with border-only extents for client-decorated windows and zero extents for override-redirect and
+fullscreen windows.
+Changes and explicit requests cause bounded checked property writes, repeated values coalesce,
+and destroyed window generations retire the cache. Normal title-bar ownership changes preserve client root
+coordinates; maximized changes preserve outer dimensions. Composed-frame measurements replace
+estimated offsets without moving normal X11 client content. No resize delay is introduced.
+
+Implementation audit: read `xwayland/properties.rs`, `xwm.rs`, `manager.rs`, and the desktop
+`compatibility.rs`, `x11_windows.rs`, `geometry.rs`, `input.rs`, and `layers.rs` paths. The adjacent
+`../other-rendering-libs` sources are unavailable; no independent compositor comparison is claimed.
+This CPU protocol/policy change follows [GTK's Motif decoration contract](https://docs.gtk.org/gdk3/method.Window.set_decorations.html)
+and [EWMH frame extents and pre-map estimates](https://specifications.freedesktop.org/wm/latest-single/).
+Rejected approaches: treating an undecorated window as unmanaged, dropping validation, blocking the
+owner loop for properties, or treating GTK's own client-side margins as compositor frame extents.
+Tests cover malformed/missing/deleted/stale properties, live notifications, wire extents and request
+replies, property coalescing, normal/maximized/fullscreen geometry, custom chrome and integer density.
+Live Firefox decoration switching remains manually qualified.
 
 The approved target is a rootless Xwayland 24.1.13 helper with a Telorgon-owned
 XWM, modern committed-serial association, and one delivered desktop executable
@@ -201,7 +278,7 @@ Still required: real-server launch/authentication qualification, managed use of
 the dedicated Wayland client, supervision/readiness/session
 integration, remaining XWM initialization/window handling using the bounded
 request tracker, and committed-serial association routing,
-protocol-neutral desktop windows, ICCCM/EWMH policy, DMA-BUF v4 feedback and
+protocol-neutral desktop windows, ICCCM/EWMH policy,
 DRM-syncobj support, multiple outputs, clipboard/PRIMARY/Xdnd bridges, capture
 policy and emergency release, managed keyboard replacement and settings publication.
 The extraction API does not yet collect unused generations or repair partial
@@ -575,3 +652,50 @@ turn. Quiescing holds queued work, closing cancels it without spawning, and reco
 journals retain recoverable queued commands without claiming an existing PID.
 `ManagedChild::id()` is zero until a deferred process is created. Shared activation
 service updates and explicit X11-required launch errors remain outstanding.
+
+The outer-frame policy uses `window_has_frame`, separately from title-bar ownership. Managed X11
+windows retain frame composition and clipping when Motif requests client decorations. Fullscreen
+and unmanaged popups are excluded; native Wayland decoration policy is unchanged. The frame model's
+`title_bar_visible` flag tells templates whether to omit compositor title/drag/control elements.
+`EasyWindowFrame` honors it while retaining the selected active/inactive palette, border, state radius,
+shadow and resize regions. The content slot gets all remaining inner space, including the application's
+own header. Scene clipping, size limits, hit testing and frame extents use the outer-frame policy;
+only title-bar controls depend on server-decoration ownership. This uses existing frame geometry and
+rounded clipping rather than adding a renderer path or reading/replacing application UI pixels.
+The prior source/specification audit applies; adjacent reference sources remain unavailable.
+
+Application-owned headers can initiate pointer moves and resizes using `_NET_WM_MOVERESIZE`, now
+advertised in `_NET_SUPPORTED`. The XWM queues at most 256 requests per owner drain, accepts only
+mapped managed windows, and resolves their live incarnation/association again at consumption.
+The desktop requires a matching implicit pointer grab and held physical button, uses its own pointer
+position, and delegates to the existing shared interaction implementation. Cancellation is processed
+in order and ends only the matching window's interaction. Late requests after button release,
+unknown/unmanaged windows, malformed formats and unsupported directions are ignored. Keyboard
+move/resize directions are not implemented. The existing release and session-lock paths end grabs.
+
+Audit: inspected XWM client-message dispatch, `SeatState` press ownership, native move/resize actions,
+and the shared desktop interaction loop; checked the official EWMH `_NET_WM_MOVERESIZE` contract.
+The adjacent reference library remains unavailable. Treating arbitrary clicks in application content
+as title-bar drags was rejected: the application chooses its own draggable regions. Tests cover wire
+request parsing and rejection plus held-button/surface ownership checks. Live Firefox dragging awaits
+manual confirmation.
+
+Mapped X11 maximize requests now use `_NET_WM_STATE` add/remove/toggle messages and
+Telorgon's existing work-area maximize/restore policy. Either maximize atom selects
+that single, both-axis policy; a paired request is processed once. Separate horizontal
+or vertical maximization and pre-map initial state hints remain unsupported. The XWM
+advertises the state/maximize atoms and publishes the actual shell state as ATOM/32,
+including changes from compositor controls. Writes coalesce, use checked requests,
+and retry after backpressure or command failure. Request queues are bounded and resolve
+live mapped, managed window incarnations to committed surfaces before desktop dispatch.
+Requests during a locked session or active move/resize are ignored.
+
+Maximize audit: inspected `xwayland/{discovery,manager,xwm,window}.rs` and desktop
+`{compatibility,x11_windows,interaction}.rs`; the adjacent reference tree is still
+absent. This CPU protocol bridge follows the official
+[EWMH state request/property contract](https://specifications.freedesktop.org/wm/latest-single/).
+The shell remains authoritative; no client-reported geometry or pointer grab is required
+for maximize. Rejected a second geometry implementation and per-atom double toggles.
+Socket tests cover request validation, paired atom ordering, association retirement,
+state publication and redundant-write coalescing. Existing desktop tests cover X11
+maximize/restore geometry and resize previews. Live Firefox button behavior remains user-run.

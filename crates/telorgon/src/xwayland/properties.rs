@@ -55,12 +55,14 @@ enum Value {
     Normal(super::normal_hints::NormalHints),
     Text(String),
     Counter(u32),
+    Decorations(bool),
 }
 #[derive(Clone, Copy)]
 enum PropertyKind {
     Protocols,
     Counter,
     Input,
+    Decorations,
     Normal,
     Text { utf8: bool },
 }
@@ -122,6 +124,46 @@ impl PropertyReader {
         }
         let counter = u32::from_ne_bytes(reply.value.get(..4)?.try_into().ok()?);
         (counter != 0).then_some(counter)
+    }
+    pub fn new_decorations(property: u32) -> Self {
+        let mut reader = Self::new(property, 0, 0);
+        reader.kind = PropertyKind::Decorations;
+        reader
+    }
+    pub fn decorations(&self, window: XWindow) -> Option<bool> {
+        match self.entries.get(&window)?.value.as_ref()? {
+            Value::Decorations(decorated) => Some(*decorated),
+            _ => None,
+        }
+    }
+    fn parse_decorations(&self, bytes: &[u8]) -> Option<bool> {
+        if bytes.len() != 52 {
+            return None;
+        }
+        let (reply, _) = xproto::GetPropertyReply::try_parse(bytes).ok()?;
+        if reply.type_ != self.property
+            || reply.format != 32
+            || reply.value_len != 5
+            || reply.bytes_after != 0
+        {
+            return None;
+        }
+        let flags = u32::from_ne_bytes(reply.value.get(..4)?.try_into().ok()?);
+        if flags & 2 == 0 {
+            return Some(true);
+        }
+        let decorations = u32::from_ne_bytes(reply.value.get(8..12)?.try_into().ok()?);
+        if decorations & !0x7f != 0 {
+            return None;
+        }
+        // Motif ALL inverts the remaining decoration bits. Telorgon's shell has one
+        // complete frame, so any requested standard decoration selects that frame.
+        let mask = if decorations & 1 != 0 {
+            !decorations & 0x7e
+        } else {
+            decorations & 0x7e
+        };
+        Some(mask != 0)
     }
     pub fn new_hints() -> Self {
         let mut reader = Self::new(xproto::AtomEnum::WM_HINTS.into(), 0, 0);
@@ -205,7 +247,9 @@ impl PropertyReader {
             .checked_add(1)
             .ok_or_else(|| Error("XWM property revision exhausted".into()))?;
         entry.dirty = true;
-        entry.value = None;
+        if !matches!(self.kind, PropertyKind::Decorations) {
+            entry.value = None;
+        }
         Ok(())
     }
     pub fn schedule(
@@ -234,7 +278,7 @@ impl PropertyReader {
                     property: self.property,
                     type_: match self.kind {
                         PropertyKind::Counter => xproto::AtomEnum::CARDINAL.into(),
-                        PropertyKind::Input => self.property,
+                        PropertyKind::Input | PropertyKind::Decorations => self.property,
                         PropertyKind::Normal => xproto::AtomEnum::WM_SIZE_HINTS.into(),
                         PropertyKind::Protocols => xproto::AtomEnum::ATOM.into(),
                         PropertyKind::Text { .. } => self.delete,
@@ -243,6 +287,7 @@ impl PropertyReader {
                     long_length: match self.kind {
                         PropertyKind::Counter => 2,
                         PropertyKind::Input => 9,
+                        PropertyKind::Decorations => 5,
                         PropertyKind::Normal => 18,
                         PropertyKind::Protocols => 256,
                         PropertyKind::Text { .. } => 1024,
@@ -336,6 +381,9 @@ impl PropertyReader {
             Completion::Reply(_, bytes) => match self.kind {
                 PropertyKind::Counter => Self::parse_counter(bytes).map(Value::Counter),
                 PropertyKind::Input => self.parse_hints(bytes).map(Value::Hints),
+                PropertyKind::Decorations => Some(Value::Decorations(
+                    self.parse_decorations(bytes).unwrap_or(true),
+                )),
                 PropertyKind::Normal => super::normal_hints::parse(bytes).map(Value::Normal),
                 PropertyKind::Protocols => self.parse(bytes).map(Value::Protocols),
                 PropertyKind::Text { utf8 } => self.parse_text(bytes, utf8).map(Value::Text),
@@ -348,7 +396,7 @@ impl PropertyReader {
             {
                 entry.value = value;
                 actions.push(match self.kind {
-                    PropertyKind::Counter => Action::Changed(window),
+                    PropertyKind::Counter | PropertyKind::Decorations => Action::Changed(window),
                     PropertyKind::Input => Action::HintsChanged(window),
                     PropertyKind::Normal => Action::NormalHintsChanged(window),
                     PropertyKind::Protocols => Action::ProtocolsChanged(window),
@@ -399,6 +447,103 @@ mod tests {
             }
             .serialize(),
         )
+    }
+    fn motif_reply(sequence: u64, flags: u32, mask: u32) -> Completion {
+        let mut result = reply(sequence, &[flags, 0, mask, 0, 0]);
+        if let Completion::Reply(_, bytes) = &mut result {
+            bytes[8..12].copy_from_slice(&200u32.to_ne_bytes());
+        }
+        result
+    }
+    #[test]
+    fn motif_decorations_validate_flags_masks_and_wire_shape() {
+        let reader = PropertyReader::new_decorations(200);
+        for (flags, mask, expected) in [
+            (0, 0, true),
+            (2, 0, false),
+            (2, 1, true),
+            (2, 8, true),
+            (2, 0x7f, false),
+        ] {
+            let Completion::Reply(_, bytes) = motif_reply(1, flags, mask) else {
+                unreachable!()
+            };
+            assert_eq!(reader.parse_decorations(&bytes), Some(expected));
+        }
+        let Completion::Reply(_, bytes) = motif_reply(1, 2, 0) else {
+            unreachable!()
+        };
+        for (offset, value) in [(1, 8), (8, 201), (12, 1), (16, 4)] {
+            let mut bad = bytes.clone();
+            bad[offset] = value;
+            assert_eq!(reader.parse_decorations(&bad), None);
+        }
+        assert_eq!(reader.parse_decorations(&bytes[..48]), None);
+    }
+    #[test]
+    fn motif_refresh_coalesces_and_deleted_or_invalid_properties_restore_decorations() {
+        let (mut transport, mut requests, _, _peer, now) = ready();
+        let (windows, id) = window();
+        let mut reader = PropertyReader::new_decorations(200);
+        let mut actions = Vec::new();
+        let schedule =
+            |reader: &mut PropertyReader, transport: &mut Transport, requests: &mut Requests| {
+                reader
+                    .schedule(
+                        transport,
+                        requests,
+                        now + Duration::from_secs(10),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .unwrap();
+                requests.last_sequence()
+            };
+        reader.refresh(id).unwrap();
+        let first = schedule(&mut reader, &mut transport, &mut requests);
+        reader
+            .completion(&motif_reply(first, 2, 0), &windows, &mut actions)
+            .unwrap();
+        assert_eq!(reader.decorations(id), Some(false));
+        reader.refresh(id).unwrap();
+        let stale = schedule(&mut reader, &mut transport, &mut requests);
+        reader.refresh(id).unwrap();
+        assert_eq!(reader.decorations(id), Some(false)); // No flash while the property read is pending.
+        actions.clear();
+        reader
+            .completion(&motif_reply(stale, 2, 1), &windows, &mut actions)
+            .unwrap();
+        assert!(actions.is_empty());
+        assert_eq!(reader.decorations(id), Some(false));
+        let latest = schedule(&mut reader, &mut transport, &mut requests);
+        reader
+            .completion(&motif_reply(latest, 2, 0), &windows, &mut actions)
+            .unwrap();
+        for invalid in [true, false] {
+            reader.refresh(id).unwrap();
+            let sequence = schedule(&mut reader, &mut transport, &mut requests);
+            let completion = if invalid {
+                reply(sequence, &[2, 0, 0, 0, 0])
+            } else {
+                Completion::Reply(
+                    RequestId {
+                        generation: 1,
+                        sequence,
+                    },
+                    xproto::GetPropertyReply::default().serialize(),
+                )
+            };
+            reader
+                .completion(&completion, &windows, &mut actions)
+                .unwrap();
+            assert_eq!(reader.decorations(id), Some(true));
+        }
+        reader.refresh(id).unwrap();
+        let sequence = schedule(&mut reader, &mut transport, &mut requests);
+        reader.forget(id);
+        reader
+            .completion(&motif_reply(sequence, 2, 0), &windows, &mut actions)
+            .unwrap();
+        assert_eq!(reader.decorations(id), None);
     }
     #[test]
     fn basic_sync_counter_requires_bounded_cardinal_and_advertised_protocol() {
@@ -530,7 +675,7 @@ mod tests {
         reader.refresh(id).unwrap();
         let mut actions = Vec::new();
         reader
-            .completion(&response(33), &windows, &mut actions)
+            .completion(&response(40), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -543,7 +688,7 @@ mod tests {
             )
             .unwrap();
         reader
-            .completion(&response(34), &windows, &mut actions)
+            .completion(&response(41), &windows, &mut actions)
             .unwrap();
         assert!(
             matches!(actions.as_slice(), [Action::NormalHintsChanged(window)] if *window == id)
@@ -568,7 +713,7 @@ mod tests {
         reader.forget(id);
         actions.clear();
         reader
-            .completion(&response(35), &windows, &mut actions)
+            .completion(&response(42), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -603,7 +748,7 @@ mod tests {
         );
         assert!(reader.pending.is_empty());
         let mut response = xproto::GetInputFocusReply {
-            sequence: 33,
+            sequence: 40,
             ..Default::default()
         }
         .serialize()
@@ -715,7 +860,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.pending.len(), 1);
         let mut actions = vec![];
-        p.completion(&reply(33, &[105, 106]), &w, &mut actions)
+        p.completion(&reply(40, &[105, 106]), &w, &mut actions)
             .unwrap();
         assert_eq!(p.get(id), None);
         assert!(actions.is_empty());
@@ -726,14 +871,14 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
-        p.completion(&reply(34, &[]), &w, &mut actions).unwrap();
+        p.completion(&reply(41, &[]), &w, &mut actions).unwrap();
         assert_eq!(p.get(id), Some(Protocols::default()));
         assert_eq!(actions, vec![Action::ProtocolsChanged(id)]);
     }
     #[test]
     fn invalid_or_incomplete_properties_grant_no_capabilities() {
         let p = PropertyReader::new(104, 105, 106);
-        let Completion::Reply(_, mut bytes) = reply(33, &[105]) else {
+        let Completion::Reply(_, mut bytes) = reply(40, &[105]) else {
             unreachable!()
         };
         assert_eq!(
@@ -760,7 +905,7 @@ mod tests {
             .unwrap();
         p.forget(id);
         let mut actions = vec![];
-        assert!(p.completion(&reply(33, &[105]), &w, &mut actions).unwrap());
+        assert!(p.completion(&reply(40, &[105]), &w, &mut actions).unwrap());
         assert!(actions.is_empty());
         assert_eq!(p.get(id), None);
     }

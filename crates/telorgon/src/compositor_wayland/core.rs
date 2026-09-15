@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::compositor_wayland::{
@@ -62,6 +62,15 @@ pub struct CompositorCore {
     buffers: BTreeMap<WaylandBufferId, (ClientId, BufferDescriptor)>,
     xdg_surfaces: BTreeMap<WaylandSurfaceId, XdgSurfaceState>,
     actions: Vec<CompositorAction>,
+    // Buffer ownership is not coalesced with the latest image publication.
+    queued_publications: BTreeMap<WaylandSurfaceId, QueuedPublication>,
+    superseded_publications: Vec<(WaylandSurfaceId, u64, WaylandBufferId)>,
+}
+
+#[derive(Debug)]
+struct QueuedPublication {
+    action_index: usize,
+    buffer_use: Option<(u64, WaylandBufferId)>,
 }
 
 impl CompositorCore {
@@ -78,6 +87,8 @@ impl CompositorCore {
             buffers: BTreeMap::new(),
             xdg_surfaces: BTreeMap::new(),
             actions: Vec::new(),
+            queued_publications: BTreeMap::new(),
+            superseded_publications: Vec::new(),
         })
     }
 
@@ -98,8 +109,9 @@ impl CompositorCore {
         for seat in self.seats.values_mut() {
             seat.remove_client(client);
         }
-        self.actions
-            .extend(surfaces.into_iter().map(CompositorAction::WithdrawSurface));
+        for surface in surfaces {
+            self.queue_action(CompositorAction::WithdrawSurface(surface));
+        }
         self.actions
             .push(CompositorAction::DisconnectClient(client));
         Ok(())
@@ -115,8 +127,7 @@ impl CompositorCore {
         for seat in self.seats.values_mut() {
             seat.remove_surface(surface);
         }
-        self.actions
-            .push(CompositorAction::WithdrawSurface(surface));
+        self.queue_action(CompositorAction::WithdrawSurface(surface));
         Ok(state)
     }
 
@@ -193,11 +204,71 @@ impl CompositorCore {
     }
 
     pub fn queue_action(&mut self, action: CompositorAction) {
+        if let CompositorAction::PublishSurface(surface)
+        | CompositorAction::WithdrawSurface(surface) = action
+        {
+            let buffer_use = if matches!(action, CompositorAction::PublishSurface(_)) {
+                self.world.surface(surface).and_then(|state| {
+                    let snapshot = state.snapshot();
+                    snapshot
+                        .attachment
+                        .map(|attachment| (snapshot.revision, attachment.buffer))
+                })
+            } else {
+                None
+            };
+            let previous = self.queued_publications.insert(
+                surface,
+                QueuedPublication {
+                    action_index: self.actions.len(),
+                    buffer_use,
+                },
+            );
+            if let Some((revision, buffer)) = previous.and_then(|pending| pending.buffer_use)
+                && Some((revision, buffer)) != buffer_use
+            {
+                self.superseded_publications
+                    .push((surface, revision, buffer));
+            }
+        }
+        // Appending is O(1). Avoid rescanning the whole batch for every commit;
+        // drain_actions uses the recorded final position to preserve event order.
         self.actions.push(action);
     }
 
+    /// Unsubmitted uses superseded before the host consumes its action batch. The host must
+    /// finish their per-commit releases, and release storage only when no other use retains it.
+    pub fn take_superseded_publications(
+        &mut self,
+    ) -> Vec<(WaylandSurfaceId, u64, WaylandBufferId)> {
+        std::mem::take(&mut self.superseded_publications)
+    }
+
+    pub fn pending_publication_buffers(&self) -> BTreeSet<WaylandBufferId> {
+        self.queued_publications
+            .values()
+            .filter_map(|pending| pending.buffer_use.map(|(_, buffer)| buffer))
+            .collect()
+    }
+
     pub fn drain_actions(&mut self) -> impl Iterator<Item = CompositorAction> + '_ {
-        self.actions.drain(..)
+        let publications = std::mem::take(&mut self.queued_publications);
+        self.actions
+            .drain(..)
+            .enumerate()
+            .filter_map(move |(index, action)| {
+                if let CompositorAction::PublishSurface(surface)
+                | CompositorAction::WithdrawSurface(surface) = action
+                {
+                    if publications
+                        .get(&surface)
+                        .is_some_and(|pending| pending.action_index != index)
+                    {
+                        return None;
+                    }
+                }
+                Some(action)
+            })
     }
 }
 
@@ -311,5 +382,123 @@ mod tests {
                 CompositorAction::DisconnectClient(client),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::{
+        compositor_wayland::{BufferAttachment, SurfaceRole},
+        core::PointI,
+    };
+
+    fn setup() -> (CompositorCore, ClientId, WaylandSurfaceId) {
+        let mut core = CompositorCore::default();
+        let client = ClientId::from_raw(1).unwrap();
+        let surface = WaylandSurfaceId::from_raw(2).unwrap();
+        core.connect_client(client).unwrap();
+        core.world.create_surface(client, surface).unwrap();
+        core.world
+            .surface_mut(surface)
+            .unwrap()
+            .assign_role(SurfaceRole::Xwayland)
+            .unwrap();
+        (core, client, surface)
+    }
+    fn publish(core: &mut CompositorCore, surface: WaylandSurfaceId, buffer: u32) -> u64 {
+        let state = core.world.surface_mut(surface).unwrap();
+        state.attach(Some(BufferAttachment {
+            buffer: WaylandBufferId::from_raw(buffer).unwrap(),
+            offset: PointI::default(),
+        }));
+        let revision = state.commit().unwrap().revision;
+        core.queue_action(CompositorAction::PublishSurface(surface));
+        revision
+    }
+    #[test]
+    fn batched_images_coalesce_but_each_superseded_use_is_retired() {
+        let (mut core, _, surface) = setup();
+        let revision = publish(&mut core, surface, 10);
+        publish(&mut core, surface, 11);
+        assert_eq!(
+            core.take_superseded_publications(),
+            vec![(surface, revision, WaylandBufferId::from_raw(10).unwrap())]
+        );
+        assert!(
+            core.pending_publication_buffers()
+                .contains(&WaylandBufferId::from_raw(11).unwrap())
+        );
+        assert!(
+            !core
+                .pending_publication_buffers()
+                .contains(&WaylandBufferId::from_raw(10).unwrap())
+        );
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::PublishSurface(surface)]
+        );
+        assert!(
+            !core
+                .pending_publication_buffers()
+                .contains(&WaylandBufferId::from_raw(11).unwrap())
+        );
+        publish(&mut core, surface, 12);
+        assert!(core.take_superseded_publications().is_empty()); // Previous batch belongs to the host.
+    }
+    #[test]
+    fn duplicate_publication_is_not_a_second_buffer_use() {
+        let (mut core, _, surface) = setup();
+        publish(&mut core, surface, 10);
+        core.queue_action(CompositorAction::PublishSurface(surface));
+        assert!(core.take_superseded_publications().is_empty());
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::PublishSurface(surface)]
+        );
+    }
+
+    #[test]
+    fn coalescing_preserves_other_actions_and_latest_publication_order() {
+        let (mut core, _, surface) = setup();
+        publish(&mut core, surface, 10);
+        core.queue_action(CompositorAction::RepaintOutput(1));
+        publish(&mut core, surface, 11);
+        core.queue_action(CompositorAction::RepaintOutput(2));
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![
+                CompositorAction::RepaintOutput(1),
+                CompositorAction::PublishSurface(surface),
+                CompositorAction::RepaintOutput(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn destruction_retires_unsubmitted_buffers_and_removes_stale_publication() {
+        let (mut core, client, surface) = setup();
+        let revision = publish(&mut core, surface, 10);
+        core.destroy_surface(client, surface).unwrap();
+        assert_eq!(
+            core.take_superseded_publications(),
+            vec![(surface, revision, WaylandBufferId::from_raw(10).unwrap())]
+        );
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::WithdrawSurface(surface)]
+        );
+    }
+    #[test]
+    fn reused_buffer_has_separate_commit_release_but_retains_latest_storage_use() {
+        let (mut core, _, surface) = setup();
+        let revision = publish(&mut core, surface, 10);
+        publish(&mut core, surface, 10);
+        assert_eq!(core.take_superseded_publications().len(), 1);
+        assert!(
+            core.pending_publication_buffers()
+                .contains(&WaylandBufferId::from_raw(10).unwrap())
+        );
+        assert!(core.world.surface(surface).unwrap().snapshot().revision > revision);
     }
 }

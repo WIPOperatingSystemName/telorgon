@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import struct
 import tempfile
+import tomllib
 import unittest
 import zlib
 import pack
@@ -52,6 +53,22 @@ class PackTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     pack.pack(self.stage, self.components)
                 alias.unlink()
+
+    def test_rejects_stale_stages_that_shadow_host_graphics_dependencies(self):
+        libraries = self.stage / "lib"
+        libraries.mkdir()
+        for name in ("libwayland-client.so.0", "libEGL.so.1", "libgbm.so.1"):
+            with self.subTest(name=name):
+                library = libraries / name
+                library.write_bytes((self.stage / "bin/Xwayland").read_bytes())
+                with self.assertRaisesRegex(ValueError, "shadows a host runtime dependency"):
+                    pack.pack(self.stage, self.components)
+                library.unlink()
+
+    def test_wayland_client_shares_the_host_driver_runtime(self):
+        policy = tomllib.loads(Path(pack.__file__).with_name("runtime-policy.toml").read_text())
+        self.assertIn("libwayland-client.so.0", policy["host"])
+        self.assertFalse(set(policy["host"]) & set(policy["private"]))
 
     def test_rejects_hardlinks(self):
         (self.stage / "hardlink").hardlink_to(self.stage / "bin/Xwayland")

@@ -7,6 +7,23 @@ use crate::xwayland::{
     xwm::Xwm,
 };
 
+pub(super) fn authorize_move_resize(
+    seat: &crate::compositor_wayland::SeatState,
+    surface: WaylandSurfaceId,
+    button: u32,
+) -> bool {
+    let button = match button {
+        1 => 0x110,
+        2 => 0x112,
+        3 => 0x111,
+        _ => return false,
+    };
+    seat.pressed_buttons().contains(&button)
+        && seat
+            .pointer_grab_focus()
+            .is_some_and(|focus| focus.surface == surface)
+}
+
 /// Visual diagnostic only: never replaces client acknowledgement or buffer checks.
 fn diagnostic_preview_hold() -> Duration {
     static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -86,7 +103,7 @@ impl ResizePreview {
             Self::Idle => None,
         }
     }
-    fn submitted(&mut self, size: SizeI, revision: u64, matching_content: bool) {
+    pub(super) fn submitted(&mut self, size: SizeI, revision: u64, matching_content: bool) {
         if let Self::Settling { target, .. } = self {
             if target.is_none_or(|old| old.size != size) {
                 *target = Some(ResizeTarget {
@@ -97,13 +114,23 @@ impl ResizePreview {
         }
     }
     fn settle(&mut self, server: SizeI, content: SizeI, revision: u64, pending: bool) -> bool {
-        if self.hold_deadline(Instant::now()).is_some() {
+        self.settle_at(server, content, revision, pending, Instant::now())
+    }
+    fn settle_at(
+        &mut self,
+        server: SizeI,
+        content: SizeI,
+        revision: u64,
+        pending: bool,
+        now: Instant,
+    ) -> bool {
+        if self.hold_deadline(now).is_some() {
             return false;
         }
         let Self::Settling {
             target: Some(target),
             ..
-        } = *self
+        } = self
         else {
             return false;
         };
@@ -128,11 +155,14 @@ impl ResizePreview {
 pub(super) struct X11Windows {
     entries: BTreeMap<XWindow, Entry>,
     requests: BTreeMap<XWindow, RequestedConfigure>,
+    unattached_replies: BTreeMap<XWindow, u16>,
     preview_deadline: Option<Instant>,
 }
 struct Entry {
     surface: WaylandSurfaceId,
     sent: Option<Geometry>,
+    notify_border: Option<u16>,
+    requested_border: u16,
 }
 
 impl X11Windows {
@@ -142,6 +172,7 @@ impl X11Windows {
     pub(super) fn retain(&mut self, live: &BTreeSet<XWindow>) {
         self.entries.retain(|id, _| live.contains(id));
         self.requests.retain(|id, _| live.contains(id));
+        self.unattached_replies.retain(|id, _| live.contains(id));
     }
 
     pub(super) fn configure_requested(&mut self, id: XWindow, request: RequestedConfigure) {
@@ -172,6 +203,7 @@ impl X11Windows {
         window: &mut ClientWindow,
         config: &LinuxDesktopConfig,
     ) {
+        let density = window.surface_scale.max(1);
         if unmanaged {
             window.resize_preview = Default::default();
             window.backend = None;
@@ -180,8 +212,8 @@ impl X11Windows {
             window.chrome_outer = None;
             window.chrome_content_offset = None;
             window.position = PointI {
-                x: geometry.x.into(),
-                y: geometry.y.into(),
+                x: i32::from(geometry.x).div_euclid(density),
+                y: i32::from(geometry.y).div_euclid(density),
             };
             window.minimized = false;
             return;
@@ -192,46 +224,152 @@ impl X11Windows {
             .is_none_or(|entry| entry.surface != surface)
             || window.backend != Some(WindowBackend::X11(id));
         window.backend = Some(WindowBackend::X11(id));
-        window.server_decorated = true;
         if fresh {
+            window.server_decorated = true;
             window.resize_preview = Default::default();
             let offset = window_content_offset(window, config);
             window.position = PointI {
-                x: i32::from(geometry.x).saturating_sub(offset.x).max(0),
-                y: i32::from(geometry.y).saturating_sub(offset.y).max(0),
+                x: i32::from(geometry.x)
+                    .div_euclid(density)
+                    .saturating_sub(offset.x)
+                    .max(0),
+                y: i32::from(geometry.y)
+                    .div_euclid(density)
+                    .saturating_sub(offset.y)
+                    .max(0),
             };
             window.requested_size = SizeI {
-                width: geometry.width.into(),
-                height: geometry.height.into(),
+                width: (i32::from(geometry.width) / density).max(1),
+                height: (i32::from(geometry.height) / density).max(1),
             };
             window.minimized = false;
+            let (notify_border, requested_border) = self
+                .entries
+                .get(&id)
+                .map(|entry| (entry.notify_border, entry.requested_border))
+                .unwrap_or((None, geometry.border));
             self.entries.insert(
                 id,
                 Entry {
                     surface,
                     sent: None,
+                    notify_border,
+                    requested_border,
                 },
             );
         }
         if let Some(request) = self.requests.remove(&id) {
+            let entry = self.entries.get_mut(&id).expect("attached entry");
+            if let Some(border) = request.border {
+                entry.requested_border = border;
+            }
+            entry.notify_border = Some(entry.requested_border);
+            // Client stacking is denied by the desktop's click-to-raise policy.
+            // Even a stack-only/no-op request receives the actual geometry below.
             // Explicit client configure requests enter shared policy. A server
             // ConfigureNotify is confirmation, not authority to undo a drag.
             if !window.maximized && !window.fullscreen && !window.resize_preview.active() {
                 let offset = window_content_offset(window, config);
                 if let Some(x) = request.x {
-                    window.position.x = i32::from(x) - offset.x;
+                    window.position.x = i32::from(x).div_euclid(density) - offset.x;
                 }
                 if let Some(y) = request.y {
-                    window.position.y = i32::from(y) - offset.y;
+                    window.position.y = i32::from(y).div_euclid(density) - offset.y;
                 }
                 if let Some(width) = request.width {
-                    window.requested_size.width = i32::from(width.max(1));
+                    window.requested_size.width = (i32::from(width) / density).max(1);
                 }
                 if let Some(height) = request.height {
-                    window.requested_size.height = i32::from(height.max(1));
+                    window.requested_size.height = (i32::from(height) / density).max(1);
                 }
             }
         }
+    }
+
+    /// Before a Wayland image is associated, geometry negotiation must still
+    /// progress: clients may wait for ConfigureNotify before creating that image.
+    fn flush_unattached(
+        &mut self,
+        xwm: &mut Xwm,
+        submitted: &mut usize,
+    ) -> crate::xwayland::Result<()> {
+        let requests: Vec<_> = self
+            .requests
+            .keys()
+            .filter(|id| {
+                self.entries.get(id).is_none_or(|entry| {
+                    xwm.windows()
+                        .and_then(|windows| windows.presentable_surface(**id))
+                        != Some(u64::from(entry.surface.get()))
+                })
+            })
+            .copied()
+            .take(16)
+            .collect();
+        for id in requests {
+            if *submitted >= 16 || xwm.command_capacity() == 0 {
+                break;
+            }
+            if xwm.commands_pending(id) {
+                continue;
+            }
+            let Some(actual) = xwm
+                .windows()
+                .and_then(|windows| windows.get(id.xid))
+                .filter(|window| window.id == id)
+                .map(|window| window.geometry)
+            else {
+                continue;
+            };
+            let request = self.requests.remove(&id).expect("listed request");
+            let desired = Geometry {
+                x: request.x.unwrap_or(actual.x),
+                y: request.y.unwrap_or(actual.y),
+                width: request.width.unwrap_or(actual.width).max(1),
+                height: request.height.unwrap_or(actual.height).max(1),
+                border: request.border.unwrap_or(actual.border),
+            };
+            if desired != actual {
+                xwm.configure_window(id, desired, Instant::now())?;
+                *submitted += 1;
+            }
+            let notify_border = if let Some(entry) = self.entries.get_mut(&id) {
+                if let Some(border) = request.border {
+                    entry.requested_border = border;
+                }
+                entry.notify_border = None;
+                entry.requested_border
+            } else {
+                desired.border
+            };
+            self.unattached_replies.insert(id, notify_border);
+        }
+        let replies: Vec<_> = self.unattached_replies.keys().copied().take(16).collect();
+        for id in replies {
+            if *submitted >= 16 || xwm.command_capacity() == 0 {
+                break;
+            }
+            if xwm.commands_pending(id) {
+                continue;
+            }
+            let Some(actual) = xwm
+                .windows()
+                .and_then(|windows| windows.get(id.xid))
+                .filter(|window| window.id == id)
+                .map(|window| window.geometry)
+            else {
+                continue;
+            };
+            let border = self.unattached_replies.remove(&id).expect("listed reply");
+            xwm.notify_configured(
+                id,
+                notification_geometry(actual, border),
+                None,
+                Instant::now(),
+            )?;
+            *submitted += 1;
+        }
+        Ok(())
     }
 
     pub(super) fn flush(
@@ -247,8 +385,9 @@ impl X11Windows {
             .filter_map(|window| window.resize_preview.hold_deadline(started))
             .min();
         let mut submitted = 0;
+        self.flush_unattached(xwm, &mut submitted)?;
         for (id, entry) in &mut self.entries {
-            if submitted == 16 || started.elapsed() >= Duration::from_millis(1) {
+            if submitted >= 16 || started.elapsed() >= Duration::from_millis(1) {
                 break;
             }
             let Some(window) = windows
@@ -264,23 +403,64 @@ impl X11Windows {
             {
                 continue;
             }
+            if !xwm.set_frame_extents(*id, frame_extents(window, config), Instant::now())? {
+                break;
+            }
+            if !xwm.set_maximized_state(*id, window.maximized, Instant::now())? {
+                break;
+            }
             if window.resize_preview.dragging() {
+                if !xwm.commands_pending(*id) && xwm.command_capacity() > 0 {
+                    if let Some(border) = entry.notify_border.take() {
+                        let actual = xwm
+                            .windows()
+                            .and_then(|registry| registry.get(id.xid))
+                            .expect("presentable window")
+                            .geometry;
+                        xwm.notify_configured(
+                            *id,
+                            notification_geometry(actual, border),
+                            None,
+                            Instant::now(),
+                        )?;
+                        submitted += 1;
+                    }
+                }
                 continue;
             }
+            let density = window.surface_scale.max(1);
+            let mut constrained_pixels = None;
             if !window.maximized && !window.fullscreen {
-                if let Some(hints) = xwm.normal_hints(*id) {
-                    let fallback =
-                        xwm.windows()
-                            .and_then(|registry| registry.get(id.xid))
-                            .map(|actual| SizeI {
-                                width: actual.geometry.width.into(),
-                                height: actual.geometry.height.into(),
-                            });
-                    let previous_size = window.requested_size;
-                    window.requested_size = constrained_size(hints, window.requested_size)
-                        .or(fallback)
-                        .unwrap_or(window.requested_size);
-                    changed |= previous_size != window.requested_size;
+                let hints = xwm.normal_hints(*id).unwrap_or_default();
+                let logical = |size: SizeI| SizeI {
+                    width: (size.width / density).max(1),
+                    height: (size.height / density).max(1),
+                };
+                window.size_policy.minimum = hints.minimum.map(logical);
+                window.size_policy.maximum = hints.maximum.map(logical);
+                let pixels = |size: SizeI| SizeI {
+                    width: size.width.saturating_mul(density).min(65535),
+                    height: size.height.saturating_mul(density).min(65535),
+                };
+                let size = preferred_size(
+                    hints,
+                    pixels(window.requested_size),
+                    pixels(window.size_policy.preferred),
+                    pixels(window.size_policy.available),
+                );
+                constrained_pixels = Some(size);
+                let previous = window.requested_size;
+                window.requested_size = logical(size);
+                if previous != window.requested_size {
+                    if !window.resize_preview.active() {
+                        window.resize_preview.begin(
+                            window.position,
+                            previous,
+                            ResizeEdge::BottomRight,
+                        );
+                        window.resize_preview.finish();
+                    }
+                    changed = true;
                 }
             }
             if let Some(anchor) = window.resize_preview.anchor() {
@@ -288,7 +468,11 @@ impl X11Windows {
                 window.position = anchor.reconcile_position(window.position, window.requested_size);
                 changed |= previous != window.position;
             }
-            let desired = frame_geometry(window, config);
+            let mut desired = frame_geometry(window, config);
+            if let Some(size) = constrained_pixels {
+                desired.width = size.width.clamp(1, u16::MAX.into()) as u16;
+                desired.height = size.height.clamp(1, u16::MAX.into()) as u16;
+            }
             let Some(server) = xwm
                 .windows()
                 .and_then(|registry| registry.get(id.xid))
@@ -310,6 +494,18 @@ impl X11Windows {
                     continue;
                 }
                 // Snapshot before dispatch can publish content for the queued request.
+                if window.resize_preview.active() {
+                    resize_trace::begin(
+                        entry.surface.get(),
+                        format_args!(
+                            "xid={} target={:?} previous_revision={} sync={:?}",
+                            id.xid,
+                            target_size,
+                            window.presentation.revision,
+                            xwm.resize_sync_status(*id)
+                        ),
+                    );
+                }
                 window.resize_preview.submitted(
                     target_size,
                     window.presentation.revision,
@@ -326,24 +522,148 @@ impl X11Windows {
                         && window.presentation.size == target_size,
                 );
             }
-            changed |= window.resize_preview.settle(
+            if !xwm.commands_pending(*id) && xwm.command_capacity() > 0 {
+                if let Some(border) = entry.notify_border.take() {
+                    xwm.notify_configured(
+                        *id,
+                        notification_geometry(server, border),
+                        None,
+                        Instant::now(),
+                    )?;
+                    submitted += 1;
+                }
+            }
+            let settled = settle_resize(
+                window,
                 server_size,
-                window.presentation.size,
-                window.presentation.revision,
                 xwm.commands_pending(*id) || xwm.repaint_pending(*id),
             );
+            if settled {
+                resize_trace::reveal(
+                    entry.surface.get(),
+                    format_args!(
+                        "revision={} size={:?}",
+                        window.presentation.revision, window.presentation.size
+                    ),
+                );
+            }
+            changed |= settled;
         }
+        // Refresh optional diagnostic wakeups after completion changes.
+        self.preview_deadline = windows
+            .values()
+            .filter_map(|window| window.resize_preview.hold_deadline(started))
+            .min();
         Ok(changed)
     }
 }
 
+/// The client can finish before retained chrome is laid out. Never reveal its
+/// replacement image against a frame snapshot from the previous requested size.
+pub(super) fn settle_resize(window: &mut ClientWindow, server: SizeI, pending: bool) -> bool {
+    let frame_pending = window.chrome.as_ref().is_some_and(|chrome| {
+        let content = chrome.content.bounds;
+        content.width.round().max(1.0) as i32 != window.requested_size.width
+            || content.height.round().max(1.0) as i32 != window.requested_size.height
+    });
+    window.resize_preview.settle(
+        server,
+        window.presentation.size,
+        window.presentation.revision,
+        pending || frame_pending,
+    )
+}
+
+/// Switch frame ownership without moving the client content or dropping management.
+pub(super) fn apply_decorations(
+    window: &mut ClientWindow,
+    decorated: bool,
+    config: &LinuxDesktopConfig,
+) {
+    if window.server_decorated == decorated {
+        return;
+    }
+    let old_offset = window_content_offset(window, config);
+    let old_outer = if window_has_frame(window) {
+        window
+            .chrome_outer
+            .unwrap_or_else(|| legacy_window_outer(window, config))
+    } else {
+        window.requested_size
+    };
+    window.server_decorated = decorated;
+    window.chrome = None;
+    window.chrome_outer = None;
+    window.chrome_content_offset = None;
+    let new_offset = window_content_offset(window, config);
+    let delta = PointI {
+        x: old_offset.x - new_offset.x,
+        y: old_offset.y - new_offset.y,
+    };
+    if window.maximized && !window.fullscreen {
+        let new_outer = if window_has_frame(window) {
+            legacy_window_outer(window, config)
+        } else {
+            window.requested_size
+        };
+        window.requested_size = SizeI {
+            width: (old_outer.width - (new_outer.width - window.requested_size.width)).max(1),
+            height: (old_outer.height - (new_outer.height - window.requested_size.height)).max(1),
+        };
+        window.resize_preview.finish();
+    } else {
+        window.position.x = window.position.x.saturating_add(delta.x);
+        window.position.y = window.position.y.saturating_add(delta.y);
+    }
+    if let Some((position, _)) = &mut window.restore_geometry {
+        // Restore geometry describes a non-fullscreen frame, even when the current frame is hidden.
+        let title_delta = if decorated {
+            -config.titlebar_height
+        } else {
+            config.titlebar_height
+        };
+        position.y = position.y.saturating_add(title_delta);
+    }
+}
+
+pub(super) fn frame_extents(window: &ClientWindow, config: &LinuxDesktopConfig) -> [u32; 4] {
+    if !window_has_frame(window) {
+        return [0; 4];
+    }
+    let offset = window_content_offset(window, config);
+    let outer = window
+        .chrome_outer
+        .unwrap_or_else(|| legacy_window_outer(window, config));
+    let density = window.surface_scale.max(1);
+    [
+        offset.x,
+        outer.width - window.requested_size.width - offset.x,
+        offset.y,
+        outer.height - window.requested_size.height - offset.y,
+    ]
+    .map(|value| value.max(0).saturating_mul(density) as u32)
+}
+
 fn frame_geometry(window: &ClientWindow, config: &LinuxDesktopConfig) -> Geometry {
     let content = window_content_rect(window, window.position, config);
+    let density = window.surface_scale.max(1);
     Geometry {
-        x: content.x.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
-        y: content.y.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
-        width: content.width.clamp(1, u16::MAX.into()) as u16,
-        height: content.height.clamp(1, u16::MAX.into()) as u16,
+        x: content
+            .x
+            .saturating_mul(density)
+            .clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+        y: content
+            .y
+            .saturating_mul(density)
+            .clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+        width: content
+            .width
+            .saturating_mul(density)
+            .clamp(1, u16::MAX.into()) as u16,
+        height: content
+            .height
+            .saturating_mul(density)
+            .clamp(1, u16::MAX.into()) as u16,
         // The compositor supplies the border; an X11 server border would be a
         // second frame and would shift the surface/input origin.
         border: 0,
@@ -352,18 +672,96 @@ fn frame_geometry(window: &ClientWindow, config: &LinuxDesktopConfig) -> Geometr
 
 /// Bounded grid/aspect projection. Candidate count is independent of client
 /// dimensions; inconsistent hints fall back to confirmed server size.
+fn preferred_size(
+    hints: crate::xwayland::normal_hints::NormalHints,
+    wanted: SizeI,
+    preferred: SizeI,
+    available: SizeI,
+) -> SizeI {
+    let client_max = hints.maximum.unwrap_or(SizeI {
+        width: 65535,
+        height: 65535,
+    });
+    let floor = SizeI {
+        width: preferred
+            .width
+            .min(available.width)
+            .min(client_max.width)
+            .max(1),
+        height: preferred
+            .height
+            .min(available.height)
+            .min(client_max.height)
+            .max(1),
+    };
+    constrained_size_in(hints, wanted, floor, available)
+        .or_else(|| {
+            constrained_size_in(
+                hints,
+                wanted,
+                SizeI {
+                    width: 1,
+                    height: 1,
+                },
+                available,
+            )
+        })
+        .or_else(|| constrained_size(hints, wanted))
+        .unwrap_or_else(|| {
+            super::size_policy::SizePolicy {
+                preferred,
+                available,
+                ..Default::default()
+            }
+            .resolve(wanted)
+        })
+}
+
 fn constrained_size(
     hints: crate::xwayland::normal_hints::NormalHints,
     wanted: SizeI,
 ) -> Option<SizeI> {
-    if hints.accepts_size(wanted) {
-        return Some(wanted);
-    }
-    let minimum = hints.minimum_size();
-    let maximum = hints.maximum.unwrap_or(SizeI {
+    constrained_size_in(
+        hints,
+        wanted,
+        SizeI {
+            width: 1,
+            height: 1,
+        },
+        SizeI {
+            width: 65535,
+            height: 65535,
+        },
+    )
+}
+
+fn constrained_size_in(
+    hints: crate::xwayland::normal_hints::NormalHints,
+    wanted: SizeI,
+    floor: SizeI,
+    ceiling: SizeI,
+) -> Option<SizeI> {
+    let client_min = hints.minimum_size();
+    let client_max = hints.maximum.unwrap_or(SizeI {
         width: 65535,
         height: 65535,
     });
+    let minimum = SizeI {
+        width: client_min.width.max(floor.width),
+        height: client_min.height.max(floor.height),
+    };
+    let maximum = SizeI {
+        width: client_max.width.min(ceiling.width),
+        height: client_max.height.min(ceiling.height),
+    };
+    if hints.accepts_size(wanted)
+        && wanted.width >= minimum.width
+        && wanted.height >= minimum.height
+        && wanted.width <= maximum.width
+        && wanted.height <= maximum.height
+    {
+        return Some(wanted);
+    }
     let base = hints.increment_base();
     let step = hints.increment.unwrap_or(SizeI {
         width: 1,
@@ -476,6 +874,290 @@ mod tests {
         registry.get(10).unwrap().id
     }
 
+    #[test]
+    fn app_header_move_requires_a_live_press_owned_by_that_surface() {
+        use crate::compositor_wayland::{
+            ButtonState, ClientId, PointerFocus, SeatCapabilities, SeatState,
+        };
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        let other = WaylandSurfaceId::from_raw(2).unwrap();
+        let mut seat = SeatState::new(
+            "test",
+            SeatCapabilities {
+                pointer: true,
+                keyboard: false,
+                touch: false,
+            },
+        );
+        seat.pointer_focus = Some(PointerFocus {
+            client: ClientId::from_raw(1).unwrap(),
+            surface,
+            position: PointF::default(),
+            enter_serial: 1,
+        });
+        assert!(!authorize_move_resize(&seat, surface, 1));
+        seat.pointer_button_target(0x110, ButtonState::Pressed, false);
+        assert!(authorize_move_resize(&seat, surface, 1));
+        assert!(!authorize_move_resize(&seat, other, 1));
+        assert!(!authorize_move_resize(&seat, surface, 3));
+        assert!(!authorize_move_resize(&seat, surface, 0));
+        seat.pointer_button_target(0x110, ButtonState::Released, false);
+        assert!(!authorize_move_resize(&seat, surface, 1));
+    }
+
+    #[test]
+    fn client_header_receives_input_while_outer_border_keeps_resize_hits() {
+        let config = LinuxDesktopConfig::default();
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        let mut window = test_window(
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+            PointI { x: 100, y: 100 },
+        );
+        window.role = SurfaceRole::Xwayland;
+        window.backend = Some(WindowBackend::X11(id()));
+        apply_decorations(&mut window, false, &config);
+        let content = window_content_rect(&window, window.position, &config);
+        let border = PointF {
+            x: window.position.x as f32 + 1.0,
+            y: window.position.y as f32 + 100.0,
+        };
+        let windows = BTreeMap::from([(surface, window)]);
+        assert_eq!(
+            hit_test_decoration(
+                &windows,
+                &[surface],
+                PointF {
+                    x: content.x as f32 + 20.0,
+                    y: content.y as f32 + 2.0
+                },
+                &config,
+                &[]
+            ),
+            None
+        );
+        assert!(matches!(
+            hit_test_decoration(&windows, &[surface], border, &config, &[]),
+            Some((_, DecorationHit::Resize(ResizeEdge::Left)))
+        ));
+    }
+
+    #[test]
+    fn decoration_changes_preserve_client_geometry_management_and_scaled_extents() {
+        let config = LinuxDesktopConfig::default();
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        for density in [1, 3] {
+            let mut window = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI { x: 100, y: 100 },
+            );
+            window.role = SurfaceRole::Xwayland;
+            window.surface_scale = density;
+            let mut adapter = X11Windows::default();
+            let initial = frame_geometry(&window, &config);
+            adapter.attach(id(), surface, initial, false, &mut window, &config);
+            let content = frame_geometry(&window, &config);
+            let extents = frame_extents(&window, &config);
+            assert_eq!(
+                extents[2],
+                ((config.titlebar_height + config.window_border) * density) as u32
+            );
+            apply_decorations(&mut window, false, &config);
+            assert_eq!(frame_geometry(&window, &config), content);
+            assert_eq!(
+                frame_extents(&window, &config),
+                [(config.window_border * density) as u32; 4]
+            );
+            assert_eq!(window.backend, Some(WindowBackend::X11(id())));
+            assert!(!window.minimized);
+            adapter.attach(id(), surface, content, false, &mut window, &config);
+            assert!(!window.server_decorated); // Subsequent image sync must not restore chrome.
+            apply_decorations(&mut window, true, &config);
+            assert_eq!(frame_geometry(&window, &config), content);
+            assert_eq!(frame_extents(&window, &config), extents);
+            window.fullscreen = true;
+            assert_eq!(frame_extents(&window, &config), [0; 4]);
+        }
+    }
+    #[test]
+    fn decoration_toggle_keeps_maximized_outer_size_and_custom_extents() {
+        let config = LinuxDesktopConfig::default();
+        let mut window = test_window(
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+            PointI { x: 10, y: 20 },
+        );
+        window.role = SurfaceRole::Xwayland;
+        window.backend = Some(WindowBackend::X11(id()));
+        window.chrome_content_offset = Some(PointI { x: 7, y: 45 });
+        window.chrome_outer = Some(SizeI {
+            width: 659,
+            height: 535,
+        });
+        assert_eq!(frame_extents(&window, &config), [7, 12, 45, 10]);
+        window.maximized = true;
+        let position = window.position;
+        apply_decorations(&mut window, false, &config);
+        assert_eq!(window.position, position);
+        assert_eq!(
+            legacy_window_outer(&window, &config),
+            SizeI {
+                width: 659,
+                height: 535
+            }
+        );
+        assert!(window.chrome_content_offset.is_none());
+        assert!(window.chrome_outer.is_none());
+        apply_decorations(&mut window, true, &config);
+        assert_eq!(window.position, position);
+        assert_eq!(
+            legacy_window_outer(&window, &config),
+            SizeI {
+                width: 659,
+                height: 535
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_pixel_minimum_preserves_grid_aspect_and_fixed_exceptions() {
+        use crate::xwayland::normal_hints::{AspectRatio, NormalHints};
+        let wanted = SizeI {
+            width: 300,
+            height: 300,
+        };
+        let preferred = SizeI {
+            width: 900,
+            height: 600,
+        }; // 300x200 logical at 3x
+        let available = SizeI {
+            width: 1800,
+            height: 1200,
+        };
+        let ordinary = preferred_size(NormalHints::default(), wanted, preferred, available);
+        assert_eq!(ordinary, preferred);
+        let fixed = NormalHints {
+            minimum: Some(wanted),
+            maximum: Some(wanted),
+            ..Default::default()
+        };
+        assert_eq!(
+            preferred_size(fixed, preferred, preferred, available),
+            wanted
+        );
+        let grid = NormalHints {
+            base: Some(SizeI {
+                width: 2,
+                height: 4,
+            }),
+            increment: Some(SizeI {
+                width: 8,
+                height: 16,
+            }),
+            aspect: Some((
+                AspectRatio {
+                    numerator: 1,
+                    denominator: 1,
+                },
+                AspectRatio {
+                    numerator: 2,
+                    denominator: 1,
+                },
+            )),
+            ..Default::default()
+        };
+        let size = preferred_size(grid, wanted, preferred, available);
+        assert!(grid.accepts_size(size));
+        assert!(size.width >= preferred.width && size.height >= preferred.height);
+        assert!(size.width <= available.width && size.height <= available.height);
+        let invalid = NormalHints {
+            minimum: Some(preferred),
+            maximum: Some(wanted),
+            ..Default::default()
+        };
+        assert_eq!(
+            preferred_size(invalid, wanted, preferred, available),
+            preferred
+        );
+    }
+    #[test]
+    fn dense_x11_geometry_round_trips_without_scaling_chrome_or_input_twice() {
+        let config = LinuxDesktopConfig::default();
+        let mut window = test_window(
+            SizeI {
+                width: 900,
+                height: 600,
+            },
+            PointI::default(),
+        );
+        window.role = SurfaceRole::Xwayland;
+        window.surface_scale = 3;
+        window.presentation.size = SizeI {
+            width: 900,
+            height: 600,
+        };
+        let geometry = Geometry {
+            x: 300,
+            y: 300,
+            width: 900,
+            height: 600,
+            border: 0,
+        };
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        let mut adapter = X11Windows::default();
+        adapter.attach(id(), surface, geometry, false, &mut window, &config);
+        assert_eq!(
+            window.requested_size,
+            SizeI {
+                width: 300,
+                height: 200
+            }
+        );
+        assert_eq!(frame_geometry(&window, &config), geometry);
+        let placement = surface_placement(&window, window.position, &config);
+        assert_eq!(
+            placement.target,
+            RectI {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200
+            }
+        );
+        let desktop = PointF {
+            x: 110.5,
+            y: 120.25,
+        };
+        assert_eq!(
+            placement.surface_local(desktop),
+            PointF { x: 31.5, y: 60.75 }
+        );
+        assert_eq!(
+            placement.output_position(placement.surface_local(desktop)),
+            desktop
+        );
+        adapter.attach(
+            id(),
+            surface,
+            Geometry {
+                x: -90,
+                y: 150,
+                ..geometry
+            },
+            true,
+            &mut window,
+            &config,
+        );
+        assert_eq!(window.position, PointI { x: -30, y: 50 });
+        assert!(!window.server_decorated);
+    }
     #[test]
     fn resize_preview_waits_for_checked_matching_new_content_and_can_be_superseded() {
         let old = SizeI {
@@ -931,5 +1613,122 @@ mod tests {
         .unwrap();
         assert_eq!(size.width, size.height);
         assert!(square.accepts_size(size));
+    }
+}
+
+fn notification_geometry(actual: Geometry, requested_border: u16) -> Geometry {
+    let adjust = |value: i16| {
+        (i32::from(value) + i32::from(actual.border) - i32::from(requested_border))
+            .clamp(i16::MIN.into(), i16::MAX.into()) as i16
+    };
+    Geometry {
+        x: adjust(actual.x),
+        y: adjust(actual.y),
+        border: requested_border,
+        ..actual
+    }
+}
+
+#[cfg(test)]
+mod configure_reply_tests {
+    use super::*;
+    #[test]
+    fn configure_reply_does_not_require_a_wayland_image() {
+        use crate::xwayland::xwm::decoration_tests::wire_request as request;
+        use crate::xwayland::xwm::decoration_tests::{drive, fixture};
+        let (mut xwm, mut peer, now, id) = fixture();
+        let mut adapter = X11Windows::default();
+        // A previous image's adapter may remain while the X window is unmapped.
+        adapter.entries.insert(
+            id,
+            Entry {
+                surface: WaylandSurfaceId::from_raw(100).unwrap(),
+                sent: None,
+                notify_border: None,
+                requested_border: 5,
+            },
+        );
+        adapter.configure_requested(id, RequestedConfigure::default());
+        let mut submitted = 0;
+        adapter.flush_unattached(&mut xwm, &mut submitted).unwrap();
+        assert_eq!(submitted, 1);
+        drive(&mut xwm, now);
+        let bytes = request(&mut peer);
+        assert_eq!(bytes[0], 25); // SendEvent, with no preceding ConfigureWindow for a no-op.
+        assert_eq!(bytes[12] & 0x7f, 22); // ConfigureNotify.
+        assert_eq!(
+            u32::from_ne_bytes(bytes[20..24].try_into().unwrap()),
+            id.xid
+        );
+        assert!(adapter.requests.is_empty());
+        assert!(adapter.unattached_replies.is_empty());
+    }
+
+    #[test]
+    fn denied_and_no_op_requests_keep_actual_geometry_and_last_requested_border() {
+        use super::super::client::maximize_preview_tests::test_window;
+        let surface = WaylandSurfaceId::from_raw(10).unwrap();
+        let id = XWindow {
+            generation: 1,
+            xid: 100,
+            incarnation: 1,
+        };
+        let geometry = Geometry {
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 480,
+            border: 0,
+        };
+        let config = LinuxDesktopConfig::default();
+        let mut window = test_window(
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+            PointI::default(),
+        );
+        window.role = SurfaceRole::Xwayland;
+        let mut adapter = X11Windows::default();
+        adapter.attach(id, surface, geometry, false, &mut window, &config);
+        window.maximized = true;
+        let original = (window.position, window.requested_size);
+        adapter.configure_requested(
+            id,
+            RequestedConfigure {
+                x: Some(50),
+                width: Some(320),
+                border: Some(5),
+                ..Default::default()
+            },
+        );
+        adapter.attach(id, surface, geometry, false, &mut window, &config);
+        assert_eq!((window.position, window.requested_size), original);
+        assert_eq!(adapter.entries[&id].notify_border, Some(5));
+        adapter.entries.get_mut(&id).unwrap().notify_border = None;
+        adapter.configure_requested(id, RequestedConfigure::default());
+        adapter.attach(id, surface, geometry, false, &mut window, &config);
+        assert_eq!(adapter.entries[&id].notify_border, Some(5));
+    }
+
+    #[test]
+    fn synthetic_coordinates_preserve_client_origin_with_requested_border() {
+        let actual = Geometry {
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 480,
+            border: 0,
+        };
+        assert_eq!(
+            notification_geometry(actual, 3),
+            Geometry {
+                x: 7,
+                y: 17,
+                border: 3,
+                ..actual
+            }
+        );
+        assert_eq!(notification_geometry(actual, 0), actual);
     }
 }

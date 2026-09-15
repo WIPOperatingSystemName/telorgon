@@ -235,15 +235,62 @@ pub enum ImageResourceDelta {
     Remove(ImageId),
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+/// Render-native liquid-glass parameters. Distances use the material's local pixel space.
+/// The shader receives 16 packed f32 words (64 bytes), separate from image ownership.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LiquidGlassMaterial {
+    pub backdrop: ImageId,
+    /// Top-left, top-right, bottom-right, bottom-left.
+    pub radii: [f32; 4],
+    pub inverse_output_size: [f32; 2],
+    pub inverse_bevel: f32,
+    pub blend_softness: f32,
+    pub refraction: f32,
+    pub dispersion: f32,
+    pub rim: f32,
+    pub fresnel: f32,
+    pub specular: f32,
+    /// Linear RGB already multiplied by tint strength; W is remaining transmission.
+    pub tint: [f32; 4],
+}
+
+impl LiquidGlassMaterial {
+    pub(crate) fn words(self) -> [u32; 17] {
+        [
+            self.radii[0], self.radii[1], self.radii[2], self.radii[3],
+            self.inverse_output_size[0], self.inverse_output_size[1],
+            self.inverse_bevel, self.refraction,
+            self.dispersion, self.rim, self.fresnel, self.specular,
+            self.tint[0], self.tint[1], self.tint[2], self.tint[3],
+            self.blend_softness,
+        ].map(f32::to_bits)
+    }
+
+    pub(crate) fn valid(self) -> bool {
+        self.words().into_iter().all(|v| f32::from_bits(v).is_finite())
+            && self.radii.into_iter().all(|v| v >= 0.0)
+            && self.inverse_output_size.into_iter().all(|v| v > 0.0)
+            && self.inverse_bevel > 0.0
+            && self.blend_softness >= 0.0
+            && self.refraction >= 0.0
+            && self.dispersion >= 0.0
+            && [self.rim, self.fresnel, self.specular]
+                .into_iter().all(|v| (0.0..=1.0).contains(&v))
+            && self.tint.into_iter().all(|v| (0.0..=1.0).contains(&v))
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum MaterialKind {
     #[default]
     Solid,
     LinearGradientHorizontal,
     LinearGradientVertical,
+    /// Sampled rounded-window lens; the backdrop must be an owned image in this scene.
+    LiquidGlass(LiquidGlassMaterial),
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct MaterialResource {
     pub material: MaterialId,
     pub content_version: u64,
@@ -251,7 +298,7 @@ pub struct MaterialResource {
     pub colors: [ColorRgba8; 2],
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum MaterialResourceDelta {
     Upsert(MaterialResource),
     Remove(MaterialId),
@@ -303,6 +350,7 @@ pub enum PrimitiveKind {
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PipelineKind {
+    LiquidGlass,
     AnalyticBox,
     Glyph,
     Image,
@@ -310,6 +358,8 @@ pub enum PipelineKind {
 }
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BlendMode {
+    /// Sum premultiplied contributions, used for isolated weighted crossfades.
+    Add,
     Opaque,
     #[default]
     Alpha,

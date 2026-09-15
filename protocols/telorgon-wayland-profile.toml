@@ -103,8 +103,8 @@ availability = "per-seat"
 
 [[global]]
 name = "zwp_linux_dmabuf_v1"
-max_version = 3
-availability = "exact-vulkan-format-modifier-capabilities"
+max_version = 4
+availability = "exact-vulkan-format-modifier-capabilities-and-matched-drm-device-feedback"
 
 [[global]]
 name = "zwp_linux_explicit_synchronization_v1"

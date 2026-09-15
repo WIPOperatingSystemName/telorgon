@@ -12,6 +12,61 @@ pub(super) enum DecorationHit {
     ShellAction(crate::ShellActionId),
 }
 
+/// Compositor control clicks share press/release semantics across client backends.
+#[derive(Default)]
+pub(super) struct DecorationClick(Option<(WaylandSurfaceId, DecorationHit)>);
+impl DecorationClick {
+    pub fn press(&mut self, surface: WaylandSurfaceId, hit: DecorationHit) {
+        self.0 = Some((surface, hit));
+    }
+    pub fn release(
+        &mut self,
+        over: Option<(WaylandSurfaceId, DecorationHit)>,
+    ) -> Option<(WaylandSurfaceId, DecorationHit)> {
+        self.0.take().filter(|pressed| Some(*pressed) == over)
+    }
+    pub fn cancel(&mut self) {
+        self.0 = None;
+    }
+    pub fn cancel_surface(&mut self, surface: WaylandSurfaceId) {
+        if self.0.is_some_and(|(id, _)| id == surface) {
+            self.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod decoration_click_tests {
+    use super::*;
+    #[test]
+    fn controls_require_matching_press_and_release_and_fire_only_once() {
+        let a = WaylandSurfaceId::from_raw(1).unwrap();
+        let b = WaylandSurfaceId::from_raw(2).unwrap();
+        for control in [
+            DecorationHit::Close,
+            DecorationHit::Maximize,
+            DecorationHit::Minimize,
+        ] {
+            let mut click = DecorationClick::default();
+            assert_eq!(click.release(Some((a, control))), None);
+            click.press(a, control);
+            assert_eq!(click.release(Some((a, control))), Some((a, control)));
+            assert_eq!(click.release(Some((a, control))), None);
+            for outside in [None, Some((a, DecorationHit::Titlebar)), Some((b, control))] {
+                click.press(a, control);
+                assert_eq!(click.release(outside), None);
+                assert_eq!(click.release(Some((a, control))), None);
+            }
+            click.press(a, control);
+            click.cancel_surface(a);
+            assert_eq!(click.release(Some((a, control))), None);
+            click.press(a, control);
+            click.cancel();
+            assert_eq!(click.release(Some((a, control))), None);
+        }
+    }
+}
+
 fn pointer_focus_requires_transition(
     seat_focus: Option<WaylandSurfaceId>,
     next: Option<WaylandSurfaceId>,
@@ -248,6 +303,9 @@ pub(super) fn hit_test_decoration(
         let Some(window) = windows.get(surface) else {
             continue;
         };
+        let position = window
+            .motion_input
+            .map_or(position, |input| input.map(position));
         if window.role == SurfaceRole::Xwayland
             && window.backend.is_none()
             && !window.minimized
@@ -265,15 +323,17 @@ pub(super) fn hit_test_decoration(
                 && position.y < content.bottom() as f32
             {
                 // A veil is compositor content, not a hit target for a lower window's controls.
-                if window.resize_veil_active() {
+                if window.resize_veil_active()
+                    || window.motion_input.is_some_and(|i| i.block_content)
+                {
                     return Some((*surface, DecorationHit::Frame));
                 }
-                if !window_is_decorated(window) {
+                if !window_has_frame(window) {
                     return None;
                 }
             }
         }
-        if window.backend.is_none() || window.minimized || !window_is_decorated(window) {
+        if window.backend.is_none() || window.minimized || !window_has_frame(window) {
             continue;
         }
         let outer = window
@@ -359,7 +419,7 @@ pub(super) fn hit_test_decoration(
         if let Some(edge) = edge {
             return Some((*surface, DecorationHit::Resize(edge)));
         }
-        if local.y < border + config.titlebar_height {
+        if window_is_decorated(window) && local.y < border + config.titlebar_height {
             let icon_extent = config.titlebar_height.clamp(1, 24);
             for (index, (name, hit)) in [
                 ("window.close", DecorationHit::Close),
@@ -528,6 +588,7 @@ pub(super) fn hit_test_surface(
             resize_veil_owner(windows, *surface).is_none_or(|owner| owner == *surface)
         })
         .find(|(_, window)| {
+            let position = window.motion_input.map_or(position, |input|input.map(position));
             let target = window_content_rect(window, window.position, config);
             window.role != SurfaceRole::Cursor
                 && !window.minimized
@@ -540,7 +601,8 @@ pub(super) fn hit_test_surface(
         // The first window owns its whole live slot, including resize padding. Do not send
         // out-of-buffer coordinates to it or let padding click through to a lower window.
         .filter(|(surface, window)| {
-            resize_veil_owner(windows, *surface).is_none()
+            let position = window.motion_input.map_or(position, |input|input.map(position));
+            !window.motion_input.is_some_and(|i|i.block_content) && resize_veil_owner(windows, *surface).is_none()
                 && surface_placement(window, window.position, config).contains(position)
                 // Rounded corner handles overlap the rectangular content slot. Use the same
                 // chrome geometry as cursor/decoration routing so leaving a handle produces a

@@ -26,6 +26,9 @@ use x11rb_protocol::{
 const CAPACITY: usize = 4096;
 const BUDGET: Duration = Duration::from_millis(1);
 #[cfg(test)]
+#[path = "xwm_decoration_tests.rs"]
+pub(crate) mod decoration_tests;
+#[cfg(test)]
 #[path = "xwm_sync_tests.rs"]
 mod resize_sync_tests;
 enum Phase {
@@ -49,6 +52,11 @@ struct Tracking {
     server_time: u32,
     hints: PropertyReader,
     normal_hints: PropertyReader,
+    decorations: PropertyReader,
+    frame_extents: BTreeMap<XWindow, [u32; 4]>,
+    move_resize_requests: Vec<(XWindow, u32, u32)>,
+    maximize_requests: Vec<(XWindow, u32)>,
+    maximized: BTreeMap<XWindow, bool>,
     title: PropertyReader,
     legacy_title: PropertyReader,
     last_focus_request: Option<(u32, Instant)>,
@@ -269,6 +277,15 @@ impl Xwm {
         }
         result
     }
+    pub fn command_capacity(&self) -> usize {
+        match &self.phase {
+            Some(Phase::Tracking(t)) => t
+                .commands
+                .available_groups()
+                .min(t.requests.available_slots() / 2),
+            _ => 0,
+        }
+    }
     /// Queue a policy-approved map; only MapNotify changes confirmed map state.
     pub fn map_window(&mut self, window: XWindow, now: Instant) -> Result<()> {
         self.command(window, xproto::MapWindowRequest { window: window.xid }, now)
@@ -315,6 +332,9 @@ impl Xwm {
             .ok_or_else(|| Error("stale resize sync window".into()))?
             .geometry;
         let resized = actual.width != geometry.width || actual.height != geometry.height;
+        if self.command_capacity() == 0 {
+            return Ok(false);
+        }
         if resized {
             let Some(Phase::Tracking(t)) = self.phase.as_mut() else {
                 return Err(Error("resize requires tracking".into()));
@@ -545,6 +565,169 @@ impl Xwm {
         };
         tracking.title.refresh(window)?;
         tracking.legacy_title.refresh(window)
+    }
+
+    /// Resolve queued requests against live window incarnations and surface associations.
+    pub fn take_move_resize_requests(&mut self) -> Vec<(u64, u32, u32)> {
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Vec::new();
+        };
+        let Some(windows) = &self.windows else {
+            return Vec::new();
+        };
+        std::mem::take(&mut tracking.move_resize_requests)
+            .into_iter()
+            .filter_map(|(id, direction, button)| {
+                windows
+                    .presentable_surface(id)
+                    .map(|surface| (surface, direction, button))
+            })
+            .collect()
+    }
+
+    /// Mapped managed clients request remove (0), add (1), or toggle (2).
+    /// Resolve incarnations at consumption so stale requests cannot affect reused XIDs.
+    pub fn take_maximize_requests(&mut self) -> Vec<(u64, u32)> {
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Vec::new();
+        };
+        let Some(windows) = &self.windows else {
+            return Vec::new();
+        };
+        std::mem::take(&mut tracking.maximize_requests)
+            .into_iter()
+            .filter_map(|(id, action)| {
+                windows
+                    .get(id.xid)
+                    .filter(|w| w.id == id && !w.override_redirect)?;
+                windows
+                    .presentable_surface(id)
+                    .map(|surface| (surface, action))
+            })
+            .collect()
+    }
+
+    /// Publish the shell's actual maximize state, including changes from compositor controls.
+    /// Telorgon currently has one maximize mode, covering both axes.
+    pub fn set_maximized_state(
+        &mut self,
+        window: XWindow,
+        maximized: bool,
+        now: Instant,
+    ) -> Result<bool> {
+        if !self
+            .windows
+            .as_ref()
+            .and_then(|w| w.get(window.xid))
+            .is_some_and(|w| w.id == window && w.mapped && !w.override_redirect)
+        {
+            return Err(Error("stale or unmanaged XWM state window".into()));
+        }
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Err(Error("XWM not initialized".into()));
+        };
+        if tracking.maximized.get(&window) == Some(&maximized) {
+            return Ok(true);
+        }
+        if tracking.commands.available_groups() == 0 || tracking.requests.available_slots() < 2 {
+            return Ok(false);
+        }
+        let atoms = if maximized {
+            vec![
+                tracking.discovered.atoms["_NET_WM_STATE_MAXIMIZED_VERT"],
+                tracking.discovered.atoms["_NET_WM_STATE_MAXIMIZED_HORZ"],
+            ]
+        } else {
+            Vec::new()
+        };
+        tracking.commands.queue(
+            xproto::ChangePropertyRequest {
+                mode: xproto::PropMode::REPLACE,
+                window: window.xid,
+                property: tracking.discovered.atoms["_NET_WM_STATE"],
+                type_: xproto::AtomEnum::ATOM.into(),
+                format: 32,
+                data_len: atoms.len() as u32,
+                data: Cow::Owned(atoms.into_iter().flat_map(u32::to_ne_bytes).collect()),
+            },
+            window,
+            &mut tracking.transport,
+            &mut tracking.requests,
+            now + Duration::from_secs(10),
+        )?;
+        tracking.maximized.insert(window, maximized);
+        Ok(true)
+    }
+
+    pub fn decorations(&self, window: XWindow) -> bool {
+        match &self.phase {
+            Some(Phase::Tracking(tracking)) => {
+                tracking.decorations.decorations(window).unwrap_or(true)
+            }
+            _ => true,
+        }
+    }
+    pub fn refresh_decorations(&mut self, window: XWindow) -> Result<()> {
+        if !self
+            .windows
+            .as_ref()
+            .and_then(|w| w.get(window.xid))
+            .is_some_and(|w| w.id == window)
+        {
+            return Err(Error("stale XWM decoration window".into()));
+        }
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Err(Error("XWM not initialized".into()));
+        };
+        if !tracking.protocols.tracked(window) {
+            return Err(Error(
+                "decoration hints require property subscription".into(),
+            ));
+        }
+        tracking.decorations.refresh(window)
+    }
+    /// Publish left/right/top/bottom frame widths in X11 pixels. Repeated values coalesce.
+    /// Returns false on backpressure; the owner retries on its next presentation sync.
+    pub fn set_frame_extents(
+        &mut self,
+        window: XWindow,
+        extents: [u32; 4],
+        now: Instant,
+    ) -> Result<bool> {
+        if !self
+            .windows
+            .as_ref()
+            .and_then(|w| w.get(window.xid))
+            .is_some_and(|w| w.id == window)
+        {
+            return Err(Error("stale XWM frame extents window".into()));
+        }
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Err(Error("XWM not initialized".into()));
+        };
+        if tracking.frame_extents.get(&window) == Some(&extents) {
+            return Ok(true);
+        }
+        if tracking.commands.available_groups() == 0 || tracking.requests.available_slots() < 2 {
+            return Ok(false);
+        }
+        tracking.commands.queue(
+            xproto::ChangePropertyRequest {
+                mode: xproto::PropMode::REPLACE,
+                window: window.xid,
+                property: tracking.discovered.atoms["_NET_FRAME_EXTENTS"],
+                type_: xproto::AtomEnum::CARDINAL.into(),
+                format: 32,
+                data_len: 4,
+                data: Cow::Owned(extents.into_iter().flat_map(u32::to_ne_bytes).collect()),
+            },
+            window,
+            &mut tracking.transport,
+            &mut tracking.requests,
+            now + Duration::from_secs(10),
+        )?;
+        tracking.frame_extents.insert(window, extents);
+        Ok(true)
     }
 
     pub fn normal_hints(&self, window: XWindow) -> Option<super::normal_hints::NormalHints> {
@@ -901,6 +1084,8 @@ impl Xwm {
                             discovered.atoms["UTF8_STRING"],
                             true,
                         );
+                        let decorations =
+                            PropertyReader::new_decorations(discovered.atoms["_MOTIF_WM_HINTS"]);
                         Phase::Tracking(Tracking {
                             selection_checks: BTreeMap::new(),
                             selection_watches: Vec::new(),
@@ -917,6 +1102,11 @@ impl Xwm {
                             server_time: 0,
                             hints: PropertyReader::new_hints(),
                             normal_hints: PropertyReader::new_normal_hints(),
+                            decorations,
+                            frame_extents: BTreeMap::new(),
+                            move_resize_requests: Vec::new(),
+                            maximize_requests: Vec::new(),
+                            maximized: BTreeMap::new(),
                             title,
                             legacy_title: PropertyReader::new_text(
                                 xproto::AtomEnum::WM_NAME.into(),
@@ -950,6 +1140,11 @@ impl Xwm {
                                 &mut actions,
                             )?
                             && !tracking.hints.completion(
+                                &completion,
+                                self.windows.as_ref().unwrap(),
+                                &mut actions,
+                            )?
+                            && !tracking.decorations.completion(
                                 &completion,
                                 self.windows.as_ref().unwrap(),
                                 &mut actions,
@@ -1023,6 +1218,9 @@ impl Xwm {
                                         tracking.hints.refresh(w.id)?;
                                     }
                                     if let Some(w) = self.windows.as_ref().unwrap().get(e.window) {
+                                        if e.atom == tracking.decorations.property() {
+                                            tracking.decorations.refresh(w.id)?;
+                                        }
                                         if e.atom == tracking.title.property() {
                                             tracking.title.refresh(w.id)?;
                                         }
@@ -1035,6 +1233,69 @@ impl Xwm {
                                             self.windows.as_ref().unwrap().get(e.window)
                                     {
                                         tracking.normal_hints.refresh(w.id)?;
+                                    }
+                                }
+                                if bytes[0] & 0x7f == xproto::CLIENT_MESSAGE_EVENT {
+                                    let (e, _) = xproto::ClientMessageEvent::try_parse(&bytes)
+                                        .map_err(|_| {
+                                            Error("malformed frame extents request".into())
+                                        })?;
+                                    if e.format == 32
+                                        && e.type_ == tracking.discovered.atoms["_NET_WM_STATE"]
+                                    {
+                                        let data = e.data.as_data32();
+                                        let is_maximize = data[1..=2].iter().any(|atom| {
+                                            *atom == tracking.discovered.atoms["_NET_WM_STATE_MAXIMIZED_VERT"]
+                                                || *atom == tracking.discovered.atoms["_NET_WM_STATE_MAXIMIZED_HORZ"]
+                                        });
+                                        if data[0] <= 2
+                                            && data[3] <= 2
+                                            && is_maximize
+                                            && tracking.maximize_requests.len() < 256
+                                        {
+                                            if let Some(w) = self
+                                                .windows
+                                                .as_ref()
+                                                .unwrap()
+                                                .get(e.window)
+                                                .filter(|w| w.mapped && !w.override_redirect)
+                                            {
+                                                // Process a two-atom toggle once, not once per axis.
+                                                tracking.maximize_requests.push((w.id, data[0]));
+                                            }
+                                        }
+                                    }
+                                    if e.format == 32
+                                        && e.type_
+                                            == tracking.discovered.atoms["_NET_WM_MOVERESIZE"]
+                                    {
+                                        let data = e.data.as_data32();
+                                        if matches!(data[2], 0..=8 | 11)
+                                            && data[4] <= 2
+                                            && tracking.move_resize_requests.len() < 256
+                                        {
+                                            if let Some(w) = self
+                                                .windows
+                                                .as_ref()
+                                                .unwrap()
+                                                .get(e.window)
+                                                .filter(|w| w.mapped && !w.override_redirect)
+                                            {
+                                                tracking
+                                                    .move_resize_requests
+                                                    .push((w.id, data[2], data[3]));
+                                            }
+                                        }
+                                    }
+                                    if e.format == 32
+                                        && e.type_
+                                            == tracking.discovered.atoms["_NET_REQUEST_FRAME_EXTENTS"]
+                                    {
+                                        if let Some(w) =
+                                            self.windows.as_ref().unwrap().get(e.window)
+                                        {
+                                            tracking.frame_extents.remove(&w.id);
+                                        }
                                     }
                                 }
                                 if bytes[0] == xproto::SELECTION_CLEAR_EVENT {
@@ -1077,6 +1338,11 @@ impl Xwm {
                                     self.windows.as_ref().unwrap(),
                                     &mut actions,
                                 )?
+                                && !tracking.decorations.completion(
+                                    &completion,
+                                    self.windows.as_ref().unwrap(),
+                                    &mut actions,
+                                )?
                                 && !tracking.normal_hints.completion(
                                     &completion,
                                     self.windows.as_ref().unwrap(),
@@ -1103,12 +1369,19 @@ impl Xwm {
                         }
                     }
                     for action in &actions {
+                        if let Action::CommandFailed(window) = action {
+                            tracking.frame_extents.remove(window);
+                            tracking.maximized.remove(window);
+                        }
                         if let Action::Destroyed(window) = action {
                             tracking.resize_sync.forget(*window);
                             tracking.sync_counter.forget(*window);
                             tracking.protocols.forget(*window);
                             tracking.hints.forget(*window);
                             tracking.normal_hints.forget(*window);
+                            tracking.decorations.forget(*window);
+                            tracking.frame_extents.remove(window);
+                            tracking.maximized.remove(window);
                             tracking.title.forget(*window);
                             tracking.legacy_title.forget(*window);
                         }
@@ -1173,6 +1446,12 @@ impl Xwm {
                         started + BUDGET,
                     )?;
                     reschedule |= tracking.hints.schedule(
+                        &mut tracking.transport,
+                        &mut tracking.requests,
+                        now + Duration::from_secs(10),
+                        started + BUDGET,
+                    )?;
+                    reschedule |= tracking.decorations.schedule(
                         &mut tracking.transport,
                         &mut tracking.requests,
                         now + Duration::from_secs(10),
@@ -1319,7 +1598,7 @@ mod tests {
                 manager = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
             }
         }
-        for sequence in [35, 36] {
+        for sequence in [42, 43] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -1333,14 +1612,14 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 38,
+                sequence: 45,
                 ..Default::default()
             }
             .serialize(),
         );
         let create: [u8; 32] = xproto::CreateNotifyEvent {
             response_type: xproto::CREATE_NOTIFY_EVENT,
-            sequence: 38,
+            sequence: 45,
             parent: 1,
             window: 10,
             width: 640,
@@ -1351,7 +1630,7 @@ mod tests {
         peer.write_all(&create).unwrap();
         let timestamp: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 38,
+            sequence: 45,
             window: manager,
             atom: 110,
             time: 123,
@@ -1368,7 +1647,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 39 + index as u16,
+                        sequence: 46 + index as u16,
                         owner: manager,
                         ..Default::default()
                     }
@@ -1383,7 +1662,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 53,
+                sequence: 60,
                 ..Default::default()
             }
             .serialize(),
@@ -1393,7 +1672,7 @@ mod tests {
         assert_eq!(query[0], 15);
         assert_eq!(u32::from_ne_bytes(query[4..8].try_into().unwrap()), 1);
         let mut tree = xproto::QueryTreeReply {
-            sequence: 54,
+            sequence: 61,
             root: 1,
             parent: 0,
             children: vec![manager, 10],
@@ -1426,7 +1705,7 @@ mod tests {
                 assert_eq!(u32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 800);
             }
         }
-        for sequence in [56, 58] {
+        for sequence in [63, 65] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1441,7 +1720,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(10).unwrap().geometry.width, 640);
         let map: [u8; 32] = xproto::MapNotifyEvent {
             response_type: xproto::MAP_NOTIFY_EVENT,
-            sequence: 58,
+            sequence: 65,
             event: 1,
             window: 10,
             ..Default::default()
@@ -1450,7 +1729,7 @@ mod tests {
         peer.write_all(&map).unwrap();
         let configured: [u8; 32] = xproto::ConfigureNotifyEvent {
             response_type: xproto::CONFIGURE_NOTIFY_EVENT,
-            sequence: 58,
+            sequence: 65,
             event: 1,
             window: 10,
             x: -20,
@@ -1463,7 +1742,7 @@ mod tests {
         peer.write_all(&configured).unwrap();
         let serial: [u8; 32] = xproto::ClientMessageEvent {
             response_type: xproto::CLIENT_MESSAGE_EVENT | 128,
-            sequence: 58,
+            sequence: 65,
             format: 32,
             window: 10,
             type_: serial_atom,
@@ -1517,7 +1796,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 60,
+                sequence: 67,
                 ..Default::default()
             }
             .serialize(),
@@ -1538,7 +1817,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 62,
+                sequence: 69,
                 ..Default::default()
             }
             .serialize(),
@@ -1556,7 +1835,7 @@ mod tests {
             .flat_map(u32::to_ne_bytes)
             .collect();
         let protocol_reply = xproto::GetPropertyReply {
-            sequence: 63,
+            sequence: 70,
             format: 32,
             length: 2,
             type_: 4,
@@ -1591,7 +1870,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 65,
+                sequence: 72,
                 ..Default::default()
             }
             .serialize(),
@@ -1627,7 +1906,7 @@ mod tests {
             }
             .serialize()
         };
-        peer.write_all(&hints_reply(66, 1)).unwrap();
+        peer.write_all(&hints_reply(73, 1)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         // Leave capacity for one checked command, but not the complete focus pair.
         let (mut blocked_transport, mut blocked_requests, _, _blocked_peer, _) = ready();
@@ -1672,7 +1951,7 @@ mod tests {
         let (message, _) = xproto::ClientMessageEvent::try_parse(&take[12..]).unwrap();
         assert_eq!(message.data.as_data32(), [106, 124, 0, 0, 0]);
         assert_eq!(request(&mut peer)[0], 43);
-        for sequence in [68, 70] {
+        for sequence in [75, 77] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1685,7 +1964,7 @@ mod tests {
         assert!(drive(&mut xwm, now).is_empty());
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 70,
+            sequence: 77,
             window: 10,
             atom: 35,
             time: 125,
@@ -1697,7 +1976,7 @@ mod tests {
         assert_eq!(xwm.input_hints(id), None);
         assert!(xwm.focus_window(id, 125, now).is_err());
         assert_eq!(request(&mut peer)[0], 20);
-        peer.write_all(&hints_reply(71, 0)).unwrap();
+        peer.write_all(&hints_reply(78, 0)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         assert_eq!(
             xwm.focus_window(id, 125, now).unwrap(),
@@ -1709,7 +1988,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 73,
+                sequence: 80,
                 ..Default::default()
             }
             .serialize(),
@@ -1723,7 +2002,7 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(normal[8..12].try_into().unwrap()), 40);
         assert_eq!(u32::from_ne_bytes(normal[12..16].try_into().unwrap()), 41);
         let normal_reply = xproto::GetPropertyReply {
-            sequence: 74,
+            sequence: 81,
             format: 32,
             type_: 41,
             length: 18,
@@ -1796,7 +2075,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 76,
+                sequence: 83,
                 ..Default::default()
             }
             .serialize(),
@@ -1805,7 +2084,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(id.xid).unwrap().geometry, before);
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 76,
+            sequence: 83,
             window: id.xid,
             atom: 40,
             ..Default::default()
@@ -1818,7 +2097,7 @@ mod tests {
         assert_eq!(request(&mut peer)[0], 20);
         peer.write_all(
             &xproto::GetPropertyReply {
-                sequence: 77,
+                sequence: 84,
                 ..Default::default()
             }
             .serialize(),
@@ -1843,7 +2122,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 79,
+                sequence: 86,
                 ..Default::default()
             }
             .serialize(),
@@ -1887,7 +2166,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let notification: [u8; 32] = x11rb_protocol::protocol::xfixes::SelectionNotifyEvent {
             response_type: subscription.first_event,
-            sequence: 79,
+            sequence: 86,
             window: manager,
             owner: 77,
             selection: 1,
@@ -1951,7 +2230,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 81,
+                sequence: 88,
                 ..Default::default()
             }
             .serialize(),
@@ -1960,7 +2239,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let clock_sequence = xwm.request_focus_timestamp(id, now).unwrap();
         assert!(xwm.commands_pending(id));
-        assert_eq!(clock_sequence, 82);
+        assert_eq!(clock_sequence, 89);
         drive(&mut xwm, now);
         let marker = request(&mut peer);
         assert_eq!(marker[0], 18);
@@ -1987,7 +2266,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 83,
+                sequence: 90,
                 ..Default::default()
             }
             .serialize(),
@@ -2004,7 +2283,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 85,
+                sequence: 92,
                 ..Default::default()
             }
             .serialize(),
@@ -2013,7 +2292,7 @@ mod tests {
         assert!(!xwm.commands_pending(id));
         let clear: [u8; 32] = xproto::SelectionClearEvent {
             response_type: xproto::SELECTION_CLEAR_EVENT,
-            sequence: 85,
+            sequence: 92,
             time: 124,
             owner: manager,
             selection: wm_atom,

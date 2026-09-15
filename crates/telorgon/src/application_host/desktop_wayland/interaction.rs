@@ -109,6 +109,7 @@ pub(super) fn apply_window_interaction(
                     .clamp(0.0, 1.0);
                 let grab_y = (pointer_start.y - window.position.y as f32).max(0.0);
                 window.maximized = false;
+                window.motion_veil_pending = window.motion_style.enabled();
                 #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
                 {
                     window.resize_preview = Default::default();
@@ -116,6 +117,10 @@ pub(super) fn apply_window_interaction(
                 window.native_configure.resize_anchor = None;
                 window.native_configure.resize_final = None;
                 window.requested_size = restored_size;
+                if window.motion_style.enabled() && window.backend == Some(WindowBackend::Wayland) {
+                    window.native_configure.resize_final =
+                        Some(FinalResizeConfigure::pending(restored_size));
+                }
                 #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
                 if matches!(window.backend, Some(WindowBackend::X11(_))) {
                     window.resize_preview.finish();
@@ -158,8 +163,12 @@ pub(super) fn apply_window_interaction(
             let Some(window) = windows.get_mut(&surface) else {
                 return Ok(());
             };
-            window.position = position;
+            window.size_policy.preferred = config.preferred_window_minimum;
+            let size = window.size_policy.resolve(size);
+            window.position = ResizeAnchor::new(position_start, size_start, edge)
+                .reconcile_position(position, size);
             window.requested_size = size;
+            window.last_policy_request = None;
         }
     }
     Ok(())
@@ -264,6 +273,7 @@ pub(super) fn set_window_maximized(
     let Some(window) = windows.get_mut(&surface) else {
         return Ok(());
     };
+    window.motion_veil_pending = window.motion_style.enabled();
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
     {
         window.resize_preview = Default::default();
@@ -281,11 +291,17 @@ pub(super) fn set_window_maximized(
             x: work_area.x,
             y: work_area.y,
         };
-        window.requested_size = if window.server_decorated {
+        window.requested_size = if window_has_frame(window) {
             SizeI {
                 width: (work_area.width - config.window_border * 2).max(1),
-                height: (work_area.height - config.window_border * 2 - config.titlebar_height)
-                    .max(1),
+                height: (work_area.height
+                    - config.window_border * 2
+                    - if window_is_decorated(window) {
+                        config.titlebar_height
+                    } else {
+                        0
+                    })
+                .max(1),
             }
         } else {
             SizeI {
@@ -306,7 +322,9 @@ pub(super) fn set_window_maximized(
     if matches!(window.backend, Some(WindowBackend::X11(_))) {
         window.resize_preview.finish();
     }
-    if maximized && window.backend == Some(WindowBackend::Wayland) {
+    if (maximized || window.motion_style.enabled())
+        && window.backend == Some(WindowBackend::Wayland)
+    {
         window.native_configure.resize_final =
             Some(FinalResizeConfigure::pending(window.requested_size));
     }

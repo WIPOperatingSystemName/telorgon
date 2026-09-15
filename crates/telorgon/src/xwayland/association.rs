@@ -4,7 +4,7 @@
 //! serial. Surface identities must be compositor identities, never wire object
 //! IDs. This table is independent of protocol-object lifetime and map state.
 use super::{Error, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct XWindow {
@@ -19,8 +19,8 @@ pub struct Association {
     pub surface: u64,
 }
 
-/// Bounded per-server state. Exhausting history requires restarting the
-/// compatibility instance, never forgetting old serials and accepting reuse.
+/// Bounded live associations with lossless interval-compressed replay history.
+/// The live-window capacity is not a cumulative limit on a server's lifetimes.
 pub struct Associations {
     generation: u64,
     capacity: usize,
@@ -29,8 +29,9 @@ pub struct Associations {
     serial_windows: BTreeMap<u64, XWindow>,
     serial_surfaces: BTreeMap<u64, u64>,
     surface_serials: BTreeMap<u64, u64>,
-    used_serials: BTreeSet<u64>,
-    dead_surfaces: BTreeSet<u64>,
+    used_serials: History,
+    used_x_serials: History,
+    dead_surfaces: History,
     links: BTreeMap<XWindow, u64>,
     current_serials: BTreeMap<XWindow, u64>,
 }
@@ -47,8 +48,9 @@ impl Associations {
             serial_windows: BTreeMap::new(),
             serial_surfaces: BTreeMap::new(),
             surface_serials: BTreeMap::new(),
-            used_serials: BTreeSet::new(),
-            dead_surfaces: BTreeSet::new(),
+            used_serials: History::default(),
+            used_x_serials: History::default(),
+            dead_surfaces: History::default(),
             links: BTreeMap::new(),
             current_serials: BTreeMap::new(),
         })
@@ -104,8 +106,12 @@ impl Associations {
             }
             return Ok(None);
         }
-        if self.serial_windows.len() >= self.capacity {
-            return Err(Error("X serial history exhausted".into()));
+        if self.used_x_serials.contains(&serial) {
+            return Err(Error("retired Xwayland serial reused".into()));
+        }
+        self.used_x_serials.insert(serial)?;
+        if let Some(old) = self.current_serials.get(&window) {
+            self.serial_windows.remove(old);
         }
         self.serial_windows.insert(serial, window);
         self.current_serials.insert(window, serial);
@@ -128,10 +134,10 @@ impl Associations {
         {
             return Err(Error("invalid or repeated committed surface serial".into()));
         }
-        if self.used_serials.len() >= self.capacity {
-            return Err(Error("surface serial history exhausted".into()));
+        if self.surface_serials.len() >= self.capacity {
+            return Err(Error("live surface association bound reached".into()));
         }
-        self.used_serials.insert(serial);
+        self.used_serials.insert(serial)?;
         self.surface_serials.insert(surface, serial);
         self.serial_surfaces.insert(serial, surface);
         Ok(self.join(serial))
@@ -143,17 +149,19 @@ impl Associations {
         if self.live(window) {
             self.windows.remove(&window.xid);
             self.links.remove(&window);
-            self.current_serials.remove(&window);
+            if let Some(serial) = self.current_serials.remove(&window) {
+                self.serial_windows.remove(&serial);
+            }
         }
     }
     pub fn destroy_surface(&mut self, generation: u64, surface: u64) -> Result<()> {
         if generation != self.generation {
             return Ok(());
         }
-        if !self.dead_surfaces.contains(&surface) && self.dead_surfaces.len() >= self.capacity {
-            return Err(Error("destroyed surface history exhausted".into()));
+        self.dead_surfaces.insert(surface)?;
+        if let Some(serial) = self.surface_serials.remove(&surface) {
+            self.serial_surfaces.remove(&serial);
         }
-        self.dead_surfaces.insert(surface);
         self.links.retain(|_, value| *value != surface);
         Ok(())
     }
@@ -220,7 +228,7 @@ mod tests {
         let mut table = Associations::new(1, 1).unwrap();
         table.committed_surface(1, 100, 7).unwrap();
         table.destroy_surface(1, 100).unwrap();
-        assert!(table.committed_surface(1, 200, 8).is_err());
+        assert!(table.committed_surface(1, 200, 8).is_ok());
         assert!(table.committed_surface(1, 200, 7).is_err());
     }
     #[test]
@@ -232,5 +240,80 @@ mod tests {
         table.committed_surface(1, 200, 8).unwrap();
         assert_eq!(table.committed_surface(1, 100, 7).unwrap(), None);
         assert_eq!(table.surface_for(w), Some(200));
+    }
+}
+
+/// Lossless compression: sequential IDs consume one range rather than one allocation each.
+/// A separate fragmentation bound contains hostile sparse IDs without limiting ordinary churn.
+#[derive(Default)]
+struct History(BTreeMap<u64, u64>);
+impl History {
+    fn contains(&self, value: &u64) -> bool {
+        self.0
+            .range(..=value)
+            .next_back()
+            .is_some_and(|(_, end)| value <= end)
+    }
+    fn insert(&mut self, value: u64) -> Result<()> {
+        if self.contains(&value) {
+            return Ok(());
+        }
+        let previous = self.0.range(..value).next_back().map(|(&a, &b)| (a, b));
+        let next = self.0.range(value..).next().map(|(&a, &b)| (a, b));
+        let left = previous.filter(|(_, end)| end.checked_add(1) == Some(value));
+        let right = next.filter(|(start, _)| value.checked_add(1) == Some(*start));
+        if left.is_none() && right.is_none() && self.0.len() >= 1_048_576 {
+            return Err(Error(
+                "association history fragmentation bound reached".into(),
+            ));
+        }
+        let start = left.map_or(value, |(start, _)| start);
+        let end = right.map_or(value, |(_, end)| end);
+        if let Some((start, _)) = right {
+            self.0.remove(&start);
+        }
+        self.0.insert(start, end);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    #[test]
+    fn long_lived_server_reclaims_live_records_without_forgetting_replays() {
+        let mut table = Associations::new(1, 2).unwrap();
+        for serial in 1..=100_000 {
+            let window = table.create_window(10).unwrap();
+            table.window_serial(window, serial).unwrap();
+            table.committed_surface(1, serial, serial).unwrap();
+            table.destroy_surface(1, serial).unwrap();
+            table.destroy_window(window);
+        }
+        assert!(table.serial_windows.is_empty());
+        assert!(table.serial_surfaces.is_empty());
+        assert!(table.surface_serials.is_empty());
+        assert_eq!(table.used_serials.0.len(), 1);
+        assert_eq!(table.used_x_serials.0.len(), 1);
+        assert_eq!(table.dead_surfaces.0.len(), 1);
+        let window = table.create_window(10).unwrap();
+        assert!(table.window_serial(window, 1).is_err());
+        assert!(table.committed_surface(1, 100_001, 1).is_err());
+    }
+    #[test]
+    fn history_merges_out_of_order_ranges_without_accepting_gaps() {
+        let mut history = History::default();
+        for value in [8, 3, 5, 4, 7, 6] {
+            history.insert(value).unwrap();
+        }
+        assert_eq!(history.0.len(), 1);
+        for value in 3..=8 {
+            assert!(history.contains(&value));
+        }
+        assert!(!history.contains(&2));
+        assert!(!history.contains(&9));
+        history.insert(u64::MAX).unwrap();
+        history.insert(u64::MAX - 1).unwrap();
+        assert!(history.contains(&u64::MAX));
     }
 }

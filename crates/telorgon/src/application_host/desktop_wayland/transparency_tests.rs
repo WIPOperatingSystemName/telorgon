@@ -27,6 +27,7 @@ struct Raster {
     composition: DesktopComposition,
     scenes: BTreeMap<DesktopSceneKey, SoftwareScene>,
     surface: SoftwareSurface,
+    extent: SizeI,
 }
 
 impl Raster {
@@ -35,11 +36,12 @@ impl Raster {
             composition: DesktopComposition::new(EXTENT),
             scenes: BTreeMap::new(),
             surface: SoftwareSurface::default(),
+            extent: EXTENT,
         }
     }
 
     fn draw(&mut self, layers: Vec<DesktopLayer>) -> DesktopFrame {
-        let frame = self.composition.synchronize(EXTENT, layers).unwrap();
+        let frame = self.composition.synchronize(self.extent, layers).unwrap();
         for update in &frame.updates {
             let scene = self
                 .scenes
@@ -64,7 +66,7 @@ impl Raster {
             .render_composite(
                 &mut self.surface,
                 &layers,
-                EXTENT,
+                self.extent,
                 frame.damage,
                 ColorRgba8::rgba(0, 255, 0, 255),
             )
@@ -73,7 +75,7 @@ impl Raster {
     }
 
     fn pixel(&self, x: usize, y: usize) -> &[u8] {
-        let index = (y * EXTENT.width as usize + x) * 4;
+        let index = (y * self.extent.width as usize + x) * 4;
         &self.surface.pixels_rgba8()[index..index + 4]
     }
 }
@@ -470,9 +472,194 @@ fn rounded_frame_with_aperture(
         clips,
     ));
     layers.push(DesktopLayer::content_border(
-        9, border, extent, position, content,
+        9, border, extent, position, content, None,
     ));
     (layers, clips, content)
+}
+
+#[test]
+fn frame_outline_does_not_thin_an_already_rounded_border() {
+    for radius in [4.0, 8.0, 10.0] {
+        for width in [1.0, 2.0, 2.5] {
+            for opacity in [0.5, 1.0] {
+                let (layers, _, _) = rounded_frame(radius, width);
+                let border = layers
+                    .into_iter()
+                    .find(|layer| layer.key == DesktopLayerKey::ContentBorder(9))
+                    .unwrap();
+                let DesktopLayerContent::Decoration { mut instance, .. } = border.content else {
+                    unreachable!()
+                };
+                instance.opacity = opacity;
+                let position = PointI { x: 2, y: 1 };
+                let bounds = RectI {
+                    x: 2,
+                    y: 1,
+                    width: 28,
+                    height: 22,
+                };
+                let make = || {
+                    DesktopLayer::content_border(
+                        9,
+                        instance.clone(),
+                        border.source_extent,
+                        position,
+                        bounds,
+                        None,
+                    )
+                };
+                let mut reference = Raster::new();
+                reference.draw(vec![make()]);
+                let mut clipped = Raster::new();
+                clipped.draw(vec![make().with_frame_outline(&instance, position)]);
+                for y in 0..EXTENT.height as usize {
+                    for x in 0..EXTENT.width as usize {
+                        assert_eq!(
+                            clipped.pixel(x, y),
+                            reference.pixel(x, y),
+                            "outline reduced border coverage at {x},{y}, radius={radius}, width={width}, opacity={opacity}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn content_backing_and_border_leave_no_desktop_seam_at_any_corner() {
+    use crate::core::{PointF, RectF};
+    use crate::render::RoundedClip;
+    let blue = ColorRgba8::rgba(0, 0, 255, 255);
+    for factor in [1.0, 1.25, 1.5, 2.0] {
+        for width in [1.0, 2.0, 2.5] {
+            let (layers, _, _) = rounded_frame(8.0, width);
+            let border = layers
+                .into_iter()
+                .find(|layer| layer.key == DesktopLayerKey::ContentBorder(9))
+                .unwrap();
+            let DesktopLayerContent::Decoration { mut instance, .. } = border.content else {
+                unreachable!()
+            };
+            // Include all four corners, as in a frame with its title bar hidden.
+            let outer = RoundedClip::new(
+                RectF {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 28.0 * factor,
+                    height: 22.0 * factor,
+                },
+                crate::ui::CornerRadii::all(8.0 * factor),
+            );
+            let inner = outer.inset(crate::render::Border::all(width * factor, blue));
+            instance.rect = outer.rect;
+            instance.view_bounds = outer.rect;
+            instance.corner_radii = outer.radii;
+            instance.border =
+                crate::render::Border::all(width * factor, ColorRgba8::rgba(255, 0, 0, 255));
+            let extent = SizeI {
+                width: outer.rect.width.ceil() as i32,
+                height: outer.rect.height.ceil() as i32,
+            };
+            let content = RectI {
+                x: 0,
+                y: 0,
+                width: extent.width,
+                height: extent.height,
+            };
+            let mut separate = Raster::new();
+            separate.extent = extent;
+            separate.draw(vec![
+                DesktopLayer::content_border(
+                    9,
+                    instance.clone(),
+                    extent,
+                    PointI::default(),
+                    content,
+                    None,
+                ),
+                DesktopLayer::solid(
+                    DesktopLayerKey::ContentBackground(9),
+                    DesktopSceneKey::ContentBackground(9),
+                    blue,
+                    content,
+                )
+                .with_content_clip(content, [Some(inner), None]),
+            ]);
+            let patch = DesktopLayer::content_border(
+                9,
+                instance,
+                extent,
+                PointI::default(),
+                content,
+                Some(blue),
+            );
+            let mut raster = Raster::new();
+            raster.extent = extent;
+            raster.draw(vec![patch]);
+            let mut partial = [0; 4];
+            let mut original_leaks = 0;
+            for y in 0..raster.extent.height as usize {
+                for x in 0..raster.extent.width as usize {
+                    let point = PointF {
+                        x: x as f32 + 0.5,
+                        y: y as f32 + 0.5,
+                    };
+                    let c = inner.coverage(point);
+                    if outer.coverage(point) == 1.0 && c > 0.0 && c < 1.0 {
+                        let quadrant = usize::from(point.x > 14.0 * factor)
+                            + 2 * usize::from(point.y > 11.0 * factor);
+                        partial[quadrant] += 1;
+                        original_leaks += usize::from(separate.pixel(x, y)[1] > 0);
+                        assert_eq!(
+                            raster.pixel(x, y)[1],
+                            0,
+                            "desktop leaked at {x},{y}, scale={factor}, border={width}"
+                        );
+                        assert!(
+                            raster.pixel(x, y)[0] > 0 && raster.pixel(x, y)[2] > 0,
+                            "the edge must retain both border and backing coverage"
+                        );
+                    }
+                }
+            }
+            assert!(partial.into_iter().all(|count| count > 0));
+            assert!(
+                original_leaks > 0,
+                "fixture must reproduce the separate-draw seam"
+            );
+        }
+    }
+}
+
+#[test]
+fn combined_content_backing_preserves_transparent_and_translucent_backgrounds() {
+    for (alpha, expected) in [
+        (0, [0, 255, 0, 255]),
+        (128, [0, 187, 188, 255]),
+        (255, [0, 0, 255, 255]),
+    ] {
+        let (layers, _, content) = rounded_frame(8.0, 2.0);
+        let border = layers
+            .into_iter()
+            .find(|layer| layer.key == DesktopLayerKey::ContentBorder(9))
+            .unwrap();
+        let DesktopLayerContent::Decoration { instance, .. } = border.content else {
+            unreachable!()
+        };
+        let mut raster = Raster::new();
+        raster.draw(vec![DesktopLayer::content_border(
+            9,
+            instance,
+            border.source_extent,
+            PointI { x: 2, y: 1 },
+            content,
+            Some(ColorRgba8::rgba(0, 0, 255, alpha)),
+        )]);
+        assert_eq!(raster.pixel(16, 16), expected);
+        assert_eq!(raster.pixel(4, 19), [255, 0, 0, 255], "border lost opacity");
+        assert_eq!(raster.pixel(2, 22), [0, 255, 0, 255], "outer corner leaked");
+    }
 }
 
 #[test]
@@ -808,6 +995,7 @@ fn replaced_frame_nodes_update_the_same_border_scene_slot() {
         border.source_extent,
         PointI { x: 2, y: 1 },
         border.clip.unwrap(),
+        None,
     )]);
     assert_eq!(raster.pixel(4, 19), [255, 0, 0, 255]);
     instance.node = crate::scene::NodeId::new(99, 5);
@@ -818,6 +1006,7 @@ fn replaced_frame_nodes_update_the_same_border_scene_slot() {
         border.source_extent,
         PointI { x: 2, y: 1 },
         border.clip.unwrap(),
+        None,
     )]);
     assert_eq!(raster.pixel(4, 19), [0, 0, 255, 255]);
     assert_eq!(

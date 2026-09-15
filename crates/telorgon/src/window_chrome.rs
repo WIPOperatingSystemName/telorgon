@@ -1,10 +1,99 @@
 //! Protocol-neutral window metadata, chrome roles, actions, and layout-derived hit regions.
 
+mod motion;
+pub use motion::{
+    ContentFade, GeometryMotion, Minimize, Spring, WindowMotion, WindowTween, tween_ms,
+};
+
 use crate::assets::Icon;
 use crate::core::{ColorRgba8, EdgeInsets, RectF};
 use crate::layout::LayoutEngine;
 use crate::render::ImageId;
 use crate::ui::{MountedUi, UiNodeId};
+
+/// Appearance of the whole-window placeholder while waiting for resized client content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResizePreview {
+    /// Straight RGBA; alpha reveals the sharp desktop underneath.
+    Color(ColorRgba8),
+    /// Cached, filtered desktop backdrop with an opaque tinted result.
+    Glass(GlassStyle),
+}
+
+impl ResizePreview {
+    /// Flat color, or the glass tint (also the software fallback).
+    pub const fn color(self) -> ColorRgba8 {
+        match self {
+            Self::Color(color) => color,
+            Self::Glass(style) => style.tint,
+        }
+    }
+}
+
+/// Rounded liquid-glass lens over a cached desktop backdrop. Software uses the flat tint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassStyle {
+    /// RGB tint and tint strength in alpha; zero alpha still produces opaque glass.
+    pub tint: ColorRgba8,
+    /// Approximate blur footprint in logical pixels, quantized to a filtered pyramid.
+    /// Zero keeps the sharp backdrop. Clamped to 0..=64; non-finite values use 4.
+    pub blur_radius: f32,
+    /// Inward glass band width from the rounded window outline in logical pixels
+    /// (1..=128), limited to the smaller window half-size. Corner bending blends smoothly.
+    pub bevel_width: f32,
+    /// Additional gentle inner fade in logical pixels (0..=128). Zero keeps the edge-only profile.
+    pub blend_softness: f32,
+    /// Refraction strength in logical pixels (0..=64); zero removes lens displacement.
+    pub refraction: f32,
+    /// RGB separation near the rim in logical pixels (0..=4). Zero uses one texture sample.
+    pub dispersion: f32,
+    /// Directional rim, grazing-angle reflection, and specular strengths (each 0..=1).
+    pub rim: f32,
+    pub fresnel: f32,
+    pub specular: f32,
+}
+
+impl GlassStyle {
+    /// A mildly blurred, mostly clear lens with a restrained reflective rim.
+    pub const fn liquid() -> Self {
+        Self {
+            tint: ColorRgba8::rgba(23, 27, 37, 32),
+            blur_radius: 4.0,
+            bevel_width: 24.0,
+            blend_softness: 0.0,
+            refraction: 18.0,
+            dispersion: 0.65,
+            rim: 0.3,
+            fresnel: 0.45,
+            specular: 0.2,
+        }
+    }
+
+    pub(crate) fn normalized(mut self) -> Self {
+        fn finite(value: f32, default: f32, min: f32, max: f32) -> f32 {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                default
+            }
+        }
+        self.blur_radius = finite(self.blur_radius, 4.0, 0.0, 64.0);
+        self.bevel_width = finite(self.bevel_width, 24.0, 1.0, 128.0);
+        self.blend_softness = finite(self.blend_softness, 0.0, 0.0, 128.0);
+        self.refraction = finite(self.refraction, 18.0, 0.0, 64.0);
+        self.dispersion = finite(self.dispersion, 0.65, 0.0, 4.0);
+        self.rim = finite(self.rim, 0.3, 0.0, 1.0);
+        self.fresnel = finite(self.fresnel, 0.45, 0.0, 1.0);
+        self.specular = finite(self.specular, 0.2, 0.0, 1.0);
+        self
+    }
+}
+
+impl Default for GlassStyle {
+    fn default() -> Self {
+        Self::liquid()
+    }
+}
 
 /// Separate backing for an externally supplied client surface in a compositor-owned frame.
 ///
@@ -21,8 +110,8 @@ pub struct WindowContentStyle {
     pub background: ColorRgba8,
     /// Finite, nonnegative content-aperture radius in logical pixels, anchored at the window top.
     pub corner_radius: f32,
-    /// `None` inherits the host's resize-preview color.
-    pub resize_preview_color: Option<ColorRgba8>,
+    /// Whole-window resize-placeholder appearance, including the title bar. `None` inherits the host.
+    pub resize_preview: Option<crate::ResizePreview>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -118,6 +207,8 @@ impl WindowChromeCapabilities {
 pub struct WindowChromeModel {
     pub window_id: u64,
     pub title: String,
+    /// Whether the compositor owns the title bar and its controls. Outer styling remains available.
+    pub title_bar_visible: bool,
     pub app_icon: Option<Icon>,
     pub app_icon_name: Option<String>,
     pub app_icon_image: Option<ImageId>,
@@ -132,6 +223,7 @@ impl WindowChromeModel {
         Self {
             window_id,
             title: title.into(),
+            title_bar_visible: true,
             app_icon: None,
             app_icon_name: None,
             app_icon_image: None,
@@ -140,6 +232,11 @@ impl WindowChromeModel {
             active: false,
             capabilities: WindowChromeCapabilities::MANAGED_TOPLEVEL,
         }
+    }
+
+    pub const fn title_bar_visible(mut self, visible: bool) -> Self {
+        self.title_bar_visible = visible;
+        self
     }
 
     pub const fn app_icon(mut self, icon: Icon) -> Self {

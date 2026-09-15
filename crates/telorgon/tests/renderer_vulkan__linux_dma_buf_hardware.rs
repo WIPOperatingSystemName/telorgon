@@ -31,6 +31,17 @@ use telorgon::scene::NodeId;
 #[test]
 #[ignore = "requires Linux, TELORGON_TEST_MODE=developer-hardware, and DMA-BUF/modifier/sync-FD Vulkan support"]
 fn dma_buf_is_imported_sampled_and_released_with_sync_fds() {
+    run_dma_buf_test(false);
+}
+
+#[cfg(feature = "desktop-wayland-linux")]
+#[test]
+#[ignore = "requires Linux, TELORGON_TEST_MODE=developer-hardware, and DMA-BUF/modifier/sync-FD Vulkan support"]
+fn cached_dma_buf_rearms_acquire_and_release_across_three_generations() {
+    run_dma_buf_test(true);
+}
+
+fn run_dma_buf_test(cached: bool) {
     assert_eq!(
         std::env::var("TELORGON_TEST_MODE").as_deref(),
         Ok("developer-hardware"),
@@ -89,7 +100,11 @@ fn dma_buf_is_imported_sampled_and_released_with_sync_fds() {
         .dma_buf_import_capabilities(source_usage)
         .expect("query Linux DMA-BUF format/modifier capabilities")
         .into_iter()
-        .find(|capability| capability.drm_fourcc == DRM_FORMAT_ABGR8888 && capability.exportable())
+        .find(|capability| {
+            capability.drm_fourcc == DRM_FORMAT_ABGR8888
+                && capability.exportable()
+                && (!cached || capability.format == vk::Format::R8G8B8A8_SRGB)
+        })
         .expect("adapter has no jointly importable/exportable ABGR8888 DMA-BUF tuple");
 
     let extent = vk::Extent2D {
@@ -129,207 +144,304 @@ fn dma_buf_is_imported_sampled_and_released_with_sync_fds() {
             usage: source_usage,
         },
     );
-    let target = OffscreenVulkanTarget::new(
-        &hosted,
-        SizeI {
-            width: extent.width as i32,
-            height: extent.height as i32,
-        },
-    )
-    .expect("create hosted output target");
-    let target_parts = interop::borrowed_target_parts(&target.target());
-    let lease = unsafe {
-        hosted.import_dma_buf(VulkanDmaBufImport {
-            planes: vec![VulkanDmaBufPlane {
-                memory: source.dma_buf,
-                memory_index: 0,
-                offset: source.layout.offset,
-                size: source.layout.size,
-                row_pitch: source.layout.row_pitch as u32,
-                allocation_size: source.allocation_size,
-            }],
-            drm_fourcc: negotiated.drm_fourcc,
-            drm_modifier: source.modifier,
-            format: negotiated.format,
-            extent,
-            usage: negotiated.usage,
-            content_version: 1,
-            lease_generation: 1,
-            color_encoding: negotiated.color_encoding,
-            alpha_mode: negotiated.alpha_mode,
-            origin: VulkanExternalImageOrigin::TopLeft,
-            initial_use: HostedImageUse::General,
-            final_use: HostedImageUse::General,
-            acquire: Some(source.acquire_sync_fd),
-            damage: vec![RectI {
-                x: 0,
-                y: 0,
-                width: extent.width as i32,
-                height: extent.height as i32,
-            }],
-            protected: false,
-        })
-    }
-    .expect("import DMA-BUF and acquire sync FD");
+    #[cfg(feature = "desktop-wayland-linux")]
+    let mut importer = telorgon::compositor_render::DmaBufImporter::new(&hosted).unwrap();
     let mut scene = hosted.create_scene().expect("create hosted scene");
-    scene
-        .bind_external_image(ImageId(41), lease)
-        .expect("bind imported DMA-BUF lease");
-    hosted
-        .apply_scene_delta(&mut scene, &external_image_scene(extent))
-        .expect("upload external-image scene records");
-
-    unsafe { raw.begin_command_buffer(commands[1], &vk::CommandBufferBeginInfo::default()) }
-        .expect("host begins Telorgon command buffer");
-    let target_descriptor = unsafe {
-        HostedTargetDescriptor::new(
-            target_parts.image,
-            target_parts.view,
-            target_parts.format,
-            target_parts.extent,
-            RectI {
-                x: 0,
-                y: 0,
+    let image_id = ImageId(if cached { u32::MAX } else { 41 });
+    let mut previous_import = None;
+    for generation in 1..=if cached { 3 } else { 1 } {
+        if generation > 1 {
+            unsafe {
+                raw.reset_command_buffer(commands[1], vk::CommandBufferResetFlags::empty())
+                    .unwrap();
+                raw.reset_command_buffer(commands[2], vk::CommandBufferResetFlags::empty())
+                    .unwrap();
+            }
+        }
+        scene.remove_external_image(image_id);
+        let target = OffscreenVulkanTarget::new(
+            &hosted,
+            SizeI {
                 width: extent.width as i32,
                 height: extent.height as i32,
             },
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
-            queue_family,
-            HostedImageUse::Undefined,
-            HostedImageUse::TransferSource,
-            ColorSpace::Linear,
-            AlphaMode::Premultiplied,
         )
-    };
-    let descriptor = unsafe { HostedFrameDescriptor::new(commands[1], target_descriptor) };
-    let mut frame =
-        unsafe { hosted.begin_hosted_frame(descriptor) }.expect("begin command-only DMA-BUF frame");
-    let stats = {
-        let (mut context, target_view) = frame.context_and_target();
-        hosted
-            .render(
-                &mut scene,
-                &mut context,
-                &target_view,
-                &RenderRequest {
-                    force: true,
-                    load: TargetLoad::Clear(telorgon::core::ColorRgba8::rgba(0, 0, 0, 255)),
-                    store: TargetStore::Store,
-                    region: None,
-                },
-            )
-            .expect("record DMA-BUF sample")
-    };
-    let receipt = frame.finish().expect("finish hosted DMA-BUF frame");
-    assert_eq!(stats.upload_bytes_recorded, 0);
-    assert_eq!(receipt.external_waits().len(), 1);
-    assert_eq!(receipt.external_signals().len(), 1);
-    unsafe { raw.end_command_buffer(commands[1]) }.expect("host ends Telorgon command buffer");
-
-    let waits = receipt
-        .external_waits()
-        .iter()
-        .map(|wait| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(wait.semaphore)
-                .stage_mask(wait.stage_mask)
-        })
-        .collect::<Vec<_>>();
-    let signals = receipt
-        .external_signals()
-        .iter()
-        .map(|signal| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(signal.semaphore)
-                .stage_mask(signal.stage_mask)
-        })
-        .collect::<Vec<_>>();
-    let command_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(commands[1])];
-    let submit = [vk::SubmitInfo2::default()
-        .wait_semaphore_infos(&waits)
-        .command_buffer_infos(&command_infos)
-        .signal_semaphore_infos(&signals)];
-    unsafe { raw.queue_submit2(queue, &submit, vk::Fence::null()) }
-        .expect("host submits DMA-BUF consumer");
-    let external_use = receipt.external_image_uses()[0];
-    let release = unsafe {
-        receipt.export_external_release_sync_fd(external_use.image, external_use.lease_generation)
-    }
-    .expect("export one-shot DMA-BUF release sync FD after submission");
-    assert_eq!(release.content_version, 1);
-    assert_eq!(release.lease_generation, 1);
-    let point = domain.point(1).expect("declare host completion point");
-    hosted
-        .commit_hosted(receipt, point)
-        .expect("commit DMA-BUF pins after release export");
-
-    let readback = HostReadback::new(&instance, &raw, physical_device, extent);
-    let release_wait = unsafe { import_sync_fd(&instance, &raw, release.sync_fd) };
-    unsafe { raw.begin_command_buffer(commands[2], &vk::CommandBufferBeginInfo::default()) }
-        .expect("begin host readback command buffer");
-    unsafe {
-        raw.cmd_copy_image_to_buffer(
-            commands[2],
-            target_parts.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            readback.buffer,
-            &[vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
+        .expect("create hosted output target");
+        let target_parts = interop::borrowed_target_parts(&target.target());
+        if cached {
+            #[cfg(feature = "desktop-wayland-linux")]
+            {
+                use telorgon::compositor_wayland::{
+                    DmaBufDescriptor, DmaBufFlags, DmaBufImage, DmaBufPlane, WaylandBufferId,
+                };
+                importer
+                    .import_and_bind(
+                        &hosted,
+                        &mut scene,
+                        WaylandBufferId::from_raw(41).unwrap(),
+                        generation,
+                        DmaBufImage {
+                            descriptor: DmaBufDescriptor::new(
+                                SizeI {
+                                    width: extent.width as i32,
+                                    height: extent.height as i32,
+                                },
+                                negotiated.drm_fourcc,
+                                DmaBufFlags::default(),
+                                vec![DmaBufPlane {
+                                    index: 0,
+                                    fd_token: 1,
+                                    offset: source.layout.offset as u32,
+                                    stride: source.layout.row_pitch as u32,
+                                    modifier: source.modifier,
+                                }],
+                            )
+                            .unwrap(),
+                            planes: vec![source.dma_buf.try_clone().unwrap()],
+                        },
+                        // The producer contents stay unchanged; each commit imports a fresh duplicate
+                        // of its completed producer fence into the cached acquire semaphore.
+                        Some(source.acquire_sync_fd.try_clone().unwrap()),
+                        vec![RectI {
+                            x: 0,
+                            y: 0,
+                            width: extent.width as i32,
+                            height: extent.height as i32,
+                        }],
+                    )
+                    .expect("bind a cached DMA-BUF generation");
+            }
+            #[cfg(not(feature = "desktop-wayland-linux"))]
+            unreachable!("cache bridge requires the desktop feature");
+        } else {
+            let lease = unsafe {
+                hosted.import_dma_buf(VulkanDmaBufImport {
+                    planes: vec![VulkanDmaBufPlane {
+                        memory: source.dma_buf.try_clone().unwrap(),
+                        memory_index: 0,
+                        offset: source.layout.offset,
+                        size: source.layout.size,
+                        row_pitch: source.layout.row_pitch as u32,
+                        allocation_size: source.allocation_size,
+                    }],
+                    drm_fourcc: negotiated.drm_fourcc,
+                    drm_modifier: source.modifier,
+                    format: negotiated.format,
+                    extent,
+                    usage: negotiated.usage,
+                    content_version: 1,
+                    lease_generation: 1,
+                    color_encoding: negotiated.color_encoding,
+                    alpha_mode: negotiated.alpha_mode,
+                    origin: VulkanExternalImageOrigin::TopLeft,
+                    initial_use: HostedImageUse::General,
+                    final_use: HostedImageUse::General,
+                    acquire: Some(source.acquire_sync_fd.try_clone().unwrap()),
+                    damage: vec![RectI {
+                        x: 0,
+                        y: 0,
+                        width: extent.width as i32,
+                        height: extent.height as i32,
+                    }],
+                    protected: false,
                 })
-                .image_extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                })],
+            }
+            .expect("import DMA-BUF and acquire sync FD");
+            scene
+                .bind_external_image(image_id, lease)
+                .expect("bind imported DMA-BUF lease");
+        }
+        let update = hosted
+            .apply_scene_delta(
+                &mut scene,
+                &external_image_scene(extent, image_id, generation),
+            )
+            .expect("upload external-image scene records");
+        assert_eq!(
+            update.epoch, generation,
+            "each cached generation must update the retained scene"
         );
-        raw.end_command_buffer(commands[2])
-    }
-    .expect("record host readback copy");
-    let fence = unsafe { raw.create_fence(&vk::FenceCreateInfo::default(), None) }
-        .expect("create host readback fence");
-    let wait_infos = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(release_wait)
-        .stage_mask(vk::PipelineStageFlags2::TRANSFER)];
-    let readback_commands = [vk::CommandBufferSubmitInfo::default().command_buffer(commands[2])];
-    let readback_submit = [vk::SubmitInfo2::default()
-        .wait_semaphore_infos(&wait_infos)
-        .command_buffer_infos(&readback_commands)];
-    unsafe { raw.queue_submit2(queue, &readback_submit, fence) }
-        .expect("wait release sync FD and submit readback");
-    unsafe { raw.wait_for_fences(&[fence], true, 10_000_000_000) }
-        .expect("wait for DMA-BUF composition");
-    let pixel = readback.center_pixel(&raw, extent);
-    assert!(
-        pixel[0] >= 245 && pixel[1] <= 5 && pixel[2] <= 5 && pixel[3] >= 245,
-        "unexpected imported DMA-BUF pixel: {pixel:?}"
-    );
-    let maintenance = hosted
-        .advance_host_completion(&domain, 1)
-        .expect("retire imported DMA-BUF resources");
-    assert_eq!(maintenance.released_external_images, 1);
-    assert_eq!(domain.contract_violations(), 0);
-    let validation_errors = instance.diagnostics().error_count();
-    assert_eq!(
-        validation_errors,
-        0,
-        "validation messages: {:#?}",
-        instance.diagnostics().messages()
-    );
-    println!(
-        "TELORGON_EVIDENCE case=vulkan.external-image.linux-dma-buf-sync-fd layer=E8 outcome=pass external_pixel_upload_bytes=0 draws=1 dma_buf_import=true acquire_sync_fd=true release_sync_fd=true foreign_queue_transfer=true completion_receipts=1 validation_errors={validation_errors}"
-    );
 
-    unsafe {
-        raw.destroy_fence(fence, None);
-        raw.destroy_semaphore(release_wait, None);
+        unsafe { raw.begin_command_buffer(commands[1], &vk::CommandBufferBeginInfo::default()) }
+            .expect("host begins Telorgon command buffer");
+        let target_descriptor = unsafe {
+            HostedTargetDescriptor::new(
+                target_parts.image,
+                target_parts.view,
+                target_parts.format,
+                target_parts.extent,
+                RectI {
+                    x: 0,
+                    y: 0,
+                    width: extent.width as i32,
+                    height: extent.height as i32,
+                },
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                queue_family,
+                HostedImageUse::Undefined,
+                HostedImageUse::TransferSource,
+                ColorSpace::Linear,
+                AlphaMode::Premultiplied,
+            )
+        };
+        let descriptor = unsafe { HostedFrameDescriptor::new(commands[1], target_descriptor) };
+        let mut frame = unsafe { hosted.begin_hosted_frame(descriptor) }
+            .expect("begin command-only DMA-BUF frame");
+        let stats = {
+            let (mut context, target_view) = frame.context_and_target();
+            hosted
+                .render(
+                    &mut scene,
+                    &mut context,
+                    &target_view,
+                    &RenderRequest {
+                        force: true,
+                        load: TargetLoad::Clear(telorgon::core::ColorRgba8::rgba(0, 0, 0, 255)),
+                        store: TargetStore::Store,
+                        region: None,
+                    },
+                )
+                .expect("record DMA-BUF sample")
+        };
+        let receipt = frame.finish().expect("finish hosted DMA-BUF frame");
+        assert_eq!(stats.upload_bytes_recorded, 0);
+        assert_eq!(receipt.external_waits().len(), 1);
+        assert_eq!(receipt.external_signals().len(), 1);
+        let import_handles = (
+            receipt.external_image_uses()[0].image,
+            receipt.external_waits()[0].semaphore,
+            receipt.external_signals()[0].semaphore,
+        );
+        if let Some(previous) = previous_import {
+            assert_eq!(
+                import_handles, previous,
+                "cache must retain the native image and semaphore handles"
+            );
+        }
+        previous_import = Some(import_handles);
+        unsafe { raw.end_command_buffer(commands[1]) }.expect("host ends Telorgon command buffer");
+
+        let waits = receipt
+            .external_waits()
+            .iter()
+            .map(|wait| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(wait.semaphore)
+                    .stage_mask(wait.stage_mask)
+            })
+            .collect::<Vec<_>>();
+        let signals = receipt
+            .external_signals()
+            .iter()
+            .map(|signal| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(signal.semaphore)
+                    .stage_mask(signal.stage_mask)
+            })
+            .collect::<Vec<_>>();
+        let command_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(commands[1])];
+        let submit = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
+            .command_buffer_infos(&command_infos)
+            .signal_semaphore_infos(&signals)];
+        unsafe { raw.queue_submit2(queue, &submit, vk::Fence::null()) }
+            .expect("host submits DMA-BUF consumer");
+        let external_use = receipt.external_image_uses()[0];
+        let release = unsafe {
+            receipt
+                .export_external_release_sync_fd(external_use.image, external_use.lease_generation)
+        }
+        .expect("export one-shot DMA-BUF release sync FD after submission");
+        assert_eq!(release.content_version, generation);
+        assert_eq!(release.lease_generation, generation);
+        assert!(
+            unsafe {
+                receipt.export_external_release_sync_fd(
+                    external_use.image,
+                    external_use.lease_generation,
+                )
+            }
+            .is_err(),
+            "each generation may export its release only once"
+        );
+        let point = domain
+            .point(generation)
+            .expect("declare host completion point");
+        hosted
+            .commit_hosted(receipt, point)
+            .expect("commit DMA-BUF pins after release export");
+
+        let readback = HostReadback::new(&instance, &raw, physical_device, extent);
+        let release_wait = unsafe { import_sync_fd(&instance, &raw, release.sync_fd) };
+        unsafe { raw.begin_command_buffer(commands[2], &vk::CommandBufferBeginInfo::default()) }
+            .expect("begin host readback command buffer");
+        unsafe {
+            raw.cmd_copy_image_to_buffer(
+                commands[2],
+                target_parts.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback.buffer,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })],
+            );
+            raw.end_command_buffer(commands[2])
+        }
+        .expect("record host readback copy");
+        let fence = unsafe { raw.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .expect("create host readback fence");
+        let wait_infos = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(release_wait)
+            .stage_mask(vk::PipelineStageFlags2::TRANSFER)];
+        let readback_commands =
+            [vk::CommandBufferSubmitInfo::default().command_buffer(commands[2])];
+        let readback_submit = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&wait_infos)
+            .command_buffer_infos(&readback_commands)];
+        unsafe { raw.queue_submit2(queue, &readback_submit, fence) }
+            .expect("wait release sync FD and submit readback");
+        unsafe { raw.wait_for_fences(&[fence], true, 10_000_000_000) }
+            .expect("wait for DMA-BUF composition");
+        let pixel = readback.center_pixel(&raw, extent);
+        assert!(
+            pixel[0] >= 245 && pixel[1] <= 5 && pixel[2] <= 5 && pixel[3] >= 245,
+            "unexpected imported DMA-BUF pixel: {pixel:?}"
+        );
+        let maintenance = hosted
+            .advance_host_completion(&domain, generation)
+            .expect("retire imported DMA-BUF resources");
+        assert_eq!(maintenance.released_external_images, 1);
+        assert_eq!(domain.contract_violations(), 0);
+        let validation_errors = instance.diagnostics().error_count();
+        assert_eq!(
+            validation_errors,
+            0,
+            "validation messages: {:#?}",
+            instance.diagnostics().messages()
+        );
+        println!(
+            "TELORGON_EVIDENCE case=vulkan.external-image.linux-dma-buf-sync-fd layer=E8 outcome=pass external_pixel_upload_bytes=0 draws=1 dma_buf_import=true acquire_sync_fd=true release_sync_fd=true foreign_queue_transfer=true completion_receipts=1 generation={generation} cached={cached} validation_errors={validation_errors}"
+        );
+
+        unsafe {
+            raw.destroy_fence(fence, None);
+            raw.destroy_semaphore(release_wait, None);
+        }
+        drop(readback);
+        drop(target);
     }
-    drop(readback);
     drop(scene);
-    drop(target);
+    #[cfg(feature = "desktop-wayland-linux")]
+    drop(importer);
     drop(hosted);
     unsafe {
         raw.destroy_semaphore(source.acquire_export_semaphore, None);
@@ -725,14 +837,18 @@ fn color_range() -> vk::ImageSubresourceRange {
     }
 }
 
-fn external_image_scene(extent: vk::Extent2D) -> telorgon::render::RenderSceneDelta {
+fn external_image_scene(
+    extent: vk::Extent2D,
+    image_id: ImageId,
+    generation: u64,
+) -> telorgon::render::RenderSceneDelta {
     let mut scene = RenderScene::default();
     let node = NodeId::new(41, 1);
     scene.images.upsert(
         node,
         ImageInstance {
             node,
-            image: ImageId(41),
+            image: image_id,
             tint: None,
             rect: RectF {
                 x: 0.0,
@@ -746,7 +862,7 @@ fn external_image_scene(extent: vk::Extent2D) -> telorgon::render::RenderSceneDe
                 width: extent.width as f32,
                 height: extent.height as f32,
             },
-            content_version: 1,
+            content_version: generation,
             opacity: 1.0,
             clip: ClipId(0),
             spatial: SpatialId(0),
@@ -757,7 +873,7 @@ fn external_image_scene(extent: vk::Extent2D) -> telorgon::render::RenderSceneDe
         index: 0,
         batch: BatchKey {
             pipeline: PipelineKind::Image,
-            resource: 41,
+            resource: image_id.0,
             clip: ClipId(0),
             blend: BlendMode::Alpha,
             target: 0,
@@ -775,5 +891,7 @@ fn external_image_scene(extent: vk::Extent2D) -> telorgon::render::RenderSceneDe
             height: extent.height as f32,
         },
     );
-    scene.take_delta().expect("DMA-BUF scene delta")
+    let mut delta = scene.take_delta().expect("DMA-BUF scene delta");
+    delta.epoch = generation;
+    delta
 }

@@ -38,6 +38,13 @@ const ATOMS: &[&str] = &[
     "COMPOUND_TEXT",
     "_NET_WM_SYNC_REQUEST",
     "_NET_WM_SYNC_REQUEST_COUNTER",
+    "_MOTIF_WM_HINTS",
+    "_NET_FRAME_EXTENTS",
+    "_NET_REQUEST_FRAME_EXTENTS",
+    "_NET_WM_MOVERESIZE",
+    "_NET_WM_STATE",
+    "_NET_WM_STATE_MAXIMIZED_VERT",
+    "_NET_WM_STATE_MAXIMIZED_HORZ",
 ];
 const EXTENSIONS: &[&str] = &["Composite", "XFIXES", "SHAPE", "RANDR", "SYNC"];
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -530,7 +537,11 @@ pub(super) mod tests {
                 break;
             }
         }
-        flush_requests(&mut discovery.transport); // All version requests have been queued.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while discovery.transport.wants_write() {
+            assert!(Instant::now() < deadline, "version requests did not drain");
+            discovery.dispatch(now).unwrap();
+        }
         assert!(discovery.result().is_none());
         for (index, name) in EXTENSIONS.iter().enumerate() {
             let bytes = request(peer);

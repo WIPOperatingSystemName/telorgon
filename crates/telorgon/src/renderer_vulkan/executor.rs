@@ -52,19 +52,7 @@ impl RenderBackend for VulkanDevice {
                 "Vulkan scene belongs to another logical device",
             ));
         }
-        if delta.epoch <= scene.epoch {
-            return Ok(SceneUpdateStats {
-                epoch: scene.epoch,
-                ..SceneUpdateStats::default()
-            });
-        }
-        validate_delta(scene, delta)?;
-        scene.apply(delta);
-        Ok(SceneUpdateStats {
-            epoch: scene.epoch,
-            upload_bytes_queued: scene.pending_upload_bytes(),
-            descriptor_writes_queued: scene.queued_descriptor_writes(),
-        })
+        scene.apply_delta_checked(delta)
     }
 
     fn render<'frame>(
@@ -433,6 +421,28 @@ impl RenderBackend for VulkanDevice {
     }
 }
 
+impl VulkanScene {
+    /// CPU-only retained-state admission, shared by the device entry point and regression tests.
+    pub(crate) fn apply_delta_checked(
+        &mut self,
+        delta: &RenderSceneDelta,
+    ) -> RenderResult<SceneUpdateStats> {
+        if delta.epoch <= self.epoch {
+            return Ok(SceneUpdateStats {
+                epoch: self.epoch,
+                ..SceneUpdateStats::default()
+            });
+        }
+        validate_delta(self, delta)?;
+        self.apply(delta);
+        Ok(SceneUpdateStats {
+            epoch: self.epoch,
+            upload_bytes_queued: self.pending_upload_bytes(),
+            descriptor_writes_queued: self.queued_descriptor_writes(),
+        })
+    }
+}
+
 fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult<()> {
     validate_patch_ranges("boxes", &delta.boxes, delta.box_len)?;
     validate_patch_ranges("glyphs", &delta.glyphs, delta.glyph_len)?;
@@ -525,11 +535,11 @@ fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult
             }
         }
     }
-    let mut material_resources = scene.material_resource_ids();
+    let mut material_resources = scene.material_resources.clone();
     for update in &delta.material_resources {
         match update {
             MaterialResourceDelta::Upsert(value) => {
-                material_resources.insert(value.material.0);
+                material_resources.insert(value.material.0, *value);
             }
             MaterialResourceDelta::Remove(id) => {
                 material_resources.remove(&id.0);
@@ -589,11 +599,31 @@ fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult
         if draw.kind == PrimitiveKind::Material {
             let instance = &materials[draw.index as usize];
             if draw.batch.resource != instance.material.0
-                || !material_resources.contains(&instance.material.0)
+                || !material_resources.contains_key(&instance.material.0)
             {
                 return Err(invalid_scene(
                     "Vulkan material draw references a missing or mismatched material resource",
                 ));
+            }
+            let resource = material_resources[&instance.material.0];
+            match resource.kind {
+                crate::render::MaterialKind::LiquidGlass(parameters) => {
+                    if draw.batch.pipeline != crate::render::PipelineKind::LiquidGlass
+                        || !parameters.valid()
+                        || !image_resources.contains(&parameters.backdrop.0)
+                        || scene.has_external_image(parameters.backdrop)
+                    {
+                        return Err(invalid_scene(
+                            "liquid glass needs finite parameters, its dedicated pipeline, and an owned backdrop",
+                        ));
+                    }
+                }
+                _ if draw.batch.pipeline == crate::render::PipelineKind::LiquidGlass => {
+                    return Err(invalid_scene(
+                        "liquid glass pipeline requires liquid glass parameters",
+                    ));
+                }
+                _ => {}
             }
         }
     }
@@ -680,9 +710,10 @@ pub(crate) fn validate_retained_scene(scene: &VulkanScene) -> RenderResult<()> {
             if let Some(content_version) = scene.external_image_content_version(instance.image)
                 && content_version != instance.content_version
             {
-                return Err(invalid_scene(
-                    "Vulkan retained external image content version is stale",
-                ));
+                return Err(invalid_scene(format!(
+                    "Vulkan retained external image content version is stale: image={} scene_epoch={} draw_version={} bound_version={content_version}",
+                    instance.image.0, scene.epoch, instance.content_version,
+                )));
             }
         }
     }

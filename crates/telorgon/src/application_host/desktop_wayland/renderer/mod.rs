@@ -38,6 +38,12 @@ pub(super) enum DesktopRenderer {
 }
 
 impl DesktopRenderer {
+    pub(super) fn motion_enabled(&self) -> bool {
+        match self {
+            Self::Vulkan(r) => r.motion_enabled(),
+            Self::Software(_) => true,
+        }
+    }
     pub(super) fn is_vulkan(&self) -> bool {
         matches!(self, Self::Vulkan(_))
     }
@@ -52,9 +58,10 @@ impl DesktopRenderer {
     pub(super) fn queue_dma_buf(
         &mut self,
         publication: DmaBufPublication,
+        display: &crate::wayland_server::Display,
     ) -> AppResult<DmaBufQueueResult> {
         match self {
-            Self::Vulkan(renderer) => renderer.queue_dma_buf(publication),
+            Self::Vulkan(renderer) => renderer.queue_dma_buf(publication, display),
             Self::Software(_) => Err(crate::application_host::AppError::new(
                 "DMA-BUF publication reached the software desktop renderer",
             )),
@@ -78,6 +85,34 @@ impl DesktopRenderer {
         }
     }
 
+    pub(super) fn take_acquire_wakeup(&mut self) -> bool {
+        match self {
+            Self::Vulkan(r) => r.take_acquire_wakeup(),
+            Self::Software(_) => false,
+        }
+    }
+
+    pub(super) fn poll_allocations(
+        &mut self,
+        trace: &mut super::latency_trace::LatencyTrace,
+    ) -> AppResult<bool> {
+        match self {
+            Self::Vulkan(renderer) => renderer.poll_allocations(trace),
+            Self::Software(_) => Ok(false),
+        }
+    }
+
+    pub(super) fn prepare_render(
+        &mut self,
+        eligible: &std::collections::BTreeSet<crate::compositor_wayland::WaylandSurfaceId>,
+        trace: &mut super::latency_trace::LatencyTrace,
+    ) -> AppResult<std::collections::BTreeSet<crate::compositor_wayland::WaylandSurfaceId>> {
+        match self {
+            Self::Vulkan(renderer) => renderer.prepare_render(eligible, trace),
+            Self::Software(_) => Ok(eligible.clone()),
+        }
+    }
+
     pub(super) fn drain_completions(&self) -> Vec<VulkanCompletion> {
         match self {
             Self::Vulkan(renderer) => renderer.drain_completions(),
@@ -89,10 +124,11 @@ impl DesktopRenderer {
         &mut self,
         target_index: usize,
         frame: DesktopFrame,
+        trace: &mut super::latency_trace::LatencyTrace,
     ) -> AppResult<DesktopRenderResult> {
         match self {
             Self::Vulkan(renderer) => {
-                let result = renderer.render(target_index, frame)?;
+                let result = renderer.render(target_index, frame, trace)?;
                 Ok(DesktopRenderResult::Vulkan {
                     releases: result.releases,
                     discarded: result.discarded,

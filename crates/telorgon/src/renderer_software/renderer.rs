@@ -673,10 +673,22 @@ impl RasterTarget<'_> {
         source_rgb: [f32; 3],
         source_alpha: f32,
     ) {
+        let coverage = self.placement_coverage(x, y);
+        if coverage <= 0.0 {
+            return;
+        }
+        self.blend_covered_linear_premultiplied(
+            x,
+            y,
+            source_rgb.map(|c| c * coverage),
+            source_alpha * coverage,
+        );
+    }
+
+    fn placement_coverage(&self, x: i32, y: i32) -> f32 {
         let x = x.saturating_add(self.origin.x);
         let y = y.saturating_add(self.origin.y);
-        let coverage = self
-            .rounded_clips
+        self.rounded_clips
             .iter()
             .flatten()
             .fold(1.0_f32, |amount, clip| {
@@ -684,12 +696,19 @@ impl RasterTarget<'_> {
                     x: x as f32 + 0.5,
                     y: y as f32 + 0.5,
                 }))
-            });
-        if coverage <= 0.0 {
-            return;
-        }
-        let source_alpha = source_alpha * coverage;
-        let source_rgb = source_rgb.map(|c| c * coverage);
+            })
+    }
+
+    /// Blend a source whose geometric coverage already includes the placement clips.
+    fn blend_covered_linear_premultiplied(
+        &mut self,
+        x: i32,
+        y: i32,
+        source_rgb: [f32; 3],
+        source_alpha: f32,
+    ) {
+        let x = x.saturating_add(self.origin.x);
+        let y = y.saturating_add(self.origin.y);
         if x < 0
             || y < 0
             || x as usize >= self.width
@@ -703,7 +722,11 @@ impl RasterTarget<'_> {
             return;
         }
         let source_alpha = source_alpha.clamp(0.0, 1.0);
-        let inverse = 1.0 - source_alpha;
+        let inverse = if self.blend_mode == BlendMode::Add {
+            1.0
+        } else {
+            1.0 - source_alpha
+        };
         let (rgb, alpha) = if self.blend_mode == BlendMode::Opaque
             && self.rounded_clips.iter().all(Option::is_none)
         {
@@ -928,7 +951,11 @@ fn draw_box(
                 }
             }
 
-            let outer = rounded_coverage(local.x, local.y, instance.rect, radii, scale_min);
+            // Intersect geometric coverage before applying material alpha. Reapplying a
+            // matching rounded frame clip to an antialiased box would square its coverage.
+            let body_clip = clip_amount.min(raster.placement_coverage(x, y));
+            let outer =
+                rounded_coverage(local.x, local.y, instance.rect, radii, scale_min).min(body_clip);
             if outer <= 0.0 {
                 continue;
             }
@@ -960,12 +987,7 @@ fn draw_box(
                     *channel += srgb_decode_byte(value) * amount;
                 }
             }
-            raster.blend_linear_premultiplied(
-                x,
-                y,
-                rgb.map(|c| c * clip_amount),
-                alpha * clip_amount,
-            );
+            raster.blend_covered_linear_premultiplied(x, y, rgb, alpha);
         }
     }
 }
@@ -1279,7 +1301,7 @@ fn draw_material(
                 y: point_y,
             });
             let amount = match material.kind {
-                MaterialKind::Solid => 0.0,
+                MaterialKind::Solid | MaterialKind::LiquidGlass(_) => 0.0,
                 MaterialKind::LinearGradientHorizontal => {
                     (local.x - instance.rect.x) / instance.rect.width
                 }

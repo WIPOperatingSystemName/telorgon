@@ -25,6 +25,19 @@ pub struct SubsurfaceGraph {
 }
 
 impl SubsurfaceGraph {
+    pub(crate) fn cached_buffer(
+        &self,
+        surface: WaylandSurfaceId,
+    ) -> Option<crate::compositor_wayland::WaylandBufferId> {
+        self.nodes
+            .get(&surface)?
+            .cached_commit
+            .as_ref()?
+            .attachment
+            .flatten()
+            .map(|attachment| attachment.buffer)
+    }
+
     pub fn add(
         &mut self,
         child: WaylandSurfaceId,

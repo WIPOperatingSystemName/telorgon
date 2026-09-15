@@ -261,7 +261,7 @@ pub enum Status {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub status: Status,
-    /// Content-free accounting; diagnostic bytes are discarded as they arrive.
+    /// Content-free accounting; output is discarded unless bounded diagnostic logging is enabled.
     pub diagnostic_bytes: u64,
 }
 
@@ -472,6 +472,12 @@ fn supervise(
     notify_change(notify);
     let mut deadline = None;
     let mut killed = false;
+    let mut diagnostic_budget = if std::env::var("TELORGON_WAYLAND_ERROR_LOG").as_deref() == Ok("1")
+    {
+        64 * 1024
+    } else {
+        0
+    };
     loop {
         // Bound each diagnostic drain. Output cannot grow host memory, and
         // continuous logging cannot starve cancellation or waitpid.
@@ -480,7 +486,24 @@ fn supervise(
         for _ in 0..32 {
             match diagnostics.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => count += n as u64,
+                Ok(n) => {
+                    count += n as u64;
+                    if diagnostic_budget != 0 {
+                        let logged = n.min(diagnostic_budget);
+                        // Escape control characters; keep draining after the cap.
+                        eprintln!(
+                            "telorgon-xwayland-stderr: pid={} chunk={:?}",
+                            pid,
+                            String::from_utf8_lossy(&buffer[..logged])
+                        );
+                        diagnostic_budget -= logged;
+                        if diagnostic_budget == 0 {
+                            eprintln!(
+                                "telorgon-xwayland-stderr: pid={pid} diagnostic limit reached (64 KiB)"
+                            );
+                        }
+                    }
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }

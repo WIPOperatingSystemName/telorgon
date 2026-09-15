@@ -768,6 +768,162 @@ fn flush_controls_have_no_diagonal_or_edge_seams_under_rounded_clipping() {
     );
 }
 
+#[test]
+#[ignore = "requires TELORGON_TEST_MODE=developer-hardware and a non-CPU Vulkan 1.3 adapter"]
+fn rounded_border_coverage_matches_its_physical_width_with_a_matching_clip() {
+    assert_eq!(
+        std::env::var("TELORGON_TEST_MODE").as_deref(),
+        Ok("developer-hardware")
+    );
+    let config = VulkanConfig {
+        enable_validation: true,
+        ..VulkanConfig::default()
+    };
+    let instance = VulkanInstance::load(&config, &[]).unwrap();
+    let selection = DeviceSelection::best(&instance.adapters().unwrap()).unwrap();
+    let device = VulkanDevice::create_owned(instance.clone(), &config, &selection, None).unwrap();
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        for width in [1.0, 2.0, 2.5] {
+            for opacity in [0.5, 1.0] {
+                let extent = SizeI {
+                    width: (40.0 * scale) as i32,
+                    height: (40.0 * scale) as i32,
+                };
+                let target = OffscreenVulkanTarget::new(&device, extent).unwrap();
+                let mut source = RenderScene::default();
+                source.extent = SizeF {
+                    width: 40.0,
+                    height: 40.0,
+                };
+                source.background = ColorRgba8::rgba(0, 0, 0, 0);
+                let node = NodeId::new(0, 1);
+                let rect = RectF {
+                    x: 2.25,
+                    y: 2.25,
+                    width: 35.5,
+                    height: 35.5,
+                };
+                let radii = telorgon::ui::CornerRadii::all(12.0);
+                source.spatial_nodes.upsert(
+                    node,
+                    RenderSpatialNode {
+                        id: SpatialId(0),
+                        transform: telorgon::core::Affine2D::IDENTITY,
+                    },
+                );
+                source.clips.upsert(
+                    node,
+                    RenderClip {
+                        id: ClipId(1),
+                        rect,
+                        corner_radii: radii,
+                    },
+                );
+                source.boxes.upsert(
+                    node,
+                    BoxInstance {
+                        node,
+                        rect,
+                        view_bounds: rect,
+                        background: None,
+                        border: telorgon::render::Border::all(
+                            width,
+                            ColorRgba8::rgba(255, 0, 0, 255),
+                        ),
+                        outline: Default::default(),
+                        corner_radii: radii,
+                        shadows: Default::default(),
+                        opacity,
+                        clip: ClipId(1),
+                        spatial: SpatialId(0),
+                    },
+                );
+                source.set_draw_order(vec![draw(
+                    PrimitiveKind::Box,
+                    PipelineKind::AnalyticBox,
+                    0,
+                    0,
+                    ClipId(1),
+                )]);
+                let mut scene = device.create_scene().unwrap();
+                device
+                    .apply_scene_delta(&mut scene, &source.take_delta().unwrap())
+                    .unwrap();
+                let mut frame = device.begin_owned_frame().unwrap();
+                let pending = {
+                    let mut context = frame.context_mut();
+                    device
+                        .render(
+                            &mut scene,
+                            &mut context,
+                            &target.target(),
+                            &RenderRequest {
+                                force: true,
+                                load: TargetLoad::Clear(ColorRgba8::rgba(0, 0, 0, 0)),
+                                store: TargetStore::Store,
+                                region: None,
+                            },
+                        )
+                        .unwrap();
+                    context
+                        .record_readback(
+                            &target.target(),
+                            &ReadbackRequest {
+                                region: RectI {
+                                    x: 0,
+                                    y: 0,
+                                    width: extent.width,
+                                    height: extent.height,
+                                },
+                                format: ReadbackFormat::Rgba8,
+                            },
+                        )
+                        .unwrap()
+                };
+                let receipt = frame.finish().unwrap().submit().unwrap();
+                let pixels = pending
+                    .bind_to_submission(receipt)
+                    .unwrap()
+                    .wait(Duration::from_secs(10))
+                    .unwrap()
+                    .pixels;
+                let outer = telorgon::render::RoundedClip::new(
+                    RectF {
+                        x: rect.x * scale,
+                        y: rect.y * scale,
+                        width: rect.width * scale,
+                        height: rect.height * scale,
+                    },
+                    telorgon::ui::CornerRadii::all(12.0 * scale),
+                );
+                let inner = outer.inset(telorgon::render::Border::all(
+                    width * scale,
+                    ColorRgba8::rgba(255, 0, 0, 255),
+                ));
+                let mut fractional = 0;
+                for y in 0..extent.height {
+                    for x in 0..extent.width {
+                        let point = telorgon::core::PointF {
+                            x: x as f32 + 0.5,
+                            y: y as f32 + 0.5,
+                        };
+                        let coverage = (outer.coverage(point) - inner.coverage(point)).max(0.0);
+                        fractional += usize::from(coverage > 0.0 && coverage < 1.0);
+                        let expected = (255.0 * opacity * coverage).round() as u8;
+                        let actual = pixels[((y * extent.width + x) * 4 + 3) as usize];
+                        assert!(
+                            actual.abs_diff(expected) <= 2,
+                            "border coverage at {x},{y}: {actual} != {expected}, scale={scale}, width={width}, opacity={opacity}"
+                        );
+                    }
+                }
+                assert!(fractional > 20, "fixture must exercise the curved AA bands");
+            }
+        }
+    }
+    assert_eq!(instance.diagnostics().error_count(), 0);
+}
+
 fn draw(
     kind: PrimitiveKind,
     pipeline: PipelineKind,
@@ -802,4 +958,148 @@ fn linear_rgba_to_srgba(pixels: &[u8]) -> Vec<u8> {
         }
     }
     converted
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires TELORGON_TEST_MODE=developer-hardware and Vulkan validation"]
+fn composite_culling_and_descriptor_pages_preserve_multipass_uploads() {
+    use telorgon::renderer_vulkan::{VulkanCompositePlacement, VulkanCompositeScene};
+    assert_eq!(
+        std::env::var("TELORGON_TEST_MODE").as_deref(),
+        Ok("developer-hardware")
+    );
+    let config = VulkanConfig {
+        enable_validation: true,
+        ..VulkanConfig::default()
+    };
+    let instance = VulkanInstance::load(&config, &[]).unwrap();
+    let selection = DeviceSelection::best(&instance.adapters().unwrap()).unwrap();
+    let device = VulkanDevice::create_owned(instance.clone(), &config, &selection, None).unwrap();
+    let size = SizeI {
+        width: 16,
+        height: 16,
+    };
+    let targets = (0..258)
+        .map(|_| OffscreenVulkanTarget::new(&device, size).unwrap())
+        .collect::<Vec<_>>();
+    let node = NodeId::new(0, 1);
+    let mut source = RenderScene::default();
+    source.extent = SizeF {
+        width: 16.0,
+        height: 16.0,
+    };
+    source.spatial_nodes.upsert(
+        node,
+        RenderSpatialNode {
+            id: SpatialId(0),
+            transform: telorgon::core::Affine2D::IDENTITY,
+        },
+    );
+    let rect = RectF {
+        x: 0.0,
+        y: 0.0,
+        width: 16.0,
+        height: 16.0,
+    };
+    source.boxes.upsert(
+        node,
+        BoxInstance {
+            node,
+            rect,
+            view_bounds: rect,
+            background: Some(ColorRgba8::rgba(255, 0, 0, 255)),
+            border: Default::default(),
+            outline: Default::default(),
+            corner_radii: Default::default(),
+            shadows: Default::default(),
+            opacity: 1.0,
+            clip: ClipId(0),
+            spatial: SpatialId(0),
+        },
+    );
+    source.set_draw_order(vec![DrawItem {
+        kind: PrimitiveKind::Box,
+        index: 0,
+        batch: BatchKey {
+            pipeline: PipelineKind::AnalyticBox,
+            resource: 0,
+            clip: ClipId(0),
+            blend: BlendMode::Opaque,
+            target: 0,
+        },
+    }]);
+    let mut scene = device.create_scene().unwrap();
+    device
+        .apply_scene_delta(&mut scene, &source.take_delta().unwrap())
+        .unwrap();
+    let mut recording = device.begin_owned_frame().unwrap();
+    let pending = {
+        let mut context = recording.context_mut();
+        for (index, target) in targets.iter().enumerate() {
+            let placement = VulkanCompositePlacement {
+                scene_index: 0,
+                target: RectI {
+                    x: if index == 0 { 32 } else { 0 },
+                    y: 0,
+                    width: 16,
+                    height: 16,
+                },
+                clip: None,
+                rounded_clips: [None; 2],
+            };
+            let stats = device
+                .render_composite(
+                    &mut [VulkanCompositeScene { scene: &mut scene }],
+                    &[placement],
+                    &mut context,
+                    &target.target(),
+                    &RenderRequest {
+                        force: true,
+                        load: TargetLoad::Clear(ColorRgba8::rgba(0, 0, 0, 255)),
+                        store: TargetStore::Store,
+                        region: None,
+                    },
+                )
+                .unwrap();
+            if index == 0 {
+                assert_eq!(stats.descriptor_writes, 0);
+                assert_eq!(stats.upload_bytes_recorded, 0);
+            } else if index == 1 {
+                assert!(
+                    stats.upload_bytes_recorded > 0,
+                    "culled scene must retain its pending uploads"
+                );
+            } else {
+                assert_eq!(stats.upload_bytes_recorded, 0);
+            }
+        }
+        context
+            .record_readback(
+                &targets.last().unwrap().target(),
+                &ReadbackRequest {
+                    region: RectI {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                    format: ReadbackFormat::Rgba8,
+                },
+            )
+            .unwrap()
+    };
+    let receipt = recording.finish().unwrap().submit().unwrap();
+    let image = pending
+        .bind_to_submission(receipt)
+        .unwrap()
+        .wait(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(&image.pixels[0..4], &[255, 0, 0, 255]);
+    assert_eq!(
+        instance.diagnostics().error_count(),
+        0,
+        "{:?}",
+        instance.diagnostics().messages()
+    );
 }

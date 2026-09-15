@@ -18,7 +18,7 @@ use std::{
 pub(super) struct Compatibility {
     pub(super) root_cursor: Option<crate::xwayland::root_cursor::RootCursor>,
     // Remove callbacks before dropping their data and owned descriptors.
-    sources: Vec<EventSource>,
+    sources: Vec<(i32, u32, EventSource)>,
     ready: Box<AtomicBool>,
     preparation: Option<Receiver<crate::xwayland::Result<PreparedServer>>>,
     helper: Option<Supervisor>,
@@ -43,6 +43,7 @@ pub(super) struct Compatibility {
         Instant,
         Option<u32>,
     )>,
+    pending_raise: Option<crate::xwayland::association::XWindow>,
     focus_result: Option<(
         WaylandSurfaceId,
         crate::xwayland::association::XWindow,
@@ -100,8 +101,21 @@ impl Compatibility {
             policy_repaint: false,
             closing: BTreeMap::new(),
             pending_focus: None,
+            pending_raise: None,
             focus_result: None,
         })
+    }
+    pub(super) fn take_maximize_requests(&mut self) -> Vec<(u64, u32)> {
+        self.xwm
+            .as_mut()
+            .map(Xwm::take_maximize_requests)
+            .unwrap_or_default()
+    }
+    pub(super) fn take_move_resize_requests(&mut self) -> Vec<(u64, u32, u32)> {
+        self.xwm
+            .as_mut()
+            .map(Xwm::take_move_resize_requests)
+            .unwrap_or_default()
     }
     pub(super) fn committed(&mut self, surface: WaylandSurfaceId, serial: u64) {
         if self.failed {
@@ -165,7 +179,7 @@ impl Compatibility {
         for dead in self.identities.difference(&live) {
             identities.destroy(*dead);
         }
-        self.identities = live.clone();
+        self.identities = live;
         let mut changed = std::mem::take(&mut self.policy_repaint);
         for (surface, window) in windows
             .iter_mut()
@@ -181,11 +195,19 @@ impl Compatibility {
                 );
                 self.desktop
                     .attach(*xwindow, *surface, *geometry, *unmanaged, window, config);
+                let decorated = !*unmanaged
+                    && self
+                        .xwm
+                        .as_ref()
+                        .is_none_or(|xwm| xwm.decorations(*xwindow));
+                super::x11_windows::apply_decorations(window, decorated, config);
                 window.desktop_id = Some(*id);
                 if let Some(xwm) = &self.xwm {
-                    let title = xwm.window_title(*xwindow).map(str::to_owned);
-                    changed |= window.frame_title != title;
-                    window.frame_title = title;
+                    let title = xwm.window_title(*xwindow);
+                    if window.frame_title.as_deref() != title {
+                        window.frame_title = title.map(str::to_owned);
+                        changed = true;
+                    }
                 }
                 changed |= before
                     != (
@@ -204,7 +226,53 @@ impl Compatibility {
                 window.server_decorated = false;
             }
         }
-        self.desktop.retain(&live);
+        self.desktop.retain(&self.identities);
+        // Unmapped windows receive estimates too, satisfying pre-map extent requests.
+        if let Some(xwm) = &mut self.xwm {
+            let targets: Vec<_> = xwm
+                .windows()
+                .into_iter()
+                .flat_map(|registry| registry.iter())
+                .map(|window| (window.id, window.override_redirect))
+                .collect();
+            let density = self.access.coordinate_scale();
+            let measured: BTreeMap<_, _> = windows
+                .values()
+                .filter_map(|window| match window.backend {
+                    Some(WindowBackend::X11(id)) => {
+                        Some((id, super::x11_windows::frame_extents(window, config)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (id, unmanaged) in targets {
+                let extents = measured.get(&id).copied().unwrap_or_else(|| {
+                    if unmanaged {
+                        [0; 4]
+                    } else {
+                        [
+                            config.window_border,
+                            config.window_border,
+                            config.window_border
+                                + if xwm.decorations(id) {
+                                    config.titlebar_height
+                                } else {
+                                    0
+                                },
+                            config.window_border,
+                        ]
+                        .map(|value| value.max(0).saturating_mul(density) as u32)
+                    }
+                });
+                if !xwm
+                    .set_frame_extents(id, extents, Instant::now())
+                    .map_err(app_error)?
+                {
+                    self.ready.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
         // Subsurfaces share their X11 root's eligibility and coordinate space.
         // Compute first, then mutate, so sibling traversal order is irrelevant.
         let children: Vec<_> = windows
@@ -367,6 +435,30 @@ impl Compatibility {
     pub(super) fn cancel_close(&mut self) {
         self.closing.clear();
     }
+    pub(super) fn raise_focused(
+        &mut self,
+        surface: WaylandSurfaceId,
+        windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+        stacking: &mut Vec<WaylandSurfaceId>,
+    ) {
+        if !raise_family(surface, windows, stacking) {
+            return;
+        }
+        self.pending_raise = self
+            .xwm
+            .as_ref()
+            .and_then(Xwm::windows)
+            .and_then(|registry| {
+                registry
+                    .iter()
+                    .find(|window| {
+                        registry.presentable_surface(window.id) == Some(u64::from(surface.get()))
+                    })
+                    .map(|window| window.id)
+            });
+        self.ready.store(true, Ordering::Release);
+    }
+
     pub(super) fn request_focus(
         &mut self,
         surface: Option<WaylandSurfaceId>,
@@ -374,6 +466,7 @@ impl Compatibility {
     ) {
         self.pending_focus = None;
         self.focus_result = None;
+        self.pending_raise = None;
         let Some(mut surface) = surface else {
             return;
         };
@@ -483,26 +576,7 @@ impl Compatibility {
         wayland
             .set_keyboard_focus(1, Some(surface), display.next_serial())
             .map_err(app_error)?;
-        let family: Vec<_> = stacking
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                let mut candidate = *candidate;
-                for _ in 0..=windows.len() {
-                    if candidate == surface {
-                        return true;
-                    }
-                    let Some(parent) = windows.get(&candidate).and_then(|image| image.parent)
-                    else {
-                        return false;
-                    };
-                    candidate = parent;
-                }
-                false
-            })
-            .collect();
-        stacking.retain(|candidate| !family.contains(candidate));
-        stacking.extend(family);
+        raise_family(surface, windows, stacking);
         Ok(true)
     }
     pub(super) fn wait(&self, wait: Option<Duration>) -> Option<Duration> {
@@ -573,8 +647,8 @@ impl Compatibility {
                 }
             }
         }
-        // Dispatch may close a failed XWM FD. Unregister before permitting that.
-        self.sources.clear();
+        // On failure dispatch immediately calls stop(), removing sources before any restart.
+        // Successful turns retain registrations and update only changed write interest.
         if let Some(helper) = &mut self.helper {
             match helper.snapshot().status {
                 Status::Starting | Status::Running { .. } => {}
@@ -650,6 +724,19 @@ impl Compatibility {
                     }
                 }
             }
+            if let Some(target) = self.pending_raise {
+                if xwm
+                    .windows()
+                    .and_then(|windows| windows.presentable_surface(target))
+                    .is_none()
+                {
+                    self.pending_raise = None;
+                } else if !xwm.commands_pending(target) && xwm.command_capacity() > 0 {
+                    xwm.raise_window(target, Instant::now())
+                        .map_err(app_error)?;
+                    self.pending_raise = None;
+                }
+            }
             for (window, sequence) in &mut self.closing {
                 let Some(expected) = *sequence else {
                     continue;
@@ -695,6 +782,7 @@ impl Compatibility {
                             .map_err(app_error)?;
                         xwm.refresh_input_hints(window).map_err(app_error)?;
                         xwm.refresh_normal_hints(window).map_err(app_error)?;
+                        xwm.refresh_decorations(window).map_err(app_error)?;
                         xwm.refresh_title(window).map_err(app_error)?;
                     }
                     Action::RequestMap(window)
@@ -744,9 +832,18 @@ impl Compatibility {
                 },
             ));
         }
+        self.sources
+            .retain(|(fd, _, _)| fds.iter().any(|(live, _)| live == fd));
         for (fd, mask) in fds {
-            self.sources.push(
-                unsafe {
+            if let Some((_, previous, source)) =
+                self.sources.iter_mut().find(|(live, _, _)| *live == fd)
+            {
+                if *previous != mask {
+                    source.update_fd_mask(mask).map_err(app_error)?;
+                    *previous = mask;
+                }
+            } else {
+                let source = unsafe {
                     display.event_loop().add_fd(
                         fd,
                         mask,
@@ -754,8 +851,9 @@ impl Compatibility {
                         std::ptr::from_ref(self.ready.as_ref()).cast_mut().cast(),
                     )
                 }
-                .map_err(app_error)?,
-            );
+                .map_err(app_error)?;
+                self.sources.push((fd, mask, source));
+            }
         }
         Ok(())
     }
@@ -774,12 +872,45 @@ impl Compatibility {
         self.closing.clear();
         self.pending_focus = None;
         self.focus_result = None;
+        self.pending_raise = None;
         self.ready.store(false, Ordering::Release);
         self.failed = true;
         self.initialized = false;
         self.environment = None;
     }
 }
+/// Raise imagery without changing keyboard ownership or issuing another focus transaction.
+fn raise_family(
+    surface: WaylandSurfaceId,
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+    stacking: &mut Vec<WaylandSurfaceId>,
+) -> bool {
+    let family: Vec<_> = stacking
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let mut candidate = *candidate;
+            for _ in 0..=windows.len() {
+                if candidate == surface {
+                    return true;
+                }
+                let Some(parent) = windows.get(&candidate).and_then(|image| image.parent) else {
+                    return false;
+                };
+                candidate = parent;
+            }
+            false
+        })
+        .collect();
+    if stacking.ends_with(&family) {
+        return false;
+    }
+    let members: BTreeSet<_> = family.iter().copied().collect();
+    stacking.retain(|candidate| !members.contains(candidate));
+    stacking.extend(family);
+    true
+}
+
 impl Drop for Compatibility {
     fn drop(&mut self) {
         self.stop();
@@ -827,6 +958,7 @@ mod tests {
                 policy_repaint: false,
                 closing: BTreeMap::new(),
                 pending_focus: None,
+                pending_raise: None,
                 focus_result: None,
             };
             host.environment = Some((":123".into(), "/private/fixture-auth".into()));
@@ -898,5 +1030,36 @@ mod tests {
             drop(host);
             assert!(native_client.is_alive());
         }
+    }
+}
+
+#[cfg(test)]
+mod raise_tests {
+    use super::super::client::maximize_preview_tests::test_window;
+    use super::*;
+
+    #[test]
+    fn raising_existing_focus_moves_its_family_once_and_preserves_child_order() {
+        let ids = [1, 2, 3, 4].map(|raw| WaylandSurfaceId::from_raw(raw).unwrap());
+        let mut windows = BTreeMap::new();
+        for id in ids {
+            windows.insert(
+                id,
+                test_window(
+                    SizeI {
+                        width: 10,
+                        height: 10,
+                    },
+                    PointI::default(),
+                ),
+            );
+        }
+        windows.get_mut(&ids[0]).unwrap().role = SurfaceRole::Xwayland;
+        windows.get_mut(&ids[1]).unwrap().parent = Some(ids[0]);
+        windows.get_mut(&ids[2]).unwrap().parent = Some(ids[1]);
+        let mut order = ids.to_vec();
+        assert!(raise_family(ids[0], &windows, &mut order));
+        assert_eq!(order, [ids[3], ids[0], ids[1], ids[2]]);
+        assert!(!raise_family(ids[0], &windows, &mut order));
     }
 }

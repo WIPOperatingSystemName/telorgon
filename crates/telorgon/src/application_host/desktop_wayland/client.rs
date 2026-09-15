@@ -2,6 +2,13 @@ use super::renderer::DmaBufRetirement;
 use super::*;
 
 pub(super) struct ClientWindow {
+    pub(super) motion_style: crate::WindowMotion,
+    /// Shared presentation latch: protocol completion may precede the first placeholder frame.
+    pub(super) motion_veil_pending: bool,
+    pub(super) motion_input: Option<super::motion::VisualInput>,
+    pub(super) size_policy: super::size_policy::SizePolicy,
+    pub(super) last_policy_request: Option<SizeI>,
+    pub(super) surface_scale: i32,
     pub(super) backend: Option<WindowBackend>,
     pub(super) frame_title: Option<String>,
     pub(super) desktop_id: Option<crate::shell::WindowId>,
@@ -28,6 +35,7 @@ pub(super) struct ClientWindow {
 /// Retained surface content, independent of desktop policy and xdg transactions.
 /// GPU ownership remains with the existing renderer retirement paths.
 pub(super) struct SurfacePresentation {
+    pub(super) content_ready: bool,
     pub(super) revision: u64,
     /// Surface-local logical extent used for window geometry and input.
     pub(super) size: SizeI,
@@ -39,13 +47,20 @@ pub(super) struct SurfacePresentation {
     pub(super) pixels: Vec<u8>,
 }
 
+impl SurfacePresentation {
+    /// Damage is relative to exactly the previous commit, never an arbitrary retained image.
+    pub(super) fn can_apply_damage(&self, revision: u64) -> bool {
+        self.revision.checked_add(1) == Some(revision)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum PendingClientImageUpdate {
     #[default]
     Unchanged,
     Full(Arc<[u8]>),
     Region(RectI),
-    External(ImageId),
+    External(ImageId, Option<RectI>),
 }
 
 impl PendingClientImageUpdate {
@@ -54,7 +69,7 @@ impl PendingClientImageUpdate {
             Self::Full(pixels) => patch_client_pixels(Arc::make_mut(pixels), update),
             Self::Region(rect) => *rect = union_rect(*rect, update.rect),
             Self::Unchanged => *self = Self::Region(update.rect),
-            Self::External(_) => unreachable!("DMA-BUF content cannot receive an SHM patch"),
+            Self::External(..) => unreachable!("DMA-BUF content cannot receive an SHM patch"),
         }
     }
 }
@@ -77,6 +92,7 @@ pub(super) enum PreparedClientImage {
         pixel_format: ImagePixelFormat,
         alpha_mode: ImageAlphaMode,
         image: ImageId,
+        damage: Option<RectI>,
     },
 }
 
@@ -153,6 +169,9 @@ impl ClientWindow {
     }
 
     pub(super) fn resize_veil_active(&self) -> bool {
+        if self.motion_veil_pending {
+            return true;
+        }
         #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
         if self.resize_preview.active() {
             return true;
@@ -209,18 +228,22 @@ impl SurfacePresentation {
                 pixel_format,
                 alpha_mode,
                 image,
+                damage,
             } => {
                 self.size = extent;
                 self.image_size = raster_extent;
                 self.alpha_mode = alpha_mode;
                 self.pixel_format = pixel_format;
                 self.pixels.clear();
-                self.pending_image_update = PendingClientImageUpdate::External(image);
+                self.pending_image_update = PendingClientImageUpdate::External(image, damage);
             }
         }
     }
 
     pub(super) fn take_image_update(&mut self) -> DesktopImageUpdate {
+        if !self.content_ready {
+            return DesktopImageUpdate::Unchanged;
+        }
         match std::mem::take(&mut self.pending_image_update) {
             PendingClientImageUpdate::Unchanged => DesktopImageUpdate::Reused,
             PendingClientImageUpdate::Full(pixels) => DesktopImageUpdate::Full(pixels),
@@ -231,9 +254,10 @@ impl SurfacePresentation {
                     pixels: copy_client_region(&self.pixels, self.image_size, rect).into(),
                 }])
             }
-            PendingClientImageUpdate::External(image) => DesktopImageUpdate::External {
+            PendingClientImageUpdate::External(image, damage) => DesktopImageUpdate::External {
                 image,
                 content_version: self.revision,
+                damage,
             },
         }
     }
@@ -300,8 +324,31 @@ pub(super) fn apply_surface_publication(
     let role = snapshot
         .role
         .ok_or_else(|| AppError::new("published surface has no role"))?;
-    let image_extent = prepared_image.extent();
+    let surface_scale = wayland.x11_surface_scale(surface);
+    let raw_extent = prepared_image.extent();
+    let image_extent = SizeI {
+        width: (raw_extent.width / surface_scale).max(1),
+        height: (raw_extent.height / surface_scale).max(1),
+    };
     let raster_extent = prepared_image.raster_extent();
+    let kind = match &prepared_image {
+        PreparedClientImage::Unchanged { .. } => "unchanged",
+        PreparedClientImage::Full { .. } => "full",
+        PreparedClientImage::Region(_) => "region",
+        PreparedClientImage::External { .. } => "external",
+    };
+    super::resize_trace::event(
+        surface.get(),
+        "prepared",
+        format_args!(
+            "revision={} buffer={:?} kind={} extent={:?} raster={:?}",
+            snapshot.revision,
+            snapshot.attachment.map(|attachment| attachment.buffer),
+            kind,
+            raw_extent,
+            raster_extent
+        ),
+    );
     let image_pixel_format = prepared_image.pixel_format();
     let image_alpha_mode = prepared_image.alpha_mode();
     let window_geometry = if role == SurfaceRole::XdgToplevel {
@@ -317,11 +364,15 @@ pub(super) fn apply_surface_publication(
     };
     let (parent, offset, position) = if role == SurfaceRole::Subsurface {
         let parent = wayland.core().subsurfaces.parent(surface);
-        let offset = wayland
-            .core()
-            .subsurfaces
-            .position(surface)
-            .map_or(PointI::default(), |position| position.offset);
+        let offset =
+            wayland
+                .core()
+                .subsurfaces
+                .position(surface)
+                .map_or(PointI::default(), |position| PointI {
+                    x: position.offset.x / surface_scale,
+                    y: position.offset.y / surface_scale,
+                });
         let position = parent
             .and_then(|parent| windows.get(&parent))
             .map_or(offset, |parent| PointI {
@@ -432,7 +483,7 @@ pub(super) fn apply_surface_publication(
         && previous_window.is_none_or(|window| {
             window.role != role
                 || window.position != reconciled_position
-                || window.presentation.size != image_extent
+                || window.presentation.size != raw_extent
                 || window.window_geometry != window_geometry
                 || window.requested_size != requested_size
                 || window.native_configure.resize_anchor != resize_anchor
@@ -441,6 +492,7 @@ pub(super) fn apply_surface_publication(
                 || window.server_decorated != server_decorated
         });
     if let Some(window) = windows.get_mut(&surface) {
+        window.surface_scale = surface_scale;
         window.role = role;
         window.parent = parent;
         window.offset = offset;
@@ -470,9 +522,10 @@ pub(super) fn apply_surface_publication(
                 PendingClientImageUpdate::Full(image.pixels),
                 retained_pixels,
             ),
-            PreparedClientImage::External { image, .. } => {
-                (PendingClientImageUpdate::External(image), Vec::new())
-            }
+            PreparedClientImage::External { image, damage, .. } => (
+                PendingClientImageUpdate::External(image, damage),
+                Vec::new(),
+            ),
             PreparedClientImage::Unchanged { .. } | PreparedClientImage::Region(_) => {
                 return Err(AppError::new(
                     "new surface publication did not provide a complete image",
@@ -482,6 +535,12 @@ pub(super) fn apply_surface_publication(
         windows.insert(
             surface,
             ClientWindow {
+                motion_style: crate::WindowMotion::none(),
+                motion_veil_pending: false,
+                motion_input: None,
+                size_policy: Default::default(),
+                last_policy_request: None,
+                surface_scale,
                 backend: (role == SurfaceRole::XdgToplevel).then_some(WindowBackend::Wayland),
                 frame_title: None,
                 desktop_id: if role == SurfaceRole::XdgToplevel {
@@ -510,8 +569,9 @@ pub(super) fn apply_surface_publication(
                     resize_final: retained_resize_final,
                 },
                 presentation: SurfacePresentation {
+                    content_ready: true,
                     revision: snapshot.revision,
-                    size: image_extent,
+                    size: raw_extent,
                     image_size: raster_extent,
                     alpha_mode: image_alpha_mode,
                     pixel_format: image_pixel_format,
@@ -763,11 +823,34 @@ pub(super) mod maximize_preview_tests {
         assert_eq!(order, [ids[0], ids[1], ids[2], ids[3]]);
     }
 
+    #[test]
+    fn shm_damage_requires_contiguous_retained_content() {
+        let mut window = test_window(
+            SizeI {
+                width: 10,
+                height: 10,
+            },
+            PointI::default(),
+        );
+        window.presentation.revision = 7;
+        assert!(window.presentation.can_apply_damage(8));
+        assert!(!window.presentation.can_apply_damage(9)); // An intervening damaged image was coalesced.
+        assert!(!window.presentation.can_apply_damage(7)); // Stale/duplicate publication.
+        window.presentation.revision = u64::MAX;
+        assert!(!window.presentation.can_apply_damage(0));
+    }
+
     pub(in crate::application_host::desktop_wayland) fn test_window(
         size: SizeI,
         position: PointI,
     ) -> ClientWindow {
         ClientWindow {
+            motion_style: crate::WindowMotion::none(),
+            motion_veil_pending: false,
+            motion_input: None,
+            size_policy: Default::default(),
+            last_policy_request: None,
+            surface_scale: 1,
             desktop_id: None,
             backend: Some(WindowBackend::Wayland),
             frame_title: None,
@@ -794,6 +877,7 @@ pub(super) mod maximize_preview_tests {
             chrome_content_offset: None,
             chrome: None,
             presentation: SurfacePresentation {
+                content_ready: true,
                 revision: 1,
                 size,
                 image_size: size,
@@ -857,6 +941,97 @@ pub(super) mod maximize_preview_tests {
         assert_eq!(windows[&surface].requested_size, size);
         assert_eq!(windows[&surface].position, position);
     }
+
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    #[test]
+    fn both_backends_hold_the_first_placeholder_even_if_redraw_finishes_early() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        for backend in [
+            WindowBackend::Wayland,
+            WindowBackend::X11(crate::xwayland::association::XWindow {
+                generation: 1,
+                xid: 10,
+                incarnation: 1,
+            }),
+        ] {
+            let mut window = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI::default(),
+            );
+            window.backend = Some(backend);
+            window.motion_style = crate::WindowMotion::smooth();
+            let mut windows = BTreeMap::from([(surface, window)]);
+            for maximized in [true, false] {
+                set_window_maximized(
+                    &mut windows,
+                    &mut ConfigureScheduler::default(),
+                    surface,
+                    maximized,
+                    RectI {
+                        x: 0,
+                        y: 0,
+                        width: 1280,
+                        height: 800,
+                    },
+                    &LinuxDesktopConfig::default(),
+                )
+                .unwrap();
+                let window = windows.get_mut(&surface).unwrap();
+                // Model protocol completion occurring before desktop composition gets a turn.
+                window.native_configure.resize_final = None;
+                window.resize_preview = Default::default();
+                assert!(
+                    window.resize_veil_active(),
+                    "fast redraw must not skip the placeholder"
+                );
+                assert!(std::mem::take(&mut window.motion_veil_pending));
+                assert!(
+                    !window.resize_veil_active(),
+                    "the shared controller now owns the visual handoff"
+                );
+            }
+        }
+    }
+    #[test]
+    fn animated_restore_waits_for_its_own_final_content() {
+        let surface = WaylandSurfaceId::from_raw(42).unwrap();
+        let original = SizeI {
+            width: 640,
+            height: 480,
+        };
+        let mut window = test_window(original, PointI { x: 50, y: 60 });
+        window.motion_style = crate::WindowMotion::smooth();
+        let mut windows = BTreeMap::from([(surface, window)]);
+        let mut scheduler = ConfigureScheduler::default();
+        let area = RectI {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        for maximized in [true, false] {
+            set_window_maximized(
+                &mut windows,
+                &mut scheduler,
+                surface,
+                maximized,
+                area,
+                &LinuxDesktopConfig::default(),
+            )
+            .unwrap();
+        }
+        let window = &windows[&surface];
+        assert_eq!(window.requested_size, original);
+        let pending = window.native_configure.resize_final.unwrap();
+        assert_eq!(pending.size, original);
+        assert!(!pending.was_acknowledged());
+        assert_eq!(resize_veil_owner(&windows, surface), Some(surface));
+        assert!(!window.resizing());
+    }
+
     #[test]
     fn titlebar_drag_restores_saved_size_and_continues_without_a_jump() {
         let surface = WaylandSurfaceId::from_raw(42).unwrap();

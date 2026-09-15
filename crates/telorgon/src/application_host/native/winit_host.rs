@@ -392,7 +392,7 @@ impl ManagedPointer {
     fn custom_frames(
         &mut self,
         event_loop: &ActiveEventLoop,
-        graphic: &crate::PointerGraphic,
+        graphic: &crate::CursorGraphic,
     ) -> AppResult<Vec<ManagedCursorFrame>> {
         let size = graphic
             .logical_size()

@@ -63,7 +63,10 @@ impl DescriptorLayouts {
                     0,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 ),
-                storage_binding(1, vk::ShaderStageFlags::FRAGMENT),
+                storage_binding(
+                    1,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                ),
             ],
         ) {
             Ok(layout) => layout,
@@ -232,9 +235,7 @@ pub(crate) fn allocate_frame_sets(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn create_composite_descriptor_pool(
-    device: &ash::Device,
-) -> RenderResult<vk::DescriptorPool> {
+fn create_composite_descriptor_pool_raw(device: &ash::Device) -> RenderResult<vk::DescriptorPool> {
     let pool_sizes = [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -323,4 +324,109 @@ pub(crate) fn allocate_composite_sets(
             textures: sets.by_ref().take(*texture_count).collect(),
         })
         .collect())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct CompositeDescriptorArena {
+    device: ash::Device,
+    pools: Vec<vk::DescriptorPool>,
+    page: usize,
+    placements: usize,
+    textures: usize,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn create_composite_descriptor_pool(
+    device: &ash::Device,
+) -> RenderResult<std::sync::Arc<std::sync::Mutex<CompositeDescriptorArena>>> {
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(
+        CompositeDescriptorArena {
+            device: device.clone(),
+            pools: vec![create_composite_descriptor_pool_raw(device)?],
+            page: 0,
+            placements: 0,
+            textures: 0,
+        },
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_page_fits(used: usize, textures: usize, added: usize, added_textures: usize) -> bool {
+    used.saturating_add(added) <= MAX_COMPOSITE_SCENES as usize
+        && textures.saturating_add(added_textures) <= MAX_COMPOSITE_TEXTURE_SETS as usize
+}
+
+#[cfg(target_os = "linux")]
+impl CompositeDescriptorArena {
+    pub(crate) fn reset(&mut self) -> RenderResult<()> {
+        for pool in &self.pools {
+            unsafe {
+                self.device
+                    .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty())
+            }
+            .map_err(|e| vk_error("failed to reset composite descriptor page", e))?;
+        }
+        self.page = 0;
+        self.placements = 0;
+        self.textures = 0;
+        Ok(())
+    }
+
+    pub(crate) fn allocate(
+        &mut self,
+        layouts: &DescriptorLayouts,
+        counts: &[usize],
+    ) -> RenderResult<Vec<CompositeDescriptorSets>> {
+        let textures = counts.iter().sum();
+        if !descriptor_page_fits(0, 0, counts.len(), textures)
+            || counts.iter().any(|n| *n > MAX_TEXTURE_SETS)
+        {
+            return Err(crate::renderer_vulkan::error::internal(
+                "composite descriptor request exceeds page capacity",
+            ));
+        }
+        if !descriptor_page_fits(self.placements, self.textures, counts.len(), textures) {
+            if self.page + 1 >= 64 {
+                return Err(crate::renderer_vulkan::error::internal(
+                    "composite frame exceeds 64 descriptor pages",
+                ));
+            }
+            let next_page = self.page + 1;
+            if next_page == self.pools.len() {
+                self.pools
+                    .push(create_composite_descriptor_pool_raw(&self.device)?);
+            }
+            // Commit the cursor only after allocation succeeds, so an error remains retryable.
+            self.page = next_page;
+            self.placements = 0;
+            self.textures = 0;
+        }
+        let sets = allocate_composite_sets(&self.device, self.pools[self.page], layouts, counts)?;
+        self.placements += counts.len();
+        self.textures += textures;
+        Ok(sets)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CompositeDescriptorArena {
+    fn drop(&mut self) {
+        for pool in &self.pools {
+            unsafe {
+                self.device.destroy_descriptor_pool(*pool, None);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod arena_tests {
+    use super::*;
+    #[test]
+    fn cumulative_passes_roll_over_before_exhaustion() {
+        assert!(descriptor_page_fits(129, 129, 127, 127));
+        assert!(!descriptor_page_fits(129, 129, 129, 129));
+        assert!(!descriptor_page_fits(1, 2048, 1, 1));
+        assert!(descriptor_page_fits(0, 0, 129, 129));
+    }
 }

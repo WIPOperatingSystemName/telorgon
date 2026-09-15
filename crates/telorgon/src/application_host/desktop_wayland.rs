@@ -34,7 +34,7 @@ use crate::render::{ImageAlphaMode, ImageId, ImagePixelFormat, RenderSceneDelta}
 use crate::runtime::CompositionDriver;
 use crate::wayland_server::Display;
 use crate::{
-    AssetBundle, AssetMediaCache, AssetRasterSize, PointerConfiguration, PointerGraphic,
+    AssetBundle, AssetMediaCache, AssetRasterSize, CursorGraphic, PointerConfiguration,
     PointerIcon, PointerRequest, PointerResolution, PointerTheme, WindowAction, WindowChromeModel,
     WindowChromeSnapshot, WindowChromeState, WindowResizeEdge, resolve_pointer,
 };
@@ -55,16 +55,22 @@ mod window_identity;
 mod x11_windows;
 use window_identity::WindowIdentities;
 mod cursor_plane;
+mod dma_buf_readiness;
 mod event_source;
+mod frame_stats;
 mod geometry;
 mod input;
 mod interaction;
+mod latency_trace;
 mod layers;
+mod motion;
 mod pointer_visual;
 mod renderer;
+mod resize_trace;
 mod scene;
 mod shm_copy;
 mod shortcuts;
+mod size_policy;
 mod state;
 
 use client::{
@@ -176,6 +182,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         "telorgon-kms: negotiating {renderer:?} scanout on {}",
         drm_path.display()
     );
+    // Renderer-owned acquire watches must unregister before libwayland destroys its event loop.
+    // Rust drops locals in reverse declaration order, including on every error return.
+    #[allow(unused_mut)]
+    let mut display = Display::new().map_err(app_error)?;
     let mut scanout = renderer::prepare(
         &kms,
         gbm.as_ref(),
@@ -204,6 +214,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         .map(|(index, framebuffer)| FrameSlot::new(index, framebuffer.id()))
         .collect::<Vec<_>>();
     let mut desktop_scene = DesktopComposition::new(extent);
+    let mut window_motion = motion::WindowMotionController::default();
     let mut frame_surface_revisions = vec![Vec::<(u32, u64)>::new(); frame_slots.len()];
     let cursor_plane = topology.planes.iter().find(|candidate| {
         candidate.possible_crtcs_mask & (1_u32.checked_shl(crtc_index as u32).unwrap_or(0)) != 0
@@ -227,12 +238,12 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         "presentation.cursor.composited_fallback"
     });
 
-    #[allow(unused_mut)]
-    let mut display = Display::new().map_err(app_error)?;
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
     let xwayland_access =
         crate::compositor_wayland::XwaylandAccess::configure_display(&mut display)
             .map_err(app_error)?;
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    xwayland_access.set_coordinate_scale(output_scale.get().ceil() as i32);
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
     let mut wayland = NativeCompositor::new_with_xwayland(
         &display,
@@ -262,12 +273,27 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         .map_err(app_error)?;
     let dma_buf_formats = desktop_renderer.dma_buf_formats();
     if !dma_buf_formats.is_empty() {
+        use std::os::unix::fs::MetadataExt;
+        // PreparedVulkan matched the renderer to this exact KMS device before importing scanout.
+        // The protocol accepts a primary node; Xwayland resolves its corresponding render node.
+        let device_file = std::fs::File::from(kms.fd().try_clone().map_err(app_error)?);
+        let main_device = device_file.metadata().map_err(app_error)?.rdev();
+        let format_count = dma_buf_formats.len();
         wayland
-            .add_linux_dmabuf(&display, dma_buf_formats)
+            .add_linux_dmabuf_with_feedback(&display, dma_buf_formats, main_device)
             .map_err(app_error)?;
         wayland
             .add_explicit_synchronization(&display)
             .map_err(app_error)?;
+        eprintln!(
+            "telorgon-dmabuf: v4 feedback enabled device={}:{} format_modifier_pairs={format_count}",
+            libc::major(main_device),
+            libc::minor(main_device)
+        );
+    } else {
+        eprintln!(
+            "telorgon-dmabuf: unavailable; client buffers use SHM (Xwayland GPU acceleration unavailable)"
+        );
     }
     let socket = display
         .add_socket_in(&runtime_directory, config.socket_name.as_deref())
@@ -482,15 +508,16 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             &pointer_config,
             pointer_theme.as_ref(),
             &mut pointer_media,
-            crate::platform::ScaleFactor::new(1.0).map_err(app_error)?,
+            crate::platform::ScaleFactor::new(output_scale.get().ceil().clamp(1.0, 8.0))
+                .map_err(app_error)?,
         )?;
         let cursor = match visual {
             Some(CursorVisual::Image(image)) => {
                 Some(crate::xwayland::root_cursor::RootCursor::new(
                     image.size.width,
                     image.size.height,
-                    image.hotspot.x,
-                    image.hotspot.y,
+                    (image.hotspot.x as f32 * output_scale.get().ceil().clamp(1.0, 8.0)) as i32,
+                    (image.hotspot.y as f32 * output_scale.get().ceil().clamp(1.0, 8.0)) as i32,
                     &image.rgba,
                     image.premultiplied,
                 ))
@@ -498,10 +525,12 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             None => Some(crate::xwayland::root_cursor::RootCursor::new(
                 1, 1, 0, 0, &[0; 4], true,
             )),
-            Some(CursorVisual::Composed { .. }) => None,
         };
         match cursor {
-            Some(Ok(cursor)) => compatibility.root_cursor = Some(cursor),
+            Some(Ok(mut cursor)) => {
+                cursor.density = output_scale.get().ceil().clamp(1.0, 8.0) as u16;
+                compatibility.root_cursor = Some(cursor);
+            }
             Some(Err(error)) => eprintln!("telorgon-xwayland: {error}; using built-in root arrow"),
             None => eprintln!(
                 "telorgon-xwayland: composed default cursor cannot be exported; using built-in root arrow"
@@ -553,10 +582,14 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let mut session_locked = false;
     let mut pending_session_lock = None;
     let mut window_interaction = None;
+    let mut decoration_click = DecorationClick::default();
     let mut configure_scheduler = ConfigureScheduler::default();
     let mut resize_configure_budget = true;
     let mut next_window_offset = 0_i32;
     let mut next_frame_id = 1_u64;
+    let mut frame_stats = frame_stats::FrameStats::from_env(mode.refresh_millihertz());
+    let mut owner_stats_start = None::<Instant>;
+    let mut latency_trace = latency_trace::LatencyTrace::from_env().map_err(app_error)?;
     let mut ready_scanout = VecDeque::<usize>::new();
     let mut pending_kms_commit = None::<PendingKmsCommit>;
     let mut current_scanout = None::<usize>;
@@ -578,6 +611,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
     let mut close_requested = std::collections::BTreeSet::new();
 
     loop {
+        latency_trace.phase("schedule");
+        if let (Some(stats), Some(started)) = (&mut frame_stats, owner_stats_start.take()) {
+            stats.owner_turn(started.elapsed());
+        }
         if termination_signals.take_requested() {
             crate::request_exit();
         }
@@ -619,6 +656,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 session.resume();
             }
         }
+        if let Some(stats) = &mut frame_stats {
+            stats.report();
+        }
         let mut presentation_completed = false;
         let mut presented_surface_revisions = Vec::new();
         let mut pointer_motion_seen = false;
@@ -652,7 +692,16 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             && hardware_cursor
                 .as_ref()
                 .is_some_and(HardwareCursor::needs_commit);
-        let immediate_work = ((repaint || runtime_immediate) && scanout_available)
+        let primary_render_ready = state::primary_render_budget(
+            frame_slots
+                .iter()
+                .filter(|slot| slot.state == FrameSlotState::GpuSubmitted)
+                .count(),
+            ready_scanout.len(),
+        );
+        let immediate_work = ((repaint || runtime_immediate)
+            && scanout_available
+            && primary_render_ready)
             || (pending_kms_commit.is_none() && (!ready_scanout.is_empty() || cursor_commit_ready))
             || runtime_ready.load(Ordering::Acquire)
             || seat_ready.load(Ordering::Acquire)
@@ -667,7 +716,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             Some(Duration::from_nanos(
                 deadline.as_nanos().saturating_sub(schedule_now.as_nanos()),
             ))
-        } else if runtime_animation && pending_kms_commit.is_none() {
+        } else if (runtime_animation || window_motion.active(schedule_now.as_nanos()))
+            && pending_kms_commit.is_none()
+        {
             Some(refresh_period)
         } else {
             None
@@ -682,7 +733,19 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         };
         #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
         let wait = compatibility.as_ref().map_or(wait, |host| host.wait(wait));
+        latency_trace.event(
+            "wait_requested",
+            [
+                wait.map_or(u64::MAX, |d| d.as_micros().min(u128::from(u64::MAX)) as u64),
+                0,
+                0,
+                0,
+            ],
+        );
+        latency_trace.phase("wayland_wait_dispatch");
         display.dispatch_and_flush(wait).map_err(app_error)?;
+        latency_trace.phase("xwm_dispatch");
+        owner_stats_start = frame_stats.as_ref().map(|_| Instant::now());
         #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
         if let Some(host) = &mut compatibility {
             host.dispatch(&display);
@@ -706,6 +769,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             )?;
         }
 
+        latency_trace.phase("seat_dispatch");
         if seat_ready.swap(false, Ordering::AcqRel) {
             seat.dispatch(0).map_err(app_error)?;
         }
@@ -779,7 +843,11 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 )
                 .map_err(app_error)?;
         }
+        latency_trace.phase("input_dispatch_route_flush");
         if seat.state() == SeatState::Enabled && input_ready.ready.swap(false, Ordering::AcqRel) {
+            let mut input_stats = (frame_stats.is_some() || latency_trace.enabled()).then(|| {
+                frame_stats::InputBatch::new(crate::platform_linux::monotonic_time_microseconds())
+            });
             #[cfg(feature = "profiler")]
             let input_callback_time_us = input_ready.callback_time_us.swap(0, Ordering::AcqRel);
             #[cfg(feature = "profiler")]
@@ -796,6 +864,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             let input_observed_us = crate::platform_linux::monotonic_time_microseconds();
             while let Some(event) = input.next_event() {
                 let time_microseconds = event.time_microseconds;
+                if let Some(stats) = &mut input_stats {
+                    stats.observe(time_microseconds);
+                }
                 if matches!(
                     event.kind,
                     LinuxInputEventKind::PointerMotion { .. }
@@ -907,10 +978,17 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             && window_interaction.is_none()
                             && (!wayland.drag_active(1) || wayland.drag_touch_slot(1).is_some())
                         {
+                            let density = pointer_focus
+                                .and_then(|surface| windows.get(&surface))
+                                .map_or(1, |window| window.surface_scale.max(1))
+                                as f32;
                             let _ = wayland.relative_pointer_motion(
                                 1,
                                 time_microseconds,
-                                delta,
+                                PointF {
+                                    x: delta.x * density,
+                                    y: delta.y * density,
+                                },
                                 unaccelerated,
                             );
                         }
@@ -1014,6 +1092,74 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 ),
                             );
                         }
+                        if button == 0x110 && !pressed {
+                            let owns_release = wayland
+                                .core()
+                                .seats
+                                .get(&1)
+                                .is_some_and(|seat| seat.compositor_owns_button(button));
+                            let over = if owns_release && !session_locked {
+                                hit_test_decoration(
+                                    &windows,
+                                    &stacking_order,
+                                    pointer_position,
+                                    &config,
+                                    &icon_layers,
+                                )
+                            } else {
+                                None
+                            };
+                            if let Some((surface, hit)) = decoration_click.release(over)
+                                && wayland.core().world.surface(surface).is_some()
+                            {
+                                match hit {
+                                    DecorationHit::Close => {
+                                        window_backend::close(
+                                            surface,
+                                            &windows,
+                                            &mut wayland,
+                                            #[cfg(all(
+                                                feature = "desktop-xwayland",
+                                                target_env = "gnu"
+                                            ))]
+                                            compatibility.as_mut(),
+                                        )?;
+                                    }
+                                    DecorationHit::Maximize => {
+                                        let maximized = windows
+                                            .get(&surface)
+                                            .is_some_and(|window| !window.maximized);
+                                        set_window_maximized(
+                                            &mut windows,
+                                            &mut configure_scheduler,
+                                            surface,
+                                            maximized,
+                                            work_area,
+                                            &config,
+                                        )?;
+                                        pointer_scene_dirty = true;
+                                    }
+                                    DecorationHit::Minimize => {
+                                        if let Some(window) = windows.get_mut(&surface) {
+                                            window.minimized = true;
+                                            stacking_order
+                                                .retain(|candidate| *candidate != surface);
+                                            pointer_scene_dirty = true;
+                                        }
+                                    }
+                                    DecorationHit::ShellAction(action) => {
+                                        invoke_shell_action(
+                                            &shell_actions,
+                                            action,
+                                            surface,
+                                            &frame_layers,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                                repaint = true;
+                            }
+                        }
                         if pressed
                             && button == 0x110
                             && !session_locked
@@ -1082,46 +1228,11 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                         pointer_position,
                                     );
                                 }
-                                DecorationHit::Close => {
-                                    window_backend::close(
-                                        surface,
-                                        &windows,
-                                        &mut wayland,
-                                        #[cfg(all(
-                                            feature = "desktop-xwayland",
-                                            target_env = "gnu"
-                                        ))]
-                                        compatibility.as_mut(),
-                                    )?;
-                                }
-                                DecorationHit::Maximize => {
-                                    let maximized = windows
-                                        .get(&surface)
-                                        .is_some_and(|window| !window.maximized);
-                                    set_window_maximized(
-                                        &mut windows,
-                                        &mut configure_scheduler,
-                                        surface,
-                                        maximized,
-                                        work_area,
-                                        &config,
-                                    )?;
-                                    pointer_scene_dirty = true;
-                                }
-                                DecorationHit::Minimize => {
-                                    if let Some(window) = windows.get_mut(&surface) {
-                                        window.minimized = true;
-                                        stacking_order.retain(|candidate| *candidate != surface);
-                                        pointer_scene_dirty = true;
-                                    }
-                                }
-                                DecorationHit::ShellAction(action) => {
-                                    invoke_shell_action(
-                                        &shell_actions,
-                                        action,
-                                        surface,
-                                        &frame_layers,
-                                    );
+                                DecorationHit::Close
+                                | DecorationHit::Maximize
+                                | DecorationHit::Minimize
+                                | DecorationHit::ShellAction(_) => {
+                                    decoration_click.press(surface, hit);
                                 }
                                 DecorationHit::Frame | DecorationHit::SystemMenu => {}
                             }
@@ -1439,6 +1550,17 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     }
                 }
             }
+            // Deliver input to Xwayland/native clients before buffer import, composition and GPU
+            // submission. Flushing only at the next event-loop dispatch adds that entire work to
+            // application input latency even when the hardware cursor already moved.
+            display.flush_clients();
+            if let Some(batch) = input_stats {
+                let flushed_us = crate::platform_linux::monotonic_time_microseconds();
+                latency_trace.event("input_flush", batch.trace_values(flushed_us));
+                if let Some(stats) = &mut frame_stats {
+                    stats.input_flushed(batch, flushed_us);
+                }
+            }
             repaint |= pointer_primary_dirty;
             #[cfg(feature = "profiler")]
             {
@@ -1476,10 +1598,12 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             &mut configure_scheduler,
             &mut resize_configure_budget,
             &config,
+            work_area,
             #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
             compatibility.as_mut(),
         )?;
 
+        latency_trace.phase("shm_completions_schedule");
         if runtime_ready.swap(false, Ordering::AcqRel) {
             runtime_wake.drain();
         }
@@ -1547,6 +1671,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         repaint |= runtime_turn_ready;
         other_work_seen |= runtime_turn_ready;
 
+        latency_trace.phase("kms_completions");
         if kms_ready.swap(false, Ordering::AcqRel) {
             kms.dispatch_events().map_err(app_error)?;
             for _ in 0..kms.take_completed_page_flips() {
@@ -1562,6 +1687,10 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             .page_flip_replaced()
                             .map_err(app_error)?;
                     }
+                    if let Some(stats) = &mut frame_stats {
+                        stats.presented(&frame_surface_revisions[completed_slot]);
+                    }
+                    latency_trace.event("primary_flip", [completed_slot as u64, 0, 0, 0]);
                     presentation_completed = true;
                     presented_surface_revisions
                         .extend(std::mem::take(&mut frame_surface_revisions[completed_slot]));
@@ -1605,10 +1734,14 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             }
         }
 
+        latency_trace.phase("gpu_completions_releases");
         if vulkan_completion_ready
             .as_ref()
             .is_some_and(|ready| ready.swap(false, Ordering::AcqRel))
         {
+            // Allocation and GPU completion share a wake FD; ordinary GPU completion alone
+            // must not trigger another otherwise unchanged desktop preparation.
+            repaint |= desktop_renderer.poll_allocations(&mut latency_trace)?;
             for completion in desktop_renderer.drain_completions() {
                 completion.result.map_err(AppError::new)?;
                 for retirement in completion.dma_bufs {
@@ -1618,11 +1751,136 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     .gpu_completed()
                     .map_err(app_error)?;
                 ready_scanout.push_back(completion.slot_index);
+                latency_trace.event("gpu_ready", [completion.slot_index as u64, 0, 0, 0]);
                 #[cfg(feature = "profiler")]
                 crate::profiler::record_instant("vulkan.scanout.completion_ready");
             }
         }
 
+        repaint |= desktop_renderer.take_acquire_wakeup();
+        latency_trace.phase("window_requests");
+        #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+        if let Some(host) = &mut compatibility {
+            for (raw, action) in host.take_maximize_requests() {
+                let Some(surface) = u32::try_from(raw).ok().and_then(WaylandSurfaceId::from_raw)
+                else {
+                    continue;
+                };
+                let Some(window) = windows.get(&surface) else {
+                    continue;
+                };
+                if session_locked || window_interaction.is_some() {
+                    continue;
+                }
+                let maximized = match action {
+                    0 => false,
+                    1 => true,
+                    2 => !window.maximized,
+                    _ => continue,
+                };
+                if maximized == window.maximized {
+                    continue;
+                }
+                set_window_maximized(
+                    &mut windows,
+                    &mut configure_scheduler,
+                    surface,
+                    maximized,
+                    work_area,
+                    &config,
+                )?;
+                pointer_scene_dirty = true;
+                repaint = true;
+            }
+            for (raw, direction, button) in host.take_move_resize_requests() {
+                let Some(surface) = u32::try_from(raw).ok().and_then(WaylandSurfaceId::from_raw)
+                else {
+                    continue;
+                };
+                if session_locked {
+                    continue;
+                }
+                if direction == 11 {
+                    if matches!(window_interaction, Some(WindowInteraction::Move { surface: target, .. } | WindowInteraction::Resize { surface: target, .. }) if target == surface)
+                    {
+                        if let Some(interaction) = window_interaction.take() {
+                            finish_window_interaction(
+                                &mut windows,
+                                &mut configure_scheduler,
+                                interaction,
+                            );
+                            pointer_scene_dirty = true;
+                            repaint = true;
+                        }
+                    }
+                    continue;
+                }
+                if window_interaction.is_some() {
+                    continue;
+                }
+                let Some(seat) = wayland.core().seats.get(&1) else {
+                    continue;
+                };
+                if !x11_windows::authorize_move_resize(seat, surface, button) {
+                    continue;
+                }
+                window_interaction = match direction {
+                    8 => WindowInteraction::begin_move(&windows, surface, pointer_position),
+                    0..=7
+                        if windows
+                            .get(&surface)
+                            .is_some_and(|w| !w.maximized && !w.fullscreen && !w.minimized) =>
+                    {
+                        WindowInteraction::begin_resize(
+                            &mut windows,
+                            &mut configure_scheduler,
+                            surface,
+                            [
+                                ResizeEdge::TopLeft,
+                                ResizeEdge::Top,
+                                ResizeEdge::TopRight,
+                                ResizeEdge::Right,
+                                ResizeEdge::BottomRight,
+                                ResizeEdge::Bottom,
+                                ResizeEdge::BottomLeft,
+                                ResizeEdge::Left,
+                            ][direction as usize],
+                            pointer_position,
+                        )
+                    }
+                    _ => None,
+                };
+                if window_interaction.is_some() {
+                    wayland
+                        .set_pointer_focus(1, None, pointer_position, display.next_serial())
+                        .map_err(app_error)?;
+                    pointer_focus = None;
+                    pointer_scene_dirty = true;
+                    repaint = true;
+                }
+            }
+        }
+        latency_trace.phase("surface_actions_import");
+        let superseded = wayland.core_mut().take_superseded_publications();
+        let mut retired_buffers = BTreeSet::new();
+        for (surface, revision, buffer) in superseded {
+            drop(wayland.take_acquire_fence(surface, revision));
+            wayland
+                .finish_explicit_release(surface, revision, None)
+                .map_err(app_error)?;
+            retired_buffers.insert(buffer);
+        }
+        if !retired_buffers.is_empty() {
+            let pending_publications = wayland.core().pending_publication_buffers();
+            for buffer in retired_buffers {
+                if !pending_publications.contains(&buffer)
+                    && !pending_shm_buffers.contains_key(&buffer)
+                    && !pending_dma_bufs.contains_key(&buffer)
+                {
+                    wayland.release_buffer(buffer).map_err(app_error)?;
+                }
+            }
+        }
         let actions = wayland.core_mut().drain_actions().collect::<Vec<_>>();
         if !actions.is_empty() {
             other_work_seen = true;
@@ -1671,6 +1929,36 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         .buffer(attachment.buffer)
                         .cloned()
                         .ok_or_else(|| AppError::new("surface references an unknown buffer"))?;
+                    let (kind, size) = match &descriptor {
+                        BufferDescriptor::Shm(buffer) => ("shm", buffer.size),
+                        BufferDescriptor::DmaBuf(buffer) => ("dmabuf", buffer.size),
+                    };
+                    latency_trace.event(
+                        "surface_commit",
+                        [
+                            surface.get() as u64,
+                            snapshot.revision,
+                            u64::from(matches!(descriptor, BufferDescriptor::DmaBuf(_))),
+                            match role {
+                                SurfaceRole::Xwayland => 1,
+                                SurfaceRole::XdgToplevel | SurfaceRole::XdgPopup => 2,
+                                _ => 3,
+                            },
+                        ],
+                    );
+                    if role == SurfaceRole::Xwayland
+                        && let Some(stats) = &mut frame_stats
+                    {
+                        stats.x11_commit(matches!(descriptor, BufferDescriptor::DmaBuf(_)));
+                    }
+                    resize_trace::event(
+                        surface.get(),
+                        "arrival",
+                        format_args!(
+                            "revision={} buffer={:?} kind={} size={:?}",
+                            snapshot.revision, attachment.buffer, kind, size
+                        ),
+                    );
                     if matches!(descriptor, BufferDescriptor::DmaBuf(_)) {
                         if let Some(request) = deferred_shm_copies.remove(&surface) {
                             deferred_shm_order.retain(|candidate| *candidate != surface);
@@ -1689,17 +1977,23 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                             Some(explicit) => explicit,
                             None => image.export_implicit_read_sync_file().map_err(app_error)?,
                         };
-                        let queued = desktop_renderer.queue_dma_buf(DmaBufPublication {
-                            surface,
-                            revision: snapshot.revision,
-                            buffer: attachment.buffer,
-                            image,
-                            acquire: Some(acquire),
-                            buffer_scale: snapshot.buffer_scale,
-                            buffer_transform: snapshot.buffer_transform,
-                            viewport,
-                            output_scale,
-                        })?;
+                        let queued = desktop_renderer.queue_dma_buf(
+                            DmaBufPublication {
+                                surface,
+                                revision: snapshot.revision,
+                                buffer: attachment.buffer,
+                                image,
+                                acquire: Some(acquire),
+                                buffer_scale: snapshot.buffer_scale,
+                                buffer_transform: snapshot.buffer_transform,
+                                viewport,
+                                output_scale,
+                                coordinate_density: wayland.x11_surface_scale(surface),
+                                surface_damage: snapshot.damage.clone(),
+                                buffer_damage: snapshot.buffer_damage.clone(),
+                            },
+                            &display,
+                        )?;
                         let pending = pending_dma_bufs.entry(attachment.buffer).or_default();
                         *pending = pending
                             .checked_add(1)
@@ -1729,6 +2023,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 pixel_format: queued.pixel_format,
                                 alpha_mode: queued.alpha_mode,
                                 image: queued.image,
+                                damage: queued.damage,
                             },
                         )?;
                         repaint = true;
@@ -1767,7 +2062,15 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     let (native_pixel_format, native_alpha_mode) =
                         shm_image_metadata(descriptor.format).map_err(app_error)?;
                     let buffer_damage = if direct_shm {
-                        union_surface_damage(&snapshot.damage, descriptor.size)
+                        union_surface_damage(
+                            &snapshot
+                                .damage
+                                .iter()
+                                .chain(&snapshot.buffer_damage)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                            descriptor.size,
+                        )
                     } else {
                         None
                     };
@@ -1784,7 +2087,11 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     let resize_copy_paused = resize_veil_owner(&windows, surface)
                         .and_then(|owner| windows.get(&owner))
                         .is_some_and(ClientWindow::resizing);
+                    let contiguous = windows.get(&surface).is_some_and(|window| {
+                        window.presentation.can_apply_damage(snapshot.revision)
+                    });
                     let can_patch = direct_shm
+                        && contiguous
                         && metadata_matches
                         && !surface_copy_pending
                         && !replaced_deferred_copy
@@ -1823,6 +2130,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                                 .shm_buffer_reader(attachment.buffer)
                                 .map_err(app_error)?,
                             output_scale,
+                            wayland.x11_surface_scale(surface),
                         );
                         let buffer = request.buffer();
                         let request_surface = request.snapshot.surface;
@@ -1939,6 +2247,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         window_identities.destroy(surface);
                     }
                     configure_scheduler.cancel(surface);
+                    decoration_click.cancel_surface(surface);
                     frame_layers.remove(&surface);
                     stacking_order.retain(|candidate| *candidate != surface);
                     if matches!(
@@ -2072,6 +2381,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                         wayland.cancel_drag(1).map_err(app_error)?;
                     }
                     session_locked = true;
+                    decoration_click.cancel();
                     for frame in frame_layers.values_mut() {
                         frame
                             .layer
@@ -2151,6 +2461,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             pointer_scene_dirty |= changed;
         }
 
+        latency_trace.phase("window_policy_cursor");
         // Resume frame-callback-paced clients after release even when the veil itself no longer
         // changes (so there may be no new KMS frame). Hidden intermediate images are not presented;
         // do not misreport presentation feedback while asking the client for its final redraw.
@@ -2198,6 +2509,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             &mut configure_scheduler,
             &mut resize_configure_budget,
             &config,
+            work_area,
             #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
             compatibility.as_mut(),
         )?;
@@ -2215,6 +2527,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
         #[cfg(feature = "profiler")]
         let pointer_motion_only = repaint && pointer_motion_seen && !other_work_seen;
 
+        latency_trace.phase("kms_submit");
         // One atomic commit per CRTC may be outstanding. Primary frames retain mailbox behavior,
         // while cursor-only motion reuses the current primary plane and commits only cursor state.
         let cursor_commit_ready = !first_modeset
@@ -2225,6 +2538,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             while ready_scanout.len() > 1 {
                 let stale = ready_scanout.pop_front().expect("length checked");
                 frame_slots[stale].discard_ready().map_err(app_error)?;
+                latency_trace.event("frame_discard", [stale as u64, 0, 0, 0]);
                 #[cfg(feature = "profiler")]
                 {
                     crate::profiler::record_instant("presentation.frame.mailbox_replaced");
@@ -2274,6 +2588,14 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             } else {
                 request.commit(false, true)
             };
+            if commit_result.is_ok()
+                && let Some(slot) = primary_slot
+            {
+                latency_trace.event(
+                    "kms_submitted",
+                    [slot as u64, u64::from(first_modeset), 0, 0],
+                );
+            }
             match commit_result {
                 Ok(()) if first_modeset => {
                     let slot_index = primary_slot
@@ -2386,6 +2708,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             }
         }
 
+        latency_trace.phase("frame_callbacks_flush");
         if presentation_completed {
             resize_configure_budget = true;
             window_backend::flush(
@@ -2395,6 +2718,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 &mut configure_scheduler,
                 &mut resize_configure_budget,
                 &config,
+                work_area,
                 #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
                 compatibility.as_mut(),
             )?;
@@ -2405,6 +2729,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             }
             let time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
             for (surface, revision) in presented_surface_revisions {
+                resize_trace::event(surface, "presented", format_args!("revision={revision}"));
                 let Some(surface) = WaylandSurfaceId::from_raw(surface) else {
                     continue;
                 };
@@ -2437,16 +2762,46 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 &widgets,
                 animation_now,
             );
-            repaint |= animation_active;
+            repaint |= animation_active || window_motion.active(animation_now.as_nanos());
         }
 
+        // Frame callbacks, completed buffer releases and configure events unblock client work.
+        // Let clients start their next frame while we prepare ours; no nested dispatch or roundtrip.
+        display.flush_clients();
         let available_scanout = frame_slots
             .iter()
             .position(|slot| slot.state == FrameSlotState::Available);
+        if repaint && available_scanout.is_none() {
+            latency_trace.event(
+                "no_scanout_slot",
+                [
+                    ready_scanout.len() as u64,
+                    u64::from(pending_kms_commit.is_some()),
+                    0,
+                    0,
+                ],
+            );
+        }
+        let primary_render_ready = state::primary_render_budget(
+            frame_slots
+                .iter()
+                .filter(|slot| slot.state == FrameSlotState::GpuSubmitted)
+                .count(),
+            ready_scanout.len(),
+        );
+        if repaint && !primary_render_ready {
+            latency_trace.event(
+                "primary_render_backpressure",
+                [ready_scanout.len() as u64, 0, 0, 0],
+            );
+        }
         if repaint
             && seat.state() == SeatState::Enabled
             && let Some(scanout_index) = available_scanout
+            && primary_render_ready
         {
+            latency_trace.phase("render_chrome");
+            let frame_stats_start = frame_stats.as_ref().map(|_| Instant::now());
             #[cfg(feature = "profiler")]
             let _profile_suppression = (pointer_motion_only
                 && !crate::profiler::pointer_move_events_enabled())
@@ -2507,6 +2862,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     &mut configure_scheduler,
                     &mut resize_configure_budget,
                     &config,
+                    work_area,
                     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
                     compatibility.as_mut(),
                 )?;
@@ -2517,6 +2873,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 .get(&1)
                 .expect("seat registered")
                 .cursor;
+            latency_trace.phase("render_cursor");
             let rendered_cursor = render_cursor_image(
                 cursor_image,
                 &mut pointer,
@@ -2571,6 +2928,21 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
             {
                 hardware_cursor = None;
             }
+            let eligible = windows
+                .iter()
+                .filter_map(|(surface, window)| {
+                    (!window.minimized
+                        && resize_veil_owner(&windows, *surface).is_none()
+                        && (window.role == SurfaceRole::SessionLock) == session_locked)
+                        .then_some(*surface)
+                })
+                .collect();
+            let mut ready = desktop_renderer.prepare_render(&eligible, &mut latency_trace)?;
+            dma_buf_readiness::retain_ready_families(&windows, &eligible, &mut ready);
+            for (surface, window) in &mut windows {
+                window.presentation.content_ready = ready.contains(surface);
+            }
+            latency_trace.phase("render_layers");
             let layers = prepare_desktop_layers(
                 session_locked,
                 extent,
@@ -2591,18 +2963,131 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                 pointer_position,
                 &config,
             )?;
-            let Some(frame) = desktop_scene.synchronize(extent, layers) else {
+            latency_trace.phase("render_scene_sync");
+            let Some(frame) =
+                desktop_scene.synchronize_with_force(extent, layers, window_motion.active(now))
+            else {
                 repaint = false;
                 continue;
             };
-            let frame = frame.into_physical(output_scale, physical_extent);
+            let mut frame = frame.into_physical(output_scale, physical_extent);
+            let mut motion_states = BTreeMap::new();
+            let mut motion_owners = BTreeMap::new();
+            if !session_locked {
+                for (surface, window) in &windows {
+                    if window.backend.is_some() && !window.fullscreen {
+                        let outer = window
+                            .chrome_outer
+                            .unwrap_or_else(|| geometry::legacy_window_outer(window, &config));
+                        let style = frame_layers
+                            .get(surface)
+                            .and_then(|layer| {
+                                window_frame
+                                    .as_ref()
+                                    .and_then(|factory| factory.motion(&layer.model))
+                            })
+                            .unwrap_or(config.window_motion);
+                        motion_states.insert(
+                            surface.get(),
+                            motion::WindowState {
+                                bounds: output_scale.physical_rect(RectI {
+                                    x: window.position.x,
+                                    y: window.position.y,
+                                    width: outer.width,
+                                    height: outer.height,
+                                }),
+                                maximized: window.maximized,
+                                interactive: matches!(window_interaction, Some(WindowInteraction::Move {surface:target,..} | WindowInteraction::Resize {surface:target,..}) if target == *surface),
+                                move_pointer: matches!(window_interaction, Some(WindowInteraction::Move {surface:target,..}) if target == *surface)
+                                    .then_some(PointF { x: pointer_position.x * output_scale.get(), y: pointer_position.y * output_scale.get() }),
+                                minimized: window.minimized,
+                                veiled: resize_veil_owner(&windows, *surface).is_some(),
+                                style,
+                                shadows: frame_layers.get(surface)
+                                    .map(|layer| layer.shadows(output_scale.get()))
+                                    .unwrap_or_default(),
+                                corner_radii: frame_layers.get(surface)
+                                    .map(|layer| layer.corner_radii(output_scale.get() as f32))
+                                    .unwrap_or_default(),
+                            },
+                        );
+                    }
+                }
+                for surface in windows.keys() {
+                    let mut owner = *surface;
+                    for _ in 0..windows.len() {
+                        if motion_states.contains_key(&owner.get()) {
+                            motion_owners.insert(surface.get(), owner.get());
+                            break;
+                        }
+                        let Some(parent) = windows.get(&owner).and_then(|w| w.parent) else {
+                            break;
+                        };
+                        owner = parent;
+                    }
+                }
+            }
+            for (surface, window) in &mut windows {
+                window.motion_style = motion_states
+                    .get(&surface.get())
+                    .map_or(crate::WindowMotion::none(), |state| state.style);
+            }
+            window_motion.apply(
+                &mut frame,
+                motion_states,
+                &motion_owners,
+                now,
+                if desktop_renderer.motion_enabled() {
+                    config.motion_preference
+                } else {
+                    crate::theme::MotionPreference::Reduced
+                },
+            );
+            let mut consumed_motion_veil = false;
+            for (surface, window) in &mut windows {
+                consumed_motion_veil |= std::mem::take(&mut window.motion_veil_pending);
+                window.motion_input = motion_owners
+                    .get(&surface.get())
+                    .and_then(|root| window_motion.input(*root, output_scale.get()));
+            }
             let frame_id = next_frame_id;
-            frame_surface_revisions[scanout_index] = frame.surface_revisions.clone();
+            for (surface, revision) in &frame.surface_revisions {
+                resize_trace::event(
+                    *surface,
+                    "render-request",
+                    format_args!(
+                        "frame={} slot={} revision={}",
+                        frame_id, scanout_index, revision
+                    ),
+                );
+            }
+            frame_surface_revisions[scanout_index] = frame
+                .surface_revisions
+                .iter()
+                .filter(|(surface, _)| !frame.motion.hidden_revisions.contains(surface))
+                .copied()
+                .collect();
             next_frame_id = next_frame_id.wrapping_add(1).max(1);
             frame_slots[scanout_index]
                 .begin_render(frame_id)
                 .map_err(app_error)?;
-            match desktop_renderer.render(scanout_index, frame)? {
+            latency_trace.phase("render_backend");
+            let rendered = desktop_renderer.render(scanout_index, frame, &mut latency_trace)?;
+            if !desktop_renderer.motion_enabled() {
+                window_motion = Default::default();
+                for window in windows.values_mut() {
+                    window.motion_input = None;
+                }
+            }
+            latency_trace.phase("render_retire");
+            latency_trace.event("render_submitted", [scanout_index as u64, frame_id, 0, 0]);
+            for &(surface, revision) in &frame_surface_revisions[scanout_index] {
+                latency_trace.event(
+                    "frame_surface",
+                    [scanout_index as u64, frame_id, surface as u64, revision],
+                );
+            }
+            match rendered {
                 DesktopRenderResult::Vulkan {
                     releases,
                     discarded,
@@ -2652,6 +3137,9 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     ready_scanout.push_back(scanout_index);
                 }
             }
+            if let (Some(stats), Some(started)) = (&mut frame_stats, frame_stats_start) {
+                stats.rendered(started.elapsed());
+            }
             #[cfg(feature = "profiler")]
             {
                 frame_pointer_event_us[scanout_index] = pending_primary_pointer_event_us.take();
@@ -2662,7 +3150,7 @@ pub(crate) fn run(application: ReadyDesktopEnvironment) -> AppResult<()> {
                     );
                 }
             }
-            repaint = false;
+            repaint = consumed_motion_veil;
         }
     }
 }
@@ -3080,36 +3568,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_directional_resize_cursors_fall_back_without_recursing() {
-        for icon in [
-            PointerIcon::EResize,
-            PointerIcon::NResize,
-            PointerIcon::NeResize,
-            PointerIcon::NwResize,
-            PointerIcon::SResize,
-            PointerIcon::SeResize,
-            PointerIcon::SwResize,
-            PointerIcon::WResize,
-            PointerIcon::EwResize,
-            PointerIcon::NsResize,
-            PointerIcon::NeswResize,
-            PointerIcon::NwseResize,
-            PointerIcon::ColResize,
-            PointerIcon::RowResize,
-        ] {
-            assert_eq!(
-                semantic_pointer_fallback(icon),
-                Some(PointerIcon::AllResize)
-            );
-        }
-        assert_eq!(
-            semantic_pointer_fallback(PointerIcon::AllResize),
-            Some(PointerIcon::Default)
-        );
-        assert_eq!(semantic_pointer_fallback(PointerIcon::Default), None);
-    }
-
-    #[test]
     fn client_commits_do_not_roll_back_a_newer_requested_resize() {
         let committed = SizeI {
             width: 640,
@@ -3230,8 +3688,8 @@ mod tests {
         assert_eq!(
             minimum_size,
             SizeI {
-                width: 64,
-                height: 48
+                width: 1,
+                height: 1
             }
         );
         assert_eq!(

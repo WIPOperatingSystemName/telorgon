@@ -90,7 +90,8 @@ pub(crate) struct FrameCore {
     pub(crate) descriptor_sets: FrameDescriptorSets,
     pub(crate) descriptor_bindings: DescriptorBindingState,
     #[cfg(target_os = "linux")]
-    pub(crate) composite_descriptor_pool: Option<vk::DescriptorPool>,
+    pub(crate) composite_descriptor_pool:
+        Option<Arc<Mutex<super::descriptor::CompositeDescriptorArena>>>,
     pub(crate) staging: Arc<AllocatedBuffer>,
     /// Bytes already assigned in the reusable staging stream by earlier render passes.
     pub(crate) staging_bytes_used: usize,
@@ -209,7 +210,7 @@ struct FrameSlot {
     descriptor_sets: FrameDescriptorSets,
     descriptor_bindings: DescriptorBindingState,
     #[cfg(target_os = "linux")]
-    composite_descriptor_pool: vk::DescriptorPool,
+    composite_descriptor_pool: Arc<Mutex<super::descriptor::CompositeDescriptorArena>>,
     staging: Arc<AllocatedBuffer>,
     #[cfg(feature = "instrumentation")]
     profiler_timestamps: Option<ProfilerTimestampQueries>,
@@ -299,9 +300,7 @@ impl FrameSlot {
             Err(error) => {
                 unsafe {
                     #[cfg(target_os = "linux")]
-                    device
-                        .raw
-                        .destroy_descriptor_pool(composite_descriptor_pool, None);
+                    drop(composite_descriptor_pool);
                     device.raw.destroy_descriptor_pool(descriptor_pool, None);
                     device.raw.destroy_fence(fence, None);
                     device.raw.destroy_command_pool(command_pool, None);
@@ -394,9 +393,6 @@ impl Drop for FrameSlot {
             }
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            #[cfg(target_os = "linux")]
-            self.device
-                .destroy_descriptor_pool(self.composite_descriptor_pool, None);
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
         }
@@ -579,15 +575,10 @@ impl FrameSlots {
                     vk_error("failed to reset Vulkan frame-slot command pool", result)
                 })?;
             #[cfg(target_os = "linux")]
-            self.device
-                .raw
-                .reset_descriptor_pool(
-                    slot.composite_descriptor_pool,
-                    vk::DescriptorPoolResetFlags::empty(),
-                )
-                .map_err(|result| {
-                    vk_error("failed to reset Vulkan composite descriptor pool", result)
-                })?;
+            slot.composite_descriptor_pool
+                .lock()
+                .map_err(|_| internal("composite descriptor arena poisoned"))?
+                .reset()?;
             self.device
                 .raw
                 .begin_command_buffer(
@@ -629,7 +620,7 @@ impl FrameSlots {
                 descriptor_sets: slot.descriptor_sets,
                 descriptor_bindings: slot.descriptor_bindings,
                 #[cfg(target_os = "linux")]
-                composite_descriptor_pool: Some(slot.composite_descriptor_pool),
+                composite_descriptor_pool: Some(Arc::clone(&slot.composite_descriptor_pool)),
                 staging: Arc::clone(&slot.staging),
                 staging_bytes_used: 0,
                 buffers: Vec::new(),

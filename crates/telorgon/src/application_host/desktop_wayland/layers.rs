@@ -97,9 +97,14 @@ pub(super) fn route_frame_pointer_motion(
                     x: -1_000_000.0,
                     y: -1_000_000.0,
                 },
-                |window| PointF {
-                    x: position.x - window.position.x as f32,
-                    y: position.y - window.position.y as f32,
+                |window| {
+                    let position = window
+                        .motion_input
+                        .map_or(position, |input| input.map(position));
+                    PointF {
+                        x: position.x - window.position.x as f32,
+                        y: position.y - window.position.y as f32,
+                    }
                 },
             );
         repaint |= frame.layer.pointer_motion(local, now);
@@ -145,7 +150,7 @@ pub(super) fn refresh_window_frames(
     frames.retain(|surface, _| {
         windows
             .get(surface)
-            .is_some_and(|window| window.backend.is_some() && window_is_decorated(window))
+            .is_some_and(|window| window.backend.is_some() && window_has_frame(window))
     });
 
     let active = wayland
@@ -156,7 +161,7 @@ pub(super) fn refresh_window_frames(
         .map(|focus| focus.surface);
     let surfaces = windows
         .iter()
-        .filter(|(_, window)| window.backend.is_some() && window_is_decorated(window))
+        .filter(|(_, window)| window.backend.is_some() && window_has_frame(window))
         .map(|(surface, _)| *surface)
         .collect::<Vec<_>>();
     let mut updates = Vec::with_capacity(surfaces.len());
@@ -193,12 +198,24 @@ pub(super) fn refresh_window_frames(
                     let logical = image.image.descriptor.size.width / image.scale.max(1);
                     logical.abs_diff(32)
                 })
-                .map(|image| (icon.revision, image.clone()))
+                .map(|image| (icon.revision, image))
         });
         let icon_image_id = icon_image
             .as_ref()
             .map(|(revision, _)| toplevel_icon_image_id(surface, *revision));
+        let fixed = window
+            .size_policy
+            .minimum
+            .is_some_and(|size| size.width > 0 && size.height > 0)
+            && window.size_policy.minimum == window.size_policy.maximum;
+        let room_for_controls = window.requested_size.width >= config.titlebar_height.max(24) * 3;
+        let mut capabilities = crate::window_chrome::WindowChromeCapabilities::MANAGED_TOPLEVEL;
+        capabilities.resize = !fixed;
+        capabilities.maximize = !fixed && room_for_controls;
+        capabilities.minimize = room_for_controls;
         let mut model = WindowChromeModel::new(u64::from(surface.get()), title)
+            .title_bar_visible(window_is_decorated(window))
+            .capabilities(capabilities)
             .state(state)
             .active(active == Some(surface));
         if let Some(name) = icon_name {
@@ -239,6 +256,7 @@ pub(super) fn refresh_window_frames(
                     content_style,
                     border: None,
                     icon_image: None,
+                    layout_key: None,
                 },
             );
         }
@@ -266,8 +284,23 @@ pub(super) fn refresh_window_frames(
             }
             frame.icon_image = icon_image_id;
         }
+        let layout_key = (window.requested_size, window.maximized.then_some(work_area));
+        let unchanged = !created
+            && frame.model == model
+            && frame.content_style == content_style
+            && frame.layout_key == Some(layout_key)
+            && frame.snapshot.is_some()
+            && window.chrome.is_some()
+            && !frame
+                .layer
+                .has_pending_runtime_turn(MonotonicInstant::from_nanos(now))
+            && !frame.layer.animation_active();
         frame.model = model;
         frame.content_style = content_style;
+        if unchanged {
+            continue;
+        }
+        frame.layout_key = Some(layout_key);
         let snapshot = layout_window_frame(
             &mut frame.layer,
             &mut frame.outer,
@@ -301,7 +334,6 @@ pub(super) fn refresh_window_frames(
             spatial: SpatialId(0),
         });
         frame.snapshot = Some(snapshot.clone());
-        frame.layer.prepare(frame.outer, now, false)?;
         updates.push((
             surface,
             frame.outer,
@@ -336,6 +368,23 @@ pub(super) fn refresh_window_frames(
                     }
                     configure_scheduler.schedule_final(surface, content_size);
                 }
+            }
+            #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+            if matches!(window.backend, Some(WindowBackend::X11(_)))
+                && !window.maximized
+                && !window.fullscreen
+            {
+                // A newly composed/customized frame can differ from the estimated insets.
+                // Preserve X11 client root coordinates when replacing that estimate.
+                let previous = window_content_offset(window, config);
+                window.position.x = window
+                    .position
+                    .x
+                    .saturating_add(previous.x - content_offset.x);
+                window.position.y = window
+                    .position
+                    .y
+                    .saturating_add(previous.y - content_offset.y);
             }
             window.chrome_outer = Some(outer);
             window.chrome_content_offset = Some(content_offset);
@@ -406,6 +455,37 @@ pub(super) struct WindowFrameLayer {
     content_style: Option<crate::window_chrome::WindowContentStyle>,
     border: Option<BoxInstance>,
     icon_image: Option<ImageId>,
+    layout_key: Option<(SizeI, Option<RectI>)>,
+}
+impl WindowFrameLayer {
+    pub(super) fn shadows(&self, scale: f32) -> crate::ui::ShadowList {
+        let shadows = self.border.as_ref().map(|b| b.shadows).unwrap_or_default();
+        let scaled = |mut s: crate::ui::Shadow| {
+            s.offset.x *= scale;
+            s.offset.y *= scale;
+            s.blur *= scale;
+            s.spread *= scale;
+            s
+        };
+        match shadows.as_slice() {
+            [a, b] => crate::ui::ShadowList::two(scaled(*a), scaled(*b)),
+            [a] => crate::ui::ShadowList::one(scaled(*a)),
+            _ => Default::default(),
+        }
+    }
+    pub(super) fn corner_radii(&self, scale: f32) -> crate::ui::CornerRadii {
+        let r = self
+            .border
+            .as_ref()
+            .map(|b| b.corner_radii)
+            .unwrap_or_default();
+        crate::ui::CornerRadii {
+            top_left: r.top_left * scale,
+            top_right: r.top_right * scale,
+            bottom_right: r.bottom_right * scale,
+            bottom_left: r.bottom_left * scale,
+        }
+    }
 }
 
 pub(super) fn desktop_runtime_schedule(
@@ -491,7 +571,7 @@ pub(super) fn prepare_desktop_layers(
     let content_clips = windows
         .iter()
         .filter_map(|(surface, window)| {
-            if !window_is_decorated(window) {
+            if !window_has_frame(window) {
                 return None;
             }
             let frame = frames.get(surface)?;
@@ -507,7 +587,22 @@ pub(super) fn prepare_desktop_layers(
             Some((*surface, (rect, clips)))
         })
         .collect::<BTreeMap<_, _>>();
-    for surface in stacking_order {
+    // Hidden windows retain their GPU/scene content without participating in output order.
+    let stacked = stacking_order
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let order = stacking_order
+        .iter()
+        .copied()
+        .chain(
+            windows
+                .keys()
+                .filter(|surface| !stacked.contains(surface))
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    for surface in &order {
         let veil_owner = resize_veil_owner(windows, *surface);
         let veiled = veil_owner.is_some();
         // Only subsurfaces inherit their toplevel's clip. Popups are independent overlays and
@@ -530,17 +625,27 @@ pub(super) fn prepare_desktop_layers(
         if matches!(window.role, SurfaceRole::Cursor | SurfaceRole::DragIcon) {
             continue;
         }
-        let visible =
-            !window.minimized && (window.role == SurfaceRole::SessionLock) == session_locked;
+        let visible = stacked.contains(surface)
+            && !window.minimized
+            && (window.role == SurfaceRole::SessionLock) == session_locked;
         let position = placements.get(surface).copied().unwrap_or(window.position);
         let outer = window
             .chrome_outer
             .unwrap_or_else(|| legacy_window_outer(window, config));
         let content_rect = window_content_rect(window, position, config);
-        let content_style = window_is_decorated(window)
+        let content_style = window_has_frame(window)
             .then(|| frames.get(surface).and_then(|frame| frame.content_style))
             .flatten();
-        if window_is_decorated(window)
+        // A border and its backing partition one pixel's coverage. Source-over between
+        // separate antialiased draws would leave C * (1 - C) of the desktop visible.
+        // The box shader already sums these disjoint regions before blending. Custom
+        // apertures and independently faded chrome still need their separate backing.
+        let border_background = content_style.and_then(|style| {
+            let (_, clips) = inherited_clip?;
+            let border = frames.get(surface)?.border.as_ref()?;
+            (clips[1].is_none() && border.opacity == 1.0).then_some(style.background)
+        });
+        if window_has_frame(window)
             && let Some(frame) = frames.get_mut(surface)
         {
             if visible && let Some(border) = &frame.border {
@@ -559,7 +664,7 @@ pub(super) fn prepare_desktop_layers(
                 },
                 frame.outer,
                 position,
-                visible,
+                visible && !veiled,
                 (veiled || content_style.is_some()).then_some(content_rect),
             );
             layers.extend(
@@ -571,7 +676,8 @@ pub(super) fn prepare_desktop_layers(
                     }),
             );
             if visible
-                && (veiled || content_style.is_some())
+                && !veiled
+                && content_style.is_some()
                 && let Some(border) = &frame.border
             {
                 // Restore both the wider chrome fill and the outline, outside the aperture.
@@ -592,11 +698,13 @@ pub(super) fn prepare_desktop_layers(
                     frame.outer,
                     position,
                     content_rect,
+                    border_background,
                 ));
             }
         }
         if visible
             && !veiled
+            && border_background.is_none()
             && let Some(style) = content_style
         {
             let mut backing = DesktopLayer::solid(
@@ -611,7 +719,8 @@ pub(super) fn prepare_desktop_layers(
             layers.push(backing);
         }
         if visible
-            && window_is_decorated(window)
+            && !veiled
+            && window_has_frame(window)
             && window.chrome.is_none()
             && window.backend.is_some()
         {
@@ -645,28 +754,47 @@ pub(super) fn prepare_desktop_layers(
                 ));
             }
         }
-        // The live resize preview is a solid retained primitive. Keep the image scene and its
-        // pending pixels intact, but do not upload or draw them underneath even a transparent veil.
+        // Keep the flat silhouette as both the Color path and the Glass fallback. Vulkan
+        // replaces glass placements with a cached backdrop; hidden chrome/client scenes never
+        // draw beneath either appearance. The existing readiness gate controls reveal.
         if visible && veil_owner == Some(*surface) {
+            let appearance = content_style
+                .and_then(|style| style.resize_preview)
+                .unwrap_or(config.resize_preview);
             let mut preview = DesktopLayer::solid(
                 DesktopLayerKey::ResizeVeil(surface.get()),
                 DesktopSceneKey::ResizeVeil(surface.get()),
-                content_style
-                    .and_then(|style| style.resize_preview_color)
-                    .unwrap_or(config.resize_preview_color),
-                content_rect,
+                appearance.color(),
+                RectI {
+                    x: position.x,
+                    y: position.y,
+                    width: outer.width,
+                    height: outer.height,
+                },
             );
-            if let Some((bounds, clips)) = inherited_clip {
-                preview = preview.with_content_clip(bounds, clips);
+            if let crate::ResizePreview::Glass(style) = appearance {
+                preview.glass = Some(style.normalized());
+            }
+            if let Some(border) = frames.get(surface).and_then(|frame| frame.border.as_ref()) {
+                preview = preview.with_frame_outline(border, position);
             }
             layers.push(preview);
         }
         let placement = surface_placement(window, position, config);
+        let output_bounds = placement
+            .clip
+            .map_or(Some(placement.target), |clip| {
+                intersect_rect(placement.target, clip)
+            })
+            .and_then(|bounds| intersect_rect(bounds, full_rect(extent)))
+            .and_then(|bounds| {
+                inherited_clip.map_or(Some(bounds), |(clip, _)| intersect_rect(bounds, clip))
+            });
         let mut client = DesktopLayer::image(
             DesktopLayerKey::Surface(surface.get()),
             DesktopSceneKey::Surface(surface.get()),
             window.presentation.revision,
-            if visible && !veiled {
+            if visible && !veiled && output_bounds.is_some() {
                 window.presentation.take_image_update()
             } else {
                 DesktopImageUpdate::Unchanged
@@ -704,8 +832,8 @@ pub(super) fn prepare_desktop_layers(
             RectI {
                 x: drag_position.x.round() as i32,
                 y: drag_position.y.round() as i32,
-                width: icon.presentation.size.width,
-                height: icon.presentation.size.height,
+                width: (icon.presentation.size.width / icon.surface_scale.max(1)).max(1),
+                height: (icon.presentation.size.height / icon.surface_scale.max(1)).max(1),
             },
             None,
             icon.presentation.alpha_mode,
@@ -756,34 +884,6 @@ pub(super) fn prepare_desktop_layers(
                 ImagePixelFormat::Rgba8,
                 true,
             )),
-            CursorVisual::Composed { source, size } => {
-                let (scene, layer) = match source {
-                    ComposedCursorSource::Pointer => {
-                        let Some(pointer) = pointer_layer.as_mut() else {
-                            return Ok(layers);
-                        };
-                        (DesktopSceneKey::ComposedPointer, pointer)
-                    }
-                    ComposedCursorSource::Icon(index) => {
-                        let Some((_, icon)) = icons.get_mut(*index) else {
-                            return Ok(layers);
-                        };
-                        (DesktopSceneKey::ComposedIcon(*index), icon)
-                    }
-                };
-                layer.prepare(*size, now, false)?;
-                layers.push(DesktopLayer::retained(
-                    DesktopLayerKey::Cursor,
-                    scene,
-                    layer.take_deltas(),
-                    *size,
-                    PointI {
-                        x: pointer_position.x.round() as i32,
-                        y: pointer_position.y.round() as i32,
-                    },
-                    true,
-                ));
-            }
         }
     }
 
@@ -862,7 +962,7 @@ mod maximize_tests {
         let child = WaylandSurfaceId::from_raw(21).unwrap();
         let color = crate::core::ColorRgba8::rgba(20, 40, 60, 96);
         let config = LinuxDesktopConfig {
-            resize_preview_color: color,
+            resize_preview: crate::ResizePreview::Color(color),
             ..Default::default()
         };
         for backend in [
@@ -898,6 +998,34 @@ mod maximize_tests {
             sub.offset = PointI { x: 10, y: 10 };
             let mut windows = BTreeMap::from([(root, image), (child, sub)]);
             let mut scheduler = ConfigureScheduler::default();
+            let declaration = crate::application_host::Compositor::new()
+                .cursor_theme(crate::CursorTheme::new())
+                .window_frame(|_: WindowChromeModel| TestFrame { title_height: 37.0 })
+                .background(TestFrame { title_height: 37.0 });
+            let display = Display::new().unwrap();
+            let wayland = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            let mut frames = BTreeMap::new();
+            refresh_window_frames(
+                declaration.window_frame(),
+                &mut frames,
+                &mut windows,
+                &wayland,
+                &config,
+                AssetBundle::default(),
+                &crate::AppIconProfile::default(),
+                &EventNotifier::new("whole window preview").unwrap(),
+                0,
+                crate::platform::ScaleFactor::new(1.0).unwrap(),
+                RectI {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                &mut scheduler,
+            )
+            .unwrap();
+            assert!(frames.contains_key(&root));
             let interaction = WindowInteraction::begin_resize(
                 &mut windows,
                 &mut scheduler,
@@ -933,7 +1061,7 @@ mod maximize_tests {
                     0,
                     true,
                     &mut background,
-                    &mut BTreeMap::new(),
+                    &mut frames,
                     &mut windows,
                     &[root, child],
                     &mut [],
@@ -951,6 +1079,24 @@ mod maximize_tests {
                     .find(|layer| layer.key == DesktopLayerKey::ResizeVeil(root.get()))
                     .unwrap();
                 assert!(veil.visible);
+                let outer = windows[&root]
+                    .chrome_outer
+                    .unwrap_or_else(|| legacy_window_outer(&windows[&root], &config));
+                assert_eq!(
+                    veil.target,
+                    RectI {
+                        x: windows[&root].position.x,
+                        y: windows[&root].position.y,
+                        width: outer.width,
+                        height: outer.height,
+                    }
+                );
+                assert!(layers.iter().all(|layer| {
+                    !matches!(
+                        layer.key,
+                        DesktopLayerKey::Frame(_, _) | DesktopLayerKey::LegacyControl(_, _)
+                    ) || !layer.visible
+                }));
                 assert!(
                     matches!(veil.content, DesktopLayerContent::Solid { color: actual, .. } if actual == color)
                 );
@@ -984,6 +1130,7 @@ mod maximize_tests {
     fn native_and_x11_windows_use_the_same_composed_frame_template() {
         use super::super::client::maximize_preview_tests::test_window;
         let declaration = crate::application_host::Compositor::new()
+            .cursor_theme(crate::CursorTheme::new())
             .window_frame(|_: WindowChromeModel| TestFrame { title_height: 37.0 })
             .background(TestFrame { title_height: 37.0 });
         let display = Display::new().unwrap();
@@ -1065,6 +1212,60 @@ mod maximize_tests {
             frames[&native].snapshot.as_ref().unwrap().content.bounds,
             frames[&x11].snapshot.as_ref().unwrap().content.bounds
         );
+
+        // A completed dense X11 buffer must not uncover the old retained frame.
+        let target = SizeI {
+            width: 800,
+            height: 550,
+        };
+        let pixels = SizeI {
+            width: 2400,
+            height: 1650,
+        };
+        let window = windows.get_mut(&x11).unwrap();
+        window.surface_scale = 3;
+        window.resize_preview.begin(
+            window.position,
+            window.requested_size,
+            ResizeEdge::BottomRight,
+        );
+        window.resize_preview.finish();
+        window.resize_preview.submitted(pixels, 7, false);
+        window.requested_size = target;
+        window.presentation.size = pixels;
+        window.presentation.revision = 8;
+        assert!(!super::super::x11_windows::settle_resize(
+            window, pixels, false
+        ));
+        assert!(window.resize_veil_active());
+
+        refresh_window_frames(
+            declaration.window_frame(),
+            &mut frames,
+            &mut windows,
+            &wayland,
+            &LinuxDesktopConfig::default(),
+            AssetBundle::default(),
+            &crate::AppIconProfile::default(),
+            &EventNotifier::new("resize frame").unwrap(),
+            1,
+            crate::platform::ScaleFactor::new(1.5).unwrap(),
+            RectI {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            &mut ConfigureScheduler::default(),
+        )
+        .unwrap();
+        let window = windows.get_mut(&x11).unwrap();
+        assert!(super::super::x11_windows::settle_resize(
+            window, pixels, false
+        ));
+        assert!(!window.resize_veil_active());
+        let content = frames[&x11].snapshot.as_ref().unwrap().content.bounds;
+        assert_eq!((content.width, content.height), (800.0, 550.0));
     }
 
     #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
@@ -1072,6 +1273,7 @@ mod maximize_tests {
     fn measured_maximized_x11_frame_restarts_the_resize_veil() {
         use super::super::client::maximize_preview_tests::test_window;
         let declaration = crate::application_host::Compositor::new()
+            .cursor_theme(crate::CursorTheme::new())
             .window_frame(|_: WindowChromeModel| TestFrame { title_height: 53.0 })
             .background(TestFrame { title_height: 53.0 });
         let display = Display::new().unwrap();

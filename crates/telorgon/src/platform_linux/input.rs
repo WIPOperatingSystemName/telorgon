@@ -159,6 +159,12 @@ impl<'seat> LibInputContext<'seat> {
     }
 
     pub fn next_event(&self) -> Option<LinuxInputEvent> {
+        next_supported_event(|| self.next_queued_event())
+    }
+
+    // Outer None means libinput's queue is empty. Inner None means this particular event was
+    // consumed/destroyed but not mapped (e.g. the modern duplicate of legacy POINTER_AXIS).
+    fn next_queued_event(&self) -> Option<Option<LinuxInputEvent>> {
         let raw = NonNull::new(unsafe { ffi::libinput_get_event(self.raw.as_ptr()) })?;
         let event_type = unsafe { ffi::libinput_event_get_type(raw.as_ptr()) };
         let device = unsafe { ffi::libinput_event_get_device(raw.as_ptr()) } as usize as u64;
@@ -277,11 +283,21 @@ impl<'seat> LibInputContext<'seat> {
             _ => None,
         };
         unsafe { ffi::libinput_event_destroy(raw.as_ptr()) };
-        event
+        Some(event)
     }
 
     pub fn opened_device_count(&self) -> usize {
         self.broker.devices.len()
+    }
+}
+
+fn next_supported_event<T>(mut next: impl FnMut() -> Option<Option<T>>) -> Option<T> {
+    loop {
+        if let Some(event) = next()? {
+            return Some(event);
+        }
+        // libinput_get_fd() describes dispatch readiness, not whether translated events remain.
+        // A skipped event must not strand subsequent input until another hardware wakeup.
     }
 }
 
@@ -321,6 +337,63 @@ impl Drop for LibInputContext<'_> {
         debug_assert!(
             self.broker.devices.is_empty(),
             "libinput retained restricted devices"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_scroll_companions_do_not_strand_clicks_or_duplicate_scroll() {
+        // libinput >= 1.19 emits modern scroll events as well as legacy POINTER_AXIS, with no
+        // ordering guarantee. Telorgon consumes the legacy stream; ignored events still drain.
+        for scroll_type in [404, 405, 406] {
+            for sequence in [
+                [scroll_type, POINTER_AXIS, POINTER_BUTTON, POINTER_MOTION],
+                [POINTER_AXIS, scroll_type, POINTER_BUTTON, POINTER_MOTION],
+            ] {
+                let mut queue = sequence.into_iter();
+                let mut consumed = Vec::new();
+                let mut next = || {
+                    queue.next().map(|kind| {
+                        consumed.push(kind); // models consuming/destroying every raw event once
+                        match kind {
+                            POINTER_AXIS | POINTER_BUTTON | POINTER_MOTION => Some(kind),
+                            _ => None,
+                        }
+                    })
+                };
+                assert_eq!(next_supported_event(&mut next), Some(POINTER_AXIS));
+                assert_eq!(next_supported_event(&mut next), Some(POINTER_BUTTON));
+                assert_eq!(next_supported_event(&mut next), Some(POINTER_MOTION));
+                assert_eq!(next_supported_event(&mut next), None);
+                assert_eq!(consumed, sequence);
+            }
+        }
+    }
+
+    #[test]
+    fn drain_skips_consecutive_unsupported_events_and_stops_at_actual_empty_queue() {
+        let mut queue = [
+            Some(None),
+            Some(None),
+            Some(Some(KEYBOARD_KEY)),
+            None,
+            Some(Some(POINTER_BUTTON)),
+        ]
+        .into_iter();
+        let mut consumed = 0;
+        let mut next = || {
+            consumed += 1;
+            queue.next().unwrap_or(None)
+        };
+        assert_eq!(next_supported_event(&mut next), Some(KEYBOARD_KEY));
+        assert_eq!(next_supported_event(&mut next), None);
+        assert_eq!(
+            consumed, 4,
+            "do not read beyond the actual queue-empty boundary"
         );
     }
 }

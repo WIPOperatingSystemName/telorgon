@@ -28,7 +28,7 @@ remains necessary on the running compositor.
 
 ## Content placeholder
 
-Maximizing uses the same `resize_preview_color` placeholder as interactive resizing. It hides
+Maximizing uses the same `resize_preview` placeholder as interactive resizing. It hides
 the existing client content until the terminal configure is acknowledged and a corresponding
 surface publication is applied. Custom frame measurement replaces the pending transaction when
 it supersedes the fallback size, so an acknowledgement for the fallback cannot reveal old pixels.

@@ -23,8 +23,8 @@ pub use scene::apply_patches;
 pub use scene::{
     BatchKey, BlendMode, BoxInstance, DamageRegion, DenseInstances, DirtyRanges, DrawItem,
     GlyphInstance, ImageAlphaMode, ImageColorEncoding, ImageInstance, ImagePixelFormat,
-    ImageResource, ImageResourceDelta, ImageResourceUpdate, MaterialInstance, MaterialKind,
-    MaterialResource, MaterialResourceDelta, PipelineKind, PrimitiveKind, RangePatch, RenderClip,
+    ImageResource, ImageResourceDelta, ImageResourceUpdate, LiquidGlassMaterial, MaterialInstance,
+    MaterialKind, MaterialResource, MaterialResourceDelta, PipelineKind, PrimitiveKind, RangePatch, RenderClip,
     RenderScene, RenderSceneDelta, RenderSpatialNode,
 };
 pub use stats::{RenderStats, SceneUpdateStats};

@@ -28,6 +28,21 @@ layout(set=3,binding=0) uniform sampler2D atlas_texture;
 layout(location=0) noperspective in vec2 uv_texels;layout(location=1) noperspective in vec2 view_position;layout(location=2) flat in uint instance_slot;layout(location=0) out vec4 output_color;
 vec4 unpack_srgba(uint p){return vec4(float(p&255u),float((p>>8u)&255u),float((p>>16u)&255u),float((p>>24u)&255u))/255.0;}
 vec3 srgb_decode(vec3 v){bvec3 low=lessThanEqual(v,vec3(.04045));return mix(pow((v+.055)/1.055,vec3(2.4)),v/12.92,low);}
+// Convert local signed distance to output pixels using the analytic edge normal.
+// An L1 derivative width (fwidth) widens the AA band by sqrt(2) at 45 degrees.
+float rounded_pixel_width(vec2 p,vec2 size,vec4 radii){
+    vec2 dx=dFdx(p);
+    vec2 dy=dFdy(p);
+    vec2 half_size=size*.5;
+    float radius=p.x<half_size.x?(p.y<half_size.y?radii.x:radii.w):(p.y<half_size.y?radii.y:radii.z);
+    radius=clamp(radius,0.0,min(half_size.x,half_size.y));
+    vec2 delta=p-half_size;
+    vec2 q=abs(delta)-(half_size-vec2(radius));
+    vec2 outside=max(q,vec2(0));
+    vec2 normal=dot(outside,outside)>0.0?normalize(outside):(q.x>q.y?vec2(1,0):vec2(0,1));
+    normal*=sign(delta);
+    return max(length(vec2(dot(normal,dx),dot(normal,dy))),1e-4);
+}
 float clip_coverage(uint slot,vec2 p){
     if(slot==0xffffffffu)return 1.0;
     GpuClip c=clips.values[slot];
@@ -40,7 +55,7 @@ float clip_coverage(uint slot,vec2 p){
     vec2 q=abs(local-half_size)-(half_size-vec2(radius));
     float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
     // Match the analytic box edge rather than rounding coverage to a boolean.
-    return clamp(.5-d/max(fwidth(d),1e-4),0.0,1.0);
+    return clamp(.5-d/rounded_pixel_width(local,c.view_bounds.zw,c.radii),0.0,1.0);
 }
 void main(){
     GpuGlyphInstance item=glyphs.values[instance_slot];

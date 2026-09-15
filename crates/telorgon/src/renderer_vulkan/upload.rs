@@ -213,15 +213,27 @@ impl StagedUploads {
         bytes: &mut Vec<u8>,
         view_alignment: usize,
     ) -> RenderResult<Self> {
-        align_vec(bytes, view_alignment.max(align_of::<GpuView>()));
-        let view_offset = bytes.len() as u64;
+        Self::append_at(view, plan, staging_capacity, bytes, view_alignment, 0)
+    }
+
+    /// Append only this pass's suffix, while GPU offsets remain absolute in the frame stream.
+    pub(crate) fn append_at(
+        view: &GpuView,
+        plan: SceneUploadPlan,
+        staging_capacity: u64,
+        bytes: &mut Vec<u8>,
+        view_alignment: usize,
+        base: usize,
+    ) -> RenderResult<Self> {
+        align_vec_at(bytes, view_alignment.max(align_of::<GpuView>()), base);
+        let view_offset = (base + bytes.len()) as u64;
         bytes.extend_from_slice(bytemuck::bytes_of(view));
         let mut destinations = Vec::with_capacity(plan.groups.len());
         for group in plan.groups {
             let mut regions = Vec::with_capacity(group.chunks.len());
             for chunk in group.chunks {
-                align_vec(bytes, COPY_ALIGNMENT);
-                let source_offset = bytes.len() as u64;
+                align_vec_at(bytes, COPY_ALIGNMENT, base);
+                let source_offset = (base + bytes.len()) as u64;
                 let size = chunk.bytes.len() as u64;
                 bytes.extend_from_slice(&chunk.bytes);
                 regions.push(
@@ -241,8 +253,8 @@ impl StagedUploads {
         for group in plan.image_groups {
             let mut regions = Vec::with_capacity(group.chunks.len());
             for chunk in group.chunks {
-                align_vec(bytes, COPY_ALIGNMENT);
-                let source_offset = bytes.len() as u64;
+                align_vec_at(bytes, COPY_ALIGNMENT, base);
+                let source_offset = (base + bytes.len()) as u64;
                 bytes.extend_from_slice(&chunk.bytes);
                 regions.push(
                     vk::BufferImageCopy2::default()
@@ -266,12 +278,12 @@ impl StagedUploads {
                 regions,
             });
         }
-        if bytes.len() as u64 > staging_capacity {
+        if (base + bytes.len()) as u64 > staging_capacity {
             return Err(RenderError::new(
                 RenderErrorKind::OutOfMemory,
                 format!(
                     "Vulkan frame staging requires {} bytes but its reusable slot provides {staging_capacity}",
-                    bytes.len()
+                    base + bytes.len()
                 ),
             ));
         }
@@ -328,6 +340,35 @@ mod tests {
     use bytemuck::Zeroable;
 
     #[test]
+    fn suffix_staging_uses_absolute_offsets_without_initializing_prefix() {
+        let view = GpuView::zeroed();
+        let base = 1024 * 1024 + 3;
+        let mut suffix = Vec::new();
+        let staged = StagedUploads::append_at(
+            &view,
+            SceneUploadPlan::default(),
+            2 * 1024 * 1024,
+            &mut suffix,
+            256,
+            base,
+        )
+        .unwrap();
+        assert_eq!(staged.view_offset, 1024 * 1024 + 256);
+        assert_eq!(suffix.len(), 253 + size_of::<GpuView>());
+        assert!(
+            StagedUploads::append_at(
+                &view,
+                SceneUploadPlan::default(),
+                base as u64,
+                &mut Vec::new(),
+                256,
+                base
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn geometric_growth_is_stable_until_capacity_is_exceeded() {
         assert_eq!(geometric_capacity(0, 1), 256);
         assert_eq!(geometric_capacity(256, 128), 256);
@@ -369,5 +410,16 @@ mod tests {
         assert_eq!(first.view_offset, 0);
         assert_eq!(second.view_offset, 256);
         assert_eq!(bytes.len(), 256 + size_of::<GpuView>());
+    }
+}
+
+fn align_vec_at(bytes: &mut Vec<u8>, alignment: usize, base: usize) {
+    if base == 0 {
+        align_vec(bytes, alignment);
+        return;
+    }
+    let remainder = (base + bytes.len()) % alignment;
+    if remainder != 0 {
+        bytes.resize(bytes.len() + alignment - remainder, 0);
     }
 }

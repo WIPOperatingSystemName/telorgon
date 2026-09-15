@@ -1939,7 +1939,11 @@ fn current_public_paths_compile() {
             );
         let _desktop_entry = telorgon::Application::desktop_environment("Compile desktop")
             .renderer(telorgon::Renderer::Vulkan)
-            .compositor(telorgon::Compositor::new().background(ComposedFixture::default()))
+            .compositor(
+                telorgon::Compositor::new()
+                    .cursor_theme(telorgon::CursorTheme::new())
+                    .background(ComposedFixture::default()),
+            )
             .shell_widget(
                 telorgon::ShellWidget::new("Panel")
                     .reserve_space(36.0)

@@ -45,6 +45,8 @@ pub(super) fn frame_content_clips(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) enum DesktopLayerKey {
+    MotionShadow(u32),
+    Motion(u32),
     Background,
     Frame(u32, u8),
     FrameShadow(u32),
@@ -70,6 +72,9 @@ pub(super) enum DesktopLayerKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) enum DesktopSceneKey {
+    ResizeGlass(u32),
+    MotionShadow(u32),
+    Motion(u64),
     FrameShadow(u32),
     Background,
     Frame(u32),
@@ -105,6 +110,8 @@ pub(super) enum DesktopImageUpdate {
     External {
         image: ImageId,
         content_version: u64,
+        /// Conservative damage in retained-image pixels; None means a full update.
+        damage: Option<RectI>,
     },
 }
 
@@ -132,6 +139,7 @@ pub(super) enum DesktopLayerContent {
 }
 
 pub(super) struct DesktopLayer {
+    pub glass: Option<crate::GlassStyle>,
     pub key: DesktopLayerKey,
     pub content: DesktopLayerContent,
     /// Extent of the retained scene or committed client buffer.
@@ -233,17 +241,21 @@ impl DesktopLayer {
         self
     }
 
+    /// Restore the border inside the content cutout. When the backing follows this same
+    /// inner contour and opacity, include it in the box so fill and ring share coverage.
+    /// Passing None leaves the aperture-specific backing to a separate layer.
     pub(super) fn content_border(
         surface: u32,
         mut instance: BoxInstance,
         extent: SizeI,
         position: PointI,
         content: RectI,
+        background: Option<ColorRgba8>,
     ) -> Self {
         // The source UI node can be replaced on a model/state change. This single-box scene
         // has its own stable slot; never accumulate obsolete frame nodes behind draw index zero.
         instance.node = NodeId::new(0, 1);
-        instance.background = None;
+        instance.background = background;
         instance.shadows = Default::default();
         let mut layer = Self::retained(
             DesktopLayerKey::ContentBorder(surface),
@@ -341,6 +353,7 @@ impl DesktopLayer {
             0.0
         };
         Self {
+            glass: None,
             key,
             content: DesktopLayerContent::Solid {
                 scene,
@@ -435,6 +448,7 @@ impl DesktopLayer {
         visible: bool,
     ) -> Self {
         Self {
+            glass: None,
             key,
             content: DesktopLayerContent::Retained { scene, deltas },
             source_extent: extent,
@@ -464,6 +478,7 @@ impl DesktopLayer {
         visible: bool,
     ) -> Self {
         Self {
+            glass: None,
             key,
             content: DesktopLayerContent::Image {
                 scene,
@@ -500,6 +515,9 @@ pub(super) struct DesktopPlacement {
 #[derive(Clone, Debug)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) struct DesktopFrame {
+    pub glass_changed: BTreeSet<DesktopSceneKey>,
+    pub glass: BTreeMap<DesktopSceneKey, crate::GlassStyle>,
+    pub motion: super::motion::MotionFrame,
     pub extent: SizeI,
     pub live_scenes: BTreeSet<DesktopSceneKey>,
     pub updates: Vec<DesktopSceneUpdate>,
@@ -519,6 +537,18 @@ impl DesktopFrame {
         extent: SizeI,
     ) -> Self {
         self.extent = extent;
+        for style in self.glass.values_mut() {
+            *style = style.normalized();
+            for distance in [
+                &mut style.blur_radius,
+                &mut style.bevel_width,
+                &mut style.blend_softness,
+                &mut style.refraction,
+                &mut style.dispersion,
+            ] {
+                *distance *= scale.get();
+            }
+        }
         self.damage = self.damage.and_then(|rect| {
             intersect(
                 scale.physical_damage(rect),
@@ -593,6 +623,9 @@ impl ImageScene {
         alpha_mode: ImageAlphaMode,
         pixel_format: ImagePixelFormat,
     ) -> Option<RenderSceneDelta> {
+        if matches!(update, DesktopImageUpdate::Unchanged) {
+            return None;
+        }
         let metadata_changed = self.extent != extent
             || self.alpha_mode != alpha_mode
             || self.pixel_format != pixel_format;
@@ -620,6 +653,7 @@ impl ImageScene {
                 DesktopImageUpdate::External {
                     image,
                     content_version,
+                    ..
                 } => {
                     self.image = *image;
                     self.content_version = *content_version;
@@ -678,11 +712,20 @@ impl ImageScene {
                 DesktopImageUpdate::External {
                     image,
                     content_version,
+                    damage,
                 } => {
                     self.image = *image;
                     self.content_version = *content_version;
-                    self.source.damage.full = true;
+                    self.source.damage.full = damage.is_none();
                     self.source.damage.rects.clear();
+                    if let Some(rect) = damage {
+                        self.source.damage.rects.push(RectF {
+                            x: rect.x as f32,
+                            y: rect.y as f32,
+                            width: rect.width as f32,
+                            height: rect.height as f32,
+                        });
+                    }
                 }
             }
         }
@@ -729,8 +772,9 @@ impl ImageScene {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct PlacementState {
+    glass: Option<crate::GlassStyle>,
     scene: DesktopSceneKey,
     bounds: Option<RectI>,
     target: RectI,
@@ -818,14 +862,25 @@ impl DesktopComposition {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn synchronize(
         &mut self,
         extent: SizeI,
         layers: Vec<DesktopLayer>,
     ) -> Option<DesktopFrame> {
+        self.synchronize_with_force(extent, layers, false)
+    }
+
+    pub(super) fn synchronize_with_force(
+        &mut self,
+        extent: SizeI,
+        layers: Vec<DesktopLayer>,
+        force: bool,
+    ) -> Option<DesktopFrame> {
         let output = full_rect(extent);
         let extent_changed = self.extent != extent;
         self.extent = extent;
+        let mut glass = BTreeMap::new();
         let mut live_scenes = BTreeSet::new();
         let mut updates = BTreeMap::<DesktopSceneKey, Vec<RenderSceneDelta>>::new();
         let mut placements = Vec::new();
@@ -833,7 +888,7 @@ impl DesktopComposition {
         let mut next_order = Vec::new();
         let mut damage = None;
 
-        for layer in layers.into_iter().filter(valid_layer) {
+        for mut layer in layers.into_iter().filter(valid_layer) {
             let scene = match layer.content {
                 DesktopLayerContent::Decoration { scene, instance } => {
                     let source = self.solid_scenes.entry(scene).or_default();
@@ -954,6 +1009,12 @@ impl DesktopComposition {
                         .image_scenes
                         .entry(scene)
                         .or_insert_with(ImageScene::new);
+                    // An unready external generation keeps the previous image geometry/revision.
+                    // New surfaces without a retained image contribute no placement yet.
+                    if matches!(update, DesktopImageUpdate::Unchanged) {
+                        layer.source_extent = source.extent;
+                        layer.visible &= source.content_version != 0;
+                    }
                     if let Some(delta) = source.synchronize(
                         content_version,
                         &update,
@@ -978,6 +1039,7 @@ impl DesktopComposition {
                 })
                 .and_then(|target| intersect(target, output));
             let state = PlacementState {
+                glass: layer.glass,
                 scene,
                 bounds,
                 target,
@@ -985,7 +1047,8 @@ impl DesktopComposition {
                 rounded_clips: layer.rounded_clips,
             };
             if self.placements.get(&layer.key).is_none_or(|previous| {
-                previous.scene != state.scene
+                previous.glass != state.glass
+                    || previous.scene != state.scene
                     || previous.bounds != state.bounds
                     || previous.target != state.target
                     || previous.clip != state.clip
@@ -1001,6 +1064,9 @@ impl DesktopComposition {
                 if let Some(bounds) = bounds {
                     add_damage(&mut damage, bounds, output);
                 }
+            }
+            if let Some(style) = layer.glass {
+                glass.insert(scene, style);
             }
             next_states.insert(layer.key, state);
             if bounds.is_some() {
@@ -1053,6 +1119,30 @@ impl DesktopComposition {
             }
         }
 
+        let mut glass_changed = self
+            .placements
+            .values()
+            .filter(|old| old.glass.is_some() && !glass.contains_key(&old.scene))
+            .map(|old| old.scene)
+            .collect::<BTreeSet<_>>();
+        for (index, placement) in placements.iter().enumerate() {
+            if !glass.contains_key(&placement.scene) {
+                continue;
+            }
+            let own_changed =
+                next_states.get(&placement.key) != self.placements.get(&placement.key);
+            let lower_changed = placements[..index].iter().any(|lower| {
+                updates.contains_key(&lower.scene)
+                    || next_states.get(&lower.key) != self.placements.get(&lower.key)
+            });
+            if order_changed || extent_changed || own_changed || lower_changed {
+                glass_changed.insert(placement.scene);
+                if let Some(bounds) = placement_bounds(*placement, output) {
+                    add_damage(&mut damage, bounds, output);
+                }
+            }
+        }
+
         self.image_scenes.retain(|key, _| live_scenes.contains(key));
         self.retained_scenes
             .retain(|key, _| live_scenes.contains(key));
@@ -1061,7 +1151,7 @@ impl DesktopComposition {
         self.order = next_order;
 
         let has_updates = !updates.is_empty();
-        if !has_updates && damage.is_none() {
+        if !force && !has_updates && damage.is_none() {
             return None;
         }
         // Resource-only changes should not get stranded without a backend turn. If a producer did
@@ -1088,10 +1178,27 @@ impl DesktopComposition {
                 self.image_scenes
                     .get(&placement.scene)
                     .filter(|scene| scene.source_version != 0)
-                    .map(|scene| (surface, scene.source_version))
+                    .map(|scene| {
+                        super::resize_trace::event(
+                            surface,
+                            "scene",
+                            format_args!(
+                                "revision={} image={:?} content_version={} extent={:?} target={:?}",
+                                scene.source_version,
+                                scene.image,
+                                scene.content_version,
+                                scene.extent,
+                                placement.target
+                            ),
+                        );
+                        (surface, scene.source_version)
+                    })
             })
             .collect();
         Some(DesktopFrame {
+            glass_changed,
+            glass,
+            motion: Default::default(),
             extent,
             live_scenes,
             updates: updates
@@ -1141,6 +1248,7 @@ fn valid_layer(layer: &DesktopLayer) -> bool {
             DesktopImageUpdate::External {
                 image,
                 content_version,
+                ..
             } => image.0 != 0 && *content_version != 0,
         },
     }
@@ -1229,6 +1337,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn glass_is_idle_until_lower_content_or_its_appearance_changes() {
+        let extent = SizeI {
+            width: 160,
+            height: 120,
+        };
+        let target = RectI {
+            x: 30,
+            y: 20,
+            width: 80,
+            height: 70,
+        };
+        let layers = |background, foreground, glass: bool| {
+            let mut preview = veil(target, ColorRgba8::rgba(23, 27, 37, 150));
+            preview.glass = glass.then_some(crate::GlassStyle::default());
+            vec![
+                DesktopLayer::solid(
+                    DesktopLayerKey::Background,
+                    DesktopSceneKey::Background,
+                    background,
+                    full_rect(extent),
+                ),
+                preview,
+                DesktopLayer::solid(
+                    DesktopLayerKey::Cursor,
+                    DesktopSceneKey::CursorImage,
+                    foreground,
+                    RectI {
+                        x: 140,
+                        y: 100,
+                        width: 5,
+                        height: 5,
+                    },
+                ),
+            ]
+        };
+        let black = ColorRgba8::rgba(0, 0, 0, 255);
+        let white = ColorRgba8::rgba(255, 255, 255, 255);
+        let mut composition = DesktopComposition::new(extent);
+        let first = composition
+            .synchronize(extent, layers(black, black, true))
+            .unwrap();
+        assert!(
+            first
+                .glass_changed
+                .contains(&DesktopSceneKey::ResizeVeil(9))
+        );
+        assert!(
+            composition
+                .synchronize(extent, layers(black, black, true))
+                .is_none()
+        );
+        let cursor = composition
+            .synchronize(extent, layers(black, white, true))
+            .unwrap();
+        assert!(
+            cursor.glass_changed.is_empty(),
+            "foreground changes must not rebuild glass snapshots"
+        );
+        assert_eq!(
+            cursor.damage,
+            Some(RectI {
+                x: 140,
+                y: 100,
+                width: 5,
+                height: 5
+            })
+        );
+        let lower = composition
+            .synchronize(extent, layers(white, white, true))
+            .unwrap();
+        assert!(
+            lower
+                .glass_changed
+                .contains(&DesktopSceneKey::ResizeVeil(9))
+        );
+        let flat = composition
+            .synchronize(extent, layers(white, white, false))
+            .unwrap();
+        assert!(flat.glass.is_empty());
+        assert_eq!(
+            flat.damage,
+            Some(target),
+            "switching to the identical flat tint must still repaint"
+        );
+    }
+
+    #[test]
+    fn glass_distances_cross_output_scale_once() {
+        let extent = SizeI {
+            width: 100,
+            height: 100,
+        };
+        let mut preview = veil(full_rect(extent), ColorRgba8::rgba(0, 0, 0, 0));
+        preview.glass = Some(crate::GlassStyle { blend_softness: 16.0, ..crate::GlassStyle::default() });
+        let mut composition = DesktopComposition::new(extent);
+        let frame = composition
+            .synchronize(extent, vec![preview])
+            .unwrap()
+            .into_physical(
+                crate::platform::ScaleFactor::new(2.0).unwrap(),
+                SizeI {
+                    width: 200,
+                    height: 200,
+                },
+            );
+        let physical = frame.glass[&DesktopSceneKey::ResizeVeil(9)];
+        let logical = crate::GlassStyle::liquid();
+        assert_eq!(physical.blur_radius, logical.blur_radius * 2.0);
+        assert_eq!(physical.bevel_width, logical.bevel_width * 2.0);
+        assert_eq!(physical.blend_softness, 32.0);
+        assert_eq!(physical.refraction, logical.refraction * 2.0);
+        assert_eq!(physical.dispersion, logical.dispersion * 2.0);
+        assert_eq!(physical.rim, logical.rim);
+        assert_eq!(physical.fresnel, logical.fresnel);
+        assert_eq!(physical.specular, logical.specular);
+        assert_eq!(physical.tint, logical.tint);
+    }
+
+    #[test]
     fn output_mapping_scales_geometry_clips_and_damage_once_and_preserves_revisions() {
         let logical = RectI {
             x: 1,
@@ -1247,6 +1474,9 @@ mod tests {
         );
         rounded.inverted = true;
         let frame = DesktopFrame {
+            glass_changed: BTreeSet::new(),
+            glass: BTreeMap::new(),
+            motion: Default::default(),
             extent: SizeI {
                 width: 1280,
                 height: 720,
@@ -1817,5 +2047,161 @@ mod tests {
         let frame = composition.synchronize(extent, vec![visible]).unwrap();
         assert_eq!(frame.updates.len(), 1);
         assert_eq!(frame.updates[0].deltas[0].image_resources.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod external_admission_tests {
+    use super::*;
+    fn layer(revision: u64, extent: SizeI, update: DesktopImageUpdate) -> DesktopLayer {
+        DesktopLayer::image(
+            DesktopLayerKey::Surface(1),
+            DesktopSceneKey::Surface(1),
+            revision,
+            update,
+            extent,
+            RectI {
+                x: 20,
+                y: 30,
+                width: extent.width,
+                height: extent.height,
+            },
+            None,
+            ImageAlphaMode::Opaque,
+            ImagePixelFormat::Rgba8,
+            true,
+        )
+    }
+    fn external(revision: u64, damage: Option<RectI>) -> DesktopImageUpdate {
+        DesktopImageUpdate::External {
+            image: ImageId(1),
+            content_version: revision,
+            damage,
+        }
+    }
+    #[test]
+    fn external_damage_reaches_output_at_hidpi() {
+        let output = SizeI {
+            width: 1280,
+            height: 800,
+        };
+        let size = SizeI {
+            width: 1000,
+            height: 700,
+        };
+        let mut composition = DesktopComposition::new(output);
+        composition
+            .synchronize(output, vec![layer(1, size, external(1, None))])
+            .unwrap();
+        let frame = composition
+            .synchronize(
+                output,
+                vec![layer(
+                    2,
+                    size,
+                    external(
+                        2,
+                        Some(RectI {
+                            x: 5,
+                            y: 7,
+                            width: 10,
+                            height: 12,
+                        }),
+                    ),
+                )],
+            )
+            .unwrap();
+        assert_eq!(frame.surface_revisions, [(1, 2)]);
+        assert_eq!(
+            frame.damage,
+            Some(RectI {
+                x: 25,
+                y: 37,
+                width: 10,
+                height: 12
+            })
+        );
+        let physical = frame.into_physical(
+            crate::platform::ScaleFactor::new(3.0).unwrap(),
+            SizeI {
+                width: 3840,
+                height: 2400,
+            },
+        );
+        assert_eq!(
+            physical.damage,
+            Some(RectI {
+                x: 75,
+                y: 111,
+                width: 30,
+                height: 36
+            })
+        );
+    }
+    #[test]
+    fn blocked_resize_keeps_old_revision_while_other_placements_move() {
+        let output = SizeI {
+            width: 1280,
+            height: 800,
+        };
+        let size = SizeI {
+            width: 100,
+            height: 80,
+        };
+        let mut composition = DesktopComposition::new(output);
+        composition
+            .synchronize(output, vec![layer(1, size, external(1, None))])
+            .unwrap();
+        let mut blocked = layer(
+            2,
+            SizeI {
+                width: 200,
+                height: 160,
+            },
+            DesktopImageUpdate::Unchanged,
+        );
+        blocked.target.x += 50;
+        let frame = composition.synchronize(output, vec![blocked]).unwrap();
+        assert_eq!(frame.surface_revisions, [(1, 1)]);
+        assert!(frame.updates.is_empty());
+        assert_eq!(frame.placements[0].target.x, 70);
+        assert_eq!(
+            composition.image_scenes[&DesktopSceneKey::Surface(1)].extent,
+            size
+        );
+        let ready = composition
+            .synchronize(
+                output,
+                vec![layer(
+                    2,
+                    SizeI {
+                        width: 200,
+                        height: 160,
+                    },
+                    external(2, None),
+                )],
+            )
+            .unwrap();
+        assert_eq!(ready.surface_revisions, [(1, 2)]);
+    }
+    #[test]
+    fn first_unready_image_is_not_presented_or_acknowledged() {
+        let output = SizeI {
+            width: 1280,
+            height: 800,
+        };
+        let mut composition = DesktopComposition::new(output);
+        let frame = composition.synchronize(
+            output,
+            vec![layer(
+                1,
+                SizeI {
+                    width: 100,
+                    height: 80,
+                },
+                DesktopImageUpdate::Unchanged,
+            )],
+        );
+        assert!(frame.is_none_or(|f| f.placements.is_empty() && f.surface_revisions.is_empty()));
     }
 }

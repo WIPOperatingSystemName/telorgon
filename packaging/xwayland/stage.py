@@ -25,6 +25,9 @@ def sha(path):
 
 def stage(work, destination, recipes):
     policy = tomllib.loads((recipes / "runtime-policy.toml").read_text())
+    overlap = set(policy["host"]) & set(policy["private"])
+    if overlap:
+        raise ValueError(f"libraries cannot be both host and private: {sorted(overlap)}")
     lock = tomllib.loads((recipes / "sources.lock.toml").read_text())
     if destination.exists():
         raise ValueError("stage must be a new directory")
@@ -45,6 +48,10 @@ def stage(work, destination, recipes):
         inventory.append(dict(name=patch.stem, version="1", input_sha256=sha(patch), license="GPL-3.0-or-later; upstream notices retained"))
         shutil.copyfile(patch, destination / "licenses" / patch.name)
     shutil.copyfile(recipes / "patches/LICENSE", destination / "licenses/Telorgon-GPL-3.0.txt")
+    shutil.copyfile(recipes / "runtime-policy.toml", destination / "licenses/runtime-policy.toml")
+    inventory.append(dict(name="runtime-policy", version=str(policy["schema"]),
+                          input_sha256=sha(recipes / "runtime-policy.toml"),
+                          license="GPL-3.0-or-later; see licenses/Telorgon-GPL-3.0.txt"))
     (destination / "licenses" / "sources.lock.toml").write_bytes((recipes / "sources.lock.toml").read_bytes())
     pending = []
     for name, source in [("Xwayland", work / "build/xwayland/hw/xwayland/Xwayland"),

@@ -12,6 +12,10 @@ mod key;
 mod signal;
 pub mod style;
 
+pub use crate::window_chrome::{
+    ContentFade, GeometryMotion, Minimize, Spring, WindowMotion, WindowTween, tween_ms,
+};
+
 pub use component::{
     Component, ComponentFields, ComponentInstanceId, ErasedComponent, RenderedView,
 };

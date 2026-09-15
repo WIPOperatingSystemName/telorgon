@@ -17,12 +17,13 @@ impl ShmCopyRequest {
         viewport: Option<crate::compositor_wayland::ViewportState>,
         reader: crate::compositor_wayland::ShmBufferReader,
         output_scale: crate::platform::ScaleFactor,
+        coordinate_density: i32,
     ) -> Self {
         Self {
             snapshot,
             viewport,
             reader,
-            output_scale,
+            output_scale: super::geometry::surface_raster_scale(output_scale, coordinate_density),
         }
     }
 

@@ -86,6 +86,7 @@ const NORMAL: WindowChromeStateStyle = WindowChromeStateStyle {
 };
 
 const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
+    motion: telorgon::WindowMotion::none(),
     active: WindowChromePalette {
         frame_background: ColorRgba8::rgba(23, 27, 38, 255),
         frame_border: ColorRgba8::rgba(101, 119, 184, 255),
@@ -153,7 +154,7 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
         gap: 6.0,
     },
     content_background: ColorRgba8::rgba(15, 18, 26, 255),
-    resize_preview_color: None,
+    resize_preview: None,
 };
 
 const PIN_WINDOW: ShellActionId = ShellActionId::named("window.pin");
@@ -185,6 +186,7 @@ fn easy_frame_is_a_closure_free_complete_desktop_declaration() {
     let desktop = Application::desktop_environment("Telorgon")
         .compositor(
             Compositor::new()
+                .cursor_theme(telorgon::CursorTheme::new())
                 .window_frame(easy_window_frame(TEST_CHROME))
                 .shell_action(PIN_WINDOW, pin_window)
                 .background(DesktopBackground::default()),
@@ -660,6 +662,7 @@ impl WindowFrameTemplate for AdvancedFrameTemplate {
 #[test]
 fn low_level_template_retains_full_composition_and_authorized_action_freedom() {
     let compositor = Compositor::new()
+        .cursor_theme(telorgon::CursorTheme::new())
         .window_frame(AdvancedFrameTemplate)
         .shell_action(PIN_WINDOW, pin_window)
         .background(DesktopBackground::default());
@@ -875,4 +878,60 @@ fn maximized_and_fullscreen_frames_fill_the_outer_bounds_without_a_border() {
             assert_eq!(normal.content.bounds.x, border);
         }
     }
+}
+
+#[test]
+fn easy_frame_exports_the_same_const_motion_style_as_custom_templates() {
+    const MOTION: WindowMotion = WindowMotion::smooth()
+        .maximize(tween_ms(210, telorgon::Easing::EaseOut))
+        .restore(tween_ms(170, telorgon::Easing::Linear))
+        .minimize(Minimize::shrink_and_fade(150))
+        .resize_content(ContentFade::new(60, 110));
+    let design = WindowChromeDesign {
+        motion: MOTION,
+        ..TEST_CHROME
+    };
+    let template = easy_window_frame(design);
+    let model = WindowChromeModel::new(1, "Motion");
+    assert_eq!(template.motion(&model), Some(MOTION));
+    assert_eq!(MOTION.maximize_transition(false).duration_ms(), 170);
+    assert_eq!(MOTION.minimize_transition(false).duration_ms, 150);
+    assert_eq!(
+        easy_window_frame(TEST_CHROME).motion(&model),
+        Some(WindowMotion::none())
+    );
+}
+
+#[test]
+fn fluid_motion_is_const_customizable_through_the_public_app_api() {
+    use telorgon::app::{GeometryMotion, Spring};
+    const MOTION: WindowMotion = WindowMotion::fluid()
+        .maximize_spring(
+            Spring::new()
+                .initial_velocity(3.2)
+                .damping_ratio(0.87)
+                .angular_frequency(20.5)
+                .settle_within_ms(450),
+        )
+        .restore_spring(
+            Spring::new()
+                .initial_velocity(2.8)
+                .damping_ratio(0.86)
+                .angular_frequency(19.5)
+                .settle_within_ms(475),
+        )
+        .maximize_content(ContentFade::new(50, 130));
+    let template = easy_window_frame(WindowChromeDesign {
+        motion: MOTION,
+        ..TEST_CHROME
+    });
+    assert_eq!(
+        template.motion(&WindowChromeModel::new(1, "Fluid")),
+        Some(MOTION)
+    );
+    assert!(matches!(
+        MOTION.maximize_transition(true),
+        GeometryMotion::Spring(_)
+    ));
+    assert_eq!(MOTION.maximize_transition(false).duration_ms(), 475);
 }

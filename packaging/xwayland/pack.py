@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 import struct
 import tempfile
+import tomllib
 import zlib
 
 MAX_COMPRESSED = 64 * 1024 * 1024
@@ -35,6 +36,7 @@ def digest(data):
 
 def pack(stage, components):
     stage = Path(stage)
+    policy = tomllib.loads(Path(__file__).with_name("runtime-policy.toml").read_text())
     if stage.is_symlink() or not stage.is_dir():
         raise ValueError("stage must be a real directory")
     if not isinstance(components, list) or not 1 <= len(components) <= 256:
@@ -58,6 +60,8 @@ def pack(stage, components):
             if visited > MAX_ENTRIES:
                 raise ValueError("too many staged entries (including directories)")
             relative = path.relative_to(stage).as_posix()
+            if relative.startswith("lib/") and path.name in policy["host"]:
+                raise ValueError(f"staged library shadows a host runtime dependency: {relative}; restage with the current runtime policy")
             if not valid_path(relative):
                 raise ValueError(f"unsafe stage path: {relative}")
             info = path.lstat()

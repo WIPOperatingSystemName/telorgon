@@ -30,7 +30,7 @@ assets/
 ```rust,ignore
 use telorgon::app::*;
 use telorgon::{
-    Background, ClientCursorMode, PointerGraphic, PointerIcon, PointerThemeOverrides,
+    Background, ClientCursorMode, CursorGraphic, PointerIcon, PointerThemeOverrides,
 };
 
 asset_catalog! { pub mod assets = "assets"; }
@@ -51,7 +51,7 @@ fn pointers() -> PointerThemeOverrides {
     // Override only exceptional states here; all other states come from default.toml or the OS.
     PointerThemeOverrides::new().set(
         PointerIcon::EwResize,
-        PointerGraphic::new(assets::cursors::RESIZE_EW)
+        CursorGraphic::new(assets::cursors::RESIZE_EW)
             .size(32)
             .hotspot(16, 16)
             .tint(WHITE),
@@ -254,6 +254,7 @@ const NORMAL: WindowChromeStateStyle = WindowChromeStateStyle {
 };
 
 const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
+    motion: WindowMotion::none(),
     active: WindowChromePalette {
         frame_background: ColorRgba8::rgba(23, 27, 38, 255),
         frame_border: ColorRgba8::rgba(101, 119, 184, 255),
@@ -309,7 +310,7 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
         gap: 6.0,
     },
     content_background: ColorRgba8::rgba(15, 18, 26, 255),
-    resize_preview_color: None, // Inherit LinuxDesktopConfig; Some(rgba(...)) overrides it.
+    resize_preview: None, // Inherit LinuxDesktopConfig; Some(ResizePreview::Color(rgba(...))) overrides it.
 };
 
 #[component]
@@ -324,11 +325,10 @@ impl Component for DesktopBackground {
 Application::desktop_environment("Telorgon")
     .assets(assets::bundle())
     .app_icon(app_icons())
-    .cursor_theme(assets::cursors::DEFAULT)
-    .pointer_overrides(pointers())
-    .client_cursor_mode(ClientCursorMode::Allow)
     .compositor(
         Compositor::new()
+            .cursor_theme(CursorTheme::from_asset(assets::cursors::DEFAULT))
+            .client_cursor_mode(ClientCursorMode::Allow)
             .window_frame(easy_window_frame(TEST_CHROME))
             .background(DesktopBackground::default()),
     )
@@ -376,13 +376,13 @@ let chrome = WindowChromeDesign {
     // Allow transparent application pixels to reveal the desktop or lower windows.
     content_background: ColorRgba8::rgba(0, 0, 0, 0),
     // A translucent slate resize placeholder; 0 alpha gives a frame-only preview.
-    resize_preview_color: Some(ColorRgba8::rgba(38, 42, 48, 160)),
+    resize_preview: Some(ResizePreview::Color(ColorRgba8::rgba(38, 42, 48, 160))),
     ..TEST_CHROME
 };
 let frame = easy_window_frame(chrome);
 ```
 
-`resize_preview_color: None` inherits `LinuxDesktopConfig::resize_preview_color` (opaque slate
+`resize_preview: None` inherits `LinuxDesktopConfig::resize_preview` (opaque slate
 by default); add this field to existing complete `WindowChromeDesign` literals when upgrading.
 All alpha values from 0 through 255 are accepted. The preview replaces the client surface tree and
 normal backing, so its alpha reveals lower desktop layers, not the old client image. Normal
@@ -392,6 +392,10 @@ app content remain opaque. This does not make transparent pixels click-through o
 
 For externally supplied Wayland content, the host excludes the entire composed frame from the
 content rectangle, including its root fill and shadow, and paints the content backing separately.
+The easy frame's content slot carries layout and clipping only; `content_style()` supplies its
+background to the host. Painting that background in the slot as well lets fractional border/title
+metrics leak a thin strip outside the host's integer client cutout. Fractional outline widths remain
+unchanged, and backing, client placement, and the cutout share the host's content rectangle.
 Client pixels, backing, and resize preview are clipped to the inner frame-border contour. For a
 uniform border the inner radius is `max(frame_radius - frame_border_width, 0)`, with its rectangle
 inset by the border width. Zero-radius frames still clip to their rectangular interior; zero-width
@@ -405,13 +409,25 @@ Subsurfaces inherit the window clip; popups keep independent bounds. Easy-frame 
 also clip to the frame/slot overflow bounds, without clipping away the frame's own outer shadow.
 Custom `WindowFrameTemplate` implementations can opt into the same transparent-backing
 separation by returning `Some(WindowContentStyle { background, corner_radius,
-resize_preview_color })` from `content_style(&WindowChromeModel)`. Its default `None` preserves
+resize_preview })` from `content_style(&WindowChromeModel)`. Its default `None` preserves
 their normal composed backing; during resize the host still excludes that backing from the preview.
 The curved border segment inside the rectangular content slot is retained even when content is
 transparent. Undecorated/client-decorated windows keep their client-authored shape and use the Linux
 configuration's preview color. No new design fields are required for rounded clipping.
 The same placeholder is shown while maximizing until newly configured client content is published.
 It uses the existing preview color and alpha settings; no extra application configuration is needed.
+
+Fractional-seam repair audit (2026-09-15): inspected `easy_window_frame.rs`, desktop
+`layers.rs`/`geometry.rs`/`scene.rs`, and the software renderer's composition path. The adjacent
+`other-rendering-libs` library was unavailable, so no external implementation comparison was made.
+The [Wayland surface specification](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_surface)
+distinguishes surface-local geometry from buffer pixels; the fix preserves that mapping and client
+sizes. The adopted invariant is that changing content backing cannot change pixels outside the
+integer client cutout. Rounding the authored border width or moving the client was rejected because
+the duplicate slot fill can be removed without changing either. The CPU framebuffer regression
+compares black and white backing around all four frame strips for integer/fractional borders and
+title heights, including hidden title bars; it failed before the repair and passes afterward.
+Live Vulkan/foot visual confirmation remains user-run.
 
 See [resize-preview behavior and verification](WAYLAND_RESIZE_PREVIEW.md) and
 [maximized window geometry](MAXIMIZED_WINDOW_GEOMETRY.md).
@@ -542,7 +558,7 @@ let close = button("Close")
     .icon(assets::icons::CLOSE)
     .icon_tint(WHITE);
 let native_icon = Icon::new(assets::icons::APP).tint(WHITE);
-let arrow = PointerGraphic::new(assets::cursors::ARROW)
+let arrow = CursorGraphic::new(assets::cursors::ARROW)
     .size(32)
     .hotspot(2, 2)
     .tint(WHITE);
@@ -565,57 +581,60 @@ The manager advertises preferred logical sizes 16, 24, 32, 48, and 64. The compo
 closest submitted image for its frame, otherwise using the desktop environment's fallback
 `AppIconProfile`.
 
-## Pointer API
+## Cursor themes and pointer requests
 
-`PointerViewExt::pointer_icon` assigns a semantic shape to any view, while `hide_pointer` requests
-no pointer over that region. Window drag, resize, and action regions select `Move`, the matching
-eight-direction resize shape, or `Pointer` automatically. `PointerThemeOverrides` handles concise
-code-local exceptions; a registered TOML cursor theme supplies the full mapping. When the Linux
-desktop compositor has no exact system or registered directional-resize graphic, it tries
-`AllResize` and then `Default`, preventing a partial cursor table from making the pointer vanish.
+`PointerViewExt::pointer_icon` selects a semantic role; `hide_pointer` explicitly hides the
+cursor. Drag and resize regions select their corresponding roles automatically.
 
-Every `PointerGraphic` can be tinted independently in code. For example, all of the cursor SVGs in
-one catalog can share the same white color while retaining their individual sizes and hotspots:
+Desktop compositors require `.cursor_theme(CursorTheme)` and a background, in either order.
+`CursorTheme::new()` returns a declaration, without `Default`, `build`, or a required manual
+validation call. Desktop startup invokes compositor validation before entering the runtime.
+Errors propagate through `.run()` to the program's `main` result.
 
 ```rust,ignore
-const WHITE: ColorRgba8 = ColorRgba8::rgba(255, 255, 255, 255);
+fn cursor_theme() -> CursorTheme {
+    CursorTheme::new()
+        .size(24.0)
+        .default_pointer(cursor(assets::cursors::ARROW).hotspot(6, 4))
+        .pointer(cursor(assets::cursors::POINTER).hotspot(14, 5))
+        .text(cursor(assets::cursors::TEXT).hotspot(16, 16))
+        // Add every other role from REQUIRED_CURSOR_ROLES.
+}
 
-PointerThemeOverrides::new()
-    .set(PointerIcon::Default, PointerGraphic::new(assets::cursors::ARROW).size(32).hotspot(2, 2).tint(WHITE))
-    .set(PointerIcon::Move, PointerGraphic::new(assets::cursors::MOVE).size(32).hotspot(16, 16).tint(WHITE))
-    .set(PointerIcon::Pointer, PointerGraphic::new(assets::cursors::POINTER).size(32).hotspot(6, 2).tint(WHITE))
-    .set(PointerIcon::EwResize, PointerGraphic::new(assets::cursors::RESIZE_EW).size(32).hotspot(16, 16).tint(WHITE))
-    .set(PointerIcon::NsResize, PointerGraphic::new(assets::cursors::RESIZE_NS).size(32).hotspot(16, 16).tint(WHITE))
-    .set(PointerIcon::Text, PointerGraphic::new(assets::cursors::TEXT).size(32).hotspot(16, 16).tint(WHITE));
+Compositor::new()
+    .cursor_theme(cursor_theme())
+    .client_cursor_mode(ClientCursorMode::Allow)
+    .background(DesktopBackground::default());
 ```
 
-```toml
-fallback = "system"
-size = 32
+The abbreviated theme above deliberately omits roles and will fail startup until completed.
+Every one of the 36 supported roles requires an explicit assignment through its named method.
+`CursorTheme` has no generic `.set(...)` method. Several roles may explicitly share artwork. The normal
+`default_pointer` role never fills missing roles. There is no desktop system or generic-resize
+fallback, nor a separate `.pointer(component)` artwork source.
 
-[default]
-asset = "cursors/arrow.svg"
-hotspot = [2, 2]
+`PointerGraphic` is renamed to `CursorGraphic`; `cursor(asset)` constructs one and is exported
+through `telorgon::app::*`. Hotspots on desktop theme graphics use source-artwork coordinates.
+Startup checks source bounds and equal animation frame dimensions, then scales hotspots with the
+artwork. Callers must remove manual hotspot scaling from old cursor helpers.
 
-[pointer]
-asset = "cursors/link.svg"
-hotspot = [6, 2]
+The theme requires a finite positive `.size(f32)` in logical units (maximum 65535). A graphic may
+set its own nominal `.size(...)`. `.cursor_size(f32)` on a compositor after `.cursor_theme(...)`
+changes the effective base size proportionally: a 24-unit theme with a 30-unit text graphic becomes
+32 and 40 units respectively. This is a declaration modifier; it does not introduce a live runtime
+control handle. Output density determines raster dimensions; integer presentation geometry rounds
+logical sizes and hotspots to the nearest supported unit. Tint and animation remain available.
 
-[text]
-asset = "cursors/text.svg"
-hotspot = [15, 15]
-```
+`CursorTheme::from_asset(asset)` defers manifest loading until startup using the desktop's shared
+asset catalog. Manifests require `size` and all role tables with `asset` and optional `hotspot`,
+`size`, or animation frames. Fallback declarations are rejected. Code setters can customize loaded
+entries before validation. Missing roles are reported together, and asset errors include role and
+asset names.
 
-The hotspot is the pixel inside the cursor image that sits exactly on the pointer coordinate. It is
-usually the arrow tip, pointing-finger tip, or I-beam center. Each semantic cursor may declare its
-own square raster size and hotspot. Different states do not need the same size. Animated graphics
-do require all frames in that one animation to share geometry and hotspot so the pointer does not
-jump between frames.
-
-Resolution order is fixed and inspectable: hidden request, permitted client cursor surface,
-application override, registered theme, then system cursor. `ClientCursorMode` is intentionally the
-only policy-like setting: `Allow` honors a focused Wayland client's cursor surface and `ThemeOnly`
-forces compositor artwork. It does not affect managed GUI applications.
+Explicit hiding and allowed client surfaces remain supported. `ClientCursorMode::ThemeOnly` uses
+compositor artwork, while `Allow` honors client artwork with its protocol-defined sizing.
+Ordinary GUI applications retain optional `PointerThemeOverrides` and asset-theme configuration;
+they do not inherit the compositor's complete-theme requirement.
 
 ## Vocabulary and compatibility
 
@@ -734,3 +753,16 @@ over a green backing, including their triangle diagonals and straight top/bottom
 window widths, fractional insets, square/rounded clips, and 1x/1.25x/1.5x/2x target scales.
 It is compiled only during this task; hardware execution and visual confirmation remain user-run.
 The offline shader builder compiles, validates, reflects, and regenerates the shipped artifacts.
+
+### Application-owned headers inside compositor frames
+
+`WindowChromeModel::title_bar_visible` separates title/control ownership from outer appearance.
+Custom frame templates should omit title bars, move regions and window-control buttons when it is
+false, leave the content slot the full inner frame area, and keep their outer border, radius, colors,
+shadows and resize regions. `EasyWindowFrame` does this automatically, including rounding all inner
+content corners when the title bar is omitted. State-specific design rules (such as maximized border
+width or radius) still apply. The desktop currently uses this mode for managed X11 clients requesting
+client decorations; fullscreen and unmanaged popup windows do not receive an outer frame.
+
+See [Desktop window motion](WINDOW_MOTION.md) to enable `WindowMotion::smooth()` and customize
+maximize, minimize, and resize-content fades on the chrome design.

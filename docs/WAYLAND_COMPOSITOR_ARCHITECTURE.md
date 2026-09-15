@@ -144,6 +144,21 @@ explicit blocking operations are isolated: the Vulkan completion waiter and a si
 copy worker. The latter receives only duplicated FDs plus immutable commit metadata; it never
 accesses Wayland objects or compositor state.
 
+Input draining distinguishes an empty libinput queue from an unsupported event: modern scroll
+companions, touch-frame and other unmapped events are consumed and destroyed without terminating
+the drain. Telorgon currently translates legacy `POINTER_AXIS` only, avoiding duplicate scroll
+delivery when libinput also emits modern scroll events. Client events are flushed immediately
+after an input batch and again before frame preparation, so input, completed frame callbacks,
+buffer releases and configure events do not wait for the next render submission. These are
+nonblocking output flushes, with no nested protocol dispatch or GPU wait.
+
+With `TELORGON_FRAME_STATS=1`, two-second summaries also report monotonic input queue age, the
+oldest event's age at a client flush attempt, input batch processing time, owner work after
+Wayland dispatch, and X11 SHM/DMA-BUF commit counts. These observations do not measure client
+receipt/processing, asynchronous GPU execution or end-to-end input latency. The consuming
+`test-compositor/start.sh` defaults to an optimized release build; `TELORGON_PROFILE=dev` retains
+the explicit unoptimized debugging option.
+
 ## Protocol source and advertisement rules
 
 The `desktop-wayland-linux` feature on a Linux target requires protocol XML **at build time only**.
@@ -217,11 +232,21 @@ resource's negotiated version. The machine-readable profile is
 | `zwp_idle_inhibit_manager_v1` | 1 | Always; scoped inhibitors exposed to shell power policy |
 | `wl_output` | 4 | Per configured KMS output |
 | `wl_seat` | 9 | Per configured libseat seat |
-| `zwp_linux_dmabuf_v1` | 3 | Only after exact Vulkan importable format/modifier tuples are supplied |
+| `zwp_linux_dmabuf_v1` | 4 | Exact Vulkan importable format/modifier tuples plus the matched DRM device; formats-only embedders retain v3 |
 | `zwp_linux_explicit_synchronization_v1` | 2 | Only when the selected render/present path accepts acquire and release fences |
 
-Linux-dmabuf feedback v4/v5 and DRM syncobj are not advertised. Their XML metadata is retained as
-an implementation roadmap, not as a support claim.
+Linux-dmabuf v4 supplies default and per-surface allocation feedback. The managed host uses the
+KMS device identity already matched to its Vulkan adapter. A sealed, immutable file contains native-
+endian 16-byte format/modifier entries; one sampling tranche covers exactly the deduplicated import
+capabilities. It does not claim client direct scanout. Index arrays are split into bounded messages.
+Every feedback request receives a complete transaction ending in `done`; policy is fixed for this
+display lifetime, so destroyed surfaces require no future updates and their feedback remains inert
+until the client destroys it. V3 binds retain modifier events, while v4 binds never receive deprecated
+format/modifier events. V5 and DRM syncobj remain unadvertised.
+
+`telorgon-dmabuf:` startup diagnostics distinguish enabled v4 feedback from unavailable DMA-BUF
+import. Enabling `TELORGON_WAYLAND_ERROR_LOG=1` also captures bounded Xwayland stderr, including
+Glamor/DRI3 fallback reasons. GPU execution and Firefox performance still require a hardware run.
 
 ## Surface and shell behavior
 
@@ -253,6 +278,25 @@ blocking presenter reports no hardware timing flags until page-flip timestamp pr
 Copied SHM buffers are released after the compositor has taken its copy. Explicit-sync acquire FDs
 are attached to a specific surface revision and release objects are completed only by the render
 path that consumed that revision.
+
+Native `wl_buffer` destruction removes the wire resource immediately, but retains its descriptor
+and owned storage FDs while a surface references it through current, pending, or synchronized cached
+state. Subsequent commits still validate geometry and can access the retained storage. Cleanup runs
+after requests and resource destruction, retiring storage after the last reference disappears;
+already duplicated worker/import FDs keep their independent lifetime. Release events are omitted
+when the wire resource no longer exists.
+
+Buffer lifetime audit: inspected `compositor_wayland/native.rs` (destruction, geometry validation,
+SHM readers), `subsurface.rs` (cached commits), and `application_host/desktop_wayland.rs` (publication
+and image copying). The adjacent `../other-rendering-libs` source library was unavailable, so no
+independent implementation comparison is claimed. The official
+[Wayland attach contract](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_surface-request-attach)
+permits destroying a committed buffer without discarding surface contents. Merely bypassing geometry
+validation was rejected because the rendering path also needs the descriptor and storage; keeping
+every destroyed buffer until client exit was rejected because memory would grow with replacements.
+Regression tests cover wire destruction followed by metadata-only commits, shared attachments,
+replacement, detach, surface/client destruction, pending and cached attachments, and continued
+rejection of invalid buffer scale. Live Firefox qualification remains a separate manual check.
 
 ## Input, output, and session
 
@@ -465,14 +509,16 @@ The operational managed path is entirely Telorgon-rendered:
    plane; it does not use the legacy cursor ioctls or asynchronous page-flip flag.
 
 `telorgon-compositor-render::DmaBufImporter` is the Vulkan client-buffer import bridge. It exposes
-only exact single-plane format/modifier tuples queried from the selected `VulkanDevice`, validates
+only exact importable single-plane sRGB format/modifier tuples queried from the selected `VulkanDevice`, validates
 allocation bounds, consumes an acquire sync FD, creates a generation-scoped
 external-image lease, and binds it into `VulkanScene`. The external-image path can export the
 matching release requirement.
 
 The managed KMS host advertises those tuples only when the owned Vulkan device also supports the
 complete sync-FD contract. A committed client DMA-BUF is sampled once into a compositor-owned
-retained Vulkan texture in the same submission as desktop composition. That submission waits on
+retained RGBA8 sRGB Vulkan texture in the same submission as desktop composition. Sampling decodes
+client sRGB into linear light; the retained attachment encodes on store and decodes on subsequent
+sampling, preserving dark shades without blending in encoded space. That submission waits on
 the acquire fence, signals and exports the per-commit release fence, and keeps `wl_buffer` busy until
 GPU completion. If the commit supplies a protocol explicit-sync fence, the host consumes it. Because
 `linux-dmabuf` otherwise uses implicit synchronization, the host snapshots the DMA-BUF reservation
@@ -610,15 +656,33 @@ raster work and distinguish worker-full from owner-regional SHM copies.
 
 ### Live-resize scheduling audit
 
+`desktop_wayland/size_policy.rs` owns the shared preferred logical minimum (default
+300x200), usable-area bounds and native min/max reconciliation. Client maximums can
+reduce the preference, fixed-size windows remain fixed, and invalid contradictory
+limits are discarded. A native client declining the same automatic resize is not
+reconfigured indefinitely; an explicit new resize can try again. Oversized constrained
+windows retain a reachable titlebar. Fullscreen/maximized and unmanaged popup policy
+are separate. Capability-aware chrome preserves close/move while suppressing secondary
+controls on narrow or fixed-size windows.
+
+The X11 adapter converts preferred/available sizes to X pixels before its bounded
+grid/aspect solver. Policy floors do not modify ICCCM base-size semantics. It first
+tries the preferred floor within available space, then relaxes the preference, then
+allows valid client constraints exceeding available space; wholly invalid constraints
+use bounded defaults. Resize previews and completion retain the actual selected pixel
+target. Tests cover fixed/max-size exceptions, work-area pressure, invalid hints,
+aspect/increment preservation and native refusal without repeated requests. Explicit
+per-window magnification remains a separate UI capability.
+
 The inherited X11 root cursor now accepts a bounded static snapshot from the same
 `render_cursor_image(TelorgonDefault)` asset/theme path used by native pointer rendering.
-It is rasterized at logical resolution, preserving tint, alpha and hotspot. Animated
+It is rasterized at the session's X11 pixel density, preserving tint, alpha and hotspot. Animated
 assets use their first frame; live theme changes and arbitrary composed pointer components
 are not exported. Composed components or oversized images retain a diagnosed built-in
 arrow fallback. An explicitly hidden default exports a transparent cursor.
 
 `xwayland/root_cursor.rs` owns protocol-neutral RGBA-to-premultiplied-ARGB conversion
-and a 128x128 bound. Manager startup asynchronously discovers RENDER 0.5 and an exact
+and a 256x256 bound. Manager startup asynchronously discovers RENDER 0.5 and an exact
 ARGB32 picture format, checks the server pixmap layout/byte order, splits PutImage by
 the negotiated request size, creates the cursor and assigns only the root attribute.
 Temporary pixmap/GC/picture/cursor resources are freed in request order; the root retains
@@ -633,6 +697,37 @@ were replacing every Xwayland cursor, monochrome conversion, and a runtime xsetr
 dependency. Tests cover alpha, byte order, invalid bounds/hotspots, upload ordering and
 checked failure; exact visual matching remains a user-run test.
 
+The managed single-output host uses one fixed X11 density: the ceiling of output scale,
+bounded to 1–8. The dedicated Xwayland connection receives xdg-output positions/extents
+multiplied by this density; ordinary clients retain the normal logical output namespace.
+X11 surface publications retain raw pixel/surface extents and a separate density, while
+desktop policy uses divided extents. Shared SurfacePlacement applies the inverse mapping
+for absolute input and pointer constraints. Accelerated relative deltas follow that mapping;
+device unaccelerated deltas remain unchanged. X11 configure positions/sizes and normal-hint
+constraints use X pixels; resize completion still compares raw server and buffer sizes.
+Completion also requires the retained custom frame's content slot to match the requested
+logical size. A ready client buffer cannot remove the veil while chrome still describes
+the previous size, including when policy adjusts geometry after frame layout. This is
+an owner-side completion check; GPU submission and resource ownership are unchanged.
+A frame-layout regression test covers stale chrome followed by matching layout at 3x
+X11 density. Live resize/maximize/restore verification remains a separate user-run check.
+Subsurface offsets, unmanaged windows and drag/cursor images use the same conversion.
+
+At 300%, a 300x200 logical content area requests 900x600 X pixels, and a 24x24 asset
+cursor is rasterized at 72x72 with its hotspot scaled before export. Composition retains
+those pixels instead of enlarging a logical-resolution intermediate. Root Xresources
+publish Xft.dpi and Xcursor.size for clients that honor them; no global toolkit backend or
+application environment override is installed. Legacy fixed-pixel applications may open
+smaller and need their own font/UI settings. Animated/live theme export, dynamic session
+density, mixed-output policy and universal toolkit DPI behavior remain outside this slice.
+Fractional outputs use an integer-density buffer and resampling; sharpness needs live testing.
+
+Source inspection included the pinned Xwayland rootless scale exclusion in
+`xwayland-screen.c:xwl_screen_update_global_surface_scale`, cursor hotspot/buffer handling
+in `xwayland-cursor.c`, and xdg-output/RandR handling in `xwayland-output.c`. Tests cover
+authorized versus ordinary output coordinates (including rotation and negative origins),
+window/configure/input round trips, and exact dense cursor pixels through hardware sizing.
+
 Hidden final-size content receives pacing callbacks through the shared window predicate
 for both native and X11 adapters. Otherwise Xwayland Present can wait for a callback
 behind the very veil waiting for its replacement image. These callbacks do not report
@@ -640,6 +735,12 @@ hidden content as presented or release GPU ownership. The pinned Xwayland 24.1.1
 `xwayland-present.c` frame-callback path and Telorgon's occluded-frame path were inspected;
 state tests cover settling, stale revisions and completion. Live GLX validation remains
 separate from these tests.
+
+Unsynchronized X11 resize completion has no artificial delay or extra-publication
+requirement. Checked server geometry, fresh matching content, pending-command,
+and chrome checks determine readiness. The user accepted occasional intermediate
+content rather than the latency of the removed 750 ms workaround. Client repaint
+acknowledgements remain an additional gate where supported.
 
 Explicit user close uses WM_DELETE_WINDOW where supported. For a live managed window
 whose known protocols omit it, the XWM sends KillClient for that window resource, as
@@ -754,6 +855,177 @@ state, policy, composition, and rendering. They remain useful external compatibi
 
 ## Verification and qualification boundary
 
+### Accelerated SDR color and latency follow-up (2026-09-13)
+
+The user-run capture `test-compositor/latency-captures/20260913-020409-hgw8mn93` confirms
+1,591 X11 DMA-BUF publications and no X11 SHM publications after the host Wayland-client linkage
+fix. Oldest-input-to-flush-attempt p99 is 12.48 ms (previous capture: 22.05 ms), and exact
+publication-to-first-flip-observation p95 is 49.77 ms (previous: 80.86 ms). These are owner
+observations from different interactive workloads, not controlled input-to-photon measurements;
+the new ring overwrote 9,323 older events. The largest active phase is now DMA-BUF preparation:
+p95 13.81 ms, maximum 17.13 ms, overlapping the slowest input batch (17.67 ms). This does not
+identify which driver operation blocks. New disjoint phases separate target/source allocation,
+external import/binding, source scene delta, and retained binding/replacement. The old
+`vulkan_dmabuf_prepare` aggregate is therefore not directly comparable to that phase alone in
+new captures; inspect all `vulkan_dmabuf_*` phases.
+
+The same run exposed overly bright client colors. `DmaBufImporter` selected the first queried
+capability for a DRM format/modifier, but both UNORM/linear and sRGB Vulkan formats can describe
+that tuple. Sorting placed UNORM first. Ordinary legacy SDR sRGB client pixels were consequently
+interpreted as linear light and encoded again on presentation (opaque gray 128 becomes about 188).
+The compositor bridge now filters its queried capability table to importable, single-plane sRGB
+RGBA/BGRA formats before advertising, describing or importing buffers. This matches the existing
+SHM SDR policy; low-level Vulkan callers can still explicitly import linear images. A modifier
+without a queried sRGB import candidate is not advertised by this bridge.
+
+The compositor-owned materialization texture also uses an sRGB format, encoding metadata and
+target color space consistently. An 8-bit linear intermediate after source decoding would lose
+near-black precision. Native sRGB sampling and attachment writes preserve the existing linear
+shader/blending contract while retaining encoded 8-bit precision. Acquire/release fences,
+submission ownership, layouts, generation retirement and alpha representation are unchanged.
+Target creation verifies queried optimal-tiling sampling, linear filtering, attachment, blending
+and transfer-source support before allocating the selected sRGB format.
+This is a legacy SDR correction, not ICC/HDR/wide-gamut color-management support.
+
+Reference audit: the adjacent `../other-rendering-libs` checkout is absent. For this narrow format
+correction, inspected upstream [wgpu Vulkan format mapping](https://raw.githubusercontent.com/gfx-rs/wgpu/trunk/wgpu-hal/src/vulkan/conv.rs)
+(`PrivateCapabilities::map_texture_format`) and independent [Flutter Impeller Vulkan format mapping](https://api.flutter.dev/impeller/formats__vk_8h_source.html)
+(`ToVKImageFormat`); both distinguish UNORM and sRGB native formats for identical channel layouts.
+Checked the [official Vulkan format semantics](https://docs.vulkan.org/refpages/latest/refpages/source/VkFormat.html)
+for encoded RGB and unchanged UNORM alpha. Local paths inspected: `compositor_render/linux.rs`,
+`renderer_vulkan/{external_dma_buf,target,scene,image}.rs`, the desktop Vulkan renderer, and
+`telorgon-shader-build/shaders/vulkan/box/image.frag`. Derived invariants: advertise the actual
+queried native format, decode before linear composition, keep retained format/metadata/target
+space consistent, and encode only through the appropriate attachment boundary. Rejected manual
+gamma in shared shaders, output-wide KMS gamma changes, and relabeling an unqueried UNORM import
+as sRGB. Also deferred resource pooling until finer timing identifies the stall; this change does
+not alter GPU lifetimes.
+
+CPU regression tests cover capability order, unsupported/multiplane/mislabeled candidates,
+RGBA/BGRA opaque and premultiplied metadata, and a 256-value opaque SDR ramp through modeled
+native decode, retained quantization and presentation. The ramp fails for the former bright
+import and for a linear 8-bit retained intermediate. It models the specified conversions and
+does not execute GPU shaders. Live color correctness and timings after this correction remain
+user-run qualification.
+
+Validation: 8 compositor-render tests (one optional timing probe ignored), 115 desktop-host tests
+and 41 Vulkan unit tests pass. Vulkan and Linux DMA-BUF hardware test binaries compile without
+being executed. The consuming compositor release build embeds the corrected real Xwayland payload;
+formatting and diff-whitespace checks pass. No compositor or hardware test was launched.
+
+### Retained DMA-BUF resource rework (2026-09-13)
+
+The later detailed owner trace `test-compositor/latency-captures/20260913-022120-1g4_77zn`
+isolates owned-target/source allocation at p95 18.14 ms, maximum 27.45 ms, versus external import
+at p95 0.21 ms, maximum 0.72 ms. Allocation spans overlap the 20 slowest retained input batches.
+The ring overwrote 169,452 older events; this is an overlap lead rather than a CPU/GPU causal trace.
+It is also a different session from the much later Ubuntu/Telorgon browser comparison.
+
+The bridge now reuses owned targets/source scenes, caches completed imports, preserves compatible
+damage, allocates target misses outside the owner thread and bounds primary render work ahead.
+See [DMA-BUF rendering rework](XWAYLAND_RENDER_REWORK.md) for queue barriers, per-generation
+acquire/release rules, cache/pool bounds, damage-history fallbacks, reference audit, diagnostics and
+regression tests. This supersedes the earlier allocation deferral; post-change hardware/color and
+latency qualification remain user-run.
+
+### Input latency capture audit (2026-09-13)
+
+`desktop_wayland/latency_trace.rs` adds an optional bounded owner recorder selected by
+`TELORGON_LATENCY_TRACE=/new/file.jsonl`. It reserves a private, create-new file and a 262,144-event
+ring, records disjoint phase wall times plus input-batch/slot/surface-revision observations, and
+writes the retained tail on owner destruction. No capture event performs file I/O, locking, or heap
+allocation. Disabled captures have no ring or trace clock reads. File creation failures stop the
+requested experiment visibly; write failures are logged. This is narrow desktop diagnostic plumbing
+alongside `frame_stats`, not a replacement for the compile-optional profiler or its GPU timestamps.
+
+The adjacent reference-source library remains absent. Inspected local paths were the complete
+desktop owner loop, `frame_stats.rs`, `renderer/{mod,vulkan}.rs`, the Vulkan completion worker,
+`wayland_server/server.rs` dispatch/flush and existing surface-revision/presentation bookkeeping.
+Only timestamp boundaries were added inside the Vulkan path; no GPU synchronization, resource
+ownership, frame scheduling, protocol advertisement or platform contract changed. The existing
+libinput/Wayland audit below supplies the input timestamp/flush semantics. The browser control probe
+follows the official [Event Timing](https://www.w3.org/TR/event-timing/) and
+[animation timing](https://www.w3.org/TR/animation-timing/) contracts. No independent renderer
+implementation review is claimed for this observational change.
+
+Invariants: idle wait/Wayland dispatch is labeled separately; phase spans do not overlap; overwritten
+evidence is counted; opaque surface/revision matches are counted only on their first observed flip;
+mailbox discards cannot masquerade as a later frame on the same slot; missing data remains missing.
+Input flush, GPU completion and page-flip observations are not client receipt, GPU timestamps or
+input-to-photon measurements. Browser clocks stay separate. The host records no input contents.
+Rejected alternatives were synchronous per-motion logging, synthetic X11 injection that bypasses
+libinput, correlating each input with an unrelated next frame, changing synchronization to diagnose
+it, and requiring a live profiling service for the initial capture.
+
+The companion `../test-compositor/INPUT_LATENCY_HARNESS.md` documents the foreground capture launcher,
+offline report/timeline, optional browser control workload, backend comparison and explicit regression
+limits. CPU tests cover bounded storage, phase boundaries, timestamp exclusions, missing-data gates,
+late-input overlap, exact revision/slot matching, discarded frames, export integrity and browser
+sample bounds. Live latency/overhead and Firefox/native-app comparisons remain user-run qualification.
+
+### Input delivery audit (2026-09-13)
+
+The owner loop previously queued input until the next `dispatch_and_flush`, after buffer processing
+and rendering. `LibInputContext::next_event` also returned `None` for unsupported events, causing
+the host's drain loop to stop with remaining input still queued. The local `/usr/include/libinput.h`
+and [official libinput context API](https://wayland.freedesktop.org/libinput/doc/latest/api/group__base.html)
+document both queue-empty semantics and modern scroll events emitted alongside legacy axis events
+with no ordering guarantee. The [official Wayland server API](https://wayland.freedesktop.org/docs/html/apc.html)
+and Telorgon's `wayland_server/server.rs` define the distinction between outgoing flush and incoming
+dispatch. The absent adjacent reference library remains unavailable; this fix is confined to CPU
+queue draining, output delivery boundaries and diagnostic counters, with no GPU mechanism changes.
+
+Regression tests cover legacy/modern scroll pairs in either order followed by button/motion events,
+consecutive ignored events followed by keyboard input, and stopping only at a genuinely empty queue.
+An in-process libwayland socket test demonstrates that an owner-generated callback remains buffered
+until flushed, is then readable without rendering, and does not dispatch a pending incoming sync
+request. Timing tests exclude missing/future timestamps and preserve weighted event-age summaries.
+Rejected approaches: processing both scroll streams, dispatching the protocol reentrantly during
+rendering, bypassing frame-completion requirements, or inventing Firefox processing latency from
+server-side timestamps. Live improvement still needs a user-run input trace.
+
+### DMA-BUF v4 / Xwayland device-discovery audit (2026-09-13)
+
+Concern: the existing v3-only global lacks the device discovery required by the bundled Xwayland
+24.1.13 when `wl_drm` is absent. The adjacent `../other-rendering-libs` library was unavailable.
+This change confines itself to protocol metadata and uses these independent read-only references:
+
+- Bundled Xwayland 24.1.13, under
+  `../xwayland-build/work/build-run/sources/xwayland-24.1.13/hw/xwayland/`:
+  `xwayland-glamor.c::xwl_glamor_has_wl_interfaces`, `xwl_glamor_init`,
+  `xwayland-glamor-gbm.c::xwl_glamor_gbm_init_main_dev`, and
+  `xwayland-dmabuf.c`'s registry bind, format-table mmap/unmap, main-device resolution, tranche
+  assembly, feedback completion, and destruction. The source/version and patches are pinned by
+  `packaging/xwayland/`; no helper binary or source was changed.
+- Upstream [Smithay DMA-BUF implementation](https://raw.githubusercontent.com/Smithay/smithay/master/src/wayland/dmabuf/mod.rs),
+  inspected as an unpinned remote snapshot on this date: `DmabufFeedbackBuilder`, sealed table
+  construction, `DmabufFeedback::send`, and surface instance weak-reference/update/removal handling.
+  Compared invariants only; no source was copied and no dependency was added.
+
+The authority is the official Wayland protocols 1.47
+`stable/linux-dmabuf/linux-dmabuf-v1.xml` (also in the bundled source tree): v4 feedback requests,
+deprecated legacy events, native-endian dev_t/16-byte table/16-bit indices, sampling tranches,
+immutable table lifetime, and inert feedback after surface destruction. The existing
+`renderer_vulkan/adapter.rs::drm_adapter` verifies KMS/Vulkan device identity, allowing the host to
+advertise that KMS primary node without guessing a render-node number. Xwayland resolves the
+matching render node with libdrm. No Vulkan import, ownership, queue, or synchronization contract
+changes were required.
+
+Telorgon uses one sealed table and one sampling tranche for the selected device. Constructor
+failures advertise no global; empty/oversized tables, zero device identities, and reconfiguration
+are rejected. Both feedback requests send a complete transaction; there is no mutable per-surface
+policy in this single-output implementation. Feedback objects use existing client object accounting
+and independent destruction. V3 format-only embedders keep their API and negotiated v3 behavior.
+
+Rejected: increasing the version without handlers, guessing `/dev/dri/renderD128`, advertising
+all DRM modifiers, adding legacy `wl_drm`, claiming direct scanout, or bypassing acquire/release
+synchronization. Tests decode real libwayland messages and SCM_RIGHTS, inspect and attempt to mutate
+the received sealed table, check event ordering and deduplication, destroy surface/factory before
+feedback/params, retain v3 modifier events, bound large index messages, and reject invalid
+configuration without replacing live state. Live driver import, Glamor, Firefox WebRender, GPU
+synchronization, visual correctness, and performance remain hardware qualification requirements;
+see [X11 GPU smoke test](X11_SMOKE_TEST.md#gpu-acceleration).
+
 Portable state tests cover surface commits, roles, ownership, serials, subsurface cycles, buffer
 release tracking, SHM/DMA-BUF validation, xdg configure ordering, XML schema bounds, and KMS frame
 slot reuse. Windows-hosted checks cover the non-Linux declarations; an
@@ -812,3 +1084,25 @@ trace of the descriptor-only test contained no protocol XML access. The non-Linu
 branch was exercised with missing inputs, but no non-Linux Rust target was installed for a full
 cross-target check. Existing unrelated dead-code warnings remain. No GUI, server, or hardware run
 was performed.
+
+### Opt-in frame pacing observations
+
+`TELORGON_FRAME_STATS=1` adds bounded owner-loop statistics, emitted approximately
+every two seconds of activity: configured mode refresh, completed primary-frame
+rate (excluding cursor-only commits and initial modeset), distinct presented
+surface revisions, longest primary completion observation gap, and CPU frame
+preparation/submission wall time. It does not add idle wakeups or alter scheduling.
+Idle gaps are not classified as dropped frames. Observation timestamps include
+owner-thread dispatch latency; these are not DRM hardware timestamps or GPU timing.
+Per-surface storage is capped at 256 entries and retires unobserved entries.
+The consumer's `test-frame-pacing.sh` and `frame-test.html` provide a repeatable
+animated workload and independent browser callback counter, with instructions in
+`test-compositor/FRAME_PACING_TEST.md` outside this repository.
+
+Audit: reviewed this document's KMS ownership/scheduling section, `PROFILER.md`,
+`PERFORMANCE.md`, the desktop owner's frame-slot completion and render paths, and
+existing resize tracing. The adjacent reference library remains absent. These
+changes only observe existing CPU transitions; no graphics API, presentation,
+resource lifetime or synchronization contract changes. Counting render submissions
+as presentations and classifying idle gaps as missed vblanks were rejected. A unit
+test verifies repeated surface revisions do not inflate new-content counts.

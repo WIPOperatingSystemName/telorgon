@@ -29,6 +29,29 @@ Telorgon test-seat/session procedure. It uses the consuming project's configured
 Vulkan renderer. Do not replace an active production session for this test.
 Repository guidance reserves interactive and hardware-presenting runs for the user.
 
+## GPU acceleration
+
+From the consuming project's usual test-session starting point, use:
+
+```sh
+cd /home/aku/CompositorStuff/test-compositor
+TELORGON_WAYLAND_ERROR_LOG=1 TELORGON_PROFILE=release ./start.sh
+```
+
+Confirm startup reports `telorgon-dmabuf: v4 feedback enabled` with the matched DRM device and
+nonzero format/modifier count. Xwayland stderr must not report `GBM Wayland interfaces not available`,
+`Failed to initialize glamor`, or `falling back to sw`. Readiness alone does not prove acceleration.
+Inside the session, `glxinfo -B` (when installed) should name the hardware renderer rather than
+llvmpipe/softpipe. Launch a fresh X11 Firefox process (`MOZ_ENABLE_WAYLAND=0 firefox --no-remote`)
+and check `about:support`: Window Protocol should be X11, Compositing should use WebRender,
+and the graphics details must not indicate a software renderer. Close other instances using the
+same profile before launching this fresh process.
+
+Exercise scrolling, animation, resize and maximize. The existing `test-frame-pacing.sh` can capture
+timings with the same environment variables. Test native Wayland clients and the software
+compositor separately: the latter must keep SHM and must not advertise DMA-BUF v4. This check
+qualifies a particular GPU/driver/session; unit tests do not establish live acceleration.
+
 ## Presentation and input
 
 1. Press **Ctrl+T** to launch Foot through Telorgon's managed session. If pressed
@@ -89,7 +112,7 @@ The inherited arrow now uses the configured Telorgon asset cursor (including tin
 hotspot), captured at startup. Restart and launch glxgears without a probe; compare the
 arrow over content with the default arrow outside the window. Check click position and
 leave/re-enter behavior. Application-specific cursors remain unchanged. This exports a
-static first frame; composed component cursors and images larger than 128x128 use a
+static first frame; composed component cursors and images larger than 256x256 use a
 logged built-in fallback. Live X11 visual validation is still outstanding.
 
 For an accelerated client regression, launch `glxgears` from the compositor's terminal.
@@ -97,8 +120,23 @@ Check the pointer stays visible over content, then resize from every edge and ve
 animation resumes after the veil clears. Repeat maximize/restore and rapid consecutive
 resizes while Foot remains usable. Close using the frame button: legacy clients without
 WM_DELETE_WINDOW are disconnected, so a nonzero process exit is acceptable here.
-Retest the disappearing cursor specifically; the pending-image fallback is covered by
-unit tests but has not yet been confirmed to explain the reported glxgears symptom.
+At 300%, X11 now uses three pixels per logical desktop unit. Compare the cursor with
+the native arrow and resize glxgears to a similar on-screen size as before: content
+should have more detail. Check click alignment, every resize edge, maximize/restore,
+and leave/re-enter. Fixed-pixel apps can initially appear smaller; Xft DPI resources
+help supporting clients but do not make every legacy toolkit scale its controls.
+This high-density path needs live validation, especially on fractional outputs.
+
+Ordinary windows now prefer a 300x200 logical minimum, configurable with
+`LinuxDesktopConfig::preferred_window_minimum`. Launch glxgears without a geometry
+override: its fixed pixel request should be enlarged to at least that logical size,
+unless client constraints or available space require an exception. Test shrinking
+from every edge and verify the opposite edge stays anchored. Test a fixed-size dialog
+and a terminal using resize increments: the dialog should retain its permitted size;
+the terminal should land on a valid grid size. Standard capability-aware frames hide
+secondary buttons when narrow and disable resize/maximize for fixed-size clients.
+Fullscreen/maximized sizing is separate. This policy does not magnify legacy text or
+controls; a per-window magnification control is not included.
 
 For visual diagnosis, restart the consuming compositor with:
 
@@ -114,7 +152,70 @@ If maximize/restore still show no veil with the diagnostic enabled, report the
 matching `resize veil` lines from `compositor.log`; a fast client alone would no
 longer explain the absence. This does not prove that xmessage supports resize sync.
 
+### Unsynchronized resize completion
+
+Normal `start.sh` uses immediate buffer-based completion once server geometry,
+content size/revision, commands, and chrome agree. There is no artificial delay
+or extra-update requirement. The 750 ms workaround was removed at the user's
+request; the user accepts the intermittent visual artifact. Explicitly advertised
+client resize acknowledgement still gates completion where supported.
+
+The old `test-x11-resize-extra-update.sh` remains a compatibility entry point for
+normal behavior. `test-x11-resize-delay.sh` is solely an opt-in diagnostic launcher
+that intentionally adds a hold; do not use it for normal startup.
+
+### Image/revision trace for intermittent flashes
+
+Launch with `test-compositor/test-x11-resize-trace.sh` instead of the earlier
+launcher. It enables `TELORGON_X11_RESIZE_TRACE=1` alongside the normal fallback.
+The separate diagnostic hold override is disabled. Inside the compositor, run glxgears in one terminal
+and `record-x11-resize-test.py` in another. Arm a trial, resize glxgears once, wait
+one second after the veil clears, and label it good or bad. Reports preserve both
+completion reasons and trace lines. Capture at least one of each outcome.
+
+Each trace line identifies the resize, surface, event order, and elapsed microseconds.
+Stages record incoming buffer ID/extent/revision, prepared-image update type,
+veil removal, retained scene image/content version, DMA-BUF materialization buffer
+and lease, successful Vulkan submission with retained binding extent/generation,
+and presentation feedback. `render-request` links the host frame and scanout slot
+to the submitted revision. A GPU submission is not proof of scanout; older
+already-queued frames may complete after veil removal. The recorder compares the
+first traced GPU submission after reveal, not the first presentation callback.
+
+Tracing lasts up to five seconds before reveal and one second afterward, capped
+at 1,000 events per capture and 64 tracked surfaces. It is disabled by default and
+captures metadata only; matching revisions cannot prove that the pixels contain
+a finished application redraw. Logging can perturb timing. The trace adds no
+GPU readback, waits, or changes to image ownership. Inspected paths include
+`client.rs:apply_surface_publication`, `scene.rs:ImageScene::synchronize`,
+`renderer/vulkan.rs:prepare_dma_bufs`/`render`, and
+`renderer_vulkan/scene.rs:bind_materialized_image`; the read-only binding query
+reports the actual retained resource's extent and generation. The adjacent
+reference library remains unavailable; this diagnostic preserves the previously
+reviewed synchronization contract rather than introducing a new one.
+
+Validation: all 108 desktop-host tests passed serially; a parallel run hit an
+existing private-client allocation failure (107 passed). Recorder classification,
+surface-ID matching, shell syntax, and a mocked launcher/interactive-report flow
+passed. No compositor was launched by the agent. Pixel capture remains a possible
+next diagnostic if revision/binding correlation does not explain a bad frame.
+
 ## Shutdown and failure containment
+
+For an unexplained Firefox channel error or private Xwayland disconnect, launch
+the consuming compositor with `test-compositor/start-x11-error-log.sh`, then run
+`test-compositor/firefox-x11-log.sh` inside its terminal. The first enables
+`TELORGON_WAYLAND_ERROR_LOG=1`: rejected dispatch requests log PID, object,
+interface, opcode and request name, while posted protocol errors log their code
+and escaped message. Global-bind failures also retain their error. Xwayland
+stderr is escaped and forwarded up to 64 KiB per helper process; remaining output
+is still drained. Normal launches retain the previous discard behavior.
+The compositor output is in `compositor.log`; Firefox console/sandbox output is
+in `firefox-x11.log`. Launchers overwrite those logs on their next invocation.
+No request arguments, environment contents, or authentication cookies are added
+to protocol logs. These diagnostics do not change protocol acceptance or repair
+a disconnected client. The existing helper-output flood test exercises draining
+with diagnostics enabled; live Firefox reproduction remains user-run.
 
 With Foot and xmessage open, press **Ctrl+Q** (the consuming project's exit binding).
 Ordinary X11 windows should participate in cooperative shutdown. A client that
@@ -133,3 +234,16 @@ GPU/driver/kernel, and compositor exit/signal diagnostics. No pixels, typed text
 clipboard content, credentials, or authority-cookie bytes are needed in the report.
 This smoke test does not qualify acceleration, multiple outputs, clipboard/DnD,
 Steam/Wine, Horizon, or release portability.
+
+### Firefox decoration ownership
+
+Launch Firefox inside Telorgon using the existing X11 launcher. In Firefox's Customize Toolbar
+screen, toggle **Title Bar**. Client decorations should retain Telorgon's border/radius/colors but have no extra Telorgon title bar; enabling
+the native title bar should restore Telorgon's chrome. Normal client content should retain its root
+position, and clicking the removed title-bar area should no longer invoke compositor controls.
+Repeat while maximized, then restore, and check at the configured X11 scale.
+
+From a terminal inside Telorgon, run `xprop _MOTIF_WM_HINTS _NET_FRAME_EXTENTS` and select Firefox.
+Client-decorated windows should report the measured outer border extents, with no added title-bar height. Decorated windows should
+report left/right/top/bottom margins in X11 pixels (including the title bar in the top margin).
+Fullscreen should report zeros. Firefox's own tabs/header are client content, not frame extents.

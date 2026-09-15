@@ -58,12 +58,20 @@ impl PipelineCache {
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(blend_mode == BlendMode::Alpha)
+            .blend_enable(blend_mode != BlendMode::Opaque)
             .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .dst_color_blend_factor(if blend_mode == BlendMode::Add {
+                vk::BlendFactor::ONE
+            } else {
+                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+            })
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .dst_alpha_blend_factor(if blend_mode == BlendMode::Add {
+                vk::BlendFactor::ONE
+            } else {
+                vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+            })
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA);
         let blend_attachments = [blend_attachment];

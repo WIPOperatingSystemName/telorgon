@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::compositor_wayland::{ResizeEdge, WaylandSurfaceId, XdgConfigure};
 use crate::core::{PointF, PointI, RectI, SizeI};
 
+/// A pending page flip may overlap one render, but don't build a queue behind GPU/ready work.
+pub(super) fn primary_render_budget(gpu_pending: usize, ready_pending: usize) -> bool {
+    gpu_pending == 0 && ready_pending == 0
+}
+
 /// Native xdg configure transaction state. Desktop geometry and retained surface
 /// imagery are deliberately outside this record. X11 geometry commands have no
 /// xdg acknowledgement or terminal-configure transaction to store here.
@@ -182,6 +187,7 @@ fn resizes_top(edge: ResizeEdge) -> bool {
 /// and viewport conversion have already been applied to `source_extent` before this boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SurfacePlacement {
+    pub surface_scale: i32,
     pub target: RectI,
     pub clip: Option<RectI>,
 }
@@ -189,6 +195,7 @@ pub(super) struct SurfacePlacement {
 impl SurfacePlacement {
     pub fn native(source_extent: SizeI, origin: PointI) -> Self {
         Self {
+            surface_scale: 1,
             target: RectI {
                 x: origin.x,
                 y: origin.y,
@@ -259,15 +266,15 @@ impl SurfacePlacement {
 
     pub fn surface_local(self, position: PointF) -> PointF {
         PointF {
-            x: position.x - self.target.x as f32,
-            y: position.y - self.target.y as f32,
+            x: (position.x - self.target.x as f32) * self.surface_scale as f32,
+            y: (position.y - self.target.y as f32) * self.surface_scale as f32,
         }
     }
 
     pub fn output_position(self, position: PointF) -> PointF {
         PointF {
-            x: position.x + self.target.x as f32,
-            y: position.y + self.target.y as f32,
+            x: position.x / self.surface_scale as f32 + self.target.x as f32,
+            y: position.y / self.surface_scale as f32 + self.target.y as f32,
         }
     }
 }
@@ -288,6 +295,17 @@ fn intersection(left: RectI, right: RectI) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_backpressure_resumes_after_gpu_and_ready_retirement() {
+        // A flip may be pending during each of these transitions. It doesn't consume the render
+        // budget itself; a completed frame waiting behind it does.
+        assert!(primary_render_budget(0, 0));
+        assert!(!primary_render_budget(1, 0)); // queued GPU work
+        assert!(!primary_render_budget(0, 1)); // completion observed, waiting for KMS
+        assert!(primary_render_budget(0, 0)); // moved to the pending flip
+        assert!(!primary_render_budget(2, 1)); // tolerate a pre-existing queue during transition
+    }
 
     #[test]
     fn native_content_does_not_stretch_or_expose_shadow_margins() {

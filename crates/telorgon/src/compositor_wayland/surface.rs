@@ -38,6 +38,7 @@ pub struct BufferAttachment {
 pub struct SurfaceCommit {
     pub attachment: Option<Option<BufferAttachment>>,
     pub damage: Vec<RectI>,
+    pub buffer_damage: Vec<RectI>,
     pub opaque_region: Option<Option<Region>>,
     pub input_region: Option<Option<Region>>,
     pub buffer_scale: Option<i32>,
@@ -51,6 +52,7 @@ pub struct SurfaceStateSnapshot {
     pub role: Option<SurfaceRole>,
     pub attachment: Option<BufferAttachment>,
     pub damage: Vec<RectI>,
+    pub buffer_damage: Vec<RectI>,
     pub opaque_region: Option<Region>,
     pub input_region: Option<Region>,
     pub buffer_scale: i32,
@@ -82,6 +84,7 @@ impl SurfaceState {
             role: None,
             attachment: None,
             damage: Vec::new(),
+            buffer_damage: Vec::new(),
             opaque_region: None,
             input_region: None,
             buffer_scale: 1,
@@ -147,7 +150,10 @@ impl SurfaceState {
         commit
             .damage
             .retain(|rectangle| rectangle.width > 0 && rectangle.height > 0);
-        if commit.damage.len() > 256 {
+        commit
+            .buffer_damage
+            .retain(|rectangle| rectangle.width > 0 && rectangle.height > 0);
+        if commit.damage.len() + commit.buffer_damage.len() > 256 {
             return Err(SurfaceError::TooManyDamageRectangles);
         }
         if commit.buffer_scale.is_some_and(|scale| scale <= 0) {
@@ -165,10 +171,21 @@ impl SurfaceState {
         if rectangle.width <= 0 || rectangle.height <= 0 {
             return Ok(());
         }
-        if self.pending.damage.len() >= 256 {
+        if self.pending.damage.len() + self.pending.buffer_damage.len() >= 256 {
             return Err(SurfaceError::TooManyDamageRectangles);
         }
         self.pending.damage.push(rectangle);
+        Ok(())
+    }
+
+    pub fn damage_buffer(&mut self, rectangle: RectI) -> Result<(), SurfaceError> {
+        if rectangle.width <= 0 || rectangle.height <= 0 {
+            return Ok(());
+        }
+        if self.pending.damage.len() + self.pending.buffer_damage.len() >= 256 {
+            return Err(SurfaceError::TooManyDamageRectangles);
+        }
+        self.pending.buffer_damage.push(rectangle);
         Ok(())
     }
 
@@ -222,6 +239,7 @@ impl SurfaceState {
             self.current.buffer_transform = transform;
         }
         self.current.damage = pending.damage;
+        self.current.buffer_damage = pending.buffer_damage;
         self.revision = revision;
         self.current.revision = revision;
         self.current.acknowledged_configure = None;
@@ -359,6 +377,32 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+
+    #[test]
+    fn surface_and_buffer_damage_remain_separate_until_commit() {
+        let mut surface = SurfaceState::new(WaylandSurfaceId::from_raw(1).unwrap());
+        let logical = RectI {
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 5,
+        };
+        let physical = RectI {
+            x: 6,
+            y: 9,
+            width: 12,
+            height: 15,
+        };
+        surface.damage(logical).unwrap();
+        surface.damage_buffer(physical).unwrap();
+        surface.set_buffer_scale(3).unwrap();
+        surface.commit().unwrap();
+        assert_eq!(surface.snapshot().damage, [logical]);
+        assert_eq!(surface.snapshot().buffer_damage, [physical]);
+        surface.commit().unwrap();
+        assert!(surface.snapshot().damage.is_empty());
+        assert!(surface.snapshot().buffer_damage.is_empty());
+    }
 
     fn surface() -> WaylandSurfaceId {
         WaylandSurfaceId::new(NonZeroU32::new(1).unwrap())

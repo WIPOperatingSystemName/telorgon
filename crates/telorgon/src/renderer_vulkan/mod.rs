@@ -44,6 +44,8 @@ pub use external_dma_buf::{
     VulkanDmaBufFormatCapability, VulkanDmaBufImport, VulkanDmaBufPlane, VulkanDmaBufReleaseSyncFd,
     VulkanDmaBufScanoutTarget,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use external_image::CachedDmaBufImage;
 pub use external_image::{
     HostedExternalImageUse, HostedExternalSemaphoreSignal, HostedExternalSemaphoreWait,
     VulkanExternalAcquire, VulkanExternalImageCapabilities, VulkanExternalImageDescriptor,

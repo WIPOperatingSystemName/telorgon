@@ -12,7 +12,6 @@ use crate::render::{
 use super::buffer::AllocatedBuffer;
 use super::descriptor::{
     CompositeDescriptorSets, MAX_COMPOSITE_SCENES, MAX_COMPOSITE_TEXTURE_SETS,
-    allocate_composite_sets,
 };
 use super::error::unsupported;
 use super::executor::{
@@ -43,6 +42,14 @@ pub struct VulkanCompositePlacement {
     pub target: RectI,
     pub clip: Option<RectI>,
     pub rounded_clips: [Option<RoundedClip>; 2],
+}
+
+fn placement_blend(blend: BlendMode, rounded: bool) -> BlendMode {
+    if rounded && blend == BlendMode::Opaque {
+        BlendMode::Alpha
+    } else {
+        blend
+    }
 }
 
 struct PreparedPlacement {
@@ -148,18 +155,25 @@ impl VulkanDevice {
                 "cannot preserve an uninitialized Vulkan target",
             ));
         }
-        let descriptor_pool = frame.core.composite_descriptor_pool.ok_or_else(|| {
-            RenderError::new(
-                RenderErrorKind::HostContract,
-                "Vulkan composite rendering requires an owned frame",
-            )
-        })?;
+        // Cull before uploads, descriptors, validation and staging; retain unseen scene deltas.
+        let placements = placements
+            .iter()
+            .copied()
+            .filter(|p| placement_intersects(*p, render_region))
+            .collect::<Vec<_>>();
+        let descriptor_pool = frame
+            .core
+            .composite_descriptor_pool
+            .clone()
+            .ok_or_else(|| {
+                RenderError::new(
+                    RenderErrorKind::HostContract,
+                    "Vulkan composite rendering requires an owned frame",
+                )
+            })?;
 
-        for scene in scenes.iter() {
-            validate_retained_scene(scene.scene)?;
-        }
         let mut used = vec![false; scenes.len()];
-        for placement in placements {
+        for placement in &placements {
             used[placement.scene_index] = true;
         }
         let mut plans = Vec::with_capacity(scenes.len());
@@ -168,6 +182,7 @@ impl VulkanDevice {
         let external_start = frame.core.external_images.len();
         for (index, scene) in scenes.iter_mut().enumerate() {
             if used[index] {
+                validate_retained_scene(scene.scene)?;
                 external_barriers = external_barriers
                     .saturating_add(begin_external_image_uses(frame.core, scene.scene)?);
                 let plan = scene.scene.prepare_uploads(&self.inner)?;
@@ -187,18 +202,16 @@ impl VulkanDevice {
         // cursor likewise lets an owned command buffer populate several independent targets
         // before its final desktop pass without later CPU writes changing earlier commands.
         let staging_start = frame.core.staging_bytes_used;
-        let mut staging_bytes = vec![0_u8; staging_start];
+        let mut staging_bytes = Vec::new();
         let mut prepared = Vec::with_capacity(placements.len());
         let texture_counts = placements
             .iter()
             .map(|placement| scenes[placement.scene_index].scene.texture_count())
             .collect::<Vec<_>>();
-        let descriptor_groups = allocate_composite_sets(
-            &self.inner.raw,
-            descriptor_pool,
-            &self.inner.layouts,
-            &texture_counts,
-        )?;
+        let descriptor_groups = descriptor_pool
+            .lock()
+            .map_err(|_| super::error::internal("composite descriptor arena poisoned"))?
+            .allocate(&self.inner.layouts, &texture_counts)?;
         for (placement, descriptors) in placements.iter().zip(descriptor_groups) {
             let scene = &scenes[placement.scene_index].scene;
             let mapping = ViewMapping::new(scene.extent, placement.target);
@@ -207,12 +220,13 @@ impl VulkanDevice {
             let plan = plans[placement.scene_index]
                 .take()
                 .unwrap_or_else(SceneUploadPlan::default);
-            let staged = StagedUploads::append(
+            let staged = StagedUploads::append_at(
                 &view,
                 plan,
                 frame.core.staging.size(),
                 &mut staging_bytes,
                 self.inner.uniform_buffer_offset_alignment as usize,
+                staging_start,
             )?;
             let descriptor_writes = write_descriptors(
                 &self.inner.raw,
@@ -244,8 +258,8 @@ impl VulkanDevice {
         frame
             .core
             .staging
-            .write_at(staging_start as u64, &staging_bytes[staging_start..])?;
-        frame.core.staging_bytes_used = staging_bytes.len();
+            .write_at(staging_start as u64, &staging_bytes)?;
+        frame.core.staging_bytes_used = staging_start + staging_bytes.len();
 
         let mut buffer_copies = 0_u32;
         let mut upload_barriers = 0_u32;
@@ -356,12 +370,9 @@ impl VulkanDevice {
                 if scissor.extent.width == 0 || scissor.extent.height == 0 {
                     continue;
                 }
-                // Even an opaque XRGB image needs source-over at its antialiased clip edge.
-                let blend = if placement.rounded {
-                    BlendMode::Alpha
-                } else {
-                    batch.key.blend
-                };
+                // Opaque images need source-over at antialiased edges. Weighted additive
+                // endpoints must keep addition after coverage is applied.
+                let blend = placement_blend(batch.key.blend, placement.rounded);
                 let pipeline = self.pipeline(target.format, batch.key.pipeline, blend)?;
                 let primitive = primitive_index(batch.kind);
                 unsafe {
@@ -694,4 +705,56 @@ fn validate_render_region(region: RectI, target_region: RectI) -> RenderResult<(
         ));
     }
     Ok(())
+}
+
+fn placement_intersects(placement: VulkanCompositePlacement, damage: RectI) -> bool {
+    let mut rect = intersect_scissor(rect2d(placement.target), damage);
+    if let Some(clip) = placement.clip {
+        rect = intersect_scissor(rect, clip);
+    }
+    rect.extent.width != 0 && rect.extent.height != 0
+}
+
+#[cfg(test)]
+mod damage_culling_tests {
+    use super::*;
+    #[test]
+    fn rounded_coverage_preserves_weighted_additive_compositing() {
+        assert_eq!(placement_blend(BlendMode::Opaque, true), BlendMode::Alpha);
+        assert_eq!(placement_blend(BlendMode::Alpha, true), BlendMode::Alpha);
+        assert_eq!(placement_blend(BlendMode::Add, true), BlendMode::Add);
+        assert_eq!(placement_blend(BlendMode::Opaque, false), BlendMode::Opaque);
+    }
+
+    #[test]
+    fn placement_culling_preserves_partial_and_clipped_intersections() {
+        let mut p = VulkanCompositePlacement {
+            scene_index: 0,
+            target: RectI {
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+            },
+            clip: None,
+            rounded_clips: [None; 2],
+        };
+        let damage = RectI {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert!(!placement_intersects(p, damage));
+        p.target.x = 99;
+        p.target.y = 99;
+        assert!(placement_intersects(p, damage));
+        p.clip = Some(RectI {
+            x: 150,
+            y: 150,
+            width: 20,
+            height: 20,
+        });
+        assert!(!placement_intersects(p, damage));
+    }
 }

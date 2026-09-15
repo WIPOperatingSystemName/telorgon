@@ -8,9 +8,9 @@ use crate::ui::ImageId;
 mod cursor_theme;
 mod media;
 pub use cursor_theme::{
-    ClientCursorMode, CursorThemeError, PointerConfiguration, PointerFrame, PointerGraphic,
-    PointerHotspot, PointerRequest, PointerResolution, PointerTheme, PointerThemeFallback,
-    PointerThemeOverrides, resolve_pointer,
+    ClientCursorMode, CursorGraphic, CursorTheme, CursorThemeError, PointerConfiguration,
+    PointerFrame, PointerHotspot, PointerRequest, PointerResolution, PointerTheme,
+    PointerThemeFallback, PointerThemeOverrides, REQUIRED_CURSOR_ROLES, cursor, resolve_pointer,
 };
 pub use media::{AssetMediaCache, AssetMediaError, AssetRasterSize, DecodedAssetImage};
 
@@ -557,3 +557,6 @@ mod tests {
         assert_eq!(ImageSource::from(tinted).tint_color(), Some(white));
     }
 }
+
+#[cfg(test)]
+pub(crate) use cursor_theme::{cursor_test_bundle, cursor_test_theme};

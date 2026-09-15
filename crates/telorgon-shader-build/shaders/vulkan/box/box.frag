@@ -37,6 +37,21 @@ layout(location=0) out vec4 output_color;
 
 vec4 unpack_srgba(uint p){return vec4(float(p&255u),float((p>>8u)&255u),float((p>>16u)&255u),float((p>>24u)&255u))/255.0;}
 vec3 srgb_decode(vec3 v){bvec3 low=lessThanEqual(v,vec3(.04045));return mix(pow((v+.055)/1.055,vec3(2.4)),v/12.92,low);}
+// Convert local signed distance to output pixels using the analytic edge normal.
+// An L1 derivative width (fwidth) widens the AA band by sqrt(2) at 45 degrees.
+float rounded_pixel_width(vec2 p,vec2 size,vec4 radii){
+    vec2 dx=dFdx(p);
+    vec2 dy=dFdy(p);
+    vec2 half_size=size*.5;
+    float radius=p.x<half_size.x?(p.y<half_size.y?radii.x:radii.w):(p.y<half_size.y?radii.y:radii.z);
+    radius=clamp(radius,0.0,min(half_size.x,half_size.y));
+    vec2 delta=p-half_size;
+    vec2 q=abs(delta)-(half_size-vec2(radius));
+    vec2 outside=max(q,vec2(0));
+    vec2 normal=dot(outside,outside)>0.0?normalize(outside):(q.x>q.y?vec2(1,0):vec2(0,1));
+    normal*=sign(delta);
+    return max(length(vec2(dot(normal,dx),dot(normal,dy))),1e-4);
+}
 float clip_coverage(uint slot,vec2 p){
     if(slot==0xffffffffu)return 1.0;
     GpuClip c=clips.values[slot];
@@ -50,7 +65,7 @@ float clip_coverage(uint slot,vec2 p){
     vec2 q=abs(local-half_size)-(half_size-vec2(radius));
     float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
     // Match the analytic box edge rather than rounding coverage to a boolean.
-    return clamp(.5-d/max(fwidth(d),1e-4),0.0,1.0);
+    return clamp(.5-d/rounded_pixel_width(local,c.view_bounds.zw,c.radii),0.0,1.0);
 }
 
 float rounded_distance(vec2 p,vec2 size,vec4 radii){
@@ -67,7 +82,7 @@ float coverage(vec2 p,vec2 size,vec4 radii){
     vec2 dx=dFdx(p);
     vec2 dy=dFdy(p);
     float d=rounded_distance(p,size,radii);
-    float rounded=clamp(.5-d/max(fwidth(d),1e-4),0.0,1.0);
+    float rounded=clamp(.5-d/rounded_pixel_width(p,size,radii),0.0,1.0);
     bool axis_aligned=(dx.y==0.0&&dy.x==0.0)||(dx.x==0.0&&dy.y==0.0);
     if(all(lessThanEqual(radii,vec4(0)))&&axis_aligned){
         // Integrate the rectangular pixel footprint independently on each axis.
@@ -109,6 +124,8 @@ uint border_color(GpuBoxInstance item,vec2 p){
 void main(){
     GpuBoxInstance item=boxes.values[instance_slot];
     float clip_amount=clip_coverage(item.border_l_spatial_clip_flags.z,view_position);
+    float placement_amount=placement_coverage();
+    float body_clip=min(clip_amount,placement_amount);
     vec2 size=item.rect.zw;
     vec2 p=local_position;
     vec4 result=vec4(0);
@@ -125,7 +142,9 @@ void main(){
         result=over(result,premul(item.outline_shadow_colors.x,clamp(outer-inner,0.0,1.0),item.opacity));
     }
 
-    float outer=coverage(p,size,item.radii);
+    // A matching rounded clip intersects this shape; it must not square its edge
+    // coverage. Keep geometric coverage separate from fill/border material alpha.
+    float outer=min(coverage(p,size,item.radii),body_clip);
     vec4 widths=max(item.border_widths,vec4(0));
     vec2 inner_origin=vec2(widths.w,widths.x);
     vec2 inner_size=max(vec2(0),size-vec2(widths.w+widths.y,widths.x+widths.z));
@@ -137,9 +156,8 @@ void main(){
     if((flags&1u)!=0u)body+=premul(item.fill_border_t_r_b.x,inner,item.opacity);
     float ring=clamp(outer-inner,0.0,1.0);
     if((flags&2u)!=0u&&ring>0.0)body+=premul(border_color(item,p),ring,item.opacity);
-    result=over(result,body);
+    result=over(result*(clip_amount*placement_amount),body);
     // Finish all derivative-dependent coverage before any per-fragment discard.
-    float placement_amount=placement_coverage()*clip_amount;
-    if(result.a<=0.0||placement_amount<=0.0)discard;
-    output_color=(result)*placement_amount;
+    if(result.a<=0.0)discard;
+    output_color=result;
 }

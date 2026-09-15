@@ -24,6 +24,9 @@ use crate::compositor_wayland::{
     XdgToplevelState,
 };
 
+mod dmabuf_feedback;
+use dmabuf_feedback::DmaBufFeedback;
+
 const IMPLEMENTED_GLOBALS: &[(&str, ResourceKind, u32)] = &[
     ("zxdg_output_manager_v1", ResourceKind::XdgOutputManager, 3),
     ("wl_compositor", ResourceKind::Compositor, 6),
@@ -109,6 +112,7 @@ enum ResourceKind {
     DataSource(ProtocolObjectId),
     DataOffer(ProtocolObjectId),
     LinuxDmaBuf,
+    LinuxDmaBufFeedback,
     LinuxBufferParams(ProtocolObjectId),
     DecorationManager,
     ToplevelDecoration(WaylandSurfaceId),
@@ -174,6 +178,7 @@ impl ResourceKind {
             Self::DataSource(_) => ProtocolObjectKind::DataSource,
             Self::DataOffer(_) => ProtocolObjectKind::DataOffer,
             Self::LinuxDmaBuf => ProtocolObjectKind::LinuxDmaBuf,
+            Self::LinuxDmaBufFeedback => ProtocolObjectKind::LinuxDmaBufFeedback,
             Self::LinuxBufferParams(_) => ProtocolObjectKind::LinuxBufferParams,
             Self::DecorationManager => ProtocolObjectKind::DecorationManager,
             Self::ToplevelDecoration(_) => ProtocolObjectKind::ToplevelDecoration,
@@ -478,12 +483,22 @@ impl NativeXdgPositioner {
 /// client is rejected; the host must explicitly disconnect the old generation.
 #[derive(Default)]
 pub struct XwaylandAccess {
+    coordinate_scale: Cell<i32>,
     display: Cell<usize>,
     client: RefCell<Option<Rc<OwnedClient>>>,
     generation: Cell<u64>,
     last_serial: Cell<u64>,
 }
 impl XwaylandAccess {
+    /// One fixed X11 pixel density for this managed desktop; set before startup.
+    #[cfg_attr(not(feature = "desktop-xwayland"), allow(dead_code))]
+    pub(crate) fn set_coordinate_scale(&self, scale: i32) {
+        self.coordinate_scale.set(scale.clamp(1, 8));
+    }
+    pub(crate) fn coordinate_scale(&self) -> i32 {
+        self.coordinate_scale.get().max(1)
+    }
+
     /// Install the Xwayland registry policy before borrowing the display for
     /// compositor globals. The returned slot supports bounded server restarts.
     pub fn configure_display(display: &mut Display) -> Result<Rc<Self>, NativeCompositorError> {
@@ -570,6 +585,8 @@ struct NativeState {
     shm_pools: BTreeMap<ProtocolObjectId, NativeShmPool>,
     buffer_files: BTreeMap<WaylandBufferId, OwnedFd>,
     dmabuf_files: BTreeMap<WaylandBufferId, Vec<OwnedFd>>,
+    // Protocol destruction must not invalidate current, pending, or cached surface content.
+    destroyed_buffers: BTreeMap<WaylandBufferId, ClientId>,
     callbacks: BTreeMap<WaylandSurfaceId, Vec<ProtocolObjectId>>,
     committed_callbacks: BTreeMap<(WaylandSurfaceId, u64), Vec<ProtocolObjectId>>,
     pending_presentation_feedbacks: BTreeMap<WaylandSurfaceId, Vec<ProtocolObjectId>>,
@@ -583,6 +600,7 @@ struct NativeState {
     popups: BTreeMap<WaylandSurfaceId, crate::compositor_wayland::XdgPopupState>,
     viewports: BTreeMap<WaylandSurfaceId, NativeViewport>,
     dmabuf_formats: Vec<DmaBufFormat>,
+    dmabuf_feedback: Option<DmaBufFeedback>,
     dmabuf_params: BTreeMap<ProtocolObjectId, NativeDmaBufParams>,
     keyboard_keymaps: BTreeMap<u32, (OwnedFd, u32)>,
     touch_points: BTreeMap<(u32, i32), NativeTouchPoint>,
@@ -699,6 +717,7 @@ impl<'display> NativeCompositor<'display> {
             shm_pools: BTreeMap::new(),
             buffer_files: BTreeMap::new(),
             dmabuf_files: BTreeMap::new(),
+            destroyed_buffers: BTreeMap::new(),
             callbacks: BTreeMap::new(),
             committed_callbacks: BTreeMap::new(),
             pending_presentation_feedbacks: BTreeMap::new(),
@@ -712,6 +731,7 @@ impl<'display> NativeCompositor<'display> {
             popups: BTreeMap::new(),
             viewports: BTreeMap::new(),
             dmabuf_formats: Vec::new(),
+            dmabuf_feedback: None,
             dmabuf_params: BTreeMap::new(),
             keyboard_keymaps: BTreeMap::new(),
             touch_points: BTreeMap::new(),
@@ -777,6 +797,22 @@ impl<'display> NativeCompositor<'display> {
         })
     }
 
+    pub(crate) fn x11_surface_scale(&self, surface: WaylandSurfaceId) -> i32 {
+        let Some(access) = &self.state.xwayland else {
+            return 1;
+        };
+        let owner = self.state.core.world.surface_owner(surface);
+        if self
+            .state
+            .clients
+            .iter()
+            .any(|(identity, client)| Some(*client) == owner && access.allows(*identity))
+        {
+            access.coordinate_scale()
+        } else {
+            1
+        }
+    }
     pub fn core(&self) -> &CompositorCore {
         &self.state.core
     }
@@ -988,8 +1024,35 @@ impl<'display> NativeCompositor<'display> {
     pub fn add_linux_dmabuf(
         &mut self,
         display: &'display Display,
-        mut formats: Vec<DmaBufFormat>,
+        formats: Vec<DmaBufFormat>,
     ) -> Result<(), NativeCompositorError> {
+        self.add_linux_dmabuf_inner(display, formats, None)
+    }
+
+    /// Advertise DMA-BUF v4 with immutable default and per-surface allocation feedback.
+    /// `main_device` must be the DRM device whose renderer supplied `formats`, encoded as dev_t.
+    /// Both primary and render node identities are accepted by the protocol. This single-device
+    /// profile advertises sampling only, never direct scanout. Capabilities cannot change in place.
+    pub fn add_linux_dmabuf_with_feedback(
+        &mut self,
+        display: &'display Display,
+        formats: Vec<DmaBufFormat>,
+        main_device: libc::dev_t,
+    ) -> Result<(), NativeCompositorError> {
+        self.add_linux_dmabuf_inner(display, formats, Some(main_device))
+    }
+
+    fn add_linux_dmabuf_inner(
+        &mut self,
+        display: &'display Display,
+        mut formats: Vec<DmaBufFormat>,
+        main_device: Option<libc::dev_t>,
+    ) -> Result<(), NativeCompositorError> {
+        if !self.state.dmabuf_formats.is_empty() {
+            return Err(NativeCompositorError::new(
+                "DMA-BUF global is already configured",
+            ));
+        }
         formats.sort_unstable_by_key(|format| (format.fourcc, format.modifier));
         formats.dedup();
         if formats.is_empty() {
@@ -997,13 +1060,18 @@ impl<'display> NativeCompositor<'display> {
                 "DMA-BUF cannot be advertised without an importable format",
             ));
         }
-        self.state.dmabuf_formats = formats;
+        let feedback = main_device
+            .map(|device| DmaBufFeedback::new(device, &formats))
+            .transpose()?;
         self.add_dynamic_global_version(
             display,
             "zwp_linux_dmabuf_v1",
             ResourceKind::LinuxDmaBuf,
-            3,
-        )
+            if feedback.is_some() { 4 } else { 3 },
+        )?;
+        self.state.dmabuf_formats = formats;
+        self.state.dmabuf_feedback = feedback;
+        Ok(())
     }
 
     pub fn add_explicit_synchronization(
@@ -1797,16 +1865,35 @@ unsafe extern "C" fn bind_global(
             return;
         };
         let state = unsafe { &mut *bind.state };
-        if state
-            .bind(client, bind.interface, bind.kind, version, id)
-            .is_err()
-        {
+        if let Err(error) = state.bind(client, bind.interface, bind.kind, version, id) {
+            if std::env::var("TELORGON_WAYLAND_ERROR_LOG").as_deref() == Ok("1") {
+                eprintln!(
+                    "telorgon-wayland-error: bind pid={} object={} version={} error={:?}",
+                    client.credentials().pid,
+                    id,
+                    version,
+                    error.to_string()
+                );
+            }
             client.post_no_memory();
         }
     }));
     if result.is_err() {
         // An unwind may never cross the C ABI. The client will be disconnected by libwayland when
         // its bind did not produce the requested object.
+    }
+}
+
+fn log_rejected_request(resource: ResourceRef<'_>, interface: &str, opcode: u32, request: &str) {
+    if std::env::var("TELORGON_WAYLAND_ERROR_LOG").as_deref() == Ok("1") {
+        eprintln!(
+            "telorgon-wayland-error: pid={} object={} interface={} opcode={} request={}",
+            resource.client().credentials().pid,
+            resource.id(),
+            interface,
+            opcode,
+            request
+        );
     }
 }
 
@@ -1838,23 +1925,30 @@ unsafe extern "C" fn dispatch_resource(
                 .and_then(|schema| schema.request(opcode))
                 .cloned()
             else {
+                log_rejected_request(resource, &interface, opcode, "unknown");
                 resource.post_error(0, "unknown request opcode");
                 return -1;
             };
             if message.since > resource.version() {
+                log_rejected_request(resource, &interface, opcode, &message.name);
                 resource.post_error(0, "request is newer than the bound interface version");
                 return -1;
             }
             let mut request = match unsafe { IncomingRequest::from_raw(&message, arguments) } {
                 Ok(request) => request,
                 Err(error) => {
+                    log_rejected_request(resource, &interface, opcode, &message.name);
                     resource.post_error(0, &error.to_string());
                     return -1;
                 }
             };
             match state.dispatch(resource, context_pointer, kind, &mut request) {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    state.collect_destroyed_buffers();
+                    outcome
+                }
                 Err(error) => {
+                    log_rejected_request(resource, &interface, opcode, &message.name);
                     resource.post_error(0, &error.to_string());
                     return -1;
                 }
@@ -3265,7 +3359,7 @@ impl NativeState {
         if let ResourceKind::Seat(seat) = kind {
             self.send_seat_description(resource, seat)?;
         }
-        if matches!(kind, ResourceKind::LinuxDmaBuf) {
+        if matches!(kind, ResourceKind::LinuxDmaBuf) && version == 3 {
             for format in &self.dmabuf_formats {
                 self.post_event(
                     resource,
@@ -3331,6 +3425,12 @@ impl NativeState {
         Ok(DispatchOutcome::default())
     }
 
+    fn x11_output_scale(&self, resource: ResourceRef<'_>) -> i32 {
+        self.xwayland
+            .as_ref()
+            .filter(|access| access.allows(resource.client().identity()))
+            .map_or(1, |access| access.coordinate_scale())
+    }
     fn send_xdg_output_description(
         &self,
         child: ResourceRef<'_>,
@@ -3343,8 +3443,13 @@ impl NativeState {
             .outputs
             .get(&output_id)
             .ok_or_else(|| NativeCompositorError::new("unknown output"))?;
-        let position = output.description.logical_position;
-        let size = output.logical_size();
+        let density = self.x11_output_scale(child);
+        let mut position = output.description.logical_position;
+        let mut size = output.logical_size();
+        position.x = position.x.saturating_mul(density);
+        position.y = position.y.saturating_mul(density);
+        size.width = size.width.saturating_mul(density);
+        size.height = size.height.saturating_mul(density);
         self.post_event(
             child,
             "zxdg_output_v1",
@@ -3622,6 +3727,7 @@ impl NativeState {
                 self.dispatch_data_offer(resource, context, offer, request)
             }
             ResourceKind::LinuxDmaBuf => self.dispatch_linux_dmabuf(resource, context, request),
+            ResourceKind::LinuxDmaBufFeedback => Err(unsupported_request(request)),
             ResourceKind::LinuxBufferParams(object) => {
                 self.dispatch_linux_buffer_params(resource, context, object, request)
             }
@@ -4325,6 +4431,36 @@ impl NativeState {
         context: &ResourceContext,
         request: &IncomingRequest<'_>,
     ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if matches!(
+            request.message().name,
+            "get_default_feedback" | "get_surface_feedback"
+        ) {
+            if request.message().name == "get_surface_feedback" {
+                let surface = request
+                    .object(1)
+                    .map_err(error)?
+                    .ok_or_else(|| NativeCompositorError::new("missing feedback surface"))?;
+                self.surface_from_resource(surface)?;
+                if surface.client().identity() != resource.client().identity() {
+                    return Err(NativeCompositorError::new(
+                        "feedback surface belongs to another client",
+                    ));
+                }
+            }
+            let feedback = self.create_resource(
+                resource.client(),
+                context.client,
+                "zwp_linux_dmabuf_feedback_v1",
+                resource.version(),
+                request.new_id(0).map_err(error)?,
+                ResourceKind::LinuxDmaBufFeedback,
+                true,
+            )?;
+            // One immutable sampling policy applies to every surface for this display lifetime.
+            // There are no later updates, so a feedback object is already inert if its surface dies.
+            self.send_dmabuf_feedback(feedback)?;
+            return Ok(DispatchOutcome::default());
+        }
         if request.message().name != "create_params" {
             return Err(unsupported_request(request));
         }
@@ -6077,14 +6213,19 @@ impl NativeState {
                     .attach(buffer.map(|buffer| BufferAttachment { buffer, offset }));
             }
             "damage" | "damage_buffer" => {
-                self.surface_mut(surface)?
-                    .damage(RectI {
-                        x: request.int(0).map_err(error)?,
-                        y: request.int(1).map_err(error)?,
-                        width: request.int(2).map_err(error)?,
-                        height: request.int(3).map_err(error)?,
-                    })
-                    .map_err(error)?;
+                let rect = RectI {
+                    x: request.int(0).map_err(error)?,
+                    y: request.int(1).map_err(error)?,
+                    width: request.int(2).map_err(error)?,
+                    height: request.int(3).map_err(error)?,
+                };
+                if request.message().name == "damage_buffer" {
+                    self.surface_mut(surface)?
+                        .damage_buffer(rect)
+                        .map_err(error)?;
+                } else {
+                    self.surface_mut(surface)?.damage(rect).map_err(error)?;
+                }
             }
             "frame" => {
                 let object = self.peek_next_object()?;
@@ -6829,6 +6970,40 @@ impl NativeState {
             _ => return Err(unsupported_request(request)),
         }
         Ok(DispatchOutcome::default())
+    }
+
+    fn collect_destroyed_buffers(&mut self) {
+        let retired: Vec<_> = self
+            .destroyed_buffers
+            .iter()
+            .filter_map(|(&buffer, &client)| {
+                let referenced =
+                    self.core
+                        .world
+                        .client_surfaces(client)
+                        .into_iter()
+                        .any(|surface| {
+                            let state = self.core.world.surface(surface).expect("listed surface");
+                            state
+                                .snapshot()
+                                .attachment
+                                .is_some_and(|attachment| attachment.buffer == buffer)
+                                || state
+                                    .pending()
+                                    .attachment
+                                    .flatten()
+                                    .is_some_and(|attachment| attachment.buffer == buffer)
+                                || self.core.subsurfaces.cached_buffer(surface) == Some(buffer)
+                        });
+                (!referenced).then_some((buffer, client))
+            })
+            .collect();
+        for (buffer, client) in retired {
+            self.destroyed_buffers.remove(&buffer);
+            self.buffer_files.remove(&buffer);
+            self.dmabuf_files.remove(&buffer);
+            let _ = self.core.destroy_buffer(client, buffer);
+        }
     }
 
     fn commit_surface(
@@ -7864,10 +8039,9 @@ impl NativeState {
                 self.synchronized_surfaces.remove(&surface);
                 self.pending_acquire_fences.remove(&surface);
                 self.pending_releases.remove(&surface);
-                self.committed_acquire_fences
-                    .retain(|(candidate, _), _| *candidate != surface);
-                self.committed_releases
-                    .retain(|(candidate, _), _| *candidate != surface);
+                // Committed uses belong to the renderer/queued publication, not to
+                // wl_surface's lifetime. Retire their fences and release objects
+                // through the normal completion path, including after destruction.
                 self.core.buffer_uses.cancel_surface(surface);
                 self.touch_points
                     .retain(|_, point| point.surface != surface);
@@ -7907,9 +8081,7 @@ impl NativeState {
                         icon.post_error(3, "an icon wl_buffer was destroyed before its icon");
                     }
                 }
-                self.buffer_files.remove(&buffer);
-                self.dmabuf_files.remove(&buffer);
-                let _ = self.core.destroy_buffer(context.client, buffer);
+                self.destroyed_buffers.insert(buffer, context.client);
             }
             ResourceKind::LinuxBufferParams(object) => {
                 self.dmabuf_params.remove(&object);
@@ -7998,7 +8170,8 @@ impl NativeState {
             ResourceKind::SurfaceSynchronization(surface) => {
                 self.synchronized_surfaces.remove(&surface);
                 self.pending_acquire_fences.remove(&surface);
-                self.pending_releases.remove(&surface);
+                // get_release creates an independent object; destroying the
+                // synchronization object must not revoke its next-commit release.
             }
             ResourceKind::ExplicitBufferRelease(surface) => {
                 self.pending_releases
@@ -8026,6 +8199,7 @@ impl NativeState {
             let _ = self.core.disconnect_client(context.client);
             self.clients.retain(|_, client| *client != context.client);
         }
+        self.collect_destroyed_buffers();
     }
 }
 
@@ -8319,6 +8493,237 @@ mod xwayland_wire_tests {
     fn words(values: &[u32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_ne_bytes()).collect()
     }
+
+    #[test]
+    fn committed_release_survives_surface_destruction_and_finishes_once() {
+        let display = Display::new().unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
+        let client = display.create_client(socket).unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let globals = registry(&display, &mut peer);
+        bind_version(&mut peer, &globals, "wl_compositor", 4, 4);
+        send(&mut peer, 4, 0, &words(&[5]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let client_id = native.state.clients[&client.identity().unwrap()];
+        let surface = native.core().world.client_surfaces(client_id)[0];
+        let client_ref = unsafe {
+            ClientRef::from_raw(client.identity().unwrap() as *mut ffi::wl_client).unwrap()
+        };
+        let release = native
+            .state
+            .create_resource(
+                client_ref,
+                client_id,
+                "zwp_linux_buffer_release_v1",
+                1,
+                6,
+                ResourceKind::ExplicitBufferRelease(surface),
+                true,
+            )
+            .unwrap();
+        let object = unsafe { &*release.user_data().cast::<ResourceContext>() }.object;
+        native.state.committed_releases.insert((surface, 2), object);
+        send(&mut peer, 5, 0, &[]);
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        assert!(native.core().world.surface(surface).is_none());
+        assert!(native.finish_explicit_release(surface, 2, None).unwrap());
+        assert!(!native.finish_explicit_release(surface, 2, None).unwrap());
+        assert!(!native.state.resources.contains_key(&object));
+    }
+
+    #[test]
+    fn destroyed_buffer_survives_surface_commits_until_last_reference_is_removed() {
+        use crate::compositor_wayland::{ShmBuffer, ShmFormat};
+        for retirement in ["detach", "replace", "destroy", "disconnect"] {
+            let display = Display::new().unwrap();
+            let (mut peer, socket) = UnixStream::pair().unwrap();
+            let client = display.create_client(socket).unwrap();
+            let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            let globals = registry(&display, &mut peer);
+            bind_version(&mut peer, &globals, "wl_compositor", 4, 4);
+            send(&mut peer, 4, 0, &words(&[5]));
+            send(&mut peer, 4, 0, &words(&[6]));
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            let client_id = native.state.clients[&client.identity().unwrap()];
+            let client_ref = unsafe {
+                ClientRef::from_raw(client.identity().unwrap() as *mut ffi::wl_client).unwrap()
+            };
+            let buffer = WaylandBufferId::from_raw(100).unwrap();
+            let replacement = WaylandBufferId::from_raw(101).unwrap();
+            for (id, wire_id) in [(buffer, 7), (replacement, 8)] {
+                native
+                    .state
+                    .core
+                    .register_buffer(
+                        client_id,
+                        id,
+                        BufferDescriptor::Shm(ShmBuffer {
+                            offset: 0,
+                            size: crate::core::SizeI {
+                                width: 16,
+                                height: 8,
+                            },
+                            stride: 64,
+                            format: ShmFormat::Argb8888,
+                        }),
+                    )
+                    .unwrap();
+                native
+                    .state
+                    .buffer_files
+                    .insert(id, std::fs::File::open("/dev/zero").unwrap().into());
+                native
+                    .state
+                    .create_resource(
+                        client_ref,
+                        client_id,
+                        "wl_buffer",
+                        1,
+                        wire_id,
+                        ResourceKind::Buffer(id),
+                        true,
+                    )
+                    .unwrap();
+            }
+            // Share the attachment to exercise last-reference cleanup as well as the failure.
+            for surface in [5, 6] {
+                send(&mut peer, surface, 1, &words(&[7, 0, 0]));
+                send(&mut peer, surface, 6, &[]);
+            }
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            native.release_buffer(buffer).unwrap();
+            send(&mut peer, 7, 0, &[]);
+            send(&mut peer, 5, 8, &words(&[2])); // Metadata-only scale change.
+            send(&mut peer, 5, 6, &[]);
+            display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+            assert!(client.is_alive(), "{retirement}");
+            assert!(native.core().buffer(buffer).is_some());
+            assert_eq!(
+                native.read_shm_buffer(buffer).unwrap().pixels.len(),
+                16 * 8 * 4
+            );
+            native.release_buffer(buffer).unwrap(); // No event for a destroyed protocol object.
+            let surface = native.core().world.client_surfaces(client_id)[0];
+            assert_eq!(
+                native.state.surface_logical_size(surface).unwrap(),
+                crate::core::SizeI {
+                    width: 8,
+                    height: 4
+                }
+            );
+            if retirement == "disconnect" {
+                client.disconnect();
+            } else {
+                for surface in [5, 6] {
+                    if retirement == "destroy" {
+                        send(&mut peer, surface, 0, &[]);
+                    } else {
+                        let next = if retirement == "replace" { 8 } else { 0 };
+                        send(&mut peer, surface, 1, &words(&[next, 0, 0]));
+                        send(&mut peer, surface, 6, &[]);
+                    }
+                    display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+                    assert!(client.is_alive());
+                    assert_eq!(native.core().buffer(buffer).is_some(), surface == 5);
+                }
+            }
+            assert!(!native.state.buffer_files.contains_key(&buffer));
+            assert!(native.state.destroyed_buffers.is_empty());
+        }
+    }
+
+    #[test]
+    fn destroyed_buffer_retains_pending_and_synchronized_cached_storage() {
+        use crate::compositor_wayland::{ShmBuffer, ShmFormat, SurfaceCommit};
+        let display = Display::new().unwrap();
+        let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let client = ClientId::from_raw(1).unwrap();
+        let parent = WaylandSurfaceId::from_raw(1).unwrap();
+        let child = WaylandSurfaceId::from_raw(2).unwrap();
+        let buffer = WaylandBufferId::from_raw(1).unwrap();
+        native.state.core.connect_client(client).unwrap();
+        for surface in [parent, child] {
+            native
+                .state
+                .core
+                .world
+                .create_surface(client, surface)
+                .unwrap();
+        }
+        native
+            .state
+            .core
+            .register_buffer(
+                client,
+                buffer,
+                BufferDescriptor::Shm(ShmBuffer {
+                    offset: 0,
+                    size: crate::core::SizeI {
+                        width: 16,
+                        height: 8,
+                    },
+                    stride: 64,
+                    format: ShmFormat::Argb8888,
+                }),
+            )
+            .unwrap();
+        let attachment = Some(BufferAttachment {
+            buffer,
+            offset: PointI::default(),
+        });
+        native.state.surface_mut(child).unwrap().attach(attachment);
+        native.state.destroyed_buffers.insert(buffer, client);
+        native.state.collect_destroyed_buffers();
+        assert!(native.core().buffer(buffer).is_some());
+        native.state.core.subsurfaces.add(child, parent).unwrap();
+        native
+            .state
+            .core
+            .subsurfaces
+            .stage_or_release(
+                child,
+                SurfaceCommit {
+                    attachment: Some(attachment),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // A later pending detach must not retire the separately cached attachment.
+        native.state.surface_mut(child).unwrap().attach(None);
+        native.state.collect_destroyed_buffers();
+        assert!(native.core().buffer(buffer).is_some());
+        let (_, commit) = native
+            .state
+            .core
+            .subsurfaces
+            .release_children(parent)
+            .pop()
+            .unwrap();
+        let state = native.state.surface_mut(child).unwrap();
+        state.stage(commit).unwrap();
+        state.commit().unwrap();
+        native.state.collect_destroyed_buffers();
+        assert!(
+            native
+                .state
+                .validate_surface_buffer_geometry(child, None)
+                .is_ok()
+        );
+        let state = native.state.surface_mut(child).unwrap();
+        state.set_buffer_scale(3).unwrap();
+        state.commit().unwrap();
+        assert!(
+            native
+                .state
+                .validate_surface_buffer_geometry(child, None)
+                .is_err()
+        );
+        let state = native.state.surface_mut(child).unwrap();
+        state.attach(None);
+        state.commit().unwrap();
+        native.state.collect_destroyed_buffers();
+        assert!(native.core().buffer(buffer).is_none());
+    }
     fn registry(display: &Display, peer: &mut UnixStream) -> BTreeMap<String, u32> {
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         send(peer, 1, 1, &words(&[2]));
@@ -8448,11 +8853,27 @@ mod xwayland_wire_tests {
         use crate::compositor_wayland::{
             OutputDescription, OutputMode, OutputState, OutputTransform,
         };
-        for (version, output_version) in [(1, 1), (2, 2), (3, 4), (3, 1)] {
-            let display = Display::new().unwrap();
+        for (version, output_version, density) in [
+            (1, 1, 1),
+            (2, 2, 1),
+            (3, 4, 1),
+            (3, 1, 1),
+            (1, 1, 3),
+            (2, 2, 3),
+            (3, 4, 3),
+            (3, 1, 3),
+        ] {
+            let mut display = Display::new().unwrap();
+            let access = XwaylandAccess::configure_display(&mut display).unwrap();
+            access.set_coordinate_scale(3);
             let (mut peer, socket) = UnixStream::pair().unwrap();
-            let client = display.create_client(socket).unwrap();
-            let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            let client = Rc::new(display.create_client(socket).unwrap());
+            if density == 3 {
+                access.set_client(client.clone(), 1).unwrap();
+            }
+            let mut native =
+                NativeCompositor::new_with_xwayland(&display, ClientLimits::default(), access)
+                    .unwrap();
             native
                 .add_output(
                     &display,
@@ -8511,7 +8932,14 @@ mod xwayland_wire_tests {
                         i32::from_ne_bytes(body[..4].try_into().unwrap()),
                         i32::from_ne_bytes(body[4..8].try_into().unwrap()),
                     );
-                    assert_eq!(pair, if opcode == 0 { (-800, 40) } else { (720, 1280) });
+                    assert_eq!(
+                        pair,
+                        if opcode == 0 {
+                            (-800 * density, 40 * density)
+                        } else {
+                            (720 * density, 1280 * density)
+                        }
+                    );
                 }
             }
             let mut expected = vec![0, 1];
@@ -8577,7 +9005,14 @@ mod xwayland_wire_tests {
                             i32::from_ne_bytes(body[..4].try_into().unwrap()),
                             i32::from_ne_bytes(body[4..8].try_into().unwrap()),
                         );
-                        assert_eq!(pair, if opcode == 0 { (-12, 64) } else { (540, 960) });
+                        assert_eq!(
+                            pair,
+                            if opcode == 0 {
+                                (-12 * density, 64 * density)
+                            } else {
+                                (540 * density, 960 * density)
+                            }
+                        );
                     }
                 }
             }

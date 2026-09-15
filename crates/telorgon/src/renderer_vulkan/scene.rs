@@ -199,7 +199,7 @@ pub struct VulkanScene {
     atlas_texture: RetainedTexture,
     image_resources: BTreeMap<ImageId, VulkanImageResource>,
     external_images: BTreeMap<ImageId, ExternalSceneImage>,
-    material_resources: BTreeMap<u32, MaterialResource>,
+    pub(crate) material_resources: BTreeMap<u32, MaterialResource>,
     texture_slots: BTreeMap<u32, usize>,
     metrics: VulkanSceneMetrics,
 }
@@ -365,7 +365,7 @@ impl VulkanScene {
             self.batches = build_batches(&self.draw_order);
             self.draw_dirty.add(0..self.draw_indices.len());
             self.rebuild_texture_slots();
-        } else if !delta.image_resources.is_empty() {
+        } else if !delta.image_resources.is_empty() || !delta.material_resources.is_empty() {
             self.rebuild_texture_slots();
         }
     }
@@ -533,6 +533,18 @@ impl VulkanScene {
             ));
         }
         let extent = target.extent();
+        if self.image_resources.get(&image).is_some_and(|resource| {
+            resource.alpha_mode == alpha_mode
+                && resource
+                    .texture
+                    .image
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, &retained))
+        }) {
+            // Storage and native view did not change. Contents are updated by an ordered GPU pass;
+            // retain descriptor identity and avoid rebuilding the binding on every commit.
+            return Ok(());
+        }
         let generation = self
             .image_resources
             .get(&image)
@@ -542,7 +554,7 @@ impl VulkanScene {
             image,
             VulkanImageResource {
                 extent,
-                color_encoding: ImageColorEncoding::Linear,
+                color_encoding: VulkanMaterializationTarget::COLOR_ENCODING,
                 alpha_mode,
                 pixel_format: ImagePixelFormat::Rgba8,
                 pixels: Vec::new(),
@@ -551,7 +563,7 @@ impl VulkanScene {
                     image: Some(retained),
                     retired: Vec::new(),
                     extent,
-                    format: vk::Format::R8G8B8A8_UNORM,
+                    format: VulkanMaterializationTarget::FORMAT,
                     generation,
                     initialized: true,
                 },
@@ -604,13 +616,18 @@ impl VulkanScene {
     }
 
     fn rebuild_materials(&mut self) {
-        self.material_parameters.clear();
+        let previous_parameters = std::mem::take(&mut self.material_parameters);
         let mut offsets = BTreeMap::new();
         for (id, resource) in &self.material_resources {
             offsets.insert(*id, self.material_parameters.len() as u32);
-            self.material_parameters.extend(resource.colors.map(pack));
+            match resource.kind {
+                MaterialKind::LiquidGlass(parameters) => {
+                    self.material_parameters.extend(parameters.words());
+                }
+                _ => self.material_parameters.extend(resource.colors.map(pack)),
+            }
         }
-        self.gpu_materials = self
+        let next_materials: Vec<GpuMaterialInstance> = self
             .materials
             .iter()
             .map(|instance| {
@@ -619,7 +636,11 @@ impl VulkanScene {
                     rect: rect(instance.rect),
                     params_spatial_clip: [
                         offsets.get(&instance.material.0).copied().unwrap_or(0),
-                        2,
+                        if resource.is_some_and(|r| matches!(r.kind, MaterialKind::LiquidGlass(_))) {
+                            17
+                        } else {
+                            2
+                        },
                         instance.spatial.0,
                         clip_slot(instance.clip.0),
                     ],
@@ -628,6 +649,7 @@ impl VulkanScene {
                         MaterialKind::Solid => 0,
                         MaterialKind::LinearGradientHorizontal => 1,
                         MaterialKind::LinearGradientVertical => 2,
+                        MaterialKind::LiquidGlass(_) => 3,
                     }),
                     flags: 0,
                     reserved: 0,
@@ -635,9 +657,13 @@ impl VulkanScene {
                 }
             })
             .collect();
-        self.material_dirty.add(0..self.gpu_materials.len());
-        self.material_parameter_dirty
-            .add(0..self.material_parameters.len());
+        if self.gpu_materials != next_materials {
+            self.material_dirty.add(0..next_materials.len());
+            self.gpu_materials = next_materials;
+        }
+        if self.material_parameters != previous_parameters {
+            self.material_parameter_dirty.add(0..self.material_parameters.len());
+        }
     }
 
     fn rebuild_clips(&mut self) {
@@ -670,8 +696,16 @@ impl VulkanScene {
         let resources = self
             .draw_order
             .iter()
-            .filter(|draw| draw.kind == PrimitiveKind::Image)
-            .map(|draw| draw.batch.resource)
+            .filter_map(|draw| match draw.kind {
+                PrimitiveKind::Image => Some(draw.batch.resource),
+                PrimitiveKind::Material => self.material_resources
+                    .get(&draw.batch.resource)
+                    .and_then(|r| match r.kind {
+                        MaterialKind::LiquidGlass(p) => Some(p.backdrop.0),
+                        _ => None,
+                    }),
+                _ => None,
+            })
             .collect::<BTreeSet<_>>();
         for (slot, resource) in resources.into_iter().enumerate() {
             self.texture_slots.insert(resource, slot + 1);
@@ -682,7 +716,13 @@ impl VulkanScene {
         match batch.kind {
             PrimitiveKind::Glyph => Some(0),
             PrimitiveKind::Image => self.texture_slots.get(&batch.key.resource).copied(),
-            PrimitiveKind::Box | PrimitiveKind::Material => None,
+            PrimitiveKind::Material => self.material_resources
+                .get(&batch.key.resource)
+                .and_then(|r| match r.kind {
+                    MaterialKind::LiquidGlass(p) => self.texture_slots.get(&p.backdrop.0).copied(),
+                    _ => None,
+                }),
+            PrimitiveKind::Box => None,
         }
     }
 
@@ -704,6 +744,13 @@ impl VulkanScene {
             .collect()
     }
 
+    /// Metadata only, for correlating desktop resize traces with retained bindings.
+    pub(crate) fn retained_image_trace_metadata(&self, image: ImageId) -> Option<(SizeI, u64)> {
+        self.image_resources
+            .get(&image)
+            .map(|resource| (resource.extent, resource.texture.generation))
+    }
+
     pub(crate) fn has_external_image(&self, image: ImageId) -> bool {
         self.external_images.contains_key(&image)
     }
@@ -712,10 +759,6 @@ impl VulkanScene {
         self.external_images
             .get(&image)
             .map(|resource| resource.image.content_version)
-    }
-
-    pub(crate) fn material_resource_ids(&self) -> BTreeSet<u32> {
-        self.material_resources.keys().copied().collect()
     }
 
     pub(crate) fn pending_upload_bytes(&self) -> u64 {
@@ -1423,7 +1466,10 @@ pub(crate) fn validate_draw_order(order: &[DrawItem]) -> Result<(), &'static str
             PrimitiveKind::Image => PipelineKind::Image,
             PrimitiveKind::Material => PipelineKind::Material,
         };
-        if draw.batch.pipeline != expected {
+        if draw.batch.pipeline != expected
+            && !(draw.kind == PrimitiveKind::Material
+                && draw.batch.pipeline == PipelineKind::LiquidGlass)
+        {
             return Err("Vulkan draw item primitive and pipeline kinds disagree");
         }
         if draw.batch.target != 0 {
@@ -1435,8 +1481,10 @@ pub(crate) fn validate_draw_order(order: &[DrawItem]) -> Result<(), &'static str
 pub(crate) fn validate_texture_count(order: &[DrawItem]) -> Result<(), &'static str> {
     let images = order
         .iter()
-        .filter(|draw| draw.kind == PrimitiveKind::Image)
-        .map(|draw| draw.batch.resource)
+        .filter(|draw| {
+            draw.kind == PrimitiveKind::Image || draw.batch.pipeline == PipelineKind::LiquidGlass
+        })
+        .map(|draw| (draw.kind as u8, draw.batch.resource))
         .collect::<BTreeSet<_>>()
         .len();
     let reserves_atlas_slot =

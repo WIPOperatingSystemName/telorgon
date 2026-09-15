@@ -18,8 +18,8 @@ pub(super) fn resize_drag_geometry(
     delta: PointI,
     output: SizeI,
 ) -> (PointI, SizeI) {
-    const MINIMUM_WIDTH: i32 = 64;
-    const MINIMUM_HEIGHT: i32 = 48;
+    const MINIMUM_WIDTH: i32 = 1;
+    const MINIMUM_HEIGHT: i32 = 1;
 
     let mut position = position_start;
     let mut size = size_start;
@@ -71,12 +71,17 @@ pub(super) fn resize_drag_geometry(
 }
 
 pub(super) fn window_content_offset(window: &ClientWindow, config: &LinuxDesktopConfig) -> PointI {
-    if !window_is_decorated(window) {
+    if !window_has_frame(window) {
         PointI::default()
     } else {
         window.chrome_content_offset.unwrap_or(PointI {
             x: config.window_border,
-            y: config.window_border + config.titlebar_height,
+            y: config.window_border
+                + if window_is_decorated(window) {
+                    config.titlebar_height
+                } else {
+                    0
+                },
         })
     }
 }
@@ -105,7 +110,13 @@ fn content_rect(position: PointI, offset: PointI, size: SizeI) -> RectI {
 pub(super) fn legacy_window_outer(window: &ClientWindow, config: &LinuxDesktopConfig) -> SizeI {
     SizeI {
         width: window.requested_size.width + config.window_border * 2,
-        height: window.requested_size.height + config.window_border * 2 + config.titlebar_height,
+        height: window.requested_size.height
+            + config.window_border * 2
+            + if window_is_decorated(window) {
+                config.titlebar_height
+            } else {
+                0
+            },
     }
 }
 
@@ -122,6 +133,18 @@ pub(super) fn wayland_resize_edge(edge: WindowResizeEdge) -> ResizeEdge {
     }
 }
 
+/// Frame appearance and application title-bar ownership are independent for managed X11 windows.
+pub(super) fn window_has_frame(window: &ClientWindow) -> bool {
+    if window.fullscreen {
+        return false;
+    }
+    #[cfg(all(feature = "desktop-xwayland", target_env = "gnu"))]
+    if matches!(window.backend, Some(WindowBackend::X11(_))) {
+        return true;
+    }
+    window_is_decorated(window)
+}
+
 pub(super) fn window_is_decorated(window: &ClientWindow) -> bool {
     window.server_decorated && !window.fullscreen
 }
@@ -135,7 +158,11 @@ pub(super) fn surface_local_position(
     let Some(window) = windows.get(&surface) else {
         return position;
     };
-    surface_placement(window, window.position, config).surface_local(position)
+    surface_placement(window, window.position, config).surface_local(
+        window
+            .motion_input
+            .map_or(position, |input| input.map(position)),
+    )
 }
 
 pub(super) fn surface_placement(
@@ -156,7 +183,16 @@ pub(super) fn surface_placement(
         x: position.x.saturating_add(offset.x),
         y: position.y.saturating_add(offset.y),
     };
-    SurfacePlacement::native(window.presentation.size, origin)
+    let density = window.surface_scale.max(1);
+    let mut placement = SurfacePlacement::native(
+        SizeI {
+            width: (window.presentation.size.width / density).max(1),
+            height: (window.presentation.size.height / density).max(1),
+        },
+        origin,
+    );
+    placement.surface_scale = density;
+    placement
 }
 
 pub(super) fn constrain_pointer(
@@ -175,10 +211,16 @@ pub(super) fn constrain_pointer(
         return current;
     };
     let surface = RectI {
-        x: visible.x.saturating_sub(placement.target.x),
-        y: visible.y.saturating_sub(placement.target.y),
-        width: visible.width,
-        height: visible.height,
+        x: visible
+            .x
+            .saturating_sub(placement.target.x)
+            .saturating_mul(placement.surface_scale),
+        y: visible
+            .y
+            .saturating_sub(placement.target.y)
+            .saturating_mul(placement.surface_scale),
+        width: visible.width.saturating_mul(placement.surface_scale),
+        height: visible.height.saturating_mul(placement.surface_scale),
     };
     let regions = constraint.region.as_ref().map_or_else(
         || vec![surface],
@@ -490,6 +532,32 @@ mod tests {
                     "{edge:?}"
                 );
             }
+        }
+    }
+}
+
+/// X11 surface coordinates include the private server's integer density already.
+/// Native Wayland surfaces use density one; wl_surface buffer_scale is separate.
+pub(super) fn surface_raster_scale(
+    output_scale: crate::platform::ScaleFactor,
+    coordinate_density: i32,
+) -> crate::platform::ScaleFactor {
+    crate::platform::ScaleFactor::new(output_scale.get() / coordinate_density.max(1) as f32)
+        .expect("validated output scale and positive coordinate density")
+}
+
+#[cfg(test)]
+mod raster_scale_tests {
+    use super::*;
+
+    #[test]
+    fn fractional_and_integer_x11_density_does_not_multiply_pixel_size_twice() {
+        for (output, density, expected) in
+            [(1.0, 1, 1.0), (1.5, 2, 0.75), (2.0, 2, 1.0), (3.0, 3, 1.0)]
+        {
+            let output = crate::platform::ScaleFactor::new(output).unwrap();
+            assert_eq!(surface_raster_scale(output, density).get(), expected);
+            assert_eq!(surface_raster_scale(output, 1), output);
         }
     }
 }

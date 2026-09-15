@@ -137,19 +137,21 @@ pub use accessibility::{
 pub use assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
     AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,
-    AssetMediaError, AssetRasterSize, ClientCursorMode, CursorAsset, CursorThemeAsset,
-    CursorThemeError, DecodedAssetImage, Icon, IconAsset, ImageAsset, ImageSource,
-    PointerConfiguration, PointerFrame, PointerGraphic, PointerHotspot, PointerRequest,
-    PointerResolution, PointerTheme, PointerThemeFallback, PointerThemeOverrides, asset_image_id,
-    resolve_pointer,
+    AssetMediaError, AssetRasterSize, ClientCursorMode, CursorAsset, CursorGraphic, CursorTheme,
+    CursorThemeAsset, CursorThemeError, DecodedAssetImage, Icon, IconAsset, ImageAsset,
+    ImageSource, PointerConfiguration, PointerFrame, PointerHotspot, PointerRequest,
+    PointerResolution, PointerTheme, PointerThemeFallback, PointerThemeOverrides,
+    REQUIRED_CURSOR_ROLES, asset_image_id, cursor, resolve_pointer,
 };
 #[cfg(feature = "embedded-profiler")]
 pub use profiler as embedded_profiler_events;
 pub use telorgon_macros::{asset_catalog, component};
 pub use window_chrome::{
-    ShellActionId, WindowAction, WindowChromeCapabilities, WindowChromeError, WindowChromeHitSpec,
+    ContentFade, GeometryMotion, GlassStyle, Minimize, ResizePreview, ShellActionId, Spring,
+    WindowAction, WindowChromeCapabilities, WindowChromeError, WindowChromeHitSpec,
     WindowChromeModel, WindowChromeRegion, WindowChromeRole, WindowChromeSnapshot,
-    WindowChromeState, WindowContentStyle, WindowEdgeMask, WindowResizeEdge, WindowTilingState,
+    WindowChromeState, WindowContentStyle, WindowEdgeMask, WindowMotion, WindowResizeEdge,
+    WindowTilingState, WindowTween, tween_ms,
 };
 
 /// Imports shared by Telorgon's high-level application facade.
@@ -162,6 +164,10 @@ mod authoring {
         WindowChromeDesign, WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle,
         WindowChromeViewExt, WindowContentSlot, WindowControlButtonStyle, WindowControlDesign,
         WindowControlVisual, WindowControlsDesign, WindowFrame, WindowTitleBarStyle,
+    };
+    pub use crate::window_chrome::{
+        ContentFade, GeometryMotion, GlassStyle, Minimize, ResizePreview, Spring, WindowMotion,
+        WindowTween, tween_ms,
     };
     pub use crate::{
         Alignment, AppIconProfile, AssetBundle, AssetCatalog, AssetKey, Background, Border,
@@ -192,6 +198,7 @@ pub mod app {
         WindowFrameTemplate,
     };
     pub use crate::session;
+    pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
 }
 #[cfg(feature = "application-software")]
 pub use application_host::HeadlessRuntime;
