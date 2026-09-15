@@ -57,7 +57,7 @@ pub fn verify_interface(
     }
     let expected_instance_stride = match shader_name.split_once('_').map(|value| value.0) {
         Some("box") => 160,
-        Some("glyph" | "image" | "material" | "liquid") => 64,
+        Some("glyph" | "image" | "material" | "liquid" | "blur") => 64,
         _ => return Err(format!("unexpected shader name {shader_name:?}")),
     };
     let array_strides = module.annotations.iter().filter_map(|instruction| {
@@ -73,17 +73,19 @@ pub fn verify_interface(
             _ => None,
         }
     });
-    if !array_strides
-        .into_iter()
-        .any(|stride| stride == expected_instance_stride)
+    // Liquid fragments receive clip/opacity as flat inputs and no longer read instances.
+    if shader_name != "liquid_fragment"
+        && !array_strides
+            .into_iter()
+            .any(|stride| stride == expected_instance_stride)
     {
         return Err(format!(
             "{shader_name} does not declare its required {expected_instance_stride}-byte instance array stride"
         ));
     }
-    if shader_name.starts_with("liquid_") {
-        // The optics block is vertex-only; flat varyings carry it to fragments.
-        // Keep the existing four-set contract and single owned sampled backdrop.
+    if shader_name.starts_with("liquid_") || shader_name.starts_with("blur_") {
+        // Base glass optics use flat varyings; the blur fragment reads its kernel.
+        // Both pipelines keep the four-set contract with owned sampled images.
         let mut descriptors = std::collections::BTreeMap::<u32, (Option<u32>, Option<u32>)>::new();
         for instruction in &module.annotations {
             if instruction.class.opcode == Op::Decorate {
@@ -107,10 +109,14 @@ pub fn verify_interface(
             .values()
             .filter_map(|(set, binding)| Some(((*set)?, (*binding)?)))
             .collect::<std::collections::BTreeSet<_>>();
-        let expected: &[(u32, u32)] = if expected_stage == "vertex" {
+        let expected: &[(u32, u32)] = if shader_name == "blur_vertex" {
+            &[(0, 0), (1, 0), (1, 2), (2, 0)]
+        } else if shader_name == "blur_fragment" {
+            &[(0, 0), (1, 1), (2, 0), (2, 1), (3, 0)]
+        } else if expected_stage == "vertex" {
             &[(0, 0), (1, 0), (1, 2), (2, 0), (2, 1)]
         } else {
-            &[(0, 0), (1, 1), (2, 0), (3, 0)]
+            &[(0, 0), (1, 1), (3, 0), (3, 1)]
         };
         if actual != expected.iter().copied().collect() {
             return Err(format!(
@@ -144,13 +150,38 @@ mod tests {
             .map(|i| i.class.opcode)
             .collect::<Vec<_>>();
         assert!(!operations.contains(&Op::ImageSampleImplicitLod));
-        // Three dispersed samples OR a single plain sample. Four static sites, not four executed samples.
+        // One blurred sample, one shared sharp center, and two dispersed channels.
         assert_eq!(
             operations
                 .iter()
                 .filter(|op| **op == Op::ImageSampleExplicitLod)
                 .count(),
             4
+        );
+    }
+
+    #[test]
+    fn gaussian_bundle_uses_the_kernel_buffer_and_explicit_lod() {
+        let vertex =
+            include_bytes!("../../telorgon/src/renderer_vulkan/shaders/vulkan/blur.vert.spv");
+        let fragment =
+            include_bytes!("../../telorgon/src/renderer_vulkan/shaders/vulkan/blur.frag.spv");
+        verify_interface(vertex, "vertex", "blur_vertex").unwrap();
+        verify_interface(fragment, "fragment", "blur_fragment").unwrap();
+        let module = dr::load_bytes(fragment).unwrap();
+        let ops: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .map(|i| i.class.opcode)
+            .collect();
+        assert!(!ops.contains(&Op::ImageSampleImplicitLod));
+        assert_eq!(
+            ops.iter()
+                .filter(|op| **op == Op::ImageSampleExplicitLod)
+                .count(),
+            3
         );
     }
 

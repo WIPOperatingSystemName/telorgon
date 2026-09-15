@@ -42,8 +42,8 @@ pub(crate) struct PrimitiveBindingState {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TextureBindingState {
-    pub(crate) view: vk::ImageView,
-    pub(crate) generation: u64,
+    pub(crate) views: [vk::ImageView; 2],
+    pub(crate) generations: [u64; 2],
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

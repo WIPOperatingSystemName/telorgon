@@ -415,13 +415,7 @@ pub(super) fn record_output(
                     sample.weight,
                     BlendMode::Add,
                 );
-                scene
-                    .bind_materialized_image(
-                        ImageId(1),
-                        caches[&sample.placement.scene].targets.last().unwrap(),
-                        ImageAlphaMode::Opaque,
-                    )
-                    .map_err(app_error)?;
+                glass::bind_backdrops(scene, &caches[&sample.placement.scene])?;
                 if let Some(mut delta) = description.take_delta() {
                     delta.epoch = scene
                         .epoch()

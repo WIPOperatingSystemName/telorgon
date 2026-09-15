@@ -16,7 +16,6 @@ use crate::renderer_vulkan::error::{invalid_scene, unsupported};
 use crate::renderer_vulkan::external_image::{
     ExternalImageInner, VulkanExternalAcquire, VulkanExternalRelease,
 };
-use crate::renderer_vulkan::frame::TextureBindingState;
 #[cfg(feature = "instrumentation")]
 use crate::renderer_vulkan::frame::{
     PROFILER_TIMESTAMP_RENDER_BEGIN, PROFILER_TIMESTAMP_RENDER_END, PROFILER_TIMESTAMP_TOTAL_END,
@@ -612,11 +611,25 @@ fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult
                         || !parameters.valid()
                         || !image_resources.contains(&parameters.backdrop.0)
                         || scene.has_external_image(parameters.backdrop)
+                        || !image_resources.contains(&parameters.sharp_backdrop.0)
+                        || scene.has_external_image(parameters.sharp_backdrop)
                     {
                         return Err(invalid_scene(
                             "liquid glass needs finite parameters, its dedicated pipeline, and an owned backdrop",
                         ));
                     }
+                }
+                crate::render::MaterialKind::GaussianBlur(parameters) => {
+                    if draw.batch.pipeline != crate::render::PipelineKind::GaussianBlur
+                        || !parameters.valid()
+                        || !image_resources.contains(&parameters.source.0)
+                        || scene.has_external_image(parameters.source)
+                    {
+                        return Err(invalid_scene("Gaussian blur requires valid parameters, its own pipeline and an owned source"));
+                    }
+                }
+                _ if draw.batch.pipeline == crate::render::PipelineKind::GaussianBlur => {
+                    return Err(invalid_scene("Gaussian blur pipeline requires Gaussian blur parameters"));
                 }
                 _ if draw.batch.pipeline == crate::render::PipelineKind::LiquidGlass => {
                     return Err(invalid_scene(
@@ -920,22 +933,20 @@ fn bind_scene_descriptors(
             }
         }
     }
-    let mut image_ops = Vec::<(vk::DescriptorSet, vk::DescriptorImageInfo)>::new();
+    let mut image_ops = Vec::<(vk::DescriptorSet, u32, vk::DescriptorImageInfo)>::new();
     for slot in 0..scene.texture_count() {
-        if let Some((view, generation)) = scene.texture(slot)
-            && (scene_changed
-                || desired.textures[slot].view != view
-                || desired.textures[slot].generation != generation)
-        {
-            image_ops.push((
-                frame.descriptor_sets.textures[slot],
-                vk::DescriptorImageInfo {
-                    sampler,
-                    image_view: view,
-                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                },
-            ));
-            desired.textures[slot] = TextureBindingState { view, generation };
+        for binding in 0..2 {
+            if let Some((view, generation)) = scene.texture(slot, binding)
+                && (scene_changed
+                    || desired.textures[slot].views[binding as usize] != view
+                    || desired.textures[slot].generations[binding as usize] != generation)
+            {
+                image_ops.push((frame.descriptor_sets.textures[slot], binding,
+                    vk::DescriptorImageInfo { sampler, image_view: view,
+                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }));
+                desired.textures[slot].views[binding as usize] = view;
+                desired.textures[slot].generations[binding as usize] = generation;
+            }
         }
     }
     let buffer_infos = buffer_ops
@@ -944,7 +955,7 @@ fn bind_scene_descriptors(
         .collect::<Vec<_>>();
     let image_infos = image_ops
         .iter()
-        .map(|(_, info)| [*info])
+        .map(|(_, _, info)| [*info])
         .collect::<Vec<_>>();
     let mut writes = Vec::with_capacity(buffer_ops.len() + image_ops.len());
     for ((set, binding, _), info) in buffer_ops.iter().zip(&buffer_infos) {
@@ -956,11 +967,11 @@ fn bind_scene_descriptors(
                 .buffer_info(info),
         );
     }
-    for ((set, _), info) in image_ops.iter().zip(&image_infos) {
+    for ((set, binding, _), info) in image_ops.iter().zip(&image_infos) {
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(*set)
-                .dst_binding(0)
+                .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(info),
         );

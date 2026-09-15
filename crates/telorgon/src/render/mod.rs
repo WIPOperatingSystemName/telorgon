@@ -3,6 +3,7 @@
 mod backend;
 mod compiler;
 mod error;
+mod gaussian_blur;
 mod readback;
 mod request;
 mod rounded_clip;
@@ -29,3 +30,5 @@ pub use scene::{
 };
 pub use stats::{RenderStats, SceneUpdateStats};
 pub use target::{AlphaMode, ColorSpace, RenderTargetInfo};
+
+pub use gaussian_blur::GaussianBlurMaterial;

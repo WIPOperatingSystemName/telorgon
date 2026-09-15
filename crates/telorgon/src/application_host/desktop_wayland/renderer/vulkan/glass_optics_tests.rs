@@ -47,11 +47,23 @@ fn lens_soft(
     };
     let r = radii[corner].clamp(0.0, half[0].min(half[1]));
     let q = [p[0].abs() - half[0] + r, p[1].abs() - half[1] + r];
-    let distance = q[0].max(0.0).hypot(q[1].max(0.0)) + q[0].max(q[1]).min(0.0) - r;
+    let outer = (bevel + softness).min(half[0].min(half[1])).max(bevel);
+    let mut nearest = q[0].max(q[1]);
+    if nearest < 0.0 {
+        let depth_sum = -(q[0] + q[1]);
+        let limit = 0.5 * outer;
+        let remaining = outer - r - 0.5 * depth_sum;
+        let fade = (remaining / limit).clamp(0.0, 1.0);
+        let width = limit * depth_sum / (limit + depth_sum) * fade * fade * (3.0 - 2.0 * fade);
+        if width > 0.0 {
+            let overlap = (1.0 - (q[0] - q[1]).abs() / width).max(0.0);
+            nearest += 0.25 * width * overlap * overlap;
+        }
+    }
+    let distance = q[0].max(0.0).hypot(q[1].max(0.0)) + nearest.min(0.0) - r;
     let t = (1.0 + distance / bevel).clamp(0.0, 1.0);
     let edge = t * t * t * (t * (6.0 * t - 15.0) + 10.0);
     let core = edge * edge;
-    let outer = (bevel + softness).min(half[0].min(half[1])).max(bevel);
     let mix = 0.25 * (outer - bevel) / outer;
     let u = (1.0 + distance / outer).clamp(0.0, 1.0);
     let tail = u * u * u * (u * (6.0 * u - 15.0) + 10.0);
@@ -233,4 +245,75 @@ fn lens_width_and_output_scale_preserve_physical_band() {
             assert!((scaled_bend[i] - bend[i]).abs() < 1e-12);
         }
     }
+}
+
+#[test]
+fn broad_bevel_has_no_first_derivative_crease_on_interior_corner_diagonals() {
+    // Continuity of values alone misses a visible crease: compare one-sided
+    // derivatives of BOTH displacement components and the sharp-source weight.
+    let half = [240.0, 160.0];
+    for radius in [0.0, 12.0, 24.0] {
+        for signs in [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]] {
+            for depth in [radius + 2.0, radius + 8.0, radius + 16.0] {
+                let sample = |offset: f64| {
+                    let (weight, bend) = lens_soft(
+                        [
+                            signs[0] * (half[0] - depth + offset),
+                            signs[1] * (half[1] - depth - offset),
+                        ],
+                        half,
+                        [radius; 4],
+                        52.0,
+                        64.0,
+                    );
+                    [weight, bend[0], bend[1]]
+                };
+                let h = 1e-4;
+                let lo = sample(-h);
+                let at = sample(0.0);
+                let hi = sample(h);
+                for i in 0..3 {
+                    let left = (at[i] - lo[i]) / h;
+                    let right = (hi[i] - at[i]) / h;
+                    assert!(
+                        (left - right).abs() < 2e-5,
+                        "radius={radius} depth={depth} component={i}: {left} != {right}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn interior_fast_path_is_identical_to_the_full_corner_profile() {
+    let mut skipped = 0;
+    for half in [
+        [0.5_f64, 0.5],
+        [100.0, 100.0],
+        [240.0, 160.0],
+        [800.0, 40.0],
+    ] {
+        for r in [0.0_f64, 12.0, 80.0] {
+            let r = r.min(half[0].min(half[1]));
+            for bevel in [8.0_f64, 52.0, 128.0] {
+                let bevel = bevel.min(half[0].min(half[1]));
+                for softness in [0.0, 64.0, 128.0] {
+                    let outer = (bevel + softness).min(half[0].min(half[1])).max(bevel);
+                    for x in -32..=32 {
+                        for y in -32..=32 {
+                            let p = [x as f64 * half[0] / 32.0, y as f64 * half[1] / 32.0];
+                            let nearest = (p[0].abs() - half[0] + r).max(p[1].abs() - half[1] + r);
+                            if nearest <= 0.0_f64.min(r - outer) {
+                                let reference = lens_soft(p, half, [r; 4], bevel, softness);
+                                assert_eq!(reference, (0.0, [0.0, 0.0]));
+                                skipped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(skipped > 1000);
 }

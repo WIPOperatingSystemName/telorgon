@@ -21,10 +21,8 @@ float placement_coverage(){
 }
 
 struct GpuClip { vec4 view_bounds; vec4 local_rect; vec4 local_from_view_0; vec4 local_from_view_1; vec4 radii; vec4 mask_uv_from_view_0; vec4 mask_uv_from_view_1; uvec4 mode_mask_flags; };
-struct GpuMaterialInstance { vec4 rect; uvec4 params_spatial_clip; float opacity; uint material_variant; uint flags; uint reserved; uvec4 resource_range_reserved; };
 layout(set=1,binding=1,std430) readonly buffer ClipBlock { GpuClip values[]; } clips;
-layout(set=2,binding=0,std430) readonly buffer MaterialBlock { GpuMaterialInstance values[]; } materials;
-layout(location=0) noperspective in vec2 unit_position;layout(location=1) noperspective in vec2 view_position;layout(location=2) flat in uint instance_slot;layout(location=0) out vec4 output_color;
+layout(location=0) noperspective in vec2 unit_position;layout(location=1) noperspective in vec2 view_position;layout(location=2) flat in uint lens_clip;layout(location=0) out vec4 output_color;
 // Convert local signed distance to output pixels using the analytic edge normal.
 // An L1 derivative width (fwidth) widens the AA band by sqrt(2) at 45 degrees.
 float rounded_pixel_width(vec2 p,vec2 size,vec4 radii){
@@ -58,12 +56,14 @@ float clip_coverage(uint slot,vec2 p){
 // Original Telorgon implementation. See docs/LIQUID_GLASS.md for the reference study
 // and outline-matched lens derivation. One owned backdrop, no feedback sampling.
 layout(set=3,binding=0) uniform sampler2D backdrop;
+layout(set=3,binding=1) uniform sampler2D sharp_backdrop;
 layout(location=3) flat in vec4 panel_rect;
 layout(location=4) flat in vec4 lens_radii;
 layout(location=5) flat in vec4 lens_uv_bevel_refraction;
-layout(location=6) flat in vec4 lens_lighting;
+layout(location=6) flat in vec2 lens_lighting;
 layout(location=7) flat in vec4 lens_tint;
-layout(location=8) flat in vec2 lens_blend;
+layout(location=8) flat in vec4 lens_blend;
+layout(location=9) flat in float lens_opacity;
 
 // Static optical tuning: tan(4 degrees). Zero disables swirl; negative reverses it.
 // Kept in the offline shader so this adds no uniform traffic or animation clock.
@@ -74,16 +74,34 @@ vec2 twist_refraction(vec2 slope, float edge_weight) {
     return (slope+vec2(-slope.y,slope.x)*twist)*inversesqrt(1.0+twist*twist);
 }
 
-// Exact rounded-window distance controls band width. The optical direction is
-// deliberately separate: the exact SDF gradient jumps on interior diagonal ties.
+// Rounded-window distance controls the outer band; its interior crease is smoothed.
+// Optical direction is separate because the exact SDF gradient jumps on diagonal ties.
 float lens_falloff(vec2 p, vec2 half_size, float radius) {
     vec2 q=abs(p)-half_size+radius;
-    float distance=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
+    float nearest=max(q.x,q.y);
+    // Exact interior fast path: no corner overlap can pull these pixels into the band.
+    if(nearest<=min(0.0,radius-lens_blend.z))return 0.0;
+    // Inside the corner's circle center, exact SDF insets have a diagonal medial
+    // crease. Smooth that interior max too: smoothing direction alone leaves a
+    // kink in bend magnitude (and in the sharp/blur blend).
+    if(nearest<0.0) {
+        float depth_sum=-(q.x+q.y);
+        float limit=lens_blend.w;
+        // Stop smoothing at the inner fade boundary so the clear center stays clear.
+        float remaining=2.0*limit-radius-0.5*depth_sum;
+        float width=limit*depth_sum/(limit+depth_sum)*smoothstep(0.0,1.0,remaining*(2.0*lens_blend.x));
+        if(width>0.0) {
+            float overlap=max(1.0-abs(q.x-q.y)/width,0.0);
+            nearest+=0.25*width*overlap*overlap;
+        }
+    }
+    float distance=length(max(q,vec2(0)))+min(nearest,0.0)-radius;
     float t=clamp(1.0+distance*lens_uv_bevel_refraction.z,0.0,1.0);
     // Quintic endpoints have zero first and second derivatives. Squaring puts
     // most bending at the rim and leaves a soft tail into the blurred interior.
     float edge=t*t*t*(t*(6.0*t-15.0)+10.0);
     float core=edge*edge;
+    if(lens_blend.y==0.0)return core;
     float outer_t=clamp(1.0+distance*lens_blend.x,0.0,1.0);
     float tail=outer_t*outer_t*outer_t*(outer_t*(6.0*outer_t-15.0)+10.0);
     // Preserve the strong rim and add only a gentle tail beyond the core band.
@@ -101,13 +119,9 @@ vec2 lens_direction(vec2 p, vec2 half_size, float radius) {
     v=v*v/(v+softness);
     return sign(p)*v*inversesqrt(max(dot(v,v),1e-8));
 }
-float power64(float x) {
-    x*=x; x*=x; x*=x; x*=x; x*=x; return x*x;
-}
 void main() {
-    GpuMaterialInstance item=materials.values[instance_slot];
     // Derivatives used by generic clipping execute before any varying control flow.
-    float coverage=placement_coverage()*clip_coverage(item.params_spatial_clip.w,view_position);
+    float coverage=placement_coverage()*clip_coverage(lens_clip,view_position);
     if(coverage<=0.0) discard;
     vec2 half_size=panel_rect.zw*0.5;
     vec2 p=(unit_position-0.5)*panel_rect.zw;
@@ -117,38 +131,33 @@ void main() {
     vec2 bend=vec2(0);
     vec2 separation=vec2(0);
     float reflection=0.0;
-    float highlight=0.0;
     if(t>0.0) {
         vec2 slope=lens_direction(p,half_size,radius)*t;
         vec2 refracted_slope=twist_refraction(slope,t);
         bend=-refracted_slope*lens_uv_bevel_refraction.w;
         separation=refracted_slope*lens_lighting.x;
-        // A smooth lighting proxy, not a traced physical surface normal.
-        vec3 normal=vec3(slope,sqrt(max(1.0-dot(slope,slope),0.0)));
-        float grazing=1.0-normal.z;
-        grazing*=grazing;
-        reflection=grazing*grazing*lens_lighting.z;
-        if(lens_lighting.w>0.0) {
-            const vec3 H0=vec3(-0.165000413,-0.289000723,0.943002358);
-            const vec3 H1=vec3(0.133943689,0.222906288,0.965594053);
-            highlight=(power64(clamp(dot(normal,H0),0.0,1.0))+0.3*power64(clamp(dot(normal,H1),0.0,1.0)))*lens_lighting.w*t;
+        if(lens_lighting.y>0.0) {
+            float grazing=1.0-sqrt(max(1.0-dot(slope,slope),0.0));
+            grazing*=grazing;
+            reflection=grazing*grazing*lens_lighting.y;
         }
-        // Spread rim light across the same smooth profile; no separate 1–2px stroke.
-        float directional=0.65-0.35*normal.y;
-        highlight+=lens_lighting.y*directional*0.10*t*t;
     }
     vec2 uv=(panel_rect.xy+unit_position*panel_rect.zw+bend)*lens_uv_bevel_refraction.xy;
-    vec3 color;
-    // Explicit LOD is well-defined in the varying bevel branch. Targets have
-    // one mip level; filtering and border handling use the cached linear sampler.
-    if(t>0.0 && lens_lighting.x>0.0) {
-        vec2 delta=separation*lens_uv_bevel_refraction.xy;
-        color=vec3(textureLod(backdrop,uv+delta,0.0).r,textureLod(backdrop,uv,0.0).g,textureLod(backdrop,uv-delta,0.0).b);
-    } else {
-        color=textureLod(backdrop,uv,0.0).rgb;
+    // The interior stays blurred. Refraction approaches the full-resolution sharp source
+    // continuously at the rim, without magnifying the blur kernel into coarse blocks.
+    vec3 color=textureLod(backdrop,uv,0.0).rgb;
+    if(t>0.0) {
+        // The central sample supplies all channels without dispersion, or green with it.
+        vec3 sharp=textureLod(sharp_backdrop,uv,0.0).rgb;
+        if(lens_lighting.x>0.0) {
+            vec2 delta=separation*lens_uv_bevel_refraction.xy;
+            sharp.r=textureLod(sharp_backdrop,uv+delta,0.0).r;
+            sharp.b=textureLod(sharp_backdrop,uv-delta,0.0).b;
+        }
+        color=mix(color,sharp,t);
     }
     color=color*lens_tint.w+lens_tint.rgb;
-    color=mix(color,vec3(1),reflection*0.2)+vec3(highlight);
-    float alpha=clamp(item.opacity,0.0,1.0)*coverage;
+    color=mix(color,vec3(1),reflection*0.2);
+    float alpha=lens_opacity*coverage;
     output_color=vec4(color*alpha,alpha);
 }

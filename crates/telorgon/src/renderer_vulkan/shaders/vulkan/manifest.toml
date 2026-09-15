@@ -1,9 +1,9 @@
 schema_version = 1
 interface_major = 4
-interface_minor = 2
+interface_minor = 4
 target = "vulkan1.3-spirv1.6"
-source_config_hash = "ae30fcfa53242e950e930063fb92e73a4ade2d197aeb1e76006a8549bbf68e2f"
-bundle_hash = "252c189c3758d58bb4bbfa9b8c7c9adb027279374d217e51daf1b9812193ca06"
+source_config_hash = "3cf164cd7e855664df27382d34ffd0979530664e0f42f75217edd59b4387f401"
+bundle_hash = "ab9c3ac5f9e76f1543698418d3b4e32b27fc2a5e52a3bf544238767eace4f549"
 
 [[shader]]
 name = "box_vertex"
@@ -80,17 +80,35 @@ entry_point = "main"
 [[shader]]
 name = "liquid_vertex"
 source = "shaders/vulkan/box/liquid.vert"
-source_hash = "39cae8af41259b988451e9895540d2bbc744f55bb377ac021fcf1963f0ff8d02"
+source_hash = "cbca7e5f61ac3a1772eb952a0ea51c0fa7a199960934b9b9919a052a8419324f"
 artifact = "liquid.vert.spv"
-artifact_hash = "582ccea1c9998d75b40e6acbd65c73b3fcdd21f1ddf6329cfa0951a90a6cd785"
+artifact_hash = "723a6f6c78547285b259a27b70662cd099ca1de03aef8c386ddab111cc0a7834"
 stage = "vertex"
 entry_point = "main"
 
 [[shader]]
 name = "liquid_fragment"
 source = "shaders/vulkan/box/liquid.frag"
-source_hash = "4e0a88958722baebd12cc45321f8bbd481dc7e6f59b53c7fcb8e44ecb23e5aac"
+source_hash = "3c8167ceff30225b1490c5c044581a9ef254758371fb61cc1eb8758f57981ec5"
 artifact = "liquid.frag.spv"
-artifact_hash = "cc70f66c8ffad0c76afd8beccd722f0170b037c1d89d5cf8b246430dc07c0043"
+artifact_hash = "54df50039ea4a6f8337db15cd147dd3d17b1cd458baf75f3571913bbcb4dce6a"
+stage = "fragment"
+entry_point = "main"
+
+[[shader]]
+name = "blur_vertex"
+source = "shaders/vulkan/box/blur.vert"
+source_hash = "c3b1a25ad01c007eb2411f4b2c7859342619024acad54c609a6f1a59d6544780"
+artifact = "blur.vert.spv"
+artifact_hash = "783af7da04c758dc2db03d1187818f7a77548101504d07d1f29a8314a806fe3c"
+stage = "vertex"
+entry_point = "main"
+
+[[shader]]
+name = "blur_fragment"
+source = "shaders/vulkan/box/blur.frag"
+source_hash = "afb512c538cdbca82a5b32bcce1e6a285e0e87920cde088edae01a100fe108a9"
+artifact = "blur.frag.spv"
+artifact_hash = "61e9d7a37fd6bc569f9a929db4b792f1567a62383a02e4c14fc24a2da796f755"
 stage = "fragment"
 entry_point = "main"

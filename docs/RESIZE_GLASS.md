@@ -25,11 +25,11 @@ allocation/budget fallback use the flat tint. The default host appearance remain
 The test compositor opts into glass.
 
 `GlassStyle::liquid()` (also the default) provides a mild blur, a smooth lens matched to the rounded window outline,
-RGB dispersion and reflective highlights. Distances use logical pixels and scale once for output
-density. `blur_radius` is an approximate footprint, quantized to a bounded filtered pyramid:
-0 disables filtering, finite values clamp to 0–64 and non-finite values become 4. It is not Gaussian
-sigma. `bevel_width` clamps to 1–128, `refraction` to 0–64 and `dispersion` to 0–4. The latter at zero
-uses one texture sample everywhere. `rim`, `fresnel` and `specular` clamp to 0–1. The shader does not
+RGB dispersion and Fresnel reflection. Distances use logical pixels and scale once for output
+density. `blur_radius` is a Gaussian diameter (sigma is half the value), filtered at full resolution.
+0 disables filtering, finite logical values clamp to 0–64 and non-finite values become 4.
+`bevel_width` clamps to 1–128, `refraction` to 0–64 and `dispersion` to 0–4. Zero dispersion
+uses one sharp rim sample instead of three. `fresnel` clamps to 0–1. Directional rim lighting and specular controls are removed. The shader does not
 add a shadow. Optical parameters are normalized before caching. `bevel_width` controls the smooth
 inward falloff measured from the actual rounded window outline. A separate smoothed direction
 field blends adjacent edges, including when the band exceeds the corner radius. The
@@ -57,19 +57,16 @@ source provenance, exact versus approximate optimizations, and remaining perform
 
 The Vulkan desktop captures the ordered layers below each veil into a full-output opaque target,
 excluding the resizing window's own shadow. The window's hidden client/chrome and higher layers
-are absent. Successive half-size linear-filtered passes produce a small blurred image, followed by
-a liquid lens draw that applies tint, refraction, dispersion and highlights. There is no separate
-tint pass. The final output samples that texture in desktop coordinates through the
-original scissor and rounded contour. It does not stretch the backdrop when the preview resizes.
-This is a filtered-pyramid blur, not a Gaussian or dual-Kawase implementation.
+are absent. Two full-resolution Gaussian passes produce the blurred interior source. The liquid
+lens blends toward the original sharp capture at its refracted rim, then applies tint and Fresnel reflection.
+Sampling uses desktop coordinates through the original scissor and rounded contour.
 
-The cache key includes output extent, pyramid depth, lower placements, lower scene
-epochs and lower glass backdrop revisions. Tint and optics do not invalidate the backdrop. Resizing or moving the veil alone reuses the prepared texture. Background publications,
-movement, or stacking changes invalidate it; upper-layer/cursor changes do not. Damage expands to
-the affected glass footprint when its backdrop changes. An idle preview schedules no extra frames.
-Targets are reused while extent/depth match and released after glass disappears. Estimated live
-backdrop pixel storage is bounded to 96 MiB; in-flight resource pins may temporarily exceed that.
-Allocation/budget failure uses the flat tint. GPU recording/submission failures remain normal errors.
+The cache key includes output extent, exact normalized blur radius, lower placements, lower scene
+epochs and lower glass backdrop revisions. Radius-only changes rerun filtering without recapture;
+tint, optics and lens movement reuse prepared pixels. Lower-source changes recapture and refilter.
+Targets remain full resolution and are reused while their extent/count match. Idle glass adds no
+frames. Three RGBA8 targets are needed with blur, one without. The 256 MiB live-pixel budget
+and flat-tint allocation fallback remain. This costs more GPU work and memory than downsampling.
 
 Window motion captures now exclude glass pixels. A small optical recipe travels alongside each
 immutable content snapshot and its weighted mixes. Maximize/restore, early-ready holding, and
@@ -88,14 +85,14 @@ A resolve is reused while content, optical recipe, displayed placement and lower
 Lower Motion scene epochs now stay stable on unchanged frames. Native lens buffers and image
 bindings survive resize; the window-sized target changes size when necessary and uses the existing
 spare pool. Resolved live-glass targets have an additional 64 MiB estimated pixel budget, separate
-from the 96 MiB backdrop budget and existing snapshot/spare budgets. In-flight pins may temporarily
+from the 256 MiB backdrop budget and existing snapshot/spare budgets. In-flight pins may temporarily
 exceed those owner budgets. At most 16 distinct glass endpoints are admitted per motion snapshot;
 resource exhaustion takes the existing immediate-presentation fallback. This correction adds GPU
 composition work during glass motion; it is not a claim of unchanged GPU time or power.
 
 ## Engineering audit
 
-The new offline liquid shader uses GPU ABI 4.2 and the existing four descriptor sets, materialization
+The new offline liquid shader uses GPU ABI 4.4 and the existing four descriptor sets, materialization
 ownership, synchronization and submission mechanisms. Reference review, mathematical derivation
 and packed parameter contract are documented in [LIQUID_GLASS.md](LIQUID_GLASS.md).
 

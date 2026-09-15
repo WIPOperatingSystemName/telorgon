@@ -1301,7 +1301,7 @@ fn draw_material(
                 y: point_y,
             });
             let amount = match material.kind {
-                MaterialKind::Solid | MaterialKind::LiquidGlass(_) => 0.0,
+                MaterialKind::Solid | MaterialKind::LiquidGlass(_) | MaterialKind::GaussianBlur(_) => 0.0,
                 MaterialKind::LinearGradientHorizontal => {
                     (local.x - instance.rect.x) / instance.rect.width
                 }

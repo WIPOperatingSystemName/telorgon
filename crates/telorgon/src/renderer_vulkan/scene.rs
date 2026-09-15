@@ -200,7 +200,7 @@ pub struct VulkanScene {
     image_resources: BTreeMap<ImageId, VulkanImageResource>,
     external_images: BTreeMap<ImageId, ExternalSceneImage>,
     pub(crate) material_resources: BTreeMap<u32, MaterialResource>,
-    texture_slots: BTreeMap<u32, usize>,
+    texture_slots: BTreeMap<(u32, Option<u32>), usize>,
     metrics: VulkanSceneMetrics,
 }
 
@@ -619,13 +619,15 @@ impl VulkanScene {
         let previous_parameters = std::mem::take(&mut self.material_parameters);
         let mut offsets = BTreeMap::new();
         for (id, resource) in &self.material_resources {
-            offsets.insert(*id, self.material_parameters.len() as u32);
+            let start = self.material_parameters.len() as u32;
             match resource.kind {
                 MaterialKind::LiquidGlass(parameters) => {
                     self.material_parameters.extend(parameters.words());
                 }
+                MaterialKind::GaussianBlur(parameters) => self.material_parameters.extend(parameters.words()),
                 _ => self.material_parameters.extend(resource.colors.map(pack)),
             }
+            offsets.insert(*id, (start, self.material_parameters.len() as u32 - start));
         }
         let next_materials: Vec<GpuMaterialInstance> = self
             .materials
@@ -635,12 +637,8 @@ impl VulkanScene {
                 GpuMaterialInstance {
                     rect: rect(instance.rect),
                     params_spatial_clip: [
-                        offsets.get(&instance.material.0).copied().unwrap_or(0),
-                        if resource.is_some_and(|r| matches!(r.kind, MaterialKind::LiquidGlass(_))) {
-                            17
-                        } else {
-                            2
-                        },
+                        offsets.get(&instance.material.0).map_or(0, |range| range.0),
+                        offsets.get(&instance.material.0).map_or(2, |range| range.1),
                         instance.spatial.0,
                         clip_slot(instance.clip.0),
                     ],
@@ -650,6 +648,7 @@ impl VulkanScene {
                         MaterialKind::LinearGradientHorizontal => 1,
                         MaterialKind::LinearGradientVertical => 2,
                         MaterialKind::LiquidGlass(_) => 3,
+                        MaterialKind::GaussianBlur(_) => 4,
                     }),
                     flags: 0,
                     reserved: 0,
@@ -697,11 +696,12 @@ impl VulkanScene {
             .draw_order
             .iter()
             .filter_map(|draw| match draw.kind {
-                PrimitiveKind::Image => Some(draw.batch.resource),
+                PrimitiveKind::Image => Some((draw.batch.resource, None)),
                 PrimitiveKind::Material => self.material_resources
                     .get(&draw.batch.resource)
                     .and_then(|r| match r.kind {
-                        MaterialKind::LiquidGlass(p) => Some(p.backdrop.0),
+                        MaterialKind::LiquidGlass(p) => Some((p.backdrop.0, Some(p.sharp_backdrop.0))),
+                        MaterialKind::GaussianBlur(p) => Some((p.source.0, None)),
                         _ => None,
                     }),
                 _ => None,
@@ -715,11 +715,12 @@ impl VulkanScene {
     pub(crate) fn texture_slot(&self, batch: &DrawBatch) -> Option<usize> {
         match batch.kind {
             PrimitiveKind::Glyph => Some(0),
-            PrimitiveKind::Image => self.texture_slots.get(&batch.key.resource).copied(),
+            PrimitiveKind::Image => self.texture_slots.get(&(batch.key.resource, None)).copied(),
             PrimitiveKind::Material => self.material_resources
                 .get(&batch.key.resource)
                 .and_then(|r| match r.kind {
-                    MaterialKind::LiquidGlass(p) => self.texture_slots.get(&p.backdrop.0).copied(),
+                    MaterialKind::LiquidGlass(p) => self.texture_slots.get(&(p.backdrop.0, Some(p.sharp_backdrop.0))).copied(),
+                    MaterialKind::GaussianBlur(p) => self.texture_slots.get(&(p.source.0, None)).copied(),
                     _ => None,
                 }),
             PrimitiveKind::Box => None,
@@ -795,6 +796,7 @@ impl VulkanScene {
             + u32::from(!self.gpu_images.is_empty() && !self.image_buffer.is_allocated())
             + u32::from(!self.gpu_materials.is_empty() && !self.material_buffer.is_allocated())
             + self.texture_count() as u32
+            + self.texture_slots.keys().filter(|(_, second)| second.is_some()).count() as u32
     }
 
     pub(crate) fn prepare_uploads(
@@ -1067,8 +1069,9 @@ impl VulkanScene {
     pub(crate) fn material_parameter_generation(&self) -> u64 {
         self.material_parameter_buffer.generation()
     }
-    pub(crate) fn texture(&self, slot: usize) -> Option<(vk::ImageView, u64)> {
+    pub(crate) fn texture(&self, slot: usize, binding: u32) -> Option<(vk::ImageView, u64)> {
         if slot == 0 {
+            if binding != 0 { return None; }
             return self
                 .atlas_texture
                 .image
@@ -1079,7 +1082,7 @@ impl VulkanScene {
             .texture_slots
             .iter()
             .find_map(|(id, value)| (*value == slot).then_some(*id))?;
-        let image = ImageId(resource_id);
+        let image = ImageId(if binding == 0 { resource_id.0 } else { resource_id.1? });
         self.image_resources
             .get(&image)
             .and_then(|resource| {
@@ -1468,7 +1471,7 @@ pub(crate) fn validate_draw_order(order: &[DrawItem]) -> Result<(), &'static str
         };
         if draw.batch.pipeline != expected
             && !(draw.kind == PrimitiveKind::Material
-                && draw.batch.pipeline == PipelineKind::LiquidGlass)
+                && matches!(draw.batch.pipeline, PipelineKind::LiquidGlass | PipelineKind::GaussianBlur))
         {
             return Err("Vulkan draw item primitive and pipeline kinds disagree");
         }
@@ -1482,7 +1485,7 @@ pub(crate) fn validate_texture_count(order: &[DrawItem]) -> Result<(), &'static 
     let images = order
         .iter()
         .filter(|draw| {
-            draw.kind == PrimitiveKind::Image || draw.batch.pipeline == PipelineKind::LiquidGlass
+            draw.kind == PrimitiveKind::Image || matches!(draw.batch.pipeline, PipelineKind::LiquidGlass | PipelineKind::GaussianBlur)
         })
         .map(|draw| (draw.kind as u8, draw.batch.resource))
         .collect::<BTreeSet<_>>()
@@ -1520,6 +1523,35 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn glass_texture_slots_distinguish_sharp_sources_and_plain_images() {
+        let mut scene = VulkanScene::default();
+        for (id, sharp) in [(1, 8), (2, 9), (3, 8)] {
+            scene.material_resources.insert(id, MaterialResource {
+                material: crate::ui::MaterialId(id),
+                content_version: 1,
+                kind: MaterialKind::LiquidGlass(crate::render::LiquidGlassMaterial {
+                    backdrop: ImageId(7), sharp_backdrop: ImageId(sharp),
+                    radii: [0.0; 4], inverse_output_size: [0.01; 2],
+                    inverse_bevel: 1.0, blend_softness: 0.0, refraction: 1.0,
+                    dispersion: 0.0, fresnel: 0.0,
+                    tint: [0.0, 0.0, 0.0, 1.0],
+                }),
+                colors: [ColorRgba8::rgba(0, 0, 0, 0); 2],
+            });
+        }
+        scene.draw_order = vec![draw(PrimitiveKind::Image, 7),
+            draw(PrimitiveKind::Material, 1), draw(PrimitiveKind::Material, 2),
+            draw(PrimitiveKind::Material, 3)];
+        scene.rebuild_texture_slots();
+        assert_eq!(scene.texture_slots.len(), 3);
+        let batches = build_batches(&scene.draw_order);
+        let slots: Vec<_> = batches.iter().map(|b| scene.texture_slot(b).unwrap()).collect();
+        assert_ne!(slots[0], slots[1]);
+        assert_ne!(slots[1], slots[2]);
+        assert_eq!(slots[1], slots[3]);
+    }
+
     #[test]
     fn glyph_upload_keeps_physical_atlas_texels_separate_from_logical_quad() {
         let instance = GlyphInstance {

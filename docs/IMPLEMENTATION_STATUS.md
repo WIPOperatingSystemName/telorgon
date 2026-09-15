@@ -1,7 +1,7 @@
 # Telorgon Implementation Status
 
 > Resize previews support flat color or Vulkan liquid glass with smooth distortion matched to the rounded window outline, bounded
-> refraction, optional dispersion and a cached backdrop. GPU ABI 4.2 packs optics into 68 bytes, including an independent inner blend softness.
+> refraction, optional dispersion, full-resolution Gaussian blur and a separately retained sharp rim backdrop. GPU ABI 4.4 packs optics into 60 bytes, including an independent inner blend softness. Rim lighting and specular highlights are removed; Fresnel remains.
 > Glass remains outside immutable motion captures; maximize/minimize resolve it at the current
 > displayed geometry, with weighted content fades and animated lower-window backdrop inputs.
 > Software uses the tint fallback. See [Resize-preview glass](RESIZE_GLASS.md) and the

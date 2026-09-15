@@ -1,4 +1,4 @@
-//! Filtered backdrop pyramid, using the existing image shader and owned snapshot lifetime.
+//! Full-resolution backdrop capture and separable Gaussian filtering with owned snapshot lifetime.
 //! No readback, extra submission, or timer: lower-scene revisions drive cache invalidation.
 use super::super::super::scene::{DesktopLayerKey, DesktopPlacement};
 use super::*;
@@ -7,12 +7,28 @@ use crate::render::{
 };
 use crate::renderer_vulkan::VulkanFrameContext;
 
+// Three full-resolution RGBA8 targets at 3840x2400 need 105.5 MiB per lens.
+// Admit two such backdrops; the former 96 MiB pyramid budget rejected even one.
+const BACKDROP_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+fn backdrop_fits_budget(extents: &[SizeI], other_bytes: u64) -> bool {
+    extents.iter().fold(other_bytes, |bytes, extent| {
+        bytes.saturating_add(extent.width as u64 * extent.height as u64 * 4)
+    }) <= BACKDROP_BUDGET_BYTES
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Signature {
     extent: SizeI,
-    levels: usize,
+    blur_radius: f32,
     // Scene epoch tracks lens geometry/optics; backdrop revision tracks texture contents.
     sources: Vec<(DesktopPlacement, u64, u64)>,
+}
+
+impl Signature {
+    fn same_capture(&self, other: &Self) -> bool {
+        self.extent == other.extent && self.sources == other.sources
+    }
 }
 
 pub(super) struct GlassCache {
@@ -45,50 +61,106 @@ pub(super) fn backdrop_sources(
         .collect()
 }
 
-fn pyramid_extents(extent: SizeI, radius: f32) -> Vec<SizeI> {
-    let radius = if radius.is_finite() {
+fn normalized_blur_radius(radius: f32) -> f32 {
+    if radius.is_finite() {
         radius.clamp(0.0, 256.0)
     } else {
         4.0
-    };
-    let levels = if radius <= 0.0 {
-        0
-    } else {
-        (radius / 2.0).log2().round().clamp(1.0, 7.0) as usize
-    };
-    let mut result = vec![extent];
-    for _ in 0..levels {
-        let last = *result.last().unwrap();
-        if last.width == 1 && last.height == 1 {
-            break;
-        }
-        result.push(SizeI {
-            width: (last.width + 1) / 2,
-            height: (last.height + 1) / 2,
-        });
     }
-    result
+}
+
+fn backdrop_extents(extent: SizeI, radius: f32) -> Vec<SizeI> {
+    // Sharp capture, horizontal intermediate, vertical result. Resolution never depends
+    // on blur strength. A zero-radius lens needs only the original capture.
+    vec![
+        extent;
+        if normalized_blur_radius(radius) > 0.0 {
+            3
+        } else {
+            1
+        }
+    ]
 }
 
 fn is_own_shadow(p: &DesktopPlacement, id: u32) -> bool {
     matches!(p.key, DesktopLayerKey::FrameShadow(owner) | DesktopLayerKey::MotionShadow(owner) if owner == id)
 }
 
-fn sample_scene(
+fn blur_scene(
     device: &VulkanDevice,
     source: &VulkanMaterializationTarget,
     extent: SizeI,
+    radius: f32,
+    horizontal: bool,
 ) -> AppResult<VulkanScene> {
-    let image = ImageId(1);
-    let mut description = super::super::super::motion::image_scene(extent, &[(image, 1.0)], false);
+    let mut description = RenderScene::default();
+    description.extent = SizeF {
+        width: extent.width as f32,
+        height: extent.height as f32,
+    };
+    description.background = ColorRgba8::rgba(0, 0, 0, 0);
+    description.set_material_resource(MaterialResource {
+        material: MaterialId(1),
+        content_version: 1,
+        kind: MaterialKind::GaussianBlur(crate::render::GaussianBlurMaterial {
+            source: ImageId(1),
+            inverse_size: [1.0 / extent.width as f32, 1.0 / extent.height as f32],
+            sigma: radius * 0.5,
+            horizontal,
+        }),
+        colors: [ColorRgba8::rgba(255, 255, 255, 255); 2],
+    });
+    let node = NodeId::new(1, 1);
+    let rect = RectF {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+    };
+    description.materials.upsert(
+        node,
+        MaterialInstance {
+            node,
+            material: MaterialId(1),
+            rect,
+            view_bounds: rect,
+            opacity: 1.0,
+            clip: ClipId(0),
+            spatial: SpatialId(0),
+        },
+    );
+    description.set_draw_order(vec![DrawItem {
+        kind: PrimitiveKind::Material,
+        index: 0,
+        batch: BatchKey {
+            pipeline: PipelineKind::GaussianBlur,
+            resource: 1,
+            clip: ClipId(0),
+            blend: BlendMode::Opaque,
+            target: 0,
+        },
+    }]);
     let mut scene = device.create_scene().map_err(app_error)?;
     scene
-        .bind_materialized_image(image, source, ImageAlphaMode::Opaque)
+        .bind_materialized_image(ImageId(1), source, ImageAlphaMode::Opaque)
         .map_err(app_error)?;
     device
         .apply_scene_delta(&mut scene, &description.take_delta().unwrap())
         .map_err(app_error)?;
     Ok(scene)
+}
+
+pub(super) fn bind_backdrops(scene: &mut VulkanScene, cache: &GlassCache) -> AppResult<()> {
+    scene
+        .bind_materialized_image(
+            ImageId(1),
+            cache.targets.last().unwrap(),
+            ImageAlphaMode::Opaque,
+        )
+        .map_err(app_error)?;
+    scene
+        .bind_materialized_image(ImageId(2), &cache.targets[0], ImageAlphaMode::Opaque)
+        .map_err(app_error)
 }
 
 /// Only this small retained material changes as the lens moves; the backdrop stays bound.
@@ -149,15 +221,14 @@ pub(super) fn update_lens_weighted(
     };
     let parameters = LiquidGlassMaterial {
         backdrop: ImageId(1),
+        sharp_backdrop: ImageId(2),
         radii,
         inverse_output_size: [1.0 / extent.width as f32, 1.0 / extent.height as f32],
         inverse_bevel: 1.0 / style.bevel_width.min(half).max(0.5),
         blend_softness: style.blend_softness,
         refraction: style.refraction,
         dispersion: style.dispersion,
-        rim: style.rim,
         fresnel: style.fresnel,
-        specular: style.specular,
         tint: [
             linear(style.tint.r),
             linear(style.tint.g),
@@ -248,11 +319,12 @@ pub(super) fn prepare_backdrop(
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<bool> {
     let cache_key = DesktopSceneKey::ResizeVeil(id);
-    let extents = pyramid_extents(extent, style.blur_radius);
+    let radius = normalized_blur_radius(style.blur_radius);
+    let extents = backdrop_extents(extent, radius);
     let sources = backdrop_sources(id, lower, scenes, caches);
     let signature = Signature {
         extent: extent,
-        levels: extents.len(),
+        blur_radius: radius,
         sources,
     };
     let rebuild = caches
@@ -266,19 +338,19 @@ pub(super) fn prepare_backdrop(
                 .map(|t| t.extent())
                 .eq(extents.iter().copied())
         });
+        let capture_changed = !reusable
+            || caches
+                .get(&cache_key)
+                .is_none_or(|cache| !cache.signature.same_capture(&signature));
         if !reusable {
             // Bound live backdrop storage. Existing image pins protect retired in-flight work.
-            let required = extents
-                .iter()
-                .map(|e| e.width as u64 * e.height as u64 * 4)
-                .sum::<u64>();
             let other_bytes = caches
                 .iter()
                 .filter(|(key, _)| **key != cache_key)
                 .flat_map(|(_, c)| &c.targets)
                 .map(|t| t.allocated_bytes())
                 .sum::<u64>();
-            if required + other_bytes > 96 * 1024 * 1024 {
+            if !backdrop_fits_budget(&extents, other_bytes) {
                 return Ok(false);
             }
             let targets = extents
@@ -305,38 +377,46 @@ pub(super) fn prepare_backdrop(
             );
         }
         let cache = caches.get_mut(&cache_key).unwrap();
-        let indices = scenes
-            .keys()
-            .enumerate()
-            .map(|(i, key)| (*key, i))
-            .collect::<BTreeMap<_, _>>();
-        let inputs = signature
-            .sources
-            .iter()
-            .map(|(p, _, _)| {
-                Ok(VulkanCompositePlacement {
-                    scene_index: *indices
-                        .get(&p.scene)
-                        .ok_or_else(|| AppError::new("glass backdrop scene missing"))?,
-                    target: p.target,
-                    clip: p.clip,
-                    rounded_clips: p.rounded_clips,
+        if capture_changed {
+            let indices = scenes
+                .keys()
+                .enumerate()
+                .map(|(i, key)| (*key, i))
+                .collect::<BTreeMap<_, _>>();
+            let inputs = signature
+                .sources
+                .iter()
+                .map(|(p, _, _)| {
+                    Ok(VulkanCompositePlacement {
+                        scene_index: *indices
+                            .get(&p.scene)
+                            .ok_or_else(|| AppError::new("glass backdrop scene missing"))?,
+                        target: p.target,
+                        clip: p.clip,
+                        rounded_clips: p.rounded_clips,
+                    })
                 })
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        let mut source_scenes = scenes
-            .values_mut()
-            .map(|scene| VulkanCompositeScene { scene })
-            .collect::<Vec<_>>();
-        draw(
-            device,
-            &mut source_scenes,
-            &inputs,
-            &mut cache.targets[0],
-            context,
-        )?;
+                .collect::<AppResult<Vec<_>>>()?;
+            let mut source_scenes = scenes
+                .values_mut()
+                .map(|scene| VulkanCompositeScene { scene })
+                .collect::<Vec<_>>();
+            draw(
+                device,
+                &mut source_scenes,
+                &inputs,
+                &mut cache.targets[0],
+                context,
+            )?;
+        }
         for level in 1..cache.targets.len() {
-            let mut source = sample_scene(device, &cache.targets[level - 1], extents[level])?;
+            let mut source = blur_scene(
+                device,
+                &cache.targets[level - 1],
+                extent,
+                radius,
+                level == 1,
+            )?;
             draw(
                 device,
                 &mut [VulkanCompositeScene { scene: &mut source }],
@@ -404,13 +484,7 @@ pub(super) fn record_glass(
                 entry.insert(device.create_scene().map_err(app_error)?)
             }
         };
-        scene
-            .bind_materialized_image(
-                ImageId(1),
-                cache.targets.last().unwrap(),
-                ImageAlphaMode::Opaque,
-            )
-            .map_err(app_error)?;
+        bind_backdrops(scene, cache)?;
         if let Some(mut delta) = cache.output.take_delta() {
             delta.epoch = scene
                 .epoch()
@@ -437,6 +511,26 @@ pub(super) fn record_glass(
 mod tests {
     use super::*;
     #[test]
+    fn full_resolution_glass_budget_admits_two_3840_by_2400_backdrops() {
+        // Regression: the real 200%-scale output exceeded the old budget for even
+        // one lens, silently selecting flat tint and losing all refraction.
+        let extent = SizeI {
+            width: 3840,
+            height: 2400,
+        };
+        let targets = backdrop_extents(extent, 20.0);
+        let one_lens_bytes = 3840_u64 * 2400 * 4 * 3;
+        assert!(one_lens_bytes > 96 * 1024 * 1024);
+        assert!(backdrop_fits_budget(&targets, 0));
+        assert!(backdrop_fits_budget(&targets, one_lens_bytes));
+        assert!(!backdrop_fits_budget(&targets, one_lens_bytes * 2));
+        assert!(!backdrop_fits_budget(&targets, u64::MAX));
+        let remaining = BACKDROP_BUDGET_BYTES - one_lens_bytes;
+        assert!(backdrop_fits_budget(&targets, remaining));
+        assert!(!backdrop_fits_budget(&targets, remaining + 1));
+    }
+
+    #[test]
     fn glass_style_invalid_inputs_normalize_to_stable_finite_values() {
         let style = crate::GlassStyle {
             blur_radius: f32::NAN,
@@ -444,9 +538,7 @@ mod tests {
             blend_softness: f32::NAN,
             refraction: -10.0,
             dispersion: 100.0,
-            rim: f32::NEG_INFINITY,
             fresnel: -1.0,
-            specular: 5.0,
             ..crate::GlassStyle::liquid()
         }
         .normalized();
@@ -460,10 +552,26 @@ mod tests {
             ),
             (4.0, 24.0, 0.0, 4.0)
         );
-        assert_eq!((style.rim, style.fresnel, style.specular), (0.3, 0.0, 1.0));
+        assert_eq!(style.fresnel, 0.0);
         assert_eq!(style.blend_softness, 0.0);
-        assert_eq!(crate::GlassStyle { blend_softness: 200.0, ..style }.normalized().blend_softness, 128.0);
-        assert_eq!(crate::GlassStyle { blend_softness: -1.0, ..style }.normalized().blend_softness, 0.0);
+        assert_eq!(
+            crate::GlassStyle {
+                blend_softness: 200.0,
+                ..style
+            }
+            .normalized()
+            .blend_softness,
+            128.0
+        );
+        assert_eq!(
+            crate::GlassStyle {
+                blend_softness: -1.0,
+                ..style
+            }
+            .normalized()
+            .blend_softness,
+            0.0
+        );
     }
 
     fn test_placement() -> DesktopPlacement {
@@ -482,27 +590,29 @@ mod tests {
     }
     fn bind_test_backdrop(delta: &mut crate::render::RenderSceneDelta) {
         use crate::render::*;
-        delta
-            .image_resources
-            .push(ImageResourceDelta::Write(ImageResourceUpdate {
-                image: ImageId(1),
-                content_version: 1,
-                extent: SizeI {
-                    width: 1,
-                    height: 1,
-                },
-                rect: RectI {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                },
-                row_bytes: 4,
-                color_encoding: ImageColorEncoding::Srgb,
-                alpha_mode: ImageAlphaMode::Opaque,
-                pixel_format: ImagePixelFormat::Rgba8,
-                pixels: vec![128, 128, 128, 255].into(),
-            }));
+        for image in [ImageId(1), ImageId(2)] {
+            delta
+                .image_resources
+                .push(ImageResourceDelta::Write(ImageResourceUpdate {
+                    image,
+                    content_version: 1,
+                    extent: SizeI {
+                        width: 1,
+                        height: 1,
+                    },
+                    rect: RectI {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    row_bytes: 4,
+                    color_encoding: ImageColorEncoding::Srgb,
+                    alpha_mode: ImageAlphaMode::Opaque,
+                    pixel_format: ImagePixelFormat::Rgba8,
+                    pixels: vec![128, 128, 128, 255].into(),
+                }));
+        }
     }
     #[test]
     fn liquid_glass_updates_geometry_and_optics_without_texture_uploads() {
@@ -518,8 +628,8 @@ mod tests {
         let mut delta = description.take_delta().unwrap();
         bind_test_backdrop(&mut delta);
         retained.apply_delta_checked(&delta).unwrap();
-        assert_eq!(retained.material_parameters.len(), 17);
-        assert_eq!(retained.gpu_materials[0].params_spatial_clip[1], 17);
+        assert_eq!(retained.material_parameters.len(), 15);
+        assert_eq!(retained.gpu_materials[0].params_spatial_clip[1], 15);
         retained.commit_uploads(0, 0, 0, 0, 0);
         update_lens(&mut description, extent, p, style);
         assert!(
@@ -552,16 +662,22 @@ mod tests {
                 .apply_delta_checked(&tint)
                 .unwrap()
                 .upload_bytes_queued,
-            68,
-            "only 68 bytes of optical data change"
+            60,
+            "only 60 bytes of optical data change"
         );
         retained.commit_uploads(0, 0, 0, 0, 0);
         style.blend_softness = 16.0;
         update_lens(&mut description, extent, p, style);
         let softness = description.take_delta().unwrap();
         assert!(softness.materials.is_empty() && softness.image_resources.is_empty());
-        assert_eq!(retained.apply_delta_checked(&softness).unwrap().upload_bytes_queued, 68);
-        assert_eq!(f32::from_bits(retained.material_parameters[16]), 16.0);
+        assert_eq!(
+            retained
+                .apply_delta_checked(&softness)
+                .unwrap()
+                .upload_bytes_queued,
+            60
+        );
+        assert_eq!(f32::from_bits(retained.material_parameters[14]), 16.0);
     }
     #[test]
     fn liquid_glass_rejects_missing_images_bad_parameters_and_wrong_pipeline_atomically() {
@@ -580,7 +696,7 @@ mod tests {
         assert!(retained.apply_delta_checked(&delta).is_err());
         let mut bound = delta.clone();
         bind_test_backdrop(&mut bound);
-        for bad in [0, 1, 2, 3] {
+        for bad in [0, 1, 2, 3, 4] {
             let mut invalid = bound.clone();
             if bad != 1 {
                 if let crate::render::MaterialResourceDelta::Upsert(r) =
@@ -590,7 +706,8 @@ mod tests {
                         match bad {
                             0 => p.inverse_bevel = f32::NAN,
                             2 => p.blend_softness = f32::NAN,
-                            _ => p.blend_softness = -1.0,
+                            3 => p.blend_softness = -1.0,
+                            _ => p.sharp_backdrop = ImageId(99),
                         }
                     }
                 }
@@ -632,7 +749,7 @@ mod tests {
             GlassCache {
                 signature: Signature {
                     extent,
-                    levels: 1,
+                    blur_radius: 0.0,
                     sources: Vec::new(),
                 },
                 revision: 1,
@@ -679,7 +796,7 @@ mod tests {
             width: 1920,
             height: 1080,
         };
-        assert_eq!(pyramid_extents(size, 0.0), vec![size]);
+        assert_eq!(backdrop_extents(size, 0.0), vec![size]);
     }
 
     #[test]
@@ -822,48 +939,65 @@ mod tests {
     }
 
     #[test]
-    fn pyramid_uses_filtered_half_steps_without_a_tint_pass() {
-        let sizes = pyramid_extents(
+    fn fractional_blur_changes_refilter_but_reuse_the_same_capture() {
+        let extent = SizeI {
+            width: 1920,
+            height: 1080,
+        };
+        let before = Signature {
+            extent,
+            blur_radius: 10.0,
+            sources: vec![(test_placement(), 1, 1)],
+        };
+        let mut after = before.clone();
+        after.blur_radius = 10.1;
+        assert_ne!(
+            before, after,
+            "changes inside the old reduction bucket must refilter"
+        );
+        assert!(before.same_capture(&after));
+        assert_eq!(
+            backdrop_extents(extent, before.blur_radius),
+            backdrop_extents(extent, after.blur_radius)
+        );
+        after.sources[0].2 += 1;
+        assert!(
+            !before.same_capture(&after),
+            "lower glass pixels invalidate the capture"
+        );
+        after = before.clone();
+        after.sources[0].0.target.x += 1;
+        assert!(!before.same_capture(&after));
+    }
+
+    #[test]
+    fn blur_strength_never_reduces_backdrop_resolution() {
+        for extent in [
             SizeI {
                 width: 1920,
                 height: 1080,
             },
-            24.0,
-        );
-        assert_eq!(
-            sizes[0],
             SizeI {
-                width: 1920,
-                height: 1080
+                width: 1931,
+                height: 1081,
+            },
+            SizeI {
+                width: 1,
+                height: 1,
+            },
+        ] {
+            for radius in [0.01, 4.0, 10.0, 24.0, 256.0] {
+                assert_eq!(backdrop_extents(extent, radius), vec![extent; 3]);
             }
-        );
-        for pair in sizes.windows(2) {
-            assert_eq!(pair[1].width, (pair[0].width + 1) / 2);
-            assert_eq!(pair[1].height, (pair[0].height + 1) / 2);
+            assert_eq!(backdrop_extents(extent, 0.0), vec![extent]);
         }
-        assert!(sizes.last().unwrap().width <= 240);
     }
     #[test]
-    fn tiny_outputs_and_invalid_radii_stay_bounded() {
-        for radius in [f32::NAN, f32::INFINITY, -5.0, 0.0, 1e30] {
-            let sizes = pyramid_extents(
-                SizeI {
-                    width: 1,
-                    height: 1,
-                },
-                radius,
-            );
-            assert_eq!(
-                sizes,
-                vec![
-                    SizeI {
-                        width: 1,
-                        height: 1
-                    };
-                    1
-                ]
-            );
-        }
+    fn invalid_blur_radii_are_normalized_before_caching() {
+        assert_eq!(normalized_blur_radius(f32::NAN), 4.0);
+        assert_eq!(normalized_blur_radius(f32::INFINITY), 4.0);
+        assert_eq!(normalized_blur_radius(-5.0), 0.0);
+        assert_eq!(normalized_blur_radius(1e30), 256.0);
     }
 }
 

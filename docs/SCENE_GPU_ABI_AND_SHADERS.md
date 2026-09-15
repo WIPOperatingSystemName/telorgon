@@ -293,7 +293,7 @@ The following offsets and sizes are normative. All offsets are bytes.
 
 ### 6.1 Frame/view record
 
-`GpuView`, alignment 16, size 192 in the implemented GPU ABI 4.2:
+`GpuView`, alignment 16, size 192 in the implemented GPU ABI 4.4:
 
 | Offset | Field | Meaning |
 |---:|---|---|
@@ -417,13 +417,20 @@ premultiplication.
 | 44 | `reserved: u32` |
 | 48 | `resource_range_reserved: [u32; 4]` | resource base/count, two reserved words |
 
-Implemented ABI 4.2 retains liquid-glass material variant 3 (`PipelineKind::LiquidGlass`). Its parameter
-range is 17 float-bit words (68 bytes): four radii; inverse output size, inverse bevel and refraction;
-dispersion/rim/Fresnel/specular; premultiplied linear tint RGB and transmission; inner blend softness.
-The appended scalar occupies byte 64 in the raw uint array, with a four-byte word stride. The vertex stage
-loads set 2 binding 1 and forwards flat optics; set 3 binding 0 samples one owned backdrop. Geometry
+Implemented ABI 4.4 retains liquid-glass material variant 3 (`PipelineKind::LiquidGlass`). Its parameter
+range is 15 float-bit words (60 bytes): four radii; inverse output size, inverse bevel and refraction;
+dispersion/Fresnel; premultiplied linear tint RGB and transmission; inner blend softness.
+The softness scalar occupies byte 56 in the raw uint array, with a four-byte word stride. The vertex stage
+loads set 2 binding 1 and forwards flat optics; set 3 bindings 0 and 1 sample owned blurred and sharp backdrops. Geometry
 and optics retain separate dirty ranges. The existing material instance layout remains unchanged.
 See [Liquid-glass analysis](LIQUID_GLASS.md) for validation and ownership details.
+
+Gaussian blur uses material variant 4 and `PipelineKind::GaussianBlur`. Its raw parameter range
+contains six float-bit header words (inverse source size XY, UV step XY, center weight, positive
+pair count), followed by up to 192 offset/weight pairs. Negative taps are symmetric. The fragment
+stage reads set 2 binding 1 and samples its owned source at set 3 binding 0. Material instances
+remain 64 bytes. Texture slots are keyed by the primary image and optional secondary image;
+liquid sharp-image identity is resource metadata, not an extra packed optics word.
 
 The draw-index buffer is a base-aligned storage-buffer array of `u32`. It has no wrapper stride
 beyond four bytes. Shaders must bounds-check indirectly through validated batch ranges; production

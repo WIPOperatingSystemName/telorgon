@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::renderer_vulkan::error::{internal, vk_error};
 use crate::renderer_vulkan::generated_shader_bundle::{
+    BLUR_FRAGMENT, BLUR_FRAGMENT_HASH, BLUR_VERTEX, BLUR_VERTEX_HASH,
     BOX_FRAGMENT, BOX_FRAGMENT_HASH, BOX_VERTEX, BOX_VERTEX_HASH, BUNDLE_HASH,
     BUNDLE_INTERFACE_MAJOR, BUNDLE_INTERFACE_MINOR, GLYPH_FRAGMENT, GLYPH_FRAGMENT_HASH,
     GLYPH_VERTEX, GLYPH_VERTEX_HASH, IMAGE_FRAGMENT, IMAGE_FRAGMENT_HASH, IMAGE_VERTEX,
@@ -23,6 +24,7 @@ impl ShaderModules {
     pub(crate) fn load(device: &ash::Device, pipeline: PipelineKind) -> RenderResult<Self> {
         verify_bundle_metadata()?;
         let (name, vertex_bytes, vertex_hash, fragment_bytes, fragment_hash) = match pipeline {
+            PipelineKind::GaussianBlur => ("blur", BLUR_VERTEX, BLUR_VERTEX_HASH, BLUR_FRAGMENT, BLUR_FRAGMENT_HASH),
             PipelineKind::LiquidGlass => (
                 "liquid",
                 LIQUID_VERTEX,
@@ -141,6 +143,8 @@ mod tests {
     fn packaged_shader_hashes_match_generated_metadata() {
         verify_bundle_metadata().unwrap();
         for (name, bytes, hash) in [
+            ("blur vertex", BLUR_VERTEX, BLUR_VERTEX_HASH),
+            ("blur fragment", BLUR_FRAGMENT, BLUR_FRAGMENT_HASH),
             ("liquid vertex", LIQUID_VERTEX, LIQUID_VERTEX_HASH),
             ("liquid fragment", LIQUID_FRAGMENT, LIQUID_FRAGMENT_HASH),
             ("box vertex", BOX_VERTEX, BOX_VERTEX_HASH),

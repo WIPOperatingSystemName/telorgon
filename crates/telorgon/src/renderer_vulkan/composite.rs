@@ -578,26 +578,18 @@ fn write_descriptors(
         }
     }
     let image_ops = (0..scene.texture_count())
-        .filter_map(|slot| {
-            scene.texture(slot).map(|(view, _)| {
-                (
-                    sets.textures[slot],
-                    vk::DescriptorImageInfo {
-                        sampler,
-                        image_view: view,
-                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    },
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+        .flat_map(|slot| (0..2).filter_map(move |binding| {
+            scene.texture(slot, binding).map(|(view, _)| (sets.textures[slot], binding,
+                vk::DescriptorImageInfo { sampler, image_view: view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }))
+        })).collect::<Vec<_>>();
     let buffer_infos = buffer_ops
         .iter()
         .map(|(_, _, _, info)| [*info])
         .collect::<Vec<_>>();
     let image_infos = image_ops
         .iter()
-        .map(|(_, info)| [*info])
+        .map(|(_, _, info)| [*info])
         .collect::<Vec<_>>();
     let mut writes = Vec::with_capacity(buffer_ops.len() + image_ops.len());
     for ((set, binding, descriptor_type, _), info) in buffer_ops.iter().zip(&buffer_infos) {
@@ -609,11 +601,11 @@ fn write_descriptors(
                 .buffer_info(info),
         );
     }
-    for ((set, _), info) in image_ops.iter().zip(&image_infos) {
+    for ((set, binding, _), info) in image_ops.iter().zip(&image_infos) {
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(*set)
-                .dst_binding(0)
+                .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(info),
         );

@@ -326,9 +326,7 @@ fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
         blur_radius: 0.0,
         refraction: 0.0,
         dispersion: 0.0,
-        rim: 0.0,
         fresnel: 0.0,
-        specular: 0.0,
         ..crate::GlassStyle::liquid()
     };
     let mut last_revision = 0;

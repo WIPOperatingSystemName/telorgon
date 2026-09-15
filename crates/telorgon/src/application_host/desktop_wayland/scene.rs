@@ -1449,9 +1449,9 @@ mod tests {
         assert_eq!(physical.blend_softness, 32.0);
         assert_eq!(physical.refraction, logical.refraction * 2.0);
         assert_eq!(physical.dispersion, logical.dispersion * 2.0);
-        assert_eq!(physical.rim, logical.rim);
+
         assert_eq!(physical.fresnel, logical.fresnel);
-        assert_eq!(physical.specular, logical.specular);
+
         assert_eq!(physical.tint, logical.tint);
     }
 

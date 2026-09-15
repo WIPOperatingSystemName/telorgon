@@ -35,7 +35,8 @@ impl ResizePreview {
 pub struct GlassStyle {
     /// RGB tint and tint strength in alpha; zero alpha still produces opaque glass.
     pub tint: ColorRgba8,
-    /// Approximate blur footprint in logical pixels, quantized to a filtered pyramid.
+    /// Gaussian blur diameter in logical pixels (sigma = half this value).
+    /// Filtering preserves the full backdrop resolution; the refracted rim uses a sharp source.
     /// Zero keeps the sharp backdrop. Clamped to 0..=64; non-finite values use 4.
     pub blur_radius: f32,
     /// Inward glass band width from the rounded window outline in logical pixels
@@ -47,10 +48,8 @@ pub struct GlassStyle {
     pub refraction: f32,
     /// RGB separation near the rim in logical pixels (0..=4). Zero uses one texture sample.
     pub dispersion: f32,
-    /// Directional rim, grazing-angle reflection, and specular strengths (each 0..=1).
-    pub rim: f32,
+    /// Grazing-angle reflection strength (0..=1).
     pub fresnel: f32,
-    pub specular: f32,
 }
 
 impl GlassStyle {
@@ -63,9 +62,7 @@ impl GlassStyle {
             blend_softness: 0.0,
             refraction: 18.0,
             dispersion: 0.65,
-            rim: 0.3,
             fresnel: 0.45,
-            specular: 0.2,
         }
     }
 
@@ -82,9 +79,8 @@ impl GlassStyle {
         self.blend_softness = finite(self.blend_softness, 0.0, 0.0, 128.0);
         self.refraction = finite(self.refraction, 18.0, 0.0, 64.0);
         self.dispersion = finite(self.dispersion, 0.65, 0.0, 4.0);
-        self.rim = finite(self.rim, 0.3, 0.0, 1.0);
+
         self.fresnel = finite(self.fresnel, 0.45, 0.0, 1.0);
-        self.specular = finite(self.specular, 0.2, 0.0, 1.0);
         self
     }
 }

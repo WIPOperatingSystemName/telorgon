@@ -240,6 +240,8 @@ pub enum ImageResourceDelta {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct LiquidGlassMaterial {
     pub backdrop: ImageId,
+    /// Full-resolution unfiltered source for the refracted rim.
+    pub sharp_backdrop: ImageId,
     /// Top-left, top-right, bottom-right, bottom-left.
     pub radii: [f32; 4],
     pub inverse_output_size: [f32; 2],
@@ -247,20 +249,18 @@ pub struct LiquidGlassMaterial {
     pub blend_softness: f32,
     pub refraction: f32,
     pub dispersion: f32,
-    pub rim: f32,
     pub fresnel: f32,
-    pub specular: f32,
     /// Linear RGB already multiplied by tint strength; W is remaining transmission.
     pub tint: [f32; 4],
 }
 
 impl LiquidGlassMaterial {
-    pub(crate) fn words(self) -> [u32; 17] {
+    pub(crate) fn words(self) -> [u32; 15] {
         [
             self.radii[0], self.radii[1], self.radii[2], self.radii[3],
             self.inverse_output_size[0], self.inverse_output_size[1],
             self.inverse_bevel, self.refraction,
-            self.dispersion, self.rim, self.fresnel, self.specular,
+            self.dispersion, self.fresnel,
             self.tint[0], self.tint[1], self.tint[2], self.tint[3],
             self.blend_softness,
         ].map(f32::to_bits)
@@ -274,8 +274,7 @@ impl LiquidGlassMaterial {
             && self.blend_softness >= 0.0
             && self.refraction >= 0.0
             && self.dispersion >= 0.0
-            && [self.rim, self.fresnel, self.specular]
-                .into_iter().all(|v| (0.0..=1.0).contains(&v))
+            && (0.0..=1.0).contains(&self.fresnel)
             && self.tint.into_iter().all(|v| (0.0..=1.0).contains(&v))
     }
 }
@@ -288,6 +287,8 @@ pub enum MaterialKind {
     LinearGradientVertical,
     /// Sampled rounded-window lens; the backdrop must be an owned image in this scene.
     LiquidGlass(LiquidGlassMaterial),
+    /// One axis of a full-resolution Gaussian filter over an owned image.
+    GaussianBlur(super::GaussianBlurMaterial),
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -350,6 +351,7 @@ pub enum PrimitiveKind {
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PipelineKind {
+    GaussianBlur,
     LiquidGlass,
     AnalyticBox,
     Glyph,
