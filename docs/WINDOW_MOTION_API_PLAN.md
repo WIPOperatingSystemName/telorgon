@@ -154,7 +154,7 @@ visibility correctness. Do not publish an operational smooth preset backed by in
 ## Reference audit and rejected alternatives
 
 Local code inspected: `compose/components/easy_window_frame.rs`, `window_chrome.rs`,
-`application_host/declaration.rs`, `application_host/desktop_wayland/{state,interaction,layers,scene}.rs`,
+`application_host/declaration.rs`, `application_host/shell_wayland/{state,interaction,layers,scene}.rs`,
 the desktop software adapter, `renderer_vulkan/composite.rs`, and `theme/{motion,processor}.rs`.
 Existing behavior is documented in [resize preview](WAYLAND_RESIZE_PREVIEW.md) and
 [maximized geometry](MAXIMIZED_WINDOW_GEOMETRY.md).

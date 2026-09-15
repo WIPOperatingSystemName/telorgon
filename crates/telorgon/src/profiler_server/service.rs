@@ -820,7 +820,7 @@ mod tests {
     fn disabled_generic_host_start_does_not_create_a_session_or_listener() {
         let result = ProfilerServer::start_if_requested(
             crate::profiler_server::ProfilerRequest::Disabled,
-            ServerConfig::for_target(crate::profiler_server::ProfileTarget::DesktopEnvironment),
+            ServerConfig::for_target(crate::profiler_server::ProfileTarget::ShellEnvironment),
         )
         .unwrap();
         assert!(result.is_none());

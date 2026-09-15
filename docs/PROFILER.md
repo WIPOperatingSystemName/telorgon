@@ -8,7 +8,7 @@ project-local `cargo profile` aliases for Gallery and Theme Studio, bounded CPU 
 completion-delayed Vulkan timestamp queries, stable per-view correlation/filtering, an embedded
 vanilla HTML/CSS/JavaScript viewer, and in-memory capture export. Unit, compile, feature, and
 protocol checks exercise these paths without launching an application or server. The ordinary GUI
-host and Linux desktop-environment/compositor host automatically own the managed profiler session;
+host and Linux shell-environment/compositor host automatically own the managed profiler session;
 widget hosts can select the same contract when their native host implementations become operational.
 
 This is not production-qualified performance tooling yet. Its overhead budgets, browser behavior,
@@ -281,7 +281,7 @@ Hash collisions must be detected during registration rather than silently mergin
 ### 6.1 Identities and correlation
 
 `ProfileViewId` identifies one independently scheduled rendered view or surface. A single-window
-GUI application uses the primary identity; desktop-environment and embedded hosts allocate one
+GUI application uses the primary identity; shell-environment and embedded hosts allocate one
 stable identity per independently scheduled output. Every frame, presentation, span, counter, and
 diagnostic inherits the current view scope. Worker transfers carry both view and frame identity so
 unframed presentation attempts remain attributable without inferring ownership from thread names.
@@ -358,7 +358,7 @@ resize, or other input work remain visible.
 
 The sidebar is target-aware session metadata rather than a hard-coded universal device list. GUI
 sessions advertise their supported Winit pointer, button, scroll, and keyboard streams. Linux
-desktop-environment sessions advertise their supported libinput pointer-motion, button, axis,
+shell-environment sessions advertise their supported libinput pointer-motion, button, axis,
 keyboard, touch-motion, touch-contact, and device-change streams. Every stream is independently
 opt-in and resets off for a new profiler session. The Inputs performance view charts each retained
 sample on a source lane, summarizes event counts and queue-age percentiles, and keeps a bounded event

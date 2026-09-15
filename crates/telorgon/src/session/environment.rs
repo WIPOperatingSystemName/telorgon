@@ -16,7 +16,7 @@ impl Environment {
         #[cfg(target_os = "linux")]
         {
             if env.get("DISPLAY").is_none() && env.get("WAYLAND_DISPLAY").is_none() {
-                return Err(Error::Invalid("GUI startup needs an existing graphical session (DISPLAY or WAYLAND_DISPLAY); a bare TTY requires Application::desktop_environment".into()));
+                return Err(Error::Invalid("GUI startup needs an existing graphical session (DISPLAY or WAYLAND_DISPLAY); a bare TTY requires Application::shell_environment".into()));
             }
             if let Some(display) = env.get("WAYLAND_DISPLAY") {
                 if !Path::new(display).is_absolute() {

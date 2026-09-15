@@ -2,7 +2,7 @@
     feature = "application-software",
     any(
         feature = "application-vulkan-windows",
-        feature = "desktop-wayland-linux",
+        feature = "shell-wayland-linux",
         feature = "embedded-vulkan"
     )
 ))]

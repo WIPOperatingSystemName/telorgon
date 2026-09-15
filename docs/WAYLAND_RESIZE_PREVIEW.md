@@ -24,7 +24,7 @@ including client-drawn decoration, popups, and subsurfaces, is hidden until the 
 Server-drawn title text and controls remain ordinary composed chrome. The first version switches
 directly; it does not add a fade, blur pass, readback, image resampling, or intermediate render target.
 
-Set `LinuxDesktopConfig::resize_preview` to `ResizePreview::Color(ColorRgba8::rgba(...))` and pass the configuration via
+Set `LinuxShellConfig::resize_preview` to `ResizePreview::Color(ColorRgba8::rgba(...))` and pass the configuration via
 the desktop declaration's `.linux(config)` method. All alpha values are supported. Easy frames can
 override it with `WindowChromeDesign::resize_preview: Some(ResizePreview::Color(color))`; `None` inherits the host
 setting. `content_background` independently configures normal backing beneath the app. Set that
@@ -233,7 +233,7 @@ before blending; the separate background placement is omitted. It retains the de
 alpha, the rectangular content cutout, and client/subsurface clipping. Custom apertures and
 independently faded chrome keep their separate composition path.
 
-Audit: inspected `desktop_wayland/{layers,scene}.rs`, `render/rounded_clip.rs`,
+Audit: inspected `shell_wayland/{layers,scene}.rs`, `render/rounded_clip.rs`,
 `renderer_software/renderer.rs`, and `telorgon-shader-build/shaders/vulkan/box/{box,image}.frag`.
 The adjacent `../other-rendering-libs` library is absent in this checkout; the routed Qt scenegraph
 and egui-wgpu renderer sources could not be inspected, so no new reference comparison is claimed.
@@ -267,7 +267,7 @@ over a neighboring fragment quad. Coordinate derivatives remain outside divergen
 All four fragment stages use the same rounded scene-clip rule; square-box pixel integration stays
 intact. The offline SPIR-V bundle was regenerated, validated, and reflected with no ABI change.
 
-Audit paths: `renderer_software/renderer.rs`, `desktop_wayland/{scene,transparency_tests}.rs`, and
+Audit paths: `renderer_software/renderer.rs`, `shell_wayland/{scene,transparency_tests}.rs`, and
 `telorgon-shader-build/shaders/vulkan/box/{box,image,glyph,material}.frag`. The adjacent reference
 library remains unavailable; no new Qt/egui source comparison is claimed. Official checks:
 [GLSL derivatives and fwidth](https://docs.vulkan.org/glsl/latest/chapters/builtinfunctions.html#derivative-functions)
@@ -340,15 +340,15 @@ scene reuse across source-node replacement. Geometry tests check inset centers a
 Verification for the current implementation, including the rounded-frame follow-up:
 
 - `cargo test -p telorgon --lib --quiet`: 938 passed.
-- `cargo test -p telorgon --lib desktop_wayland --features embedded-vulkan,profiler --quiet`:
+- `cargo test -p telorgon --lib shell_wayland --features embedded-vulkan,profiler --quiet`:
   40 passed.
 - `cargo test -p telorgon --lib clip_tests --features embedded-vulkan,profiler --quiet`:
   1 passed (CPU-only view-uniform encoding).
 - `cargo test -p telorgon --test window_frame_api --quiet`: 6 passed.
 - `cargo check -p telorgon --tests --target aarch64-unknown-linux-gnu --no-default-features
-  --features desktop-wayland-linux,embedded-vulkan,profiler`: passed.
+  --features shell-wayland-linux,embedded-vulkan,profiler`: passed.
 - `cargo build -p telorgon --lib --release --target aarch64-unknown-linux-gnu --no-default-features
-  --features desktop-wayland-linux,embedded-vulkan,profiler`: passed.
+  --features shell-wayland-linux,embedded-vulkan,profiler`: passed.
 - Formatting, whitespace, and changed-document relative links checked. Existing platform-dependent
   dead-code warnings remain; these results are not hardware performance or visual evidence.
 

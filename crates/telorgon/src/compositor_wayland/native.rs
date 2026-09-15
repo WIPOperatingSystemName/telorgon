@@ -491,7 +491,7 @@ pub struct XwaylandAccess {
 }
 impl XwaylandAccess {
     /// One fixed X11 pixel density for this managed desktop; set before startup.
-    #[cfg_attr(not(feature = "desktop-xwayland"), allow(dead_code))]
+    #[cfg_attr(not(feature = "shell-xwayland"), allow(dead_code))]
     pub(crate) fn set_coordinate_scale(&self, scale: i32) {
         self.coordinate_scale.set(scale.clamp(1, 8));
     }

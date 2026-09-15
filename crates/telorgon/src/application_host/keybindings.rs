@@ -1,6 +1,6 @@
 //! Named-function bindings for Linux compositor shortcuts.
 
-use super::{DesktopKeyAction, DesktopKeyEvent};
+use super::{ShellKeyAction, ShellKeyEvent};
 
 /// A layout-resolved XKB symbol, not a physical key position.
 ///
@@ -166,7 +166,7 @@ impl KeyChord {
             && self.logo == other.logo
     }
 
-    fn matches(self, event: DesktopKeyEvent) -> bool {
+    fn matches(self, event: ShellKeyEvent) -> bool {
         self.key.matches(event.keysym)
             && self.control == event.control
             && self.shift == event.shift
@@ -222,12 +222,12 @@ impl KeyBindings {
         self
     }
 
-    pub(crate) fn handle(&self, event: DesktopKeyEvent) -> DesktopKeyAction {
+    pub(crate) fn handle(&self, event: ShellKeyEvent) -> ShellKeyAction {
         if let Some((_, handler)) = self.bindings.iter().find(|(chord, _)| chord.matches(event)) {
             handler();
-            DesktopKeyAction::Consume
+            ShellKeyAction::Consume
         } else {
-            DesktopKeyAction::Forward
+            ShellKeyAction::Forward
         }
     }
 }
@@ -277,33 +277,33 @@ mod tests {
                 let bindings = KeyBindings::new().bind(chord, noop);
                 // Caps Lock may invert the case with either Shift state.
                 for symbol in [lower, lower.to_ascii_uppercase()] {
-                    let event = DesktopKeyEvent {
+                    let event = ShellKeyEvent {
                         keysym: u32::from(symbol),
                         control: true,
                         shift: shifted,
                         ..Default::default()
                     };
-                    assert_eq!(bindings.handle(event), DesktopKeyAction::Consume);
+                    assert_eq!(bindings.handle(event), ShellKeyAction::Consume);
                     assert_eq!(
-                        bindings.handle(DesktopKeyEvent {
+                        bindings.handle(ShellKeyEvent {
                             shift: !shifted,
                             ..event
                         }),
-                        DesktopKeyAction::Forward
+                        ShellKeyAction::Forward
                     );
                     assert_eq!(
-                        bindings.handle(DesktopKeyEvent {
+                        bindings.handle(ShellKeyEvent {
                             control: false,
                             ..event
                         }),
-                        DesktopKeyAction::Forward
+                        ShellKeyAction::Forward
                     );
                     assert_eq!(
-                        bindings.handle(DesktopKeyEvent {
+                        bindings.handle(ShellKeyEvent {
                             keysym: u32::from('é'),
                             ..event
                         }),
-                        DesktopKeyAction::Forward
+                        ShellKeyAction::Forward
                     );
                 }
             }
@@ -343,11 +343,11 @@ mod tests {
         ];
         for (key, symbol) in functions.into_iter().zip(0xffbe..=0xffc9) {
             let chord = KeyChord::new(key);
-            assert!(chord.matches(DesktopKeyEvent {
+            assert!(chord.matches(ShellKeyEvent {
                 keysym: symbol,
                 ..Default::default()
             }));
-            assert!(!chord.matches(DesktopKeyEvent {
+            assert!(!chord.matches(ShellKeyEvent {
                 keysym: symbol + 1,
                 ..Default::default()
             }));
@@ -355,7 +355,7 @@ mod tests {
         assert!(
             !KeyChord::new(ShortcutKey::Digit1)
                 .shift()
-                .matches(DesktopKeyEvent {
+                .matches(ShellKeyEvent {
                     keysym: u32::from('!'),
                     shift: true,
                     ..Default::default()
@@ -391,11 +391,11 @@ mod tests {
             ShortcutKey::from_keysym(u32::from('q')),
         ] {
             let chord = KeyChord::new(constructor);
-            assert!(chord.matches(DesktopKeyEvent {
+            assert!(chord.matches(ShellKeyEvent {
                 keysym: u32::from('q'),
                 ..Default::default()
             }));
-            assert!(!chord.matches(DesktopKeyEvent {
+            assert!(!chord.matches(ShellKeyEvent {
                 keysym: u32::from('Q'),
                 ..Default::default()
             }));
@@ -415,7 +415,7 @@ mod tests {
                 .super_key(),
             noop,
         );
-        let matched = DesktopKeyEvent {
+        let matched = ShellKeyEvent {
             keysym: u32::from('Q'),
             control: true,
             shift: true,
@@ -423,43 +423,43 @@ mod tests {
             logo: true,
             ..Default::default()
         };
-        assert_eq!(bindings.handle(matched), DesktopKeyAction::Consume);
+        assert_eq!(bindings.handle(matched), ShellKeyAction::Consume);
         for event in [
-            DesktopKeyEvent {
+            ShellKeyEvent {
                 control: false,
                 ..matched
             },
-            DesktopKeyEvent {
+            ShellKeyEvent {
                 shift: false,
                 ..matched
             },
-            DesktopKeyEvent {
+            ShellKeyEvent {
                 alt: false,
                 ..matched
             },
-            DesktopKeyEvent {
+            ShellKeyEvent {
                 logo: false,
                 ..matched
             },
-            DesktopKeyEvent {
+            ShellKeyEvent {
                 keysym: u32::from('q'),
                 ..matched
             },
         ] {
-            assert_eq!(bindings.handle(event), DesktopKeyAction::Forward);
+            assert_eq!(bindings.handle(event), ShellKeyAction::Forward);
         }
         let plain = KeyBindings::new().bind(KeyChord::new(ShortcutKey::Space), noop);
         assert_eq!(
-            plain.handle(DesktopKeyEvent {
+            plain.handle(ShellKeyEvent {
                 keysym: 0x20,
                 logo: true,
                 ..Default::default()
             }),
-            DesktopKeyAction::Forward
+            ShellKeyAction::Forward
         );
         assert_eq!(
             KeyBindings::new().handle(matched),
-            DesktopKeyAction::Forward
+            ShellKeyAction::Forward
         );
     }
 

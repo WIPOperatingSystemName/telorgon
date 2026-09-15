@@ -160,9 +160,9 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
 const PIN_WINDOW: ShellActionId = ShellActionId::named("window.pin");
 
 #[component]
-struct DesktopBackground {}
+struct ShellBackground {}
 
-impl Component for DesktopBackground {
+impl Component for ShellBackground {
     fn view(&self) -> impl View {
         stack().background(ColorRgba8::rgba(10, 12, 18, 255))
     }
@@ -177,26 +177,37 @@ impl Component for Panel {
     }
 }
 
+impl ShellWidget for ShellBackground {
+    fn surface(&self) -> ShellSurfaceSpec {
+        ShellSurfaceSpec::new()
+            .placement(WidgetPlacement::fill())
+            .layer(ShellSurfaceLayer::Background)
+            .pointer(ShellPointer::PassThrough)
+    }
+}
+impl ShellWidget for Panel {
+    fn surface(&self) -> ShellSurfaceSpec {
+        ShellSurfaceSpec::new()
+            .placement(WidgetPlacement::edge(ShellEdge::Top).height(40.0))
+            .reserve_space(ShellReservation::WhenVisible)
+    }
+}
+
 fn pin_window(_window: WindowChromeModel) {}
 
 #[test]
 fn easy_frame_is_a_closure_free_complete_desktop_declaration() {
     TEST_CHROME.validate().unwrap();
 
-    let desktop = Application::desktop_environment("Telorgon")
+    let desktop = Application::shell_environment("Telorgon")
         .compositor(
             Compositor::new()
                 .cursor_theme(telorgon::CursorTheme::new())
                 .window_frame(easy_window_frame(TEST_CHROME))
-                .shell_action(PIN_WINDOW, pin_window)
-                .background(DesktopBackground::default()),
+                .shell_action(PIN_WINDOW, pin_window),
         )
-        .shell_widget(
-            ShellWidget::new("Panel")
-                .anchor(ShellWidgetAnchor::Top)
-                .reserve_space(40.0)
-                .content(Panel::default()),
-        );
+        .widget(ShellBackground::default())
+        .widget(Panel::default());
 
     assert!(format!("{desktop:?}").contains("has_compositor: true"));
 }
@@ -664,10 +675,9 @@ fn low_level_template_retains_full_composition_and_authorized_action_freedom() {
     let compositor = Compositor::new()
         .cursor_theme(telorgon::CursorTheme::new())
         .window_frame(AdvancedFrameTemplate)
-        .shell_action(PIN_WINDOW, pin_window)
-        .background(DesktopBackground::default());
+        .shell_action(PIN_WINDOW, pin_window);
 
-    assert!(compositor.window_frame().is_some());
+    assert!(compositor.frame_template().is_some());
     assert!(compositor.authorizes_shell_action(PIN_WINDOW));
 
     let component = AdvancedFrameTemplate.compose(WindowChromeModel::new(9, "Advanced"));

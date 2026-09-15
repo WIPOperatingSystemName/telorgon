@@ -20,6 +20,9 @@ See [Desktop window motion](WINDOW_MOTION.md) for chrome motion presets, maximiz
 resize-content transitions, implementation limits, and user-run qualification. The
 [original API plan](WINDOW_MOTION_API_PLAN.md) records the design rationale.
 
+See [Component-owned shell widgets](SHELL_WIDGETS.md) for shell registration, surface descriptors,
+geometry animation, live window services, and migration from compositor backgrounds.
+
 ## Reading order
 
 1. [Project scope and architecture](PROJECT_SCOPE_AND_ARCHITECTURE.md) defines Telorgon's mission,

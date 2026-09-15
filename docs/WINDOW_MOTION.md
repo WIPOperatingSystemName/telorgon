@@ -58,7 +58,7 @@ the proposal are not included; existing rounded outlines and analytic shadows re
 
 ### Fluid sampling and performance
 
-`desktop_wayland/motion/geometry.rs` holds four floating-point positions and velocities. It solves
+`shell_wayland/motion/geometry.rs` holds four floating-point positions and velocities. It solves
 the damped oscillator analytically from monotonic elapsed time, without a keyframe table, fixed-step
 integration, or per-sample heap allocation. Decay/frequency and per-coordinate coefficients are
 prepared once per target change. One exponential and one `sin_cos` pair serve all four coordinates;
@@ -115,9 +115,9 @@ clear an explicit override. Zero-duration transitions settle immediately. Motion
 
 Custom templates can implement
 `WindowFrameTemplate::motion(&self, &WindowChromeModel) -> Option<WindowMotion>`. Returning `None`
-inherits `LinuxDesktopConfig::window_motion`, whose default is `none()` for compatibility.
+inherits `LinuxShellConfig::window_motion`, whose default is `none()` for compatibility.
 `Some(WindowMotion::none())` explicitly disables motion. Easy frames return their design's style.
-`LinuxDesktopConfig::motion_preference = MotionPreference::Reduced` settles visual motion centrally
+`LinuxShellConfig::motion_preference = MotionPreference::Reduced` settles visual motion centrally
 while preserving client-content readiness gates.
 
 The consuming `test-compositor/src/main.rs` opts into the editable configuration above. Its normal
@@ -127,7 +127,7 @@ minimize/activation, and drag resize.
 ## Behavior and implementation boundaries
 
 The neutral style lives in `window_chrome/motion.rs`; the desktop controller lives in
-`application_host/desktop_wayland/motion.rs`. The controller samples geometry, visibility, and
+`application_host/shell_wayland/motion.rs`. The controller samples geometry, visibility, and
 content independently using the existing frame clock. It never sends protocol configurations.
 Wayland and X11 retain their existing final-frame readiness and configure scheduling rules.
 Both backends also share a presentation latch for maximize/restore (including title-bar restore).
@@ -170,7 +170,7 @@ Maximize movement retains the starting shadow; restore uses the destination shad
 maximized geometry the maximized style takes effect (normally no shadow). The shadow is stacked
 immediately before its window, and opacity follows the window's visibility. Normal resting
 composition resumes on the final fully damaged frame without double-painting the shadow.
-This reuses `DesktopLayer::frame_shadow` and `DesktopComposition` with a separate retained scene
+This reuses `ShellLayer::frame_shadow` and `ShellComposition` with a separate retained scene
 identity; there are no new shadow textures, shaders, or GPU synchronization mechanisms. CPU tests
 cover expansion, restoration, manual growth/shrink, fixed shadow reach, inverse clipping, stack
 order, and image-free analytic updates. The earlier exterior-shadow reference note in
@@ -297,7 +297,7 @@ input alignment, and capture-allocation latency on the target GPU.
 
 Validation for this implementation:
 
-- Library tests with `--no-default-features --features desktop-xwayland -- --test-threads=1`:
+- Library tests with `--no-default-features --features shell-xwayland -- --test-threads=1`:
   1,271 passed, two ignored. The sandbox initially denied socket fixtures; the complete suite
   passed when run with socket access.
 - `window_frame_api` integration fixture: 12 passed.
@@ -315,3 +315,14 @@ existing binding contract; allocation, barriers, and image lifetimes are unchang
 validation or adding dummy uploaded images was rejected. An ignored Vulkan regression exercises
 both output and two-input mix scene construction; it is compile-checked, pending a user-run
 hardware test. The reference review above remains applicable to the unchanged GPU mechanism.
+
+## Horizontal drag bounds
+
+`LinuxShellConfig::window_drag_horizontal_overflow` controls horizontal window dragging
+for Wayland and Xwayland. The default `Some(0)` keeps the outer frame within the output.
+Use `Some(80)` to allow 80 logical units beyond either edge, or `None` for unrestricted
+horizontal movement. Negative allowances are rejected at startup. Windows wider than the
+output may slide between left- and right-aligned positions so either side remains accessible.
+The policy also applies when dragging a maximized window to restore it. It does not constrain
+resize operations or client-requested positions. The current host uses its single active output;
+this does not introduce multi-monitor transfer policy. Vertical dragging retains its existing rules.

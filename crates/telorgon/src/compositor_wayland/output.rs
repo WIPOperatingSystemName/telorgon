@@ -357,7 +357,7 @@ mod root_geometry_tests {
         );
         assert_eq!(wide.root_geometry(), Err(OutputError::GeometryOverflow));
     }
-    #[cfg(feature = "desktop-xwayland")]
+    #[cfg(feature = "shell-xwayland")]
     #[test]
     fn x11_root_geometry_rejects_wire_overflow_and_preserves_dimensions() {
         use crate::xwayland::window::Geometry;

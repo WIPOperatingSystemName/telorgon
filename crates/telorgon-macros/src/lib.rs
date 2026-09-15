@@ -154,7 +154,7 @@ fn expand_asset_catalog(input: AssetCatalogInput) -> syn::Result<proc_macro2::To
                     #crate_path::AssetBundle::new(&__TELORGON_ASSETS);
             }
 
-            /// Returns the immutable bundle shared by GUI and desktop-environment runtimes.
+            /// Returns the immutable bundle shared by GUI and shell-environment runtimes.
             pub const fn bundle() -> #crate_path::AssetBundle {
                 <Catalog as #crate_path::AssetCatalog>::BUNDLE
             }

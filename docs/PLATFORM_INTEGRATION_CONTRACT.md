@@ -619,7 +619,7 @@ single use. A stale snapshot or invalid grant yields a typed denial rather than 
 Imported client buffers use `ExternalContentId` and the backend import lease. Damage, transforms,
 safe areas, input regions, presentation feedback, and release completion cross explicit adapter
 interfaces. Ordinary shell UI never acquires Wayland dependencies merely to render a taskbar or
-window chrome; the explicit Linux desktop-environment assembly owns those dependencies and adapts
+window chrome; the explicit Linux shell-environment assembly owns those dependencies and adapts
 them at the host boundary.
 
 ## 14. Rust dependency baseline

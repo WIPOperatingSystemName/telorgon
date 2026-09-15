@@ -56,7 +56,7 @@ fallback, these upstream paths were inspected:
 
 Invariants: work area owns maximized outer geometry; the composed content slot owns custom client
 size; configure delivery and client commit remain asynchronous; normal restore geometry survives.
-Rejected alternatives: copy test-app constants into LinuxDesktopConfig, subtract the normal-state
+Rejected alternatives: copy test-app constants into LinuxShellConfig, subtract the normal-state
 border from maximized geometry, or use physical scanout dimensions. Those couple policy to legacy
 metrics, retain unwanted insets, or break output scaling. No reference source was copied.
 

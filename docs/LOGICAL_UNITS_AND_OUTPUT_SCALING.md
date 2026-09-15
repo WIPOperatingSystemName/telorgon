@@ -24,7 +24,7 @@ Neither variant specifies a fixed physical-pixel size.
 
 ## Selecting scale at boot
 
-`LinuxDesktopConfig::default()` uses `OutputScale::Auto`. After selecting the connector's preferred
+`LinuxShellConfig::default()` uses `OutputScale::Auto`. After selecting the connector's preferred
 mode, the host reads the physical width and height reported by KMS (usually derived from EDID):
 
 ```text
@@ -64,11 +64,11 @@ Physical metadata may still be wrong despite passing validation. Explicit prefer
 automatic selection and the workspace cap, including when physical dimensions are absent:
 
 ```rust
-use telorgon::app::{LinuxDesktopConfig, OutputScale};
+use telorgon::app::{LinuxShellConfig, OutputScale};
 
-let config = LinuxDesktopConfig {
+let config = LinuxShellConfig {
     output_scale: OutputScale::Fixed(2.0), // 200%; use 1.0 for 100%, 1.5 for 150%
-    ..LinuxDesktopConfig::default()
+    ..LinuxShellConfig::default()
 };
 ```
 
@@ -93,7 +93,7 @@ changes, monitor hotplug, and moving surfaces between differently scaled outputs
   density-independent pointer speed. Unaccelerated relative motion retains its device units.
   Absolute devices map their normalized positions into the logical desktop. Hardware cursor positions
   and hotspots convert to physical pixels at the KMS boundary.
-- `DesktopComposition` retains logical geometry and damage. `DesktopFrame::into_physical` converts
+- `ShellComposition` retains logical geometry and damage. `ShellFrame::into_physical` converts
   placements, rectangular/rounded clips, corner radii, and damage exactly once before either backend.
   The existing `ViewMapping` maps each retained scene into that physical target. KMS mode sizes and
   framebuffer allocations never use the logical desktop extent.
@@ -148,7 +148,7 @@ changing explicit preferences, and separate UI/client scale calculations were re
 cover FHD through 8K, laptop/desktop/TV sizes, rotation invariance, proportional-resolution logical
 workspace, cramped panels, invalid modes/metadata, and fixed override precedence. Selection remains
 a boot-time, single-output policy; this refactor adds no runtime hotplug or multi-monitor support.
-Validation: all seven scale-policy unit tests passed with `desktop-wayland-linux`; the consuming
+Validation: all seven scale-policy unit tests passed with `shell-wayland-linux`; the consuming
 `test-compositor` release build with embedded XWayland passed, as did formatting and whitespace
 checks. Live visual qualification remains user-run under `AGENTS.md`.
 
@@ -171,7 +171,7 @@ over ten preparations of a 3840×2400 image at 300%. In a local unoptimized test
 GPU upload, and presentation; it is not an end-to-end resize latency claim. Run explicitly with:
 
 ```sh
-cargo test -p telorgon --lib --no-default-features --features desktop-wayland-linux \
+cargo test -p telorgon --lib --no-default-features --features shell-wayland-linux \
   native_density_image_preparation_timing --offline -- --ignored --nocapture
 ```
 

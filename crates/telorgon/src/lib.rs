@@ -5,7 +5,7 @@
 
 extern crate self as telorgon;
 
-#[cfg(all(feature = "desktop-xwayland", target_os = "linux"))]
+#[cfg(all(feature = "shell-xwayland", target_os = "linux"))]
 pub mod xwayland;
 
 #[cfg(test)]
@@ -65,16 +65,16 @@ pub mod assets;
 #[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
 pub mod bridge_vulkan_dxgi;
 pub mod compose;
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod compositor_render;
-#[cfg(any(test, all(feature = "desktop-wayland-linux", target_os = "linux")))]
+#[cfg(any(test, all(feature = "shell-wayland-linux", target_os = "linux")))]
 pub mod compositor_wayland;
 pub mod core;
 #[cfg(feature = "embedded-vulkan")]
 pub mod embed;
 #[cfg(any(
     feature = "application-vulkan-windows",
-    feature = "desktop-wayland-linux",
+    feature = "shell-wayland-linux",
     feature = "embedded-vulkan"
 ))]
 pub mod gpu_abi;
@@ -83,7 +83,7 @@ pub mod layout;
 pub mod material;
 pub mod platform;
 pub mod platform_conformance;
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod platform_linux;
 #[cfg(any(
     feature = "application-software",
@@ -95,7 +95,7 @@ pub mod presentation;
 pub mod presenter_dxgi;
 #[cfg(feature = "application-software")]
 pub mod presenter_softbuffer;
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod presenter_vulkan_kms;
 #[cfg(feature = "application-vulkan-windows")]
 pub mod presenter_vulkan_wsi;
@@ -104,11 +104,11 @@ pub mod profiler;
 #[cfg(feature = "profiler")]
 pub mod profiler_server;
 pub mod render;
-#[cfg(any(feature = "application-software", feature = "desktop-wayland-linux"))]
+#[cfg(any(feature = "application-software", feature = "shell-wayland-linux"))]
 pub mod renderer_software;
 #[cfg(any(
     feature = "application-vulkan-windows",
-    feature = "desktop-wayland-linux",
+    feature = "shell-wayland-linux",
     feature = "embedded-vulkan"
 ))]
 pub mod renderer_vulkan;
@@ -121,7 +121,7 @@ pub mod shell_primitives;
 pub mod text;
 pub mod theme;
 pub mod ui;
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod wayland_server;
 pub mod window_chrome;
 
@@ -192,10 +192,18 @@ mod authoring {
 pub mod app {
     pub use super::authoring::*;
     pub use crate::application_host::{
-        Application, Compositor, DesktopKeyAction, DesktopKeyEvent, KeyBindings, KeyChord,
-        LinuxDesktopConfig, OutputScale, Renderer, ShellWidget, ShellWidgetAnchor,
-        ShellWidgetExtent, ShortcutKey, Window, WindowDecorationMode, WindowFrameFactory,
-        WindowFrameTemplate,
+        Application, Compositor, KeyBindings, KeyChord, LinuxShellConfig, OutputScale, Renderer,
+        ShellKeyAction, ShellKeyEvent, ShortcutKey, Window, WindowDecorationMode,
+        WindowFrameFactory, WindowFrameTemplate,
+    };
+    pub use crate::compose::{
+        ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
+        ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
+        ShellWidget, WidgetPlacement,
+    };
+    pub use crate::compose::{
+        ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
+        ShellWindowAction,
     };
     pub use crate::session;
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
@@ -205,16 +213,15 @@ pub use application_host::HeadlessRuntime;
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 pub use application_host::{
-    AppError, AppResult, AppRuntime, Application, ComposedAppRuntime, Compositor,
-    DesktopEnvironment, DesktopEnvironmentWithCompositor, FrameDiagnostics, GuiApplication,
-    ManagedComponentRuntime, ManagedComponentTaskTurn, ManagedTaskCapabilities,
+    AppError, AppResult, AppRuntime, Application, ComposedAppRuntime, Compositor, FrameDiagnostics,
+    GuiApplication, ManagedComponentRuntime, ManagedComponentTaskTurn, ManagedTaskCapabilities,
     ManagedTaskDiagnostics, ManagedTaskExecutor, ManagedTaskHost, ManagedTaskPoll, PlatformInput,
-    PreparedFrame, ReadyCompositor, ReadyDesktopEnvironment, ReadyGuiApplication, ReadyShellWidget,
-    ReadyWindow, Renderer, SceneDeltaQueue, ShellWidget, ShellWidgetAnchor, ShellWidgetExtent,
-    Window, WindowDecorationMode, WindowFrameFactory, WindowFrameTemplate, WindowOptions,
+    PreparedFrame, ReadyCompositor, ReadyGuiApplication, ReadyShellEnvironment, ReadyWindow,
+    Renderer, SceneDeltaQueue, ShellEnvironment, ShellEnvironmentWithCompositor, Window,
+    WindowDecorationMode, WindowFrameFactory, WindowFrameTemplate, WindowOptions,
 };
 pub type Result<T> = application_host::AppResult<T>;
 pub use application_components::{
@@ -581,4 +588,15 @@ pub use ui::{
     StyleSlotBinding, StyleSlotId, StyleVariantSelection, TextAlign, TextHandle, TextVisual,
     ThemeDomainId, ThemeScopeId, TransactionResult, UiDiagnostics, UiEvent, UiEventKind,
     UiMemoryReport, UiRoot, UiTransaction, VariantAxisId, VariantValueId,
+};
+
+pub use crate::compose::{
+    ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
+    ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
+    ShellWidget, WidgetPlacement,
+};
+
+pub use crate::compose::{
+    ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
+    ShellWindowAction,
 };

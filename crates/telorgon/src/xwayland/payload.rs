@@ -40,7 +40,7 @@ pub fn verify(bytes: &[u8]) -> Result<PayloadManifest> {
     format::validate(bytes, "x86_64-unknown-linux-gnu").map_err(Error)
 }
 
-#[cfg(feature = "desktop-xwayland-embedded")]
+#[cfg(feature = "shell-xwayland-embedded")]
 pub fn embedded() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/xwayland.payload"))
 }
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "desktop-xwayland-embedded")]
+    #[cfg(feature = "shell-xwayland-embedded")]
     fn supplied_embedded_payload_extracts_and_revalidates() {
         let temp = Temp::new();
         let a = extract(embedded(), &temp.0).unwrap();

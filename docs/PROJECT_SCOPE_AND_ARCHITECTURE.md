@@ -82,7 +82,7 @@ external-surface integration needed by a compositor.
 Telorgon's portable shell, scene, renderer-contract, and component crates do not depend on Wayland,
 X11, input-device, or console protocol types. An external protocol/policy host may supply outputs,
 seats, client surfaces, damage, synchronization, metadata, and commands through typed interfaces.
-For the Linux-only desktop-environment application type, focused first-party crates implement a
+For the Linux-only shell-environment application type, focused first-party crates implement a
 Wayland server over the official XML and `libwayland-server`, Linux input/session integration, and
 atomic KMS presentation while adapting all of that state into the same neutral Telorgon contracts.
 
@@ -893,7 +893,7 @@ focus policy, and delivering shell commands. That provider may be external or Te
 `telorgon-shell`, `telorgon-scene`, or the general component API.
 
 This boundary lets the portable Telorgon layers remain reusable even though the optional Linux
-desktop-environment assembly is itself a display-server protocol implementation.
+shell-environment assembly is itself a display-server protocol implementation.
 
 ## 10. Platform architecture
 
@@ -1213,7 +1213,7 @@ The single package provides curated profiles rather than compiling every platfor
 - `application-vulkan-windows` selects application authoring, Winit hosting, Vulkan WSI, and the
   target-gated Windows Vulkan/DXGI path;
 - `embedded-vulkan` selects host-driven runtime and Vulkan hosted mode without a window loop;
-- `desktop-wayland-linux` selects the target-gated shell/compositor, Linux platform, Vulkan,
+- `shell-wayland-linux` selects the target-gated shell/compositor, Linux platform, Vulkan,
   software-reference, and KMS modules;
 - `profiler` selects shared instrumentation and the managed profiler service; and
 - `embedded-profiler` selects shared instrumentation without forcing the managed service.

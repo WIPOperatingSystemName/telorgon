@@ -212,19 +212,19 @@ retired.
 
 - `Application::gui(name)` builds an ordinary managed GUI application and requires one `Window`
   with content before `.run()` is available.
-- `Application::desktop_environment(name)` builds a Linux desktop environment and requires a
-  compositor background before `.run()` is available. Composed `ShellWidget`s are optional;
-  omitting them starts the desktop without panels or widget space reservations.
+- `Application::shell_environment(name)` builds a Linux shell environment with a cursor-configured
+  compositor. Components implementing `ShellWidget` are registered directly through `.widget(...)`;
+  zero widgets is valid. Wallpaper is a widget, not compositor configuration.
 
-Both modes select their renderer directly on the application builder. `Window`, `Compositor`, and
-`ShellWidget` use constructors to gather their own mode-specific configuration, and `.content(...)`
-or `.background(...)` completes them before the parent builder accepts them. The deprecated
-`.policy(...)` spelling remains a compatibility forwarder. There is no generic
-`Application::new`, free `run` function, or separately runnable desktop/widget/compositor facade.
+Both modes select rendering on the application builder. `Window::content(...)` completes GUI
+content. A compositor is ready after cursor configuration and has no background/content component.
+Shell widgets define reactive `surface()` descriptors beside their ordinary `view()` methods.
+See [Shell widgets](SHELL_WIDGETS.md) for placement, animation, child surfaces, services, migration,
+and current qualification limits.
 
 `self.runtime_target()` reports `Application`, `ShellWidget`, or `Compositor` according to the
 composition's role. The GUI native host is operational. With the Linux-only
-`desktop-wayland-linux` feature, the desktop-environment declaration, validation, renderer
+`shell-wayland-linux` feature, the shell-environment declaration, validation, renderer
 selection, background/frame composition, shell widgets, and bare-metal Wayland/KMS runtime are
 operational but not production-qualified. Other targets return a clear unsupported-host error; the
 declaration never falls back to an ordinary application window because doing so would falsely

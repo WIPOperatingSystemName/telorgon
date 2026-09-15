@@ -105,7 +105,7 @@ Bounds are 64 MiB for the entire archive, 256 MiB extracted, 16,384 files and
 4 MiB of manifest JSON. Packing is deterministic for identical inputs with the
 same Python/zlib implementation; a reproducible release must pin that toolchain.
 
-The optional `desktop-xwayland-embedded` Cargo feature requires the absolute
+The optional `shell-xwayland-embedded` Cargo feature requires the absolute
 `TELORGON_XWAYLAND_PAYLOAD` build input. Cargo validates all entries and embeds
 the validated bytes in a downstream executable when its code uses
 `telorgon::xwayland::payload::embedded()`. There is no network build step, PATH

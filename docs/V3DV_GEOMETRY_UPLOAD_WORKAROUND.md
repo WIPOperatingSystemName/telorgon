@@ -118,9 +118,9 @@ Local verification recorded on 2026-09-03:
   executables, including hardware fixtures, compiled without execution.
 - `cargo check -p telorgon --lib --no-default-features --features embedded-vulkan`:
   standalone embedded Vulkan compiled without instrumentation.
-- `cargo check -p telorgon --tests --target aarch64-unknown-linux-gnu --no-default-features --features desktop-wayland-linux,embedded-vulkan,profiler`:
+- `cargo check -p telorgon --tests --target aarch64-unknown-linux-gnu --no-default-features --features shell-wayland-linux,embedded-vulkan,profiler`:
   ARM64 Linux library and test targets checked without execution.
-- `cargo build -p telorgon --lib --release --target aarch64-unknown-linux-gnu --no-default-features --features desktop-wayland-linux,embedded-vulkan,profiler`:
+- `cargo build -p telorgon --lib --release --target aarch64-unknown-linux-gnu --no-default-features --features shell-wayland-linux,embedded-vulkan,profiler`:
   optimized ARM64 Linux library built.
 - Formatting, `git diff --check`, and changed-document local Markdown links checked successfully.
 

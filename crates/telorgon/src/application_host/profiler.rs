@@ -43,7 +43,7 @@ impl ManagedProfiler {
 #[allow(dead_code)] // Each feature-selected managed host constructs its corresponding target.
 pub(crate) enum ProfileTarget {
     Gui,
-    DesktopEnvironment,
+    ShellEnvironment,
 }
 
 #[cfg(feature = "profiler")]
@@ -51,7 +51,7 @@ impl ProfileTarget {
     fn into_server_target(self) -> crate::profiler_server::ProfileTarget {
         match self {
             Self::Gui => crate::profiler_server::ProfileTarget::Gui,
-            Self::DesktopEnvironment => crate::profiler_server::ProfileTarget::DesktopEnvironment,
+            Self::ShellEnvironment => crate::profiler_server::ProfileTarget::ShellEnvironment,
         }
     }
 }
@@ -84,8 +84,8 @@ mod tests {
 
         assert_eq!(ProfileTarget::Gui.into_server_target(), ServerTarget::Gui);
         assert_eq!(
-            ProfileTarget::DesktopEnvironment.into_server_target(),
-            ServerTarget::DesktopEnvironment
+            ProfileTarget::ShellEnvironment.into_server_target(),
+            ServerTarget::ShellEnvironment
         );
     }
 }

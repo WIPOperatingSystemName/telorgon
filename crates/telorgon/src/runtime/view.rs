@@ -467,11 +467,50 @@ impl ViewRuntime<CompositionDriver> {
         }
     }
 
+    pub(crate) fn shell_input(&mut self, event: crate::input::InputEvent) -> RuntimeResult<()> {
+        let mut requested = false;
+        self.driver.shell_input(
+            &mut DriverContext {
+                ui: &mut self.ui,
+                commands: &mut self.commands,
+                frame_requested: &mut requested,
+            },
+            event,
+        );
+        if requested {
+            self.scheduler.request();
+        }
+        match self.driver.take_error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    pub(crate) fn dismiss_shell_widget(
+        &mut self,
+        reason: crate::compose::ShellDismissReason,
+    ) -> RuntimeResult<()> {
+        let mut frame_requested = false;
+        self.driver.dismiss_shell_widget(
+            &mut DriverContext {
+                ui: &mut self.ui,
+                commands: &mut self.commands,
+                frame_requested: &mut frame_requested,
+            },
+            reason,
+        );
+        if frame_requested {
+            self.scheduler.request();
+        }
+        match self.driver.take_error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
     pub fn composition_diagnostics(&self) -> CompositionDiagnostics {
         self.driver().diagnostics()
     }
 
-    #[cfg(any(test, all(feature = "desktop-wayland-linux", target_os = "linux")))]
+    #[cfg(any(test, all(feature = "shell-wayland-linux", target_os = "linux")))]
     pub(crate) fn update_composition_root(
         &mut self,
         candidate: Box<dyn crate::compose::ErasedComponent>,

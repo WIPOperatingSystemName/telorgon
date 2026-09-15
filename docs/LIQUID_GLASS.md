@@ -250,7 +250,7 @@ the [Vulkan shader interface requirements](https://docs.vulkan.org/spec/latest/c
 ## Ownership, alternatives and qualification
 
 Inspected Telorgon paths (relative to `crates/telorgon/src/`): `renderer_vulkan/{target,scene,
-composite,sync,descriptor,executor}.rs` and `application_host/desktop_wayland/{scene.rs,
+composite,sync,descriptor,executor}.rs` and `application_host/shell_wayland/{scene.rs,
 renderer/vulkan/glass.rs,renderer/vulkan/motion.rs}`. The existing buffer barrier already makes
 storage reads visible to both shader stages. Backdrop passes never sample their destination and
 keep destination/sampled-image pins through completion. Attachment-to-sampling and reuse ordering

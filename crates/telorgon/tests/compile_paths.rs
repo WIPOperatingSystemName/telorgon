@@ -45,7 +45,7 @@ use telorgon::{
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 use telorgon::{AppRuntime, WindowOptions};
 #[cfg(feature = "application-software")]
@@ -57,7 +57,7 @@ use telorgon::{
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 struct ManagedFixture;
 
@@ -239,7 +239,7 @@ impl MountedComponent for ComponentFixture {
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 impl MountedComponent for ManagedFixture {
     type State = ();
@@ -295,7 +295,7 @@ fn compile_scene_path(
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 fn compile_renderer_free_runtime_path(runtime: &mut AppRuntime<ManagedFixture>) {
     let _needs_frame = runtime.needs_frame();
@@ -1909,7 +1909,7 @@ fn current_public_paths_compile() {
     #[cfg(any(
         feature = "application-software",
         all(feature = "application-vulkan-windows", target_os = "windows"),
-        all(feature = "desktop-wayland-linux", target_os = "linux")
+        all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     let _window = WindowOptions::default();
     let neutral_input = InputEvent::mouse_button(PointerButton::PRIMARY, ButtonState::Pressed);
@@ -1923,7 +1923,7 @@ fn current_public_paths_compile() {
     #[cfg(any(
         feature = "application-software",
         all(feature = "application-vulkan-windows", target_os = "windows"),
-        all(feature = "desktop-wayland-linux", target_os = "linux")
+        all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     {
         let _managed_executor: Option<telorgon::ManagedTaskExecutor> = None;
@@ -1937,18 +1937,10 @@ fn current_public_paths_compile() {
                     .size(640, 480)
                     .content(ComposedFixture::default()),
             );
-        let _desktop_entry = telorgon::Application::desktop_environment("Compile desktop")
+        let _desktop_entry = telorgon::Application::shell_environment("Compile desktop")
             .renderer(telorgon::Renderer::Vulkan)
-            .compositor(
-                telorgon::Compositor::new()
-                    .cursor_theme(telorgon::CursorTheme::new())
-                    .background(ComposedFixture::default()),
-            )
-            .shell_widget(
-                telorgon::ShellWidget::new("Panel")
-                    .reserve_space(36.0)
-                    .content(ComposedFixture::default()),
-            );
+            .compositor(telorgon::Compositor::new().cursor_theme(telorgon::CursorTheme::new()))
+            .widget(ComposedFixture::default());
     }
     let mut text = TextBuffer::from_text("compile path").expect("valid text buffer");
     let snapshot = text.snapshot();
@@ -2016,7 +2008,7 @@ fn current_public_paths_compile() {
     #[cfg(any(
         feature = "application-software",
         all(feature = "application-vulkan-windows", target_os = "windows"),
-        all(feature = "desktop-wayland-linux", target_os = "linux")
+        all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     let _runtime_entry = compile_renderer_free_runtime_path;
     let _component_entry = compile_component_runtime_path;
@@ -2059,4 +2051,10 @@ fn current_public_paths_compile() {
     let _vulkan_policy = telorgon::renderer_vulkan::VulkanConfig::default();
 
     assert_composed_component::<ComposedFixture>();
+}
+
+impl telorgon::ShellWidget for ComposedFixture {
+    fn surface(&self) -> telorgon::ShellSurfaceSpec {
+        telorgon::ShellSurfaceSpec::new()
+    }
 }

@@ -194,7 +194,7 @@ impl AppRuntimeCore<CompositionDriver> {
 
     #[cfg(any(
         feature = "application-software",
-        feature = "desktop-wayland-linux",
+        feature = "shell-wayland-linux",
         all(feature = "application-vulkan-windows", target_os = "windows")
     ))]
     pub(crate) fn from_composition_driver(
@@ -214,7 +214,7 @@ impl AppRuntimeCore<CompositionDriver> {
         self.view.composition_diagnostics()
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn update_composition_root(
         &mut self,
         candidate: Box<dyn crate::compose::ErasedComponent>,
@@ -226,6 +226,19 @@ impl AppRuntimeCore<CompositionDriver> {
         Ok(changed)
     }
 
+    pub(crate) fn shell_input(&mut self, event: crate::input::InputEvent) -> AppResult<()> {
+        self.view.shell_input(event)?;
+        self.sync_interaction();
+        Ok(())
+    }
+    pub(crate) fn dismiss_shell_widget(
+        &mut self,
+        reason: crate::compose::ShellDismissReason,
+    ) -> AppResult<()> {
+        self.view.dismiss_shell_widget(reason)?;
+        self.sync_interaction();
+        Ok(())
+    }
     pub fn close_composition(&mut self) -> AppResult<()> {
         self.view.unmount_composition()?;
         self.sync_interaction();
@@ -294,6 +307,12 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         }
     }
 
+    pub(crate) fn motion_preference(&self) -> MotionPreference {
+        self.motion_preference
+    }
+    pub(crate) fn shell_hit_test(&mut self, point: PointF) -> bool {
+        self.layout.hit_test(self.view.ui_mut(), point).is_some()
+    }
     pub fn layout(&self) -> &LayoutEngine {
         &self.layout
     }

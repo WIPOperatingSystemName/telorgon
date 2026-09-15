@@ -24,7 +24,7 @@ const STABLE_PORT_COUNT: u16 = 7_000;
 pub enum ProfileTarget {
     #[default]
     Gui,
-    DesktopEnvironment,
+    ShellEnvironment,
 }
 
 /// Parsed activation request for a managed process.
@@ -168,7 +168,7 @@ fn input_recording_sources(target: ProfileTarget) -> Vec<InputRecordingSourceMet
                 event_prefix: "input.gui.keyboard",
             },
         ],
-        ProfileTarget::DesktopEnvironment => vec![
+        ProfileTarget::ShellEnvironment => vec![
             InputRecordingSourceMetadata {
                 id: "pointer_motion",
                 label: "libinput pointer motion",
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn every_managed_entrypoint_uses_the_same_session_contract() {
-        for target in [ProfileTarget::Gui, ProfileTarget::DesktopEnvironment] {
+        for target in [ProfileTarget::Gui, ProfileTarget::ShellEnvironment] {
             let config = ServerConfig::for_target(target);
             assert_eq!(config.metadata.entrypoint, target);
             assert!(
@@ -340,7 +340,7 @@ mod tests {
                 .any(|source| source.id == "touch_motion")
         );
 
-        let desktop = SessionMetadata::discover_for(ProfileTarget::DesktopEnvironment);
+        let desktop = SessionMetadata::discover_for(ProfileTarget::ShellEnvironment);
         assert!(
             desktop
                 .input_recording_sources

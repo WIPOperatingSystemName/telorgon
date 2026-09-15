@@ -95,11 +95,11 @@ application components without pulling an example executable into the runtime wo
 ## Presentation
 
 Both application modes select presentation in Rust rather than in the consuming project's Cargo
-features. `Application::gui(...)` and `Application::desktop_environment(...)` default to
+features. `Application::gui(...)` and `Application::shell_environment(...)` default to
 `Renderer::Auto`; an operational host tries the direct Vulkan presenter first and falls back to the
 software/Softbuffer presenter if Vulkan cannot initialize before component mounting.
 `Renderer::Vulkan` and `Renderer::Software` request an exact backend. The GUI host is the currently
-operational native entrypoint. The Linux desktop-environment declaration retains the selected
+operational native entrypoint. The Linux shell-environment declaration retains the selected
 policy for its future bare-metal host; its compositor and shell widgets do not select renderers
 independently. `HeadlessRuntime` continues to use the software backend for deterministic tests.
 

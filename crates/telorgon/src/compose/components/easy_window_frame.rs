@@ -96,7 +96,7 @@ pub struct WindowControlsDesign {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowChromeDesign {
-    /// Desktop window transitions, independent of state appearance.
+    /// Shell window transitions, independent of state appearance.
     pub motion: crate::WindowMotion,
     pub active: WindowChromePalette,
     pub inactive: WindowChromePalette,
@@ -110,7 +110,7 @@ pub struct WindowChromeDesign {
     /// reveal lower desktop layers. Opaque client buffers remain opaque.
     pub content_background: ColorRgba8,
     /// Resize placeholder appearance, independent of the normal content backing. `None`
-    /// inherits `LinuxDesktopConfig::resize_preview`. Color alpha zero is frame-only;
+    /// inherits `LinuxShellConfig::resize_preview`. Color alpha zero is frame-only;
     /// glass tint alpha zero keeps the opaque blurred backdrop.
     pub resize_preview: Option<crate::ResizePreview>,
 }
@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(component.design, DESIGN);
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     #[test]
     fn fractional_content_background_does_not_leak_into_frame_strips() {
         use crate::application_host::AppRuntimeCore;
@@ -1004,7 +1004,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     #[test]
     fn client_header_keeps_outer_style_and_resize_regions_without_title_controls() {
         use crate::application_host::AppRuntimeCore;
@@ -1054,7 +1054,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     #[test]
     fn controls_remain_centered_after_frame_state_updates_without_hover() {
         use crate::application_host::AppRuntimeCore;

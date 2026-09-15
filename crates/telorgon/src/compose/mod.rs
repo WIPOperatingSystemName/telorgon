@@ -9,7 +9,18 @@ mod context;
 mod element;
 mod event;
 mod key;
+pub(crate) mod shell_services;
 mod signal;
+pub use shell_services::{
+    ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
+    ShellWindowAction,
+};
+pub(crate) mod shell_widget;
+pub use shell_widget::{
+    ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
+    ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
+    ShellWidget, WidgetPlacement,
+};
 pub mod style;
 
 pub use crate::window_chrome::{

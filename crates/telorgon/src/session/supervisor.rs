@@ -62,7 +62,7 @@ impl State {
         }
         environment
     }
-    #[cfg(feature = "desktop-xwayland")]
+    #[cfg(feature = "shell-xwayland")]
     fn set_x11_environment(
         &mut self,
         environment: Option<(std::ffi::OsString, std::ffi::OsString)>,
@@ -613,8 +613,8 @@ impl SessionOwner {
     pub(crate) fn start_gui(env: Environment, config: SessionConfig) -> Result<Self> {
         Self::start_impl(env, config, true, false)
     }
-    #[cfg(feature = "desktop-xwayland")]
-    #[cfg_attr(not(feature = "desktop-xwayland-embedded"), allow(dead_code))]
+    #[cfg(feature = "shell-xwayland")]
+    #[cfg_attr(not(feature = "shell-xwayland-embedded"), allow(dead_code))]
     pub(crate) fn start_waiting_for_x11(env: Environment, config: SessionConfig) -> Result<Self> {
         Self::start_impl(env, config, false, true)
     }
@@ -688,7 +688,7 @@ impl SessionOwner {
         )?);
         Ok(())
     }
-    #[cfg(feature = "desktop-xwayland")]
+    #[cfg(feature = "shell-xwayland")]
     pub(crate) fn set_x11_environment(
         &self,
         environment: Option<(std::ffi::OsString, std::ffi::OsString)>,

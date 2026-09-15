@@ -2,7 +2,7 @@
     feature = "application-software",
     any(
         feature = "application-vulkan-windows",
-        feature = "desktop-wayland-linux",
+        feature = "shell-wayland-linux",
         feature = "embedded-vulkan"
     )
 ))]
@@ -34,7 +34,7 @@ fn dma_buf_is_imported_sampled_and_released_with_sync_fds() {
     run_dma_buf_test(false);
 }
 
-#[cfg(feature = "desktop-wayland-linux")]
+#[cfg(feature = "shell-wayland-linux")]
 #[test]
 #[ignore = "requires Linux, TELORGON_TEST_MODE=developer-hardware, and DMA-BUF/modifier/sync-FD Vulkan support"]
 fn cached_dma_buf_rearms_acquire_and_release_across_three_generations() {
@@ -144,7 +144,7 @@ fn run_dma_buf_test(cached: bool) {
             usage: source_usage,
         },
     );
-    #[cfg(feature = "desktop-wayland-linux")]
+    #[cfg(feature = "shell-wayland-linux")]
     let mut importer = telorgon::compositor_render::DmaBufImporter::new(&hosted).unwrap();
     let mut scene = hosted.create_scene().expect("create hosted scene");
     let image_id = ImageId(if cached { u32::MAX } else { 41 });
@@ -169,7 +169,7 @@ fn run_dma_buf_test(cached: bool) {
         .expect("create hosted output target");
         let target_parts = interop::borrowed_target_parts(&target.target());
         if cached {
-            #[cfg(feature = "desktop-wayland-linux")]
+            #[cfg(feature = "shell-wayland-linux")]
             {
                 use telorgon::compositor_wayland::{
                     DmaBufDescriptor, DmaBufFlags, DmaBufImage, DmaBufPlane, WaylandBufferId,
@@ -211,7 +211,7 @@ fn run_dma_buf_test(cached: bool) {
                     )
                     .expect("bind a cached DMA-BUF generation");
             }
-            #[cfg(not(feature = "desktop-wayland-linux"))]
+            #[cfg(not(feature = "shell-wayland-linux"))]
             unreachable!("cache bridge requires the desktop feature");
         } else {
             let lease = unsafe {
@@ -440,7 +440,7 @@ fn run_dma_buf_test(cached: bool) {
         drop(target);
     }
     drop(scene);
-    #[cfg(feature = "desktop-wayland-linux")]
+    #[cfg(feature = "shell-wayland-linux")]
     drop(importer);
     drop(hosted);
     unsafe {

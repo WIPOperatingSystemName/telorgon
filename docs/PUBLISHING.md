@@ -27,7 +27,7 @@ crate is now a module of `telorgon`. No other registry package is required.
 
 ## Owner decisions required before the first release
 
-1. Confirm that `https://github.com/TempDesktopEnvNameOrg/telorgon` is the permanent public
+1. Confirm that `https://github.com/TempShellEnvNameOrg/telorgon` is the permanent public
    repository URL, then update the workspace metadata and local remote if necessary.
 2. Recheck registry package-name availability immediately before release. Availability is not
    reserved until publication.

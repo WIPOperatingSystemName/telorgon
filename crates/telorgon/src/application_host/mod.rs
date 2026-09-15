@@ -1,28 +1,16 @@
 //! Mounted application lifecycle, renderer-free frame preparation, and managed host assembly.
 
-#[cfg(all(feature = "desktop-wayland-linux", not(target_os = "linux")))]
-compile_error!("feature `desktop-wayland-linux` is supported only for Linux targets");
+#[cfg(all(feature = "shell-wayland-linux", not(target_os = "linux")))]
+compile_error!("feature `shell-wayland-linux` is supported only for Linux targets");
 
 mod declaration;
 mod output_scale;
 pub use output_scale::OutputScale;
 mod delta_queue;
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
-mod desktop_wayland;
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+mod shell_wayland;
 // Keep the platform-neutral compositor transaction and retained-scene tests executable on the
 // development host even when the native Wayland/KMS owner is compiled only for Linux.
-#[cfg(test)]
-#[path = "desktop_wayland/backend_boundary.rs"]
-mod desktop_wayland_backend_boundary_tests;
-#[cfg(all(test, not(target_os = "linux")))]
-#[path = "desktop_wayland/scene.rs"]
-mod desktop_wayland_scene_tests;
-#[cfg(all(test, not(target_os = "linux")))]
-#[path = "desktop_wayland/state.rs"]
-mod desktop_wayland_state_tests;
-#[cfg(all(test, not(target_os = "linux"), feature = "application-software"))]
-#[path = "desktop_wayland/transparency_tests.rs"]
-mod desktop_wayland_transparency_tests;
 mod error;
 mod exit;
 #[cfg(feature = "application-software")]
@@ -38,11 +26,23 @@ mod native;
 #[cfg(any(
     feature = "application-software",
     all(feature = "application-vulkan-windows", target_os = "windows"),
-    all(feature = "desktop-wayland-linux", target_os = "linux")
+    all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 mod profiler;
 mod runtime;
 mod scheduler;
+#[cfg(test)]
+#[path = "shell_wayland/backend_boundary.rs"]
+mod shell_wayland_backend_boundary_tests;
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "shell_wayland/scene.rs"]
+mod shell_wayland_scene_tests;
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "shell_wayland/state.rs"]
+mod shell_wayland_state_tests;
+#[cfg(all(test, not(target_os = "linux"), feature = "application-software"))]
+#[path = "shell_wayland/transparency_tests.rs"]
+mod shell_wayland_transparency_tests;
 mod task_host;
 mod window;
 
@@ -64,11 +64,10 @@ pub use crate::runtime::{
     UnmountContext, UpdateContext, ViewRuntime,
 };
 pub use declaration::{
-    Application, Compositor, CompositorVisual, DesktopEnvironment,
-    DesktopEnvironmentWithCompositor, DesktopKeyAction, DesktopKeyEvent, GuiApplication,
-    KeyboardConfig, LinuxDesktopConfig, ReadyCompositor, ReadyDesktopEnvironment,
-    ReadyGuiApplication, ReadyShellWidget, ReadyWindow, Renderer, ShellWidget, ShellWidgetAnchor,
-    ShellWidgetExtent, Window, WindowFrameFactory, WindowFrameTemplate,
+    Application, Compositor, CompositorVisual, GuiApplication, KeyboardConfig, LinuxShellConfig,
+    ReadyCompositor, ReadyGuiApplication, ReadyShellEnvironment, ReadyWindow, Renderer,
+    ShellEnvironment, ShellEnvironmentWithCompositor, ShellKeyAction, ShellKeyEvent, Window,
+    WindowFrameFactory, WindowFrameTemplate,
 };
 pub use delta_queue::SceneDeltaQueue;
 pub use error::{AppError, AppResult};
@@ -87,3 +86,14 @@ pub use task_host::{
     ManagedTaskDiagnostics, ManagedTaskExecutor, ManagedTaskHost, ManagedTaskPoll,
 };
 pub use window::{WindowDecorationMode, WindowOptions};
+
+pub use crate::compose::{
+    ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
+    ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
+    ShellWidget, WidgetPlacement,
+};
+
+pub use crate::compose::{
+    ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices, ShellWindow,
+    ShellWindowAction,
+};

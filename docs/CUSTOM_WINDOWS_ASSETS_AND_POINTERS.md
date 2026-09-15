@@ -310,29 +310,29 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
         gap: 6.0,
     },
     content_background: ColorRgba8::rgba(15, 18, 26, 255),
-    resize_preview: None, // Inherit LinuxDesktopConfig; Some(ResizePreview::Color(rgba(...))) overrides it.
+    resize_preview: None, // Inherit LinuxShellConfig; Some(ResizePreview::Color(rgba(...))) overrides it.
 };
 
 #[component]
-struct DesktopBackground {}
+struct ShellBackground {}
 
-impl Component for DesktopBackground {
+impl Component for ShellBackground {
     fn view(&self) -> impl View {
         stack().background(ColorRgba8::rgba(10, 12, 18, 255))
     }
 }
 
-Application::desktop_environment("Telorgon")
+Application::shell_environment("Telorgon")
     .assets(assets::bundle())
     .app_icon(app_icons())
     .compositor(
         Compositor::new()
             .cursor_theme(CursorTheme::from_asset(assets::cursors::DEFAULT))
             .client_cursor_mode(ClientCursorMode::Allow)
-            .window_frame(easy_window_frame(TEST_CHROME))
-            .background(DesktopBackground::default()),
+            .window_frame(easy_window_frame(TEST_CHROME)),
     )
-    .shell_widget(ShellWidget::new("panel").content(MyPanel::default()))
+    .widget(ShellBackground::default())
+    .widget(MyPanel::default())
     .run()?;
 ```
 
@@ -382,7 +382,7 @@ let chrome = WindowChromeDesign {
 let frame = easy_window_frame(chrome);
 ```
 
-`resize_preview: None` inherits `LinuxDesktopConfig::resize_preview` (opaque slate
+`resize_preview: None` inherits `LinuxShellConfig::resize_preview` (opaque slate
 by default); add this field to existing complete `WindowChromeDesign` literals when upgrading.
 All alpha values from 0 through 255 are accepted. The preview replaces the client surface tree and
 normal backing, so its alpha reveals lower desktop layers, not the old client image. Normal
@@ -525,8 +525,7 @@ fn pin_window(model: WindowChromeModel) {
 
 Compositor::new()
     .window_frame(StudioFrameTemplate)
-    .shell_action(PIN, pin_window)
-    .background(DesktopBackground::default());
+    .shell_action(PIN, pin_window);
 ```
 
 An unregistered shell action is inert. This keeps arbitrary frame regions from becoming an
@@ -603,8 +602,7 @@ fn cursor_theme() -> CursorTheme {
 
 Compositor::new()
     .cursor_theme(cursor_theme())
-    .client_cursor_mode(ClientCursorMode::Allow)
-    .background(DesktopBackground::default());
+    .client_cursor_mode(ClientCursorMode::Allow);
 ```
 
 The abbreviated theme above deliberately omits roles and will fail startup until completed.

@@ -69,7 +69,7 @@ fn wait<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
-fn desktop_environment_replaces_only_session_keys_without_mutating_the_parent() {
+fn shell_environment_replaces_only_session_keys_without_mutating_the_parent() {
     let original = Environment(BTreeMap::from([
         ("PATH".into(), "/usr/bin".into()),
         ("DISPLAY".into(), ":1".into()),
@@ -119,7 +119,7 @@ fn runtime_directory_rejects_symlinks_and_insecure_permissions() {
 }
 
 #[test]
-#[cfg(all(target_os = "linux", feature = "desktop-wayland-linux"))]
+#[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
 fn wayland_socket_auto_selection_and_cleanup_use_the_explicit_directory() {
     let fixture = Fixture::new();
     let old_env = std::env::var_os("XDG_RUNTIME_DIR");
@@ -406,7 +406,7 @@ fn journal_does_not_follow_symlink_or_replay_unknown_version() {
 }
 
 #[test]
-#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+#[cfg(all(target_os = "linux", feature = "shell-xwayland"))]
 fn x11_child_environment_withdrawal_suppresses_incident_retries() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
@@ -466,7 +466,7 @@ fn x11_child_environment_withdrawal_suppresses_incident_retries() {
 }
 
 #[test]
-#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+#[cfg(all(target_os = "linux", feature = "shell-xwayland"))]
 fn initial_launches_wait_for_x11_success_failure_or_session_close() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     for outcome in [0, 1, 2] {
@@ -507,7 +507,7 @@ fn initial_launches_wait_for_x11_success_failure_or_session_close() {
 }
 
 #[test]
-#[cfg(all(target_os = "linux", feature = "desktop-xwayland"))]
+#[cfg(all(target_os = "linux", feature = "shell-xwayland"))]
 fn deferred_recoverable_launch_survives_shutdown_without_a_process_identity() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();

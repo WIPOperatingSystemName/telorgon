@@ -108,7 +108,7 @@ and pending image updates. Composition, cursor imagery and frame reporting use
 that presentation record. `ClientWindow` still owns it; independent storage/lifetimes
 remains open; shared frame action routing is connected. Native configure semantics are unchanged.
 
-Implemented behind `desktop-xwayland`:
+Implemented behind `shell-xwayland`:
 
 - An XWM driver assembles discovery, checked manager acquisition, root enumeration,
   window events and inspection scheduling over one connection. It exposes the FD,
@@ -230,7 +230,7 @@ Implemented behind `desktop-xwayland`:
   surfaces revoke their association; XID reuse cannot inherit stale state. History
   is bounded and exhaustion fails rather than evicting identity tombstones.
 
-`desktop-xwayland-embedded` additionally validates a supplied payload at build
+`shell-xwayland-embedded` additionally validates a supplied payload at build
 time and provides embedded bytes. See the [packaging instructions](../packaging/xwayland/README.md).
 These component APIs are not a claim that the complete compatibility modes or
 their managed startup defaults have been implemented.
@@ -319,14 +319,14 @@ global toolkit backend override is part of this implementation.
 
 ## Startup keyboard configuration
 
-`application_host::LinuxDesktopConfig::keyboard` accepts `KeyboardConfig` with
+`application_host::LinuxShellConfig::keyboard` accepts `KeyboardConfig` with
 optional XKB rules, model, layout, variant and options. The managed native seat
 compiles and publishes these names at startup. `None` keeps existing defaults;
 explicit empty options remain distinct from unspecified options. For example:
 
 ```rust
-use telorgon::application_host::{KeyboardConfig, LinuxDesktopConfig};
-let config = LinuxDesktopConfig {
+use telorgon::application_host::{KeyboardConfig, LinuxShellConfig};
+let config = LinuxShellConfig {
     keyboard: KeyboardConfig {
         layout: Some("us,de".into()),
         options: Some("grp:alt_shift_toggle".into()),
@@ -354,7 +354,7 @@ consumed; keyboard focus and session-lock state are unchanged.
 
 The chord deactivates pointer constraints and blocks new or persistent constraints
 on that surface until pointer focus leaves. A later enter may reactivate persistent
-constraints; one-shot constraints remain finished. `DesktopKeyAction::ReleaseCapture`
+constraints; one-shot constraints remain finished. `ShellKeyAction::ReleaseCapture`
 also exposes this action to compositor shortcut policy. Downstream exhaustive
 matches on that enum must handle the new variant.
 
@@ -593,7 +593,7 @@ reads/transfers; this component is not yet attached to native clipboard endpoint
 ## Managed launch and association integration
 
 Embedded builds now start preparation from the managed desktop unless
-`LinuxDesktopConfig::xwayland_enabled` is false. `xwayland_cache` overrides the
+`LinuxShellConfig::xwayland_enabled` is false. `xwayland_cache` overrides the
 private cache under XDG_CACHE_HOME (or HOME/.cache). Preparation/extraction runs
 on a worker; the owner inserts the private Wayland connection and registers its
 identity before spawning. XWM/helper/readiness FDs wake libwayland, writable

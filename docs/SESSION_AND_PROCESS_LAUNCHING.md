@@ -7,7 +7,7 @@ integration still require manual qualification; these features are not productio
 ## Startup
 
 Both managed `Application::gui(...).run()` and
-`Application::desktop_environment(...).run()` establish the process-wide `telorgon::session` service
+`Application::shell_environment(...).run()` establish the process-wide `telorgon::session` service
 before application callbacks can launch children. Builders can be constructed earlier, but executing
 one before startup returns `session::Error::NotReady`. Only one managed session runs per process.
 An explicitly retained `SessionHandle` is optional; old handles cannot launch into a later session.
@@ -17,12 +17,12 @@ For an ordinary GUI, the host inherits the existing graphical session. On Linux 
 Set the optional GUI `.session(session::SessionConfig::new("my-app"))` builder value for a stable
 recovery identity. Otherwise the GUI derives an identity from its application name.
 
-For a desktop environment, `LinuxDesktopConfig::default()` now selects the GPU and Wayland socket
+For a desktop environment, `LinuxShellConfig::default()` now selects the GPU and Wayland socket
 automatically. `drm_device: None` searches DRM card devices through the seat and selects a device
 with a connected output and mode. An explicit override is `Some(path.into())`.
 `socket_name: None` binds the first free `wayland-0` through `wayland-32` socket inside the
 validated runtime directory. Libwayland owns socket locking and cleanup. Startup logs the selected
-socket. Configure identity and launch policy through `LinuxDesktopConfig.session`.
+socket. Configure identity and launch policy through `LinuxShellConfig.session`.
 
 A user can start the DE executable directly from a properly established local TTY login. Linux
 still must provide an active seat, working DRM/input permissions through logind or seatd, and the

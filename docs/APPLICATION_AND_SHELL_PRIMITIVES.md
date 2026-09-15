@@ -1251,7 +1251,7 @@ QQuickAbstractButton press/key/touch/check/exclusive behavior; QQuickComboBox hi
 activation/typeahead; QQuickPopup close policy, input interception, placement, focus restoration.
 Android platform base 1cdfff555f4a21f71ccc978290e2e212e2f8b168 — SystemUI model/interactor/view-model
 separation; WindowManager Shell docs policy separation; windowdecor/WindowDecoration external task
-surface/chrome/input regions; desktopmode/DesktopModeVisualIndicator policy-driven snap feedback.
+surface/chrome/input regions; desktopmode/ShellModeVisualIndicator policy-driven snap feedback.
 
 Official specifications/guidance checked:
 WAI-ARIA 1.2 role/state/property ontology; WAI-ARIA Authoring Practices keyboard-interface guidance

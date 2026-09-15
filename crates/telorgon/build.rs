@@ -1,18 +1,18 @@
-#[cfg(feature = "desktop-wayland-linux")]
+#[cfg(feature = "shell-wayland-linux")]
 #[path = "build/wayland.rs"]
 mod wayland;
 
-#[cfg(feature = "desktop-xwayland-embedded")]
+#[cfg(feature = "shell-xwayland-embedded")]
 #[path = "src/xwayland/payload_format.rs"]
 mod payload_format;
 
 fn main() {
-    #[cfg(feature = "desktop-xwayland-embedded")]
+    #[cfg(feature = "shell-xwayland-embedded")]
     embed_xwayland();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build");
     println!("cargo:rerun-if-changed=src/wayland_server/protocol.rs");
-    #[cfg(feature = "desktop-wayland-linux")]
+    #[cfg(feature = "shell-wayland-linux")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         if let Err(error) = wayland::generate() {
             panic!("Wayland descriptor generation failed: {error}");
@@ -20,12 +20,12 @@ fn main() {
     }
 }
 
-#[cfg(feature = "desktop-xwayland-embedded")]
+#[cfg(feature = "shell-xwayland-embedded")]
 fn embed_xwayland() {
     println!("cargo:rerun-if-env-changed=TELORGON_XWAYLAND_PAYLOAD");
     println!("cargo:rerun-if-changed=src/xwayland/payload_format.rs");
     let path = std::env::var_os("TELORGON_XWAYLAND_PAYLOAD")
-        .expect("desktop-xwayland-embedded requires TELORGON_XWAYLAND_PAYLOAD; see packaging/xwayland/README.md");
+        .expect("shell-xwayland-embedded requires TELORGON_XWAYLAND_PAYLOAD; see packaging/xwayland/README.md");
     let path = std::path::PathBuf::from(path);
     assert!(
         path.is_absolute(),

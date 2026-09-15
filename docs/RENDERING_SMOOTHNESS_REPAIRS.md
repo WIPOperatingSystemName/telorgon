@@ -74,7 +74,7 @@ during automated work in this checkout.
 Validation completed on September 13:
 
 - Embedded-XWayland/software library suite: **1,296 passed, 0 failed, 2 ignored**.
-- Native-only `desktop-wayland-linux` compilation: passed.
+- Native-only `shell-wayland-linux` compilation: passed.
 - Instrumented Vulkan and Linux DMA-BUF hardware test-binary compilation: passed; not executed.
 - Consuming `test-compositor` optimized build with embedded XWayland: passed.
 

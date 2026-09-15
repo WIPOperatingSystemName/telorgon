@@ -10,10 +10,10 @@ private Ubuntu root under `/tmp`, with service startup disabled.
 
 ```sh
 cargo check -p telorgon --all-targets --no-default-features \
-  --features desktop-wayland-linux --frozen \
+  --features shell-wayland-linux --frozen \
   --target-dir /tmp/telorgon-x11-plan-check
 cargo test -p telorgon --lib --no-default-features \
-  --features desktop-wayland-linux --offline \
+  --features shell-wayland-linux --offline \
   --target-dir /tmp/telorgon-x11-plan-check compositor_wayland:: -- --test-threads=1
 ```
 
@@ -24,7 +24,7 @@ selection cancellation, and presentation/buffer lifetime accounting. It does not
 establish rendered pixels, native desktop interaction or shutdown on hardware.
 
 The DMA-BUF hardware integration test also requires `application-software` and a
-Vulkan-capable feature combination. An ordinary `desktop-wayland-linux`
+Vulkan-capable feature combination. An ordinary `shell-wayland-linux`
 `--all-targets` check does not exercise that test's implementation. Hardware test
 compilation and selected-device execution must be reported separately.
 
@@ -33,7 +33,7 @@ feature gates enabled:
 
 ```sh
 cargo test -p telorgon --no-default-features \
-  --features desktop-wayland-linux,application-software \
+  --features shell-wayland-linux,application-software \
   --test renderer_vulkan__linux_dma_buf_hardware --no-run --offline \
   --target-dir /tmp/telorgon-x11-plan-check
 ```
@@ -45,17 +45,17 @@ changes. Neither result is GPU/KMS runtime evidence.
 
 ```sh
 cargo test -p telorgon --lib --no-default-features \
-  --features desktop-xwayland --offline \
+  --features shell-xwayland --offline \
   --target-dir /tmp/telorgon-x11-plan-check xwayland:: -- --test-threads=1
 python3 -m unittest discover -s packaging/xwayland -p 'test_*.py'
 ```
 
-The full library suite with `desktop-xwayland` passed: **1,001 passed, one
+The full library suite with `shell-xwayland` passed: **1,001 passed, one
 ignored**. This includes 19 new component tests and existing native/session
 regressions. Python archive tests: **five passed**.
 
 With the real built archive supplied through `TELORGON_XWAYLAND_PAYLOAD`,
-`desktop-xwayland-embedded` component tests passed: **20 passed**, including
+`shell-xwayland-embedded` component tests passed: **20 passed**, including
 cold/warm extraction of the actual payload embedded in the Rust test executable.
 An embedded build with no supplied payload was also checked: it failed at build
 time with the documented missing-input error.
@@ -74,7 +74,7 @@ not execute them. Actual compiler execution is covered separately below.
 
 ## Private process and lifecycle follow-up
 
-The subsequent implementation chunk ran the `desktop-xwayland` component command
+The subsequent implementation chunk ran the `shell-xwayland` component command
 above again: **32 passed**, including 13 additional lifecycle, process and
 readiness tests. Six process tests execute short-lived `/usr/bin/python3` unit
 fixtures, not Xwayland or a desktop application. Coverage includes literal argv,
@@ -88,7 +88,7 @@ three bounded backoffs. Displayfd tests cover partial notification, mismatched
 display numbers, extra bytes and premature EOF. These are component results, not
 real-server startup, authentication, FD inventory, or native-survival acceptance.
 
-The native `desktop-wayland-linux --all-targets --frozen` check also passed again
+The native `shell-wayland-linux --all-targets --frozen` check also passed again
 with the same three existing warnings. Formatting and `git diff --check` passed.
 
 ## Display reservation and authority follow-up
@@ -130,7 +130,7 @@ sync test now uses the owned registration wrapper. The FD transfer and destructi
 listener contracts were checked against the [official server API](https://wayland.freedesktop.org/docs/html/apc.html).
 This verifies the wrapper mechanics, not Xwayland privileged-global filtering or
 managed restart integration. No GUI or X server was launched.
-The full `desktop-xwayland` library regression suite subsequently passed:
+The full `shell-xwayland` library regression suite subsequently passed:
 **1,026 passed, one ignored**, including the updated registry-sync test and native
 compositor/session state tests. Scoped formatting and whitespace checks passed.
 
@@ -166,7 +166,7 @@ rejected; a dead generation can be replaced without rebuilding the compositor.
 The test also checks that an ordinary same-user client sees native globals but
 cannot discover or bind the Xwayland shell. Expected protocol-error messages are
 part of the rejection tests. No X server or interactive session was launched.
-The full `desktop-xwayland` library suite then passed **1,033 tests, one ignored**.
+The full `shell-xwayland` library suite then passed **1,033 tests, one ignored**.
 The compatibility all-targets check also passed with the same three existing
 warnings; scoped formatting and whitespace checks passed.
 
@@ -216,7 +216,7 @@ checked MANAGER announcements, selection loss after acquisition, and expiration
 at the original startup deadline. Generated events are padded to the full
 32-byte wire size. No X server or interactive application was launched.
 
-The all-target `desktop-xwayland` compile check, scoped formatting and
+The all-target `shell-xwayland` compile check, scoped formatting and
 `git diff --check` also passed. The phase preserves its connection, sequence
 tracker and allocated XID range for subsequent initialization. This is component
 coverage for W04, not completed XWM readiness: root metadata, output state,
@@ -232,7 +232,7 @@ barrier test now covers metadata writes as well as manager announcements; an
 injected BadWindow on a metadata write prevents phase completion. No unsupported
 window-state or workspace handler is advertised.
 
-The all-target `desktop-xwayland` compile check, scoped formatting and
+The all-target `shell-xwayland` compile check, scoped formatting and
 `git diff --check` passed. Publication follows the self-referencing owner-window
 contract in [EWMH sections 3.1 and 3.10](https://specifications.freedesktop.org/wm/latest-single/).
 This remains component evidence: real Xwayland startup, output initialization,
@@ -248,7 +248,7 @@ before selection acquisition. This is separate from the core SubstructureRedirec
 window-management event mask already checked during discovery.
 
 The follow-up passed **59 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 The socket fixtures verify the target root, extension/minor opcode, manual mode,
 withheld-barrier behavior and conflict handling. The intended wire behavior follows
 [X.Org's Composite contract](https://xorg.freedesktop.org/archive/X11R7.5/doc/man/man3/Xcomposite.3.html).
@@ -258,7 +258,7 @@ remain runtime acceptance gates alongside window association and host integratio
 ## X11 window-event and association routing
 
 The follow-up passed **64 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 The window-registry fixtures cover native-order and reversed-order X11/Wayland
 serial arrival (including high serial bits), map request versus confirmed mapping,
 override-redirect windows, unmap/reparent/surface-loss presentation revocation,
@@ -280,7 +280,7 @@ server lifecycle observations. Input-only windows are excluded from presentation
 records. The adapter bounds outstanding inspection requests to 384.
 
 The follow-up passed **67 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 Socket fixtures verify exact request targets, no premature snapshot after one or
 two replies, complete mapped/override-redirect geometry, destruction plus XID reuse
 before replies, and timeout/late-response cleanup. Initial root inventory and
@@ -299,7 +299,7 @@ replies free slots for remaining children. Enumeration completion waits for both
 queued and outstanding inspections and is not desktop readiness.
 
 The follow-up passed **70 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 Socket tests cover manager exclusion, completion after a full child snapshot,
 invalid/excessive trees, a 129-child queue reaching the 128-inspection limit and
 resumption after a disappearing child's error replies. Managed-loop scheduling,
@@ -316,7 +316,7 @@ Successful inspection emits creation followed by an association change where
 available; association still requires an authenticated committed Wayland surface.
 
 The follow-up passed **74 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 Tests cover both commit/inspection orders, high serial bits, duplicate retention,
 timeout retry, obsolete token cancellation, destruction before metadata followed
 by XID reuse, and bound exhaustion/reclamation. Definitive inspection errors and
@@ -333,7 +333,7 @@ request deadlines, policy actions and unhandled events without publishing DISPLA
 Manager selection loss closes the driver transport and clears presentation state.
 
 The follow-up passed **76 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 A socket fixture progresses from completed discovery through manager acquisition
 and root enumeration, injects window creation before manager completion, then
 maps/associates that same window and verifies teardown on selection loss. A
@@ -352,7 +352,7 @@ identities and zero dimensions are rejected before queuing; partial queue failur
 closes the compatibility connection rather than pretending the command was atomic.
 
 The follow-up passed **78 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 The driver socket fixture checks map/configure opcodes and negative-position/size
 wire values, confirms that successful barriers leave map/geometry state unchanged,
 and then verifies state updates from MapNotify/ConfigureNotify. Further tests cover
@@ -374,7 +374,7 @@ adjusted for the client's requested border and that requested border width. The
 caller supplies this geometry according to [ICCCM 4.1.5](https://www.x.org/releases/X11R7.7/doc/xorg-docs/icccm/icccm.pdf).
 The API checks target/sibling lifetimes and preserves override-redirect metadata.
 The follow-up passed **81 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 Tests verify masked fields without actual-geometry mutation, ordered inspection
 replay, queue overflow/destruction cleanup, notification target/mask/geometry and
 unchanged server-confirmed geometry after notification. Window policy deciding
@@ -397,7 +397,7 @@ returns a structured compatibility error. WM_TAKE_FOCUS is parsed but its policy
 and input-focus behavior remain unimplemented.
 
 The follow-up passed **84 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 The driver fixture verifies the property-change subscription, bounded property
 read, protocol publication, unavailable-close rejection and close message wire
 fields. Reader tests cover property storms, stale revisions, incomplete/invalid
@@ -427,7 +427,7 @@ queuing a command/barrier pair. A regression fills the shared request table and
 verifies property reads resume only after a slot is released.
 
 The follow-up passed **87 Xwayland component tests**, the all-target
-`desktop-xwayland` compile check, scoped formatting and `git diff --check`.
+`shell-xwayland` compile check, scoped formatting and `git diff --check`.
 Tests cover the four-model matrix, hint validation/defaults, locally active wire
 requests, globally active message-only behavior, property invalidation and stale
 hint rejection. Input/IME and real desktop focus qualification remain open.
@@ -448,7 +448,7 @@ publication identity, duplicate destruction, slot reuse and generation exhaustio
 The adjacent reference library remains absent; this bounded bookkeeping change
 uses Telorgon's existing lifecycle and does not change GPU/resource retirement.
 
-The full `desktop-xwayland` library suite passed **1080 tests, one ignored**.
+The full `shell-xwayland` library suite passed **1080 tests, one ignored**.
 The first parallel run exposed an existing FD-number reuse race in the unimported
 DMA-BUF ownership test: after drop, another test can reuse the same `/proc/self/fd`
 number. The fixture now checks EOF on a retained Unix-socket peer, which proves
@@ -470,7 +470,7 @@ requested geometry, restore geometry, window state and retained imagery remain
 outside it. This is a data-layout refactor with unchanged native scheduling and
 acknowledgement rules; the future X11 adapter still needs separate routing.
 
-Validation: the full `desktop-xwayland` library suite passed **1080 tests, one
+Validation: the full `shell-xwayland` library suite passed **1080 tests, one
 ignored**. Existing regression coverage includes terminal configure acknowledgement,
 serial wraparound, superseded publication, resize anchors, maximize/restore and
 same-turn resize coalescing. Both native-only and compatibility all-target compile
@@ -771,7 +771,7 @@ The native startup extent now comes from its published output state.
 
 Three new tests cover negative origins, rotated 150% scaling, offscreen roundtrips,
 empty/disabled layouts, invalid mode indexes, extent/union/translation overflow,
-and X11 coordinate/dimension boundaries. Full desktop-xwayland library suite:
+and X11 coordinate/dimension boundaries. Full shell-xwayland library suite:
 **1,098 passed, 1 ignored** (`/tmp/telorgon-root-full-tests.log`). Native-only
 all-target compilation passed (`/tmp/telorgon-root-native-check.log`).
 
@@ -791,7 +791,7 @@ wire types, lengths and trailing data do not become usable policy metadata.
 
 Three new tests cover parsing and asynchronous stale/destruction behavior; the
 existing XWM socket fixture now checks actual normal-hint requests, replies,
-invalidation and deletion. All-target desktop-xwayland compilation passed
+invalidation and deletion. All-target shell-xwayland compilation passed
 (`/tmp/telorgon-normal-hints-check.log`). Full serial library regression:
 **1,101 passed, 1 ignored** (`/tmp/telorgon-normal-hints-serial.log`). The initial
 parallel run had 1,100 pass and one existing inspection-fixture failure:
@@ -953,7 +953,7 @@ passed (`/tmp/telorgon-focus-capacity.log`). Real input/focus qualification rema
 ## Combined XWM policy regression checkpoint
 
 After normal-hint validation, hint-aware configure, timestamp ordering and compound
-focus capacity changes, native-only and desktop-xwayland all-target checks passed
+focus capacity changes, native-only and shell-xwayland all-target checks passed
 (`/tmp/telorgon-policy-native.log`, `/tmp/telorgon-policy-compat.log`). Full serial
 library regression passed **1,104 tests, 1 ignored**
 (`/tmp/telorgon-policy-serial.log`).
@@ -1135,7 +1135,7 @@ also makes the state API safe for future internal bridge endpoints.
 After mixed-version source action fallback, explicit action-declaration state,
 wire error handling, distinct MIME bounds and duplicate-registration preservation,
 the full serial library suite passed **1,109 tests, 1 ignored**
-(`/tmp/telorgon-data-device-full.log`). Native-only and desktop-xwayland all-target
+(`/tmp/telorgon-data-device-full.log`). Native-only and shell-xwayland all-target
 compilation passed (`/tmp/telorgon-data-device-native.log`,
 `/tmp/telorgon-data-device-compat.log`). Existing three dead-code warnings remain.
 
@@ -1198,7 +1198,7 @@ This supplies scheduling mechanics, not managed-host or X11 selection integratio
 
 The accumulated transfer pump, recovery, registry and shared-budget scheduler
 passed the full serial library suite: **1,115 tests, 1 ignored**
-(`/tmp/telorgon-transfer-full.log`). Native-only and desktop-xwayland all-target
+(`/tmp/telorgon-transfer-full.log`). Native-only and shell-xwayland all-target
 checks passed (`/tmp/telorgon-transfer-native.log`, `/tmp/telorgon-transfer-compat.log`).
 Three existing dead-code warnings remain. These results cover library behavior;
 no managed readiness registration, X11 INCR or cross-protocol transfer was exercised.
@@ -1592,22 +1592,22 @@ clipboard qualification.
 Selection subscription rejection regression: duplicate kinds, duplicate server
 atoms across CLIPBOARD/PRIMARY, and zero atoms leave the existing XWM connection
 and confirmed watch intact. The three focused XWM tests passed serially with
-`desktop-xwayland` (offline); local Unix socket fixtures required execution outside
+`shell-xwayland` (offline); local Unix socket fixtures required execution outside
 the socket-restricting sandbox. No compositor or Xwayland session was launched.
 This does not qualify the still-unwired desktop selection bridge.
 
 Selection atom discovery: all 143 Xwayland component tests passed serially with
-`desktop-xwayland`, offline, after adding six selection atoms. The startup fixture
+`shell-xwayland`, offline, after adding six selection atoms. The startup fixture
 checks both PRIMARY and discovered CLIPBOARD watch requests and independent
 readiness barriers. Mock-server sequence numbers were updated for the additional
 InternAtom requests. These are socket fixtures, not a real clipboard session.
 
 Connection-scoped selection atom access: three focused XWM tests passed serially
-with `desktop-xwayland` offline. The startup fixture verifies PRIMARY/CLIPBOARD
+with `shell-xwayland` offline. The startup fixture verifies PRIMARY/CLIPBOARD
 decoding, unrelated INCR exclusion, stale-generation rejection, and removal of
 atom access on teardown. No live selection transfer was executed.
 
-ConvertSelection fixture passed with `desktop-xwayland`, offline and serial. It
+ConvertSelection fixture passed with `shell-xwayland`, offline and serial. It
 checks the outgoing request fields, synthetic SelectionNotify matching, wrong
 generation/target rejection, successful property access, owner refusal, timeout
 after checked request, and cancellation. This is a mock-server test, not an
@@ -1629,12 +1629,12 @@ native window remains active. Rendering/input acceptance must follow after those
 adapters are wired; setting DISPLAY manually does not establish that milestone.
 
 Managed X11 presentation integration: 85 desktop state/socket tests passed
-serially with desktop-xwayland; the native all-target check passed. The failure
+serially with shell-xwayland; the native all-target check passed. The failure
 fixture verifies hidden X11 roots/children, inherited child placement, and orphan
 child hiding. Mapping/association has component coverage, but no actual pixels,
 X11 input, DMA-BUF or GPU/KMS session was tested in this change.
 
-Managed click-focus integration: the serial desktop-xwayland library suite passed
+Managed click-focus integration: the serial shell-xwayland library suite passed
 1161 tests with one ignored. The XWM startup socket fixture checks the outgoing
 server-time marker, matching PropertyNotify timestamp, wrong-sequence/synthetic
 rejection and command-barrier completion. This is compile/state/wire evidence,
@@ -1662,7 +1662,7 @@ or live initial application launch was executed.
 
 Downstream integration check: `cargo check --manifest-path
 /home/aku/CompositorStuff/test-compositor/Cargo.toml --features
-telorgon/desktop-xwayland-embedded --offline --locked` passed. It used the
+telorgon/shell-xwayland-embedded --offline --locked` passed. It used the
 synthetic compile-only payload and a separate target directory; no executable was
 run. The [manual smoke test](X11_SMOKE_TEST.md) records the consuming project's
 verified bindings and installed xmessage options. Helper failure diagnostics now

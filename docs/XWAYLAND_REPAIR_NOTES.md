@@ -105,9 +105,9 @@ Automated results for this repair:
 
 - Embedded-payload library suite: **1,247 passed, 0 failed, 2 ignored**, serial execution.
 - After the final unmapped-window configure correction: **130 desktop regressions passed**.
-- Native-only `desktop-wayland-linux` library check passed.
+- Native-only `shell-wayland-linux` library check passed.
 - Linux DMA-BUF and Vulkan hardware test binaries compiled with `application-software` and
-  `desktop-xwayland` enabled (the required test bodies were included); neither was executed.
+  `shell-xwayland` enabled (the required test bodies were included); neither was executed.
 - The consuming `test-compositor` optimized release build passed offline with the real
   `/home/aku/CompositorStuff/xwayland.payload` embedded.
 - Rust formatting and diff whitespace checks passed. Unit socket fixtures required execution

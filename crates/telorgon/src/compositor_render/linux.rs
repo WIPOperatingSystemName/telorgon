@@ -23,7 +23,7 @@ pub fn imported_image_id(buffer: WaylandBufferId) -> ImageId {
 }
 
 /// DMA-BUF materialization uses a stable per-scene slot distinct from the uploaded-image slot.
-/// Desktop surface scenes are independent, so this ID does not need to encode the wl_buffer ID.
+/// Shell surface scenes are independent, so this ID does not need to encode the wl_buffer ID.
 pub fn dma_buf_image_id() -> ImageId {
     ImageId(u32::MAX)
 }

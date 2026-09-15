@@ -32,7 +32,7 @@ application-vulkan-windows = [
     "dep:windows",
     "dep:windows-sys",
 ]
-desktop-wayland-linux = [
+shell-wayland-linux = [
     "dep:roxmltree",
     "dep:ash",
     "dep:bytemuck",
@@ -40,14 +40,14 @@ desktop-wayland-linux = [
     "dep:sha2",
 ]
 # Compatibility components; does not start a server or change native defaults.
-desktop-xwayland = [
-    "desktop-wayland-linux",
+shell-xwayland = [
+    "shell-wayland-linux",
     "dep:x11rb-protocol",
     "dep:flate2",
     "dep:serde_json",
 ]
 # Distribution builds supply a validated payload; Cargo never downloads it.
-desktop-xwayland-embedded = ["desktop-xwayland", "dep:serde", "dep:sha2"]
+shell-xwayland-embedded = ["shell-xwayland", "dep:serde", "dep:sha2"]
 embedded-vulkan = [
     "dep:ash",
     "dep:bytemuck",
@@ -116,4 +116,4 @@ roxmltree = { version = "0.21.1", optional = true }
 
 [[test]]
 name = "wayland_protocol_generation"
-required-features = ["desktop-wayland-linux"]
+required-features = ["shell-wayland-linux"]

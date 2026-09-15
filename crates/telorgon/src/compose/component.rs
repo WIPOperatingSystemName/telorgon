@@ -66,6 +66,11 @@ pub trait ComponentFields: Sized + 'static {
 /// Runtime-facing erased component instance.
 #[doc(hidden)]
 pub trait ErasedComponent: Any {
+    fn shell_connected(&mut self, _services: super::ShellServices) {}
+    fn shell_input(&mut self, _event: crate::input::InputEvent) -> bool {
+        false
+    }
+    fn shell_dismissed(&mut self, _reason: super::ShellDismissReason) {}
     fn component_type_id(&self) -> TypeId;
     fn component_type_name(&self) -> &'static str;
     fn as_any_mut(&mut self) -> &mut dyn Any;

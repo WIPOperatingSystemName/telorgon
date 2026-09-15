@@ -77,7 +77,7 @@ The consolidated package retains focused build profiles:
 
 - `application-software` enables Winit and Softbuffer managed presentation;
 - `application-vulkan-windows` enables managed Vulkan WSI and the Windows DXGI bridge;
-- `desktop-wayland-linux` enables the Linux Wayland/KMS compositor assembly and is rejected on
+- `shell-wayland-linux` enables the Linux Wayland/KMS compositor assembly and is rejected on
   non-Linux targets;
 - `embedded-vulkan` enables host-driven Vulkan without a managed window loop;
 - `profiler` enables instrumentation plus the managed profiler service;

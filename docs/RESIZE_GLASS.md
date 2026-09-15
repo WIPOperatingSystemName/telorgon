@@ -5,7 +5,7 @@ Vulkan validation on hardware, timing, and battery impact require user-run quali
 
 ## API
 
-`LinuxDesktopConfig::resize_preview` takes `ResizePreview`. The optional override in
+`LinuxShellConfig::resize_preview` takes `ResizePreview`. The optional override in
 `WindowChromeDesign` and `WindowContentStyle` inherits that host setting when `None`.
 This replaces `resize_preview_color`; migrate existing colors by wrapping them in
 `ResizePreview::Color(color)`.
@@ -102,8 +102,8 @@ Inspected local paths:
   resource ownership and completion pins.
 - `src/renderer_vulkan/scene.rs`: materialized-image binding and retained sampled-image ownership.
 - `src/renderer_vulkan/composite.rs`: attachment transitions, sampled image pins, pass recording.
-- `src/application_host/desktop_wayland/renderer/vulkan/motion.rs`: snapshot recording and sampling.
-- `src/application_host/desktop_wayland/scene.rs`: placement damage and one-time output scaling.
+- `src/application_host/shell_wayland/renderer/vulkan/motion.rs`: snapshot recording and sampling.
+- `src/application_host/shell_wayland/scene.rs`: placement damage and one-time output scaling.
 - `crates/telorgon-shader-build/shaders/vulkan/box/image.frag`: linear sampled color and clipping.
 
 Paths starting with `src/` are relative to `crates/telorgon/`.

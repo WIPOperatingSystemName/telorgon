@@ -35,9 +35,18 @@ See [the documentation index](docs/README.md) for architecture, implementation s
 qualification boundaries. Features described as operational are not necessarily
 production-qualified.
 
-## Linux desktop build dependencies
+## Shell terminology
 
-Linux builds with `desktop-wayland-linux` require compatible Wayland development XML and
+Telorgon-owned environment and rendering APIs use `Shell`: `Application::shell_environment`,
+`ShellEnvironment`, `LinuxShellConfig`, `ShellKeyEvent`, and `ShellKeyAction`. Cargo features are
+`shell-wayland-linux`, `shell-xwayland`, and `shell-xwayland-embedded`. This is a breaking rename;
+consumers must update the former `Desktop` names and `desktop-*` feature selections.
+Freedesktop `.desktop` application files, `[Desktop Entry]`, and XDG environment keys retain their
+standard names.
+
+## Linux shell build dependencies
+
+Linux builds with `shell-wayland-linux` require compatible Wayland development XML and
 `wayland-protocols` data during compilation. Protocol descriptors are generated as Rust tables;
 installed applications do not need protocol XML files. Other builds do not require that data.
 See [protocol build inputs and overrides](docs/WAYLAND_COMPOSITOR_ARCHITECTURE.md#protocol-source-and-advertisement-rules)

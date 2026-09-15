@@ -67,7 +67,7 @@ impl GeometryMotion {
             Self::Spring(s) => s.settle_ms,
         }
     }
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) const fn with_duration_ms(self, duration: u32) -> Self {
         match self {
             Self::Tween(t) => Self::Tween(tween_ms(duration, t.easing)),
@@ -112,6 +112,18 @@ impl ContentFade {
             entry: tween_ms(to_placeholder_ms, Easing::EaseOut),
             exit: tween_ms(to_ready_ms, Easing::EaseOut),
         }
+    }
+
+    /// Sets the easing toward the resize placeholder, preserving its duration.
+    pub const fn to_placeholder_easing(mut self, easing: Easing) -> Self {
+        self.entry.easing = easing;
+        self
+    }
+
+    /// Sets the easing back to ready content, preserving its duration.
+    pub const fn to_ready_easing(mut self, easing: Easing) -> Self {
+        self.exit.easing = easing;
+        self
     }
 }
 

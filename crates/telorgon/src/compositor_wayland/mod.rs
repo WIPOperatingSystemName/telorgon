@@ -16,7 +16,7 @@ mod synchronization;
 mod world;
 mod xdg;
 
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 mod native;
 
 pub use buffer::{
@@ -28,7 +28,7 @@ pub use data_device::{
     DataAction, DataDeviceError, DataDeviceState, DataOffer, DataSource, MimeType,
 };
 pub use id::{ClientId, ProtocolObjectId, WaylandBufferId, WaylandSurfaceId};
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub use native::{
     DmaBufFormat, DmaBufImage, NativeCompositor, NativeCompositorError, PointerConstraintKind,
     PointerConstraintState, ShmBufferReader, ShmImage, ShmImageRegion, ToplevelIconImage,

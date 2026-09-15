@@ -53,22 +53,22 @@ native transaction isolation, unmanaged windows, size hints and bounded titles.
 
 ## Public assembly
 
-`Application::desktop_environment` is the only process entrypoint for this mode. Compositor-owned
+`Application::shell_environment` is the only process entrypoint for this mode. Compositor-owned
 pixels are normal Telorgon `Component` values:
 
 ```rust,ignore
-Application::desktop_environment("Telorgon")
-    .linux(LinuxDesktopConfig::default())
+Application::shell_environment("Telorgon")
+    .linux(LinuxShellConfig::default())
     .renderer(Renderer::Auto)
     .assets(assets::bundle())
     .app_icon(app_icons())
-    .cursor_theme(assets::cursors::DEFAULT)
     .compositor(
         Compositor::new()
-            .window_frame(easy_window_frame(MY_CHROME))
-            .background(MyDesktopBackground),
+            .cursor_theme(CursorTheme::from_asset(assets::cursors::DEFAULT))
+            .window_frame(easy_window_frame(MY_CHROME)),
     )
-    .shell_widget(ShellWidget::new("panel").content(MyPanel))
+    .widget(MyShellBackground)
+    .widget(MyPanel)
     .run()?;
 ```
 
@@ -92,11 +92,11 @@ Output scaling now uses logical desktop units with automatic density selection a
 `OutputScale::Fixed(factor)`. See [Logical units and output scaling](LOGICAL_UNITS_AND_OUTPUT_SCALING.md)
 for coordinate contracts, protocol announcements, configuration migration, and current limits.
 
-`LinuxDesktopConfig` selects the DRM device, seat, optional Wayland socket name, output scale,
+`LinuxShellConfig` selects the DRM device, seat, optional Wayland socket name, output scale,
 frame dimensions, and pointer extent. The umbrella exposes this mode through the
-`desktop-wayland-linux` Cargo feature; it remains target plumbing rather than a renderer-selection
+`shell-wayland-linux` Cargo feature; it remains target plumbing rather than a renderer-selection
 API or a second process entrypoint. The mode has no Windows or macOS implementation.
-Top/right/bottom/left `ShellWidget::reserve_space` declarations reduce the maximized work area;
+Top/right/bottom/left `ShellSurfaceSpec::reserve_space` declarations reduce the maximized work area;
 floating widgets remain overlays and fullscreen windows continue to use the complete output.
 
 ## Ownership and dependency layers
@@ -120,7 +120,7 @@ telorgon-compositor-render          telorgon-platform-linux
   DMA-BUF -> Vulkan leases                 |
              \                           /
               v                         v
-             telorgon-app desktop_wayland owner thread
+             telorgon-app shell_wayland owner thread
              Telorgon composition + scene/render orchestration
                               |
                               v
@@ -134,7 +134,7 @@ parses official XML and emits immutable Rust schema and `wl_interface`/`wl_messa
 state. `libwayland-server` remains the mature transport, resource, client, socket, and event-loop
 implementation.
 
-Within the managed host, `desktop_wayland.rs` is the single-owner orchestration loop. Its sibling
+Within the managed host, `shell_wayland.rs` is the single-owner orchestration loop. Its sibling
 modules isolate client publication, cursor-plane/KMS lifetime tracking, event sources and input
 profiling, geometry and damage math, pointer routing and hit testing, resize transactions, composed
 layer preparation, pointer visuals, renderer-neutral desktop-scene synchronization, bounded
@@ -161,7 +161,7 @@ the explicit unoptimized debugging option.
 
 ## Protocol source and advertisement rules
 
-The `desktop-wayland-linux` feature on a Linux target requires protocol XML **at build time only**.
+The `shell-wayland-linux` feature on a Linux target requires protocol XML **at build time only**.
 `crates/telorgon/build.rs` reads `/usr/share/wayland/wayland.xml` and the 14 extension paths under
 `/usr/share/wayland-protocols` listed in `wayland_server/protocol.rs`. Install the Wayland development
 data and `wayland-protocols` packages with the interface versions required by that profile (including
@@ -173,7 +173,7 @@ For custom installations and cross compilation, set build environment variables:
 ```sh
 TELORGON_WAYLAND_XML=/path/to/wayland.xml \
 TELORGON_WAYLAND_PROTOCOLS_DIR=/path/to/wayland-protocols \
-cargo build -p telorgon --no-default-features --features desktop-wayland-linux
+cargo build -p telorgon --no-default-features --features shell-wayland-linux
 ```
 
 These are host-readable build inputs; select definitions compatible with the target profile.
@@ -287,7 +287,7 @@ already duplicated worker/import FDs keep their independent lifetime. Release ev
 when the wire resource no longer exists.
 
 Buffer lifetime audit: inspected `compositor_wayland/native.rs` (destruction, geometry validation,
-SHM readers), `subsurface.rs` (cached commits), and `application_host/desktop_wayland.rs` (publication
+SHM readers), `subsurface.rs` (cached commits), and `application_host/shell_wayland.rs` (publication
 and image copying). The adjacent `../other-rendering-libs` source library was unavailable, so no
 independent implementation comparison is claimed. The official
 [Wayland attach contract](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_surface-request-attach)
@@ -360,7 +360,7 @@ thread-safe, coalesces repeated requests, and does nothing when no host is runni
 forwarding behavior, use the raw handler below.
 
 Applications may also register `Compositor::keyboard_shortcut_handler` for global desktop shortcuts.
-The callback receives a fresh `DesktopKeyEvent` before client delivery, with its evdev code,
+The callback receives a fresh `ShellKeyEvent` before client delivery, with its evdev code,
 XKB symbol, and effective Control/Shift/Alt/Logo modifiers. `Forward` preserves normal delivery;
 `Consume` reserves that key's press, repeats, and release; `Quit` returns normally from the host.
 Modifier events continue updating XKB and the Wayland seat even for consumed keys. The handler is
@@ -656,7 +656,7 @@ raster work and distinguish worker-full from owner-regional SHM copies.
 
 ### Live-resize scheduling audit
 
-`desktop_wayland/size_policy.rs` owns the shared preferred logical minimum (default
+`shell_wayland/size_policy.rs` owns the shared preferred logical minimum (default
 300x200), usable-area bounds and native min/max reconciliation. Client maximums can
 reduce the preference, fixed-size windows remain fixed, and invalid contradictory
 limits are discarded. A native client declining the same automatic resize is not
@@ -796,7 +796,7 @@ Tear-free hardware-cursor positioning, atomic primary/cursor scheduling, and com
 framebuffer reuse.
 
 Telorgon files/contracts affected:
-crates/telorgon/src/application_host/desktop_wayland.rs;
+crates/telorgon/src/application_host/shell_wayland.rs;
 crates/telorgon/src/presenter_vulkan_kms/{ffi.rs,kms.rs,model.rs}; this document.
 
 Reference revisions, paths, and symbols inspected:
@@ -930,7 +930,7 @@ latency qualification remain user-run.
 
 ### Input latency capture audit (2026-09-13)
 
-`desktop_wayland/latency_trace.rs` adds an optional bounded owner recorder selected by
+`shell_wayland/latency_trace.rs` adds an optional bounded owner recorder selected by
 `TELORGON_LATENCY_TRACE=/new/file.jsonl`. It reserves a private, create-new file and a 262,144-event
 ring, records disjoint phase wall times plus input-batch/slot/surface-revision observations, and
 writes the retained tail on owner destruction. No capture event performs file I/O, locking, or heap
@@ -1069,9 +1069,9 @@ conformance qualification remain manual.
 Validation for this refactor passed on Linux:
 
 ```sh
-cargo check -p telorgon --all-targets --no-default-features --features desktop-wayland-linux
-cargo test -p telorgon --no-default-features --features desktop-wayland-linux --test wayland_protocol_generation -- --include-ignored
-cargo test -p telorgon --lib --no-default-features --features desktop-wayland-linux compositor_wayland::
+cargo check -p telorgon --all-targets --no-default-features --features shell-wayland-linux
+cargo test -p telorgon --no-default-features --features shell-wayland-linux --test wayland_protocol_generation -- --include-ignored
+cargo test -p telorgon --lib --no-default-features --features shell-wayland-linux compositor_wayland::
 cargo fmt --all -- --check
 ```
 

@@ -69,17 +69,17 @@ impl KeyboardConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LinuxDesktopConfig {
+pub struct LinuxShellConfig {
     /// Fallback for templates without an explicit motion style.
     pub window_motion: crate::WindowMotion,
     /// Applies centrally to all desktop window motion.
     pub motion_preference: crate::theme::MotionPreference,
     /// Enable the embedded compatibility helper. Requires an embedded-payload build.
-    /// Desktop X11 presentation remains under implementation.
-    #[cfg(feature = "desktop-xwayland")]
+    /// Shell X11 presentation remains under implementation.
+    #[cfg(feature = "shell-xwayland")]
     pub xwayland_enabled: bool,
     /// Explicit private executable cache directory (created and validated securely).
-    #[cfg(feature = "desktop-xwayland")]
+    #[cfg(feature = "shell-xwayland")]
     pub xwayland_cache: Option<PathBuf>,
     /// None selects a seat-accessible KMS device with a connected output.
     pub drm_device: Option<PathBuf>,
@@ -92,6 +92,10 @@ pub struct LinuxDesktopConfig {
     pub output_scale: super::OutputScale,
     /// Window border thickness in logical units.
     pub window_border: i32,
+    /// Allowed horizontal overflow during window dragging, in logical units.
+    /// `Some(0)` (default) keeps the frame inside the output; `None` is unrestricted.
+    /// Oversized windows may slide between their left- and right-aligned positions.
+    pub window_drag_horizontal_overflow: Option<i32>,
     /// Preferred ordinary-window content minimum in logical units, excluding borders and title bar.
     /// Applies to both Wayland and X11 windows independently of output scale. Defaults to 300 × 200;
     /// both dimensions must be positive. Client constraints (including fixed sizes and resize
@@ -108,14 +112,14 @@ pub struct LinuxDesktopConfig {
     pub pointer_extent: SizeI,
 }
 
-impl Default for LinuxDesktopConfig {
+impl Default for LinuxShellConfig {
     fn default() -> Self {
         Self {
             window_motion: crate::WindowMotion::none(),
             motion_preference: crate::theme::MotionPreference::Full,
-            #[cfg(feature = "desktop-xwayland")]
-            xwayland_enabled: cfg!(feature = "desktop-xwayland-embedded"),
-            #[cfg(feature = "desktop-xwayland")]
+            #[cfg(feature = "shell-xwayland")]
+            xwayland_enabled: cfg!(feature = "shell-xwayland-embedded"),
+            #[cfg(feature = "shell-xwayland")]
             xwayland_cache: None,
             drm_device: None,
             seat_name: "seat0".to_owned(),
@@ -124,6 +128,7 @@ impl Default for LinuxDesktopConfig {
             session: crate::session::SessionConfig::default(),
             output_scale: super::OutputScale::Auto,
             window_border: 4,
+            window_drag_horizontal_overflow: Some(0),
             preferred_window_minimum: SizeI {
                 width: 300,
                 height: 200,
@@ -138,7 +143,7 @@ impl Default for LinuxDesktopConfig {
     }
 }
 
-impl LinuxDesktopConfig {
+impl LinuxShellConfig {
     fn validate(&self) -> AppResult<()> {
         self.output_scale.validate()?;
         self.keyboard.validate()?;
@@ -155,6 +160,9 @@ impl LinuxDesktopConfig {
             })
             || self.preferred_window_minimum.width <= 0
             || self.preferred_window_minimum.height <= 0
+            || self
+                .window_drag_horizontal_overflow
+                .is_some_and(|value| value < 0)
             || self.window_border < 0
             || self.titlebar_height < 0
             || self.pointer_extent.width <= 0
@@ -184,12 +192,13 @@ impl Application {
         }
     }
 
-    /// Begins one Linux desktop-environment declaration.
-    pub fn desktop_environment(name: impl Into<String>) -> DesktopEnvironment {
-        DesktopEnvironment {
+    /// Begins one Linux shell-environment declaration.
+    pub fn shell_environment(name: impl Into<String>) -> ShellEnvironment {
+        ShellEnvironment {
+            services: Default::default(),
             name: name.into(),
             renderer: Renderer::Auto,
-            linux: LinuxDesktopConfig::default(),
+            linux: LinuxShellConfig::default(),
             assets: AssetBundle::EMPTY,
             app_icon: AppIconProfile::new(),
         }
@@ -480,162 +489,23 @@ impl fmt::Debug for ReadyWindow {
     }
 }
 
-/// Placement anchor for a shell widget.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ShellWidgetAnchor {
-    #[default]
-    Top,
-    Right,
-    Bottom,
-    Left,
-    Floating,
+/// Private erased storage for a component-owned shell surface.
+pub(crate) struct RegisteredShellWidget {
+    pub(crate) content: CompositionDriver,
+    pub(crate) surface: crate::compose::shell_widget::SurfaceBinding,
 }
-
-/// One shell-widget extent.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ShellWidgetExtent {
-    Fill,
-    Pixels(f32),
-}
-
-impl Default for ShellWidgetExtent {
-    fn default() -> Self {
-        Self::Pixels(320.0)
-    }
-}
-
-/// Incomplete shell-widget declaration.
-pub struct ShellWidget {
-    name: String,
-    anchor: ShellWidgetAnchor,
-    width: ShellWidgetExtent,
-    height: ShellWidgetExtent,
-    reserved_space: f32,
-}
-
-impl ShellWidget {
-    pub fn new(name: impl Into<String>) -> Self {
+impl RegisteredShellWidget {
+    fn new<W: crate::compose::ShellWidget>(widget: W) -> Self {
+        let (root, surface) = crate::compose::shell_widget::erase(widget);
         Self {
-            name: name.into(),
-            anchor: ShellWidgetAnchor::default(),
-            width: ShellWidgetExtent::Fill,
-            height: ShellWidgetExtent::Pixels(36.0),
-            reserved_space: 0.0,
-        }
-    }
-
-    pub fn anchor(mut self, anchor: ShellWidgetAnchor) -> Self {
-        self.anchor = anchor;
-        self
-    }
-
-    pub fn width(mut self, width: ShellWidgetExtent) -> Self {
-        self.width = width;
-        self
-    }
-
-    pub fn height(mut self, height: ShellWidgetExtent) -> Self {
-        self.height = height;
-        self
-    }
-
-    pub fn reserve_space(mut self, logical_pixels: f32) -> Self {
-        self.reserved_space = logical_pixels;
-        self
-    }
-
-    /// Completes this shell widget with its composition root.
-    pub fn content<C: Component>(self, component: C) -> ReadyShellWidget {
-        ReadyShellWidget {
-            name: self.name,
-            anchor: self.anchor,
-            width: self.width,
-            height: self.height,
-            reserved_space: self.reserved_space,
-            content: CompositionDriver::for_target(component, RuntimeTarget::ShellWidget),
+            content: CompositionDriver::from_erased_for_target(root, RuntimeTarget::ShellWidget),
+            surface,
         }
     }
 }
-
-impl fmt::Debug for ShellWidget {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ShellWidget")
-            .field("name", &self.name)
-            .field("anchor", &self.anchor)
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("reserved_space", &self.reserved_space)
-            .field("has_content", &false)
-            .finish()
-    }
-}
-
-/// Complete shell-widget declaration.
-pub struct ReadyShellWidget {
-    name: String,
-    anchor: ShellWidgetAnchor,
-    width: ShellWidgetExtent,
-    height: ShellWidgetExtent,
-    reserved_space: f32,
-    content: CompositionDriver,
-}
-
-impl ReadyShellWidget {
-    fn validate(&self) -> AppResult<()> {
-        if self.name.trim().is_empty() {
-            return Err(AppError::new("ShellWidget name must not be empty"));
-        }
-        let valid_extent = |extent: ShellWidgetExtent| match extent {
-            ShellWidgetExtent::Fill => true,
-            ShellWidgetExtent::Pixels(value) => value.is_finite() && value > 0.0,
-        };
-        if !valid_extent(self.width)
-            || !valid_extent(self.height)
-            || !self.reserved_space.is_finite()
-            || self.reserved_space < 0.0
-        {
-            return Err(AppError::new(
-                "ShellWidget extents and reserved space must be finite and positive",
-            ));
-        }
-        debug_assert_eq!(self.content.target(), RuntimeTarget::ShellWidget);
-        Ok(())
-    }
-
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
-    pub(crate) fn into_runtime_parts(
-        self,
-    ) -> (
-        String,
-        ShellWidgetAnchor,
-        ShellWidgetExtent,
-        ShellWidgetExtent,
-        f32,
-        CompositionDriver,
-    ) {
-        (
-            self.name,
-            self.anchor,
-            self.width,
-            self.height,
-            self.reserved_space,
-            self.content,
-        )
-    }
-}
-
-impl fmt::Debug for ReadyShellWidget {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ShellWidget")
-            .field("name", &self.name)
-            .field("anchor", &self.anchor)
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("reserved_space", &self.reserved_space)
-            .field("has_content", &true)
-            .finish()
+impl fmt::Debug for RegisteredShellWidget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShellWidget").finish_non_exhaustive()
     }
 }
 
@@ -649,7 +519,7 @@ pub struct CompositorVisual {
 pub(crate) struct ShellActionHandler {
     id: ShellActionId,
     #[cfg_attr(
-        not(all(feature = "desktop-wayland-linux", target_os = "linux")),
+        not(all(feature = "shell-wayland-linux", target_os = "linux")),
         allow(dead_code)
     )]
     invoke: Box<dyn Fn(WindowChromeModel)>,
@@ -660,7 +530,7 @@ impl ShellActionHandler {
         self.id
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn invoke(&self, model: WindowChromeModel) {
         (self.invoke)(model);
     }
@@ -716,24 +586,24 @@ where
 /// additionally describe the independent backing/preview for externally supplied client pixels.
 pub struct WindowFrameFactory {
     #[cfg_attr(
-        not(all(feature = "desktop-wayland-linux", target_os = "linux")),
+        not(all(feature = "shell-wayland-linux", target_os = "linux")),
         allow(dead_code)
     )]
     motion: Box<dyn Fn(&WindowChromeModel) -> Option<crate::WindowMotion>>,
     #[cfg_attr(
-        not(all(feature = "desktop-wayland-linux", target_os = "linux")),
+        not(all(feature = "shell-wayland-linux", target_os = "linux")),
         allow(dead_code)
     )]
     compose: Box<dyn Fn(WindowChromeModel) -> Box<dyn ErasedComponent>>,
     #[cfg_attr(
-        not(all(feature = "desktop-wayland-linux", target_os = "linux")),
+        not(all(feature = "shell-wayland-linux", target_os = "linux")),
         allow(dead_code)
     )]
     content_style: Box<dyn Fn(&WindowChromeModel) -> Option<WindowContentStyle>>,
 }
 
 impl WindowFrameFactory {
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn motion(&self, model: &WindowChromeModel) -> Option<crate::WindowMotion> {
         (self.motion)(model)
     }
@@ -751,17 +621,17 @@ impl WindowFrameFactory {
         }
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn content_style(&self, model: &WindowChromeModel) -> Option<WindowContentStyle> {
         (self.content_style)(model)
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn compose(&self, model: WindowChromeModel) -> CompositionDriver {
         CompositionDriver::from_erased_for_target(self.candidate(model), RuntimeTarget::Compositor)
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn candidate(&self, model: WindowChromeModel) -> Box<dyn ErasedComponent> {
         (self.compose)(model)
     }
@@ -798,7 +668,7 @@ impl fmt::Debug for CompositorVisual {
 
 /// One fresh Linux desktop key press, resolved through the active XKB state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DesktopKeyEvent {
+pub struct ShellKeyEvent {
     /// Linux evdev keycode (without the XKB offset).
     pub keycode: u32,
     pub keysym: u32,
@@ -810,7 +680,7 @@ pub struct DesktopKeyEvent {
 
 /// Disposition of a compositor shortcut's initiating key press.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DesktopKeyAction {
+pub enum ShellKeyAction {
     #[default]
     Forward,
     /// Consume this key's press, repeats, and release before client delivery.
@@ -821,7 +691,7 @@ pub enum DesktopKeyAction {
     Quit,
 }
 
-pub(crate) type DesktopKeyHandler = Box<dyn FnMut(DesktopKeyEvent) -> DesktopKeyAction>;
+pub(crate) type ShellKeyHandler = Box<dyn FnMut(ShellKeyEvent) -> ShellKeyAction>;
 
 /// Incomplete compositor declaration.
 pub struct MissingCursorTheme;
@@ -835,8 +705,8 @@ pub struct MissingCursorTheme;
 /// impl Component for Background {
 ///     fn view(&self) -> impl View { text("desktop") }
 /// }
-/// let compositor = Compositor::new().background(Background::default());
-/// Application::desktop_environment("desktop").compositor(compositor);
+/// let compositor = Compositor::new().cursor_theme(crate::CursorTheme::new());
+/// Application::shell_environment("desktop").compositor(compositor);
 /// ```
 pub struct Compositor<C = MissingCursorTheme> {
     cursor_theme: C,
@@ -844,7 +714,7 @@ pub struct Compositor<C = MissingCursorTheme> {
     window_frame: Option<WindowFrameFactory>,
     icons: Vec<CompositorVisual>,
     shell_actions: Vec<ShellActionHandler>,
-    keyboard_shortcut_handler: Option<DesktopKeyHandler>,
+    keyboard_shortcut_handler: Option<ShellKeyHandler>,
 }
 
 impl Default for Compositor {
@@ -909,32 +779,10 @@ impl<C> Compositor<C> {
     /// while a session lock is active. Keep the callback short and nonblocking.
     pub fn keyboard_shortcut_handler(
         mut self,
-        handler: impl FnMut(DesktopKeyEvent) -> DesktopKeyAction + 'static,
+        handler: impl FnMut(ShellKeyEvent) -> ShellKeyAction + 'static,
     ) -> Self {
         self.keyboard_shortcut_handler = Some(Box::new(handler));
         self
-    }
-
-    /// Completes the compositor with its full-output visual rendered behind client windows.
-    pub fn background<B: Component>(self, background: B) -> ReadyCompositor<C> {
-        ReadyCompositor {
-            cursor_theme: self.cursor_theme,
-            client_cursor_mode: self.client_cursor_mode,
-            background: CompositionDriver::for_target(background, RuntimeTarget::Compositor),
-            window_frame: self.window_frame,
-            icons: self.icons,
-            shell_actions: self.shell_actions,
-            keyboard_shortcut_handler: self.keyboard_shortcut_handler,
-        }
-    }
-
-    /// Compatibility alias for [`Compositor::background`].
-    #[deprecated(
-        since = "0.1.15",
-        note = "the component is a compositor background visual; use `background`"
-    )]
-    pub fn policy<B: Component>(self, background: B) -> ReadyCompositor<C> {
-        self.background(background)
     }
 }
 
@@ -942,7 +790,6 @@ impl<C> fmt::Debug for Compositor<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Compositor")
-            .field("has_background", &false)
             .field("has_window_frame", &self.window_frame.is_some())
             .field("icons", &self.icons.len())
             .field("shell_actions", &self.shell_actions.len())
@@ -954,28 +801,19 @@ impl<C> fmt::Debug for Compositor<C> {
     }
 }
 
-/// Complete compositor declaration.
-pub struct ReadyCompositor<C = CursorTheme> {
-    cursor_theme: C,
-    client_cursor_mode: ClientCursorMode,
-    background: CompositionDriver,
-    window_frame: Option<WindowFrameFactory>,
-    icons: Vec<CompositorVisual>,
-    shell_actions: Vec<ShellActionHandler>,
-    keyboard_shortcut_handler: Option<DesktopKeyHandler>,
-}
+/// A compositor with its required cursor theme configured.
+pub type ReadyCompositor<C = CursorTheme> = Compositor<C>;
 
-#[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 type CompositorRuntimeParts = (
-    CompositionDriver,
     Option<WindowFrameFactory>,
     Option<CompositionDriver>,
     Vec<(String, CompositionDriver)>,
     Vec<ShellActionHandler>,
-    Option<DesktopKeyHandler>,
+    Option<ShellKeyHandler>,
 );
 
-impl ReadyCompositor {
+impl Compositor<CursorTheme> {
     fn prepare_cursors(&self, assets: AssetBundle) -> AppResult<PointerConfiguration> {
         self.cursor_theme
             .prepare(assets, self.client_cursor_mode)
@@ -983,7 +821,6 @@ impl ReadyCompositor {
     }
 
     fn validate(&self) -> AppResult<()> {
-        debug_assert_eq!(self.background.target(), RuntimeTarget::Compositor);
         for visual in &self.icons {
             debug_assert_eq!(visual.content.target(), RuntimeTarget::Compositor);
         }
@@ -1009,7 +846,7 @@ impl ReadyCompositor {
         Ok(())
     }
 
-    pub fn window_frame(&self) -> Option<&WindowFrameFactory> {
+    pub fn frame_template(&self) -> Option<&WindowFrameFactory> {
         self.window_frame.as_ref()
     }
 
@@ -1021,10 +858,9 @@ impl ReadyCompositor {
         self.shell_actions.iter().any(|handler| handler.id == id)
     }
 
-    #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
     pub(crate) fn into_runtime_parts(self) -> CompositorRuntimeParts {
         (
-            self.background,
             self.window_frame,
             None,
             self.icons
@@ -1037,38 +873,29 @@ impl ReadyCompositor {
     }
 }
 
-impl<C> fmt::Debug for ReadyCompositor<C> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Compositor")
-            .field("has_background", &true)
-            .field("has_window_frame", &self.window_frame.is_some())
-            .field("icons", &self.icons.len())
-            .field("shell_actions", &self.shell_actions.len())
-            .field(
-                "has_keyboard_shortcut_handler",
-                &self.keyboard_shortcut_handler.is_some(),
-            )
-            .finish()
-    }
-}
-
-/// Desktop-environment declaration that still requires its compositor.
-pub struct DesktopEnvironment {
+/// Shell-environment declaration that still requires its compositor.
+pub struct ShellEnvironment {
+    services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
-    linux: LinuxDesktopConfig,
+    linux: LinuxShellConfig,
     assets: AssetBundle,
     app_icon: AppIconProfile,
 }
 
-impl DesktopEnvironment {
+impl ShellEnvironment {
+    /// Installs an owner-thread service available to shell widget components.
+    pub fn service<T: 'static>(mut self, service: T) -> Self {
+        self.services.insert(service);
+        self
+    }
+
     pub fn renderer(mut self, renderer: Renderer) -> Self {
         self.renderer = renderer;
         self
     }
 
-    pub fn linux(mut self, config: LinuxDesktopConfig) -> Self {
+    pub fn linux(mut self, config: LinuxShellConfig) -> Self {
         self.linux = config;
         self
     }
@@ -1085,8 +912,9 @@ impl DesktopEnvironment {
         self
     }
 
-    pub fn compositor(self, compositor: ReadyCompositor) -> DesktopEnvironmentWithCompositor {
-        DesktopEnvironmentWithCompositor {
+    pub fn compositor(self, compositor: ReadyCompositor) -> ShellEnvironmentWithCompositor {
+        ShellEnvironmentWithCompositor {
+            services: self.services,
             name: self.name,
             renderer: self.renderer,
             linux: self.linux,
@@ -1097,10 +925,10 @@ impl DesktopEnvironment {
     }
 }
 
-impl fmt::Debug for DesktopEnvironment {
+impl fmt::Debug for ShellEnvironment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DesktopEnvironment")
+            .debug_struct("ShellEnvironment")
             .field("name", &self.name)
             .field("renderer", &self.renderer)
             .field("assets", &self.assets.len())
@@ -1109,23 +937,30 @@ impl fmt::Debug for DesktopEnvironment {
     }
 }
 
-/// Desktop-environment declaration that still requires its first shell widget.
-pub struct DesktopEnvironmentWithCompositor {
+/// Shell-environment declaration that still requires its first shell widget.
+pub struct ShellEnvironmentWithCompositor {
+    services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
-    linux: LinuxDesktopConfig,
+    linux: LinuxShellConfig,
     assets: AssetBundle,
     app_icon: AppIconProfile,
     compositor: ReadyCompositor,
 }
 
-impl DesktopEnvironmentWithCompositor {
+impl ShellEnvironmentWithCompositor {
+    /// Installs an owner-thread service available to shell widget components.
+    pub fn service<T: 'static>(mut self, service: T) -> Self {
+        self.services.insert(service);
+        self
+    }
+
     pub fn renderer(mut self, renderer: Renderer) -> Self {
         self.renderer = renderer;
         self
     }
 
-    pub fn linux(mut self, config: LinuxDesktopConfig) -> Self {
+    pub fn linux(mut self, config: LinuxShellConfig) -> Self {
         self.linux = config;
         self
     }
@@ -1140,17 +975,18 @@ impl DesktopEnvironmentWithCompositor {
         self
     }
 
-    pub fn shell_widget(self, widget: ReadyShellWidget) -> ReadyDesktopEnvironment {
-        self.into_ready().shell_widget(widget)
+    pub fn widget<W: crate::compose::ShellWidget>(self, widget: W) -> ReadyShellEnvironment {
+        self.into_ready().widget(widget)
     }
 
-    /// Starts the desktop with its compositor background and no shell widgets.
+    /// Starts the shell with no widgets.
     pub fn run(self) -> AppResult<()> {
         self.into_ready().run()
     }
 
-    fn into_ready(self) -> ReadyDesktopEnvironment {
-        ReadyDesktopEnvironment {
+    fn into_ready(self) -> ReadyShellEnvironment {
+        ReadyShellEnvironment {
+            services: self.services,
             name: self.name,
             renderer: self.renderer,
             linux: self.linux,
@@ -1162,10 +998,10 @@ impl DesktopEnvironmentWithCompositor {
     }
 }
 
-impl fmt::Debug for DesktopEnvironmentWithCompositor {
+impl fmt::Debug for ShellEnvironmentWithCompositor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DesktopEnvironment")
+            .debug_struct("ShellEnvironment")
             .field("name", &self.name)
             .field("renderer", &self.renderer)
             .field("assets", &self.assets.len())
@@ -1175,24 +1011,31 @@ impl fmt::Debug for DesktopEnvironmentWithCompositor {
     }
 }
 
-/// Complete desktop-environment declaration.
-pub struct ReadyDesktopEnvironment {
+/// Complete shell-environment declaration.
+pub struct ReadyShellEnvironment {
+    services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
-    linux: LinuxDesktopConfig,
+    linux: LinuxShellConfig,
     assets: AssetBundle,
     app_icon: AppIconProfile,
     compositor: ReadyCompositor,
-    shell_widgets: Vec<ReadyShellWidget>,
+    shell_widgets: Vec<RegisteredShellWidget>,
 }
 
-impl ReadyDesktopEnvironment {
+impl ReadyShellEnvironment {
+    /// Installs an owner-thread service available to shell widget components.
+    pub fn service<T: 'static>(mut self, service: T) -> Self {
+        self.services.insert(service);
+        self
+    }
+
     pub fn renderer(mut self, renderer: Renderer) -> Self {
         self.renderer = renderer;
         self
     }
 
-    pub fn linux(mut self, config: LinuxDesktopConfig) -> Self {
+    pub fn linux(mut self, config: LinuxShellConfig) -> Self {
         self.linux = config;
         self
     }
@@ -1207,22 +1050,22 @@ impl ReadyDesktopEnvironment {
         self
     }
 
-    pub fn shell_widget(mut self, widget: ReadyShellWidget) -> Self {
-        self.shell_widgets.push(widget);
+    pub fn widget<W: crate::compose::ShellWidget>(mut self, widget: W) -> Self {
+        self.shell_widgets.push(RegisteredShellWidget::new(widget));
         self
     }
 
-    /// Validates this declaration and enters the Linux desktop-environment runtime.
+    /// Validates this declaration and enters the Linux shell-environment runtime.
     pub fn run(self) -> AppResult<()> {
-        #[cfg(all(feature = "desktop-wayland-linux", target_os = "linux"))]
+        #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
         {
-            crate::application_host::desktop_wayland::run(self)
+            crate::application_host::shell_wayland::run(self)
         }
-        #[cfg(not(all(feature = "desktop-wayland-linux", target_os = "linux")))]
+        #[cfg(not(all(feature = "shell-wayland-linux", target_os = "linux")))]
         {
             let _ = self.into_parts()?;
             Err(AppError::new(
-                "the Linux Wayland desktop runtime requires target Linux and feature desktop-wayland-linux",
+                "the Linux Wayland desktop runtime requires target Linux and feature shell-wayland-linux",
             ))
         }
     }
@@ -1232,9 +1075,10 @@ impl ReadyDesktopEnvironment {
     ) -> AppResult<(
         String,
         ReadyCompositor,
-        Vec<ReadyShellWidget>,
+        Vec<RegisteredShellWidget>,
+        crate::compose::shell_services::ShellServiceRegistry,
         Renderer,
-        LinuxDesktopConfig,
+        LinuxShellConfig,
         AssetBundle,
         PointerConfiguration,
         AppIconProfile,
@@ -1246,16 +1090,17 @@ impl ReadyDesktopEnvironment {
         self.app_icon
             .validate()
             .map_err(|error| AppError::new(error.to_string()))?;
+        if self.shell_widgets.len() > 256 {
+            return Err(AppError::new("shell exceeds 256 root widgets"));
+        }
         self.compositor.validate()?;
         let pointer = self.compositor.prepare_cursors(self.assets)?;
-        for widget in &self.shell_widgets {
-            widget.validate()?;
-        }
         self.linux.validate()?;
         Ok((
             self.name,
             self.compositor,
             self.shell_widgets,
+            self.services,
             self.renderer,
             self.linux,
             self.assets,
@@ -1265,10 +1110,10 @@ impl ReadyDesktopEnvironment {
     }
 }
 
-impl fmt::Debug for ReadyDesktopEnvironment {
+impl fmt::Debug for ReadyShellEnvironment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DesktopEnvironment")
+            .debug_struct("ShellEnvironment")
             .field("name", &self.name)
             .field("renderer", &self.renderer)
             .field("assets", &self.assets.len())
@@ -1293,12 +1138,8 @@ mod tests {
 
     #[test]
     fn cursor_validation_propagates_through_desktop_startup() {
-        let error = Application::desktop_environment("Invalid cursors")
-            .compositor(
-                Compositor::new()
-                    .background(Root)
-                    .cursor_theme(CursorTheme::new()),
-            )
+        let error = Application::shell_environment("Invalid cursors")
+            .compositor(Compositor::new().cursor_theme(CursorTheme::new()))
             .into_ready()
             .into_parts()
             .unwrap_err()
@@ -1308,12 +1149,11 @@ mod tests {
     }
 
     #[test]
-    fn background_before_theme_is_a_complete_declaration() {
-        Application::desktop_environment("Cursor order")
+    fn cursor_theme_completes_compositor_without_widgets() {
+        Application::shell_environment("Cursor order")
             .assets(crate::assets::cursor_test_bundle())
             .compositor(
                 Compositor::new()
-                    .background(Root)
                     .cursor_theme(crate::assets::cursor_test_theme())
                     .cursor_size(32.0),
             )
@@ -1324,7 +1164,7 @@ mod tests {
 
     #[test]
     fn resize_preview_accepts_the_full_alpha_range() {
-        let mut config = LinuxDesktopConfig::default();
+        let mut config = LinuxShellConfig::default();
         config.drm_device = Some(std::env::current_dir().unwrap().join("card0"));
         assert_eq!(config.resize_preview.color().a, 255);
         for alpha in [0, 128, 255] {
@@ -1356,27 +1196,29 @@ mod tests {
         }
     }
 
+    impl crate::compose::ShellWidget for Root {
+        fn surface(&self) -> crate::compose::ShellSurfaceSpec {
+            crate::compose::ShellSurfaceSpec::new()
+        }
+    }
+
     #[test]
     fn mode_specific_roots_tag_their_composition_targets() {
         let window = Window::new("Window").content(Root);
         assert_eq!(window.content.target(), RuntimeTarget::Application);
 
-        let widget = ShellWidget::new("Panel").content(Root);
+        let widget = RegisteredShellWidget::new(Root);
         assert_eq!(widget.content.target(), RuntimeTarget::ShellWidget);
 
-        let compositor = Compositor::new()
-            .cursor_theme(CursorTheme::new())
-            .background(Root);
-        assert_eq!(compositor.background.target(), RuntimeTarget::Compositor);
+        let compositor = Compositor::new().cursor_theme(CursorTheme::new());
+        assert!(compositor.frame_template().is_none());
     }
 
     #[test]
-    fn deprecated_policy_alias_still_completes_the_background_visual() {
+    fn compositor_has_no_component_background() {
         #[allow(deprecated)]
-        let compositor = Compositor::new()
-            .cursor_theme(CursorTheme::new())
-            .policy(Root);
-        assert_eq!(compositor.background.target(), RuntimeTarget::Compositor);
+        let compositor = Compositor::new().cursor_theme(CursorTheme::new());
+        assert!(compositor.frame_template().is_none());
     }
 
     #[test]
@@ -1387,11 +1229,10 @@ mod tests {
 
         let compositor = Compositor::new()
             .cursor_theme(CursorTheme::new())
-            .window_frame(compose)
-            .background(Root);
-        assert!(compositor.window_frame().is_some());
+            .window_frame(compose);
+        assert!(compositor.frame_template().is_some());
         assert_eq!(
-            (compositor.window_frame().unwrap().content_style)(&WindowChromeModel::new(
+            (compositor.frame_template().unwrap().content_style)(&WindowChromeModel::new(
                 1, "Legacy"
             )),
             None
@@ -1432,52 +1273,30 @@ mod tests {
         let compositor = Compositor::new()
             .cursor_theme(CursorTheme::new())
             .shell_action(action, |_| {})
-            .shell_action(action, |_| {})
-            .background(Root);
+            .shell_action(action, |_| {});
 
         assert!(compositor.validate().is_err());
     }
 
     #[test]
     fn desktop_without_widgets_validates_and_has_no_reserved_widget_space() {
-        let desktop = Application::desktop_environment("Bare desktop")
+        let desktop = Application::shell_environment("Bare desktop")
             .assets(crate::assets::cursor_test_bundle())
-            .compositor(
-                Compositor::new()
-                    .cursor_theme(crate::assets::cursor_test_theme())
-                    .background(Root),
-            )
+            .compositor(Compositor::new().cursor_theme(crate::assets::cursor_test_theme()))
             .into_ready();
-        let (_, _, widgets, _, _, _, _, _) = desktop.into_parts().unwrap();
+        let (_, _, widgets, _, _, _, _, _, _) = desktop.into_parts().unwrap();
         assert!(widgets.is_empty());
 
         // Verify the direct entrypoint exists without starting a desktop in this test.
-        let _: fn(DesktopEnvironmentWithCompositor) -> AppResult<()> =
-            DesktopEnvironmentWithCompositor::run;
+        let _: fn(ShellEnvironmentWithCompositor) -> AppResult<()> =
+            ShellEnvironmentWithCompositor::run;
         assert!(
-            Application::desktop_environment("")
-                .compositor(
-                    Compositor::new()
-                        .cursor_theme(CursorTheme::new())
-                        .background(Root)
-                )
+            Application::shell_environment("")
+                .compositor(Compositor::new().cursor_theme(CursorTheme::new()))
                 .into_ready()
                 .into_parts()
                 .is_err()
         );
-    }
-
-    #[test]
-    fn shell_widget_validation_happens_before_host_selection() {
-        let result = Application::desktop_environment("Telorgon")
-            .compositor(
-                Compositor::new()
-                    .cursor_theme(CursorTheme::new())
-                    .background(Root),
-            )
-            .shell_widget(ShellWidget::new("").reserve_space(-1.0).content(Root))
-            .into_parts();
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1487,14 +1306,10 @@ mod tests {
             .window(Window::new("Counter").content(Root));
         assert_eq!(gui.renderer, Renderer::Software);
 
-        let desktop = Application::desktop_environment("Telorgon")
+        let desktop = Application::shell_environment("Telorgon")
             .renderer(Renderer::Vulkan)
-            .compositor(
-                Compositor::new()
-                    .cursor_theme(CursorTheme::new())
-                    .background(Root),
-            )
-            .shell_widget(ShellWidget::new("Panel").content(Root));
+            .compositor(Compositor::new().cursor_theme(CursorTheme::new()))
+            .widget(Root);
         assert_eq!(desktop.renderer, Renderer::Vulkan);
     }
 
@@ -1512,31 +1327,30 @@ mod tests {
         use crate::application_host::{KeyChord, ShortcutKey};
         fn noop() {}
         let bindings = KeyBindings::new().bind(KeyChord::new(ShortcutKey::Space), noop);
-        let event = DesktopKeyEvent {
+        let event = ShellKeyEvent {
             keysym: 0x20,
             ..Default::default()
         };
         let mut ready = Compositor::new()
             .cursor_theme(CursorTheme::new())
-            .keyboard_shortcut_handler(|_| DesktopKeyAction::Quit)
-            .keybindings(bindings.clone())
-            .background(Root);
+            .keyboard_shortcut_handler(|_| ShellKeyAction::Quit)
+            .keybindings(bindings.clone());
         assert_eq!(
             ready.keyboard_shortcut_handler.as_mut().unwrap()(event),
-            DesktopKeyAction::Consume
+            ShellKeyAction::Consume
         );
         let mut raw = Compositor::new()
             .cursor_theme(CursorTheme::new())
             .keybindings(bindings)
-            .keyboard_shortcut_handler(|_| DesktopKeyAction::Quit);
+            .keyboard_shortcut_handler(|_| ShellKeyAction::Quit);
         assert_eq!(
             raw.keyboard_shortcut_handler.as_mut().unwrap()(event),
-            DesktopKeyAction::Quit
+            ShellKeyAction::Quit
         );
         let mut empty = raw.keybindings(KeyBindings::new());
         assert_eq!(
             empty.keyboard_shortcut_handler.as_mut().unwrap()(event),
-            DesktopKeyAction::Forward
+            ShellKeyAction::Forward
         );
     }
 
@@ -1562,11 +1376,11 @@ mod keyboard_configuration_tests {
 
     #[test]
     fn keyboard_names_preserve_defaults_and_reject_nul_in_every_field() {
-        let defaults = LinuxDesktopConfig::default();
+        let defaults = LinuxShellConfig::default();
         assert_eq!(defaults.keyboard, KeyboardConfig::default());
         defaults.validate().unwrap();
         for field in 0..5 {
-            let mut config = LinuxDesktopConfig::default();
+            let mut config = LinuxShellConfig::default();
             let names = &mut config.keyboard;
             let target = match field {
                 0 => &mut names.rules,
@@ -1588,7 +1402,7 @@ mod keyboard_configuration_tests {
         assert_eq!(config.options.as_deref(), Some(""));
     }
 
-    #[cfg(all(target_os = "linux", feature = "desktop-wayland-linux"))]
+    #[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
     #[test]
     fn explicit_layout_changes_the_compiled_seat_keymap() {
         use crate::platform_linux::XkbKeyboard;
@@ -1639,35 +1453,7 @@ impl<C> Compositor<C> {
     }
 }
 
-impl<C> ReadyCompositor<C> {
-    /// Supplies the required cursor design; validated automatically by desktop startup.
-    pub fn cursor_theme(self, theme: CursorTheme) -> ReadyCompositor<CursorTheme> {
-        ReadyCompositor {
-            cursor_theme: theme,
-            client_cursor_mode: self.client_cursor_mode,
-            background: self.background,
-            window_frame: self.window_frame,
-            icons: self.icons,
-            shell_actions: self.shell_actions,
-            keyboard_shortcut_handler: self.keyboard_shortcut_handler,
-        }
-    }
-
-    pub fn client_cursor_mode(mut self, mode: ClientCursorMode) -> Self {
-        self.client_cursor_mode = mode;
-        self
-    }
-}
-
 impl Compositor<CursorTheme> {
-    /// Sets the effective logical cursor size, preserving the theme's proportions.
-    pub fn cursor_size(mut self, size: f32) -> Self {
-        self.cursor_theme = self.cursor_theme.cursor_size(size);
-        self
-    }
-}
-
-impl ReadyCompositor<CursorTheme> {
     /// Sets the effective logical cursor size, preserving the theme's proportions.
     pub fn cursor_size(mut self, size: f32) -> Self {
         self.cursor_theme = self.cursor_theme.cursor_size(size);

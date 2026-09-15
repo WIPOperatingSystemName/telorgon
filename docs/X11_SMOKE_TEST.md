@@ -20,7 +20,7 @@ real pinned archive produced by [the payload recipe](../packaging/xwayland/READM
 TELORGON_XWAYLAND_PAYLOAD=/home/aku/CompositorStuff/xwayland.payload \
   cargo build --release \
   --manifest-path /home/aku/CompositorStuff/test-compositor/Cargo.toml \
-  --features telorgon/desktop-xwayland-embedded \
+  --features telorgon/shell-xwayland-embedded \
   --target-dir /tmp/telorgon-x11-real-test
 ```
 
@@ -128,7 +128,7 @@ help supporting clients but do not make every legacy toolkit scale its controls.
 This high-density path needs live validation, especially on fractional outputs.
 
 Ordinary windows now prefer a 300x200 logical minimum, configurable with
-`LinuxDesktopConfig::preferred_window_minimum`. Launch glxgears without a geometry
+`LinuxShellConfig::preferred_window_minimum`. Launch glxgears without a geometry
 override: its fixed pixel request should be enlarged to at least that logical size,
 unless client constraints or available space require an exception. Test shrinking
 from every edge and verify the opposite edge stays anchored. Test a fixed-size dialog

@@ -254,8 +254,56 @@ impl CompositionDriver {
 
     /// Installs the host-turn wake used by external signals. Replacing it is safe because signal
     /// subscriptions consult this shared slot at publication time.
+    pub(crate) fn connect_shell(&mut self, services: crate::compose::ShellServices) {
+        if let Some(root) = self.pending_root.as_mut() {
+            root.shell_connected(services);
+        }
+    }
+
     pub fn set_wake(&mut self, wake: impl Fn() + Send + Sync + 'static) {
         *self.wake.write().expect("composition wake lock poisoned") = Some(Arc::new(wake));
+    }
+
+    pub(crate) fn shell_input(
+        &mut self,
+        context: &mut DriverContext<'_>,
+        event: crate::input::InputEvent,
+    ) {
+        let Some(root) = self.root_component else {
+            return;
+        };
+        if !self
+            .arena
+            .get_mut(root)
+            .and_then(|s| s.component.as_deref_mut())
+            .is_some_and(|c| c.shell_input(event))
+        {
+            return;
+        }
+        if let Err(error) = self.reconcile_component(context.ui, root) {
+            self.record_error(error);
+        }
+        *context.frame_requested = true;
+    }
+    pub(crate) fn dismiss_shell_widget(
+        &mut self,
+        context: &mut DriverContext<'_>,
+        reason: crate::compose::ShellDismissReason,
+    ) {
+        let Some(root) = self.root_component else {
+            return;
+        };
+        if let Some(component) = self
+            .arena
+            .get_mut(root)
+            .and_then(|s| s.component.as_deref_mut())
+        {
+            component.shell_dismissed(reason);
+        }
+        if let Err(error) = self.reconcile_component(context.ui, root) {
+            self.record_error(error);
+        }
+        *context.frame_requested = true;
     }
 
     pub fn diagnostics(&self) -> CompositionDiagnostics {
@@ -272,7 +320,7 @@ impl CompositionDriver {
         self.last_error.take()
     }
 
-    #[cfg(any(test, all(feature = "desktop-wayland-linux", target_os = "linux")))]
+    #[cfg(any(test, all(feature = "shell-wayland-linux", target_os = "linux")))]
     pub(crate) fn update_root_candidate(
         &mut self,
         context: &mut DriverContext<'_>,
@@ -306,7 +354,7 @@ impl CompositionDriver {
         }
     }
 
-    #[cfg(any(test, all(feature = "desktop-wayland-linux", target_os = "linux")))]
+    #[cfg(any(test, all(feature = "shell-wayland-linux", target_os = "linux")))]
     fn replace_root_candidate(
         &mut self,
         ui: &mut crate::ui::MountedUi,
