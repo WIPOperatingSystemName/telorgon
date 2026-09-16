@@ -9,6 +9,7 @@ pub struct Spring {
     pub(crate) damping_ratio: f64,
     pub(crate) angular_frequency: f64,
     pub(crate) settle_ms: u32,
+    pub(crate) easing: Easing,
 }
 impl Default for Spring {
     fn default() -> Self {
@@ -22,7 +23,15 @@ impl Spring {
             damping_ratio: 0.86,
             angular_frequency: 20.0,
             settle_ms: 460,
+            easing: Easing::Linear,
         }
+    }
+    /// Shapes elapsed spring time over the settling interval. Linear preserves the physical
+    /// spring; EaseIn/EaseInOut start at zero velocity. Retargets carrying velocity use Linear
+    /// to preserve momentum. The cutoff still forces the exact destination.
+    pub const fn easing(mut self, value: Easing) -> Self {
+        self.easing = value;
+        self
     }
     pub const fn initial_velocity(mut self, value: f64) -> Self {
         assert!(

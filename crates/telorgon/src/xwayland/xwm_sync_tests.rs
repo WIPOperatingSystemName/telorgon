@@ -38,6 +38,7 @@ fn sync_message_precedes_configure_and_server_barrier_does_not_ack_repaint() {
         frame_extents: BTreeMap::new(),
         move_resize_requests: Vec::new(),
         maximize_requests: Vec::new(),
+        minimize_requests: Vec::new(),
         maximized: BTreeMap::new(),
         discovered,
         _ids: IdAllocator::new(0x200000, 0x1fffff).unwrap(),

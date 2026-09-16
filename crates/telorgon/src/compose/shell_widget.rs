@@ -15,6 +15,12 @@ pub trait ShellWidget: Component {
     fn children(&self) -> Vec<ShellChild> {
         Vec::new()
     }
+    /// Client content slots in this surface's local logical coordinates.
+    /// The host aspect-fits retained client content; slots never forward input to clients.
+    /// Up to 64 finite slots entirely inside the surface are presented; other slots are ignored.
+    fn window_previews(&self) -> Vec<ShellWindowPreview> {
+        Vec::new()
+    }
     fn connected(&mut self, _services: super::ShellServices) {}
     fn input(&mut self, _event: crate::input::InputEvent) -> bool {
         false
@@ -23,11 +29,24 @@ pub trait ShellWidget: Component {
     fn dismissed(&mut self, _reason: ShellDismissReason) {}
 }
 
+/// A visual-only reference to a live managed window. Stale IDs render no content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShellWindowPreview {
+    pub window: crate::shell::WindowId,
+    pub rect: RectF,
+}
+impl ShellWindowPreview {
+    pub const fn new(window: crate::shell::WindowId, rect: RectF) -> Self {
+        Self { window, rect }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellDismissReason {
     Escape,
     OutsidePress,
     AnchorRemoved,
+    PointerLeft,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShellSurfaceLayer {
@@ -344,6 +363,8 @@ pub struct ShellSurfaceSpec {
     pub reservation: ShellReservation,
     pub dismiss_on_escape: bool,
     pub dismiss_on_outside_press: bool,
+    /// Dismiss after leaving this surface and its attachment anchor/connecting gap.
+    pub dismiss_on_pointer_leave: bool,
     pub movement: crate::GeometryMotion,
     pub enter_from: Option<ShellEdge>,
     pub exit_to: Option<ShellEdge>,
@@ -366,6 +387,7 @@ impl ShellSurfaceSpec {
             reservation: ShellReservation::None,
             dismiss_on_escape: false,
             dismiss_on_outside_press: false,
+            dismiss_on_pointer_leave: false,
             movement: crate::GeometryMotion::Tween(crate::tween_ms(0, crate::Easing::Linear)),
             enter_from: None,
             exit_to: None,
@@ -421,6 +443,10 @@ impl ShellSurfaceSpec {
     }
     pub const fn dismiss_on_outside_press(mut self, value: bool) -> Self {
         self.dismiss_on_outside_press = value;
+        self
+    }
+    pub const fn dismiss_on_pointer_leave(mut self, value: bool) -> Self {
+        self.dismiss_on_pointer_leave = value;
         self
     }
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -500,6 +526,7 @@ impl ShellSurfaceSpec {
 pub(crate) struct SurfaceBinding(
     pub Rc<RefCell<Option<ShellSurfaceSpec>>>,
     pub Rc<RefCell<Option<Vec<ShellChild>>>>,
+    pub Rc<RefCell<Vec<ShellWindowPreview>>>,
 );
 /// A keyed child surface owned by the declaring widget. It is not a second application root.
 pub struct ShellChild {
@@ -548,16 +575,29 @@ impl<W: ShellWidget> ErasedComponent for WidgetRoot<W> {
         self.widget.update_from(incoming)
     }
     fn render(&self, owner: ComponentInstanceId, target: RuntimeTarget) -> RenderedView {
-        let ((element, surface, children), signals) =
+        let ((element, surface, children, previews), signals) =
             super::context::evaluate::<W, _>(owner, target, || {
                 (
                     self.widget.view().into_element(),
                     self.widget.surface(),
                     self.widget.children(),
+                    self.widget.window_previews(),
                 )
             });
         *self.binding.0.borrow_mut() = Some(surface);
         *self.binding.1.borrow_mut() = Some(children);
+        *self.binding.2.borrow_mut() = previews
+            .into_iter()
+            .take(64)
+            .filter(|preview| {
+                let r = preview.rect;
+                [r.x, r.y, r.width, r.height]
+                    .into_iter()
+                    .all(f32::is_finite)
+                    && r.width > 0.0
+                    && r.height > 0.0
+            })
+            .collect();
         RenderedView { element, signals }
     }
     fn mounted_erased(&mut self, owner: ComponentInstanceId) -> bool {

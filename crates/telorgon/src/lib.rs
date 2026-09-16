@@ -205,7 +205,7 @@ pub mod app {
     pub use crate::compose::{
         ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
         ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-        ShellWidget, WidgetPlacement,
+        ShellWidget, ShellWindowPreview, WidgetPlacement,
     };
     pub use crate::session;
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
@@ -595,7 +595,7 @@ pub use ui::{
 pub use crate::compose::{
     ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
     ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-    ShellWidget, WidgetPlacement,
+    ShellWidget, ShellWindowPreview, WidgetPlacement,
 };
 
 pub use crate::compose::{

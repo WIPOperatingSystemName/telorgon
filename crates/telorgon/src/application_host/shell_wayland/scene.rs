@@ -58,6 +58,7 @@ pub(super) enum ShellLayerKey {
     LegacyControl(u32, u8),
     LegacyControlSource(u8),
     Widget(u32),
+    WindowPreview(u32, u32, u32),
     DragIcon(u32),
     Cursor,
     ComposedPointerSource,
@@ -1170,9 +1171,7 @@ impl ShellComposition {
             .iter()
             .filter_map(|placement| {
                 let surface = match placement.key {
-                    ShellLayerKey::Surface(surface) | ShellLayerKey::DragIcon(surface) => {
-                        surface
-                    }
+                    ShellLayerKey::Surface(surface) | ShellLayerKey::DragIcon(surface) => surface,
                     _ => return None,
                 };
                 self.image_scenes
@@ -1378,11 +1377,7 @@ mod tests {
         let first = composition
             .synchronize(extent, layers(black, black, true))
             .unwrap();
-        assert!(
-            first
-                .glass_changed
-                .contains(&ShellSceneKey::ResizeVeil(9))
-        );
+        assert!(first.glass_changed.contains(&ShellSceneKey::ResizeVeil(9)));
         assert!(
             composition
                 .synchronize(extent, layers(black, black, true))
@@ -1407,11 +1402,7 @@ mod tests {
         let lower = composition
             .synchronize(extent, layers(white, white, true))
             .unwrap();
-        assert!(
-            lower
-                .glass_changed
-                .contains(&ShellSceneKey::ResizeVeil(9))
-        );
+        assert!(lower.glass_changed.contains(&ShellSceneKey::ResizeVeil(9)));
         let flat = composition
             .synchronize(extent, layers(white, white, false))
             .unwrap();
@@ -1430,7 +1421,10 @@ mod tests {
             height: 100,
         };
         let mut preview = veil(full_rect(extent), ColorRgba8::rgba(0, 0, 0, 0));
-        preview.glass = Some(crate::GlassStyle { blend_softness: 16.0, ..crate::GlassStyle::default() });
+        preview.glass = Some(crate::GlassStyle {
+            blend_softness: 16.0,
+            ..crate::GlassStyle::default()
+        });
         let mut composition = ShellComposition::new(extent);
         let frame = composition
             .synchronize(extent, vec![preview])
@@ -1831,6 +1825,83 @@ mod tests {
         )
     }
 
+    #[test]
+    fn thumbnail_reuses_hidden_scene_without_upload_and_retires_independently() {
+        let extent = SizeI {
+            width: 800,
+            height: 600,
+        };
+        let mut composition = ShellComposition::new(SizeI {
+            width: 800,
+            height: 600,
+        });
+        let original = || image_layer(PointI { x: 10, y: 10 }, ShellImageUpdate::Unchanged);
+        let first = composition
+            .synchronize(
+                extent,
+                vec![image_layer(
+                    PointI { x: 10, y: 10 },
+                    ShellImageUpdate::Full(vec![255; 100 * 80 * 4].into()),
+                )],
+            )
+            .unwrap();
+        assert_eq!(first.updates.len(), 1);
+        let mut gpu_scene = crate::renderer_vulkan::VulkanScene::default();
+        for delta in &first.updates[0].deltas {
+            gpu_scene.apply_delta_checked(delta).unwrap();
+        }
+
+        let preview = || {
+            let mut layer = image_layer_at(
+                RectI {
+                    x: 400,
+                    y: 450,
+                    width: 100,
+                    height: 80,
+                },
+                ShellImageUpdate::Unchanged,
+            );
+            layer.key = ShellLayerKey::WindowPreview(7, 0, 9);
+            layer
+        };
+        let mut hidden = original();
+        hidden.visible = false;
+        let frame = composition
+            .synchronize(extent, vec![hidden, preview()])
+            .unwrap();
+        assert!(frame.updates.is_empty());
+        assert_eq!(frame.placements.len(), 1);
+        assert_eq!(frame.placements[0].scene, ShellSceneKey::Surface(9));
+        assert_eq!(frame.placements[0].target.x, 400);
+        let restored = composition.synchronize(extent, vec![original()]).unwrap();
+        assert!(restored.updates.is_empty());
+        assert_eq!(restored.placements.len(), 1);
+        assert!(restored.live_scenes.contains(&ShellSceneKey::Surface(9)));
+        let closed = composition.synchronize(extent, Vec::new()).unwrap();
+        assert!(closed.live_scenes.is_empty());
+        assert!(closed.placements.is_empty());
+    }
+    #[test]
+    fn thumbnail_without_a_ready_producer_does_not_emit_missing_image_draws() {
+        let mut composition = ShellComposition::new(SizeI {
+            width: 800,
+            height: 600,
+        });
+        let mut preview = image_layer(PointI::default(), ShellImageUpdate::Unchanged);
+        preview.key = ShellLayerKey::WindowPreview(7, 0, 9);
+        let frame = composition
+            .synchronize_with_force(
+                SizeI {
+                    width: 800,
+                    height: 600,
+                },
+                vec![preview],
+                true,
+            )
+            .unwrap();
+        assert!(frame.updates.is_empty());
+        assert!(frame.placements.is_empty());
+    }
     #[test]
     fn explicit_placement_scaling_does_not_require_a_content_update() {
         let extent = SizeI {

@@ -13,6 +13,8 @@ impl ShellServiceRegistry {
 pub struct ShellWindow {
     pub id: WindowId,
     pub title: String,
+    /// Retained client content size in logical units, for aspect-ratio-aware previews.
+    pub preview_size: Option<crate::core::SizeF>,
     pub application_id: Option<super::ApplicationId>,
     /// Raw Wayland app ID or X11 WM_CLASS, used for late metadata association.
     pub application_identity: String,
@@ -49,6 +51,7 @@ pub struct ShellRequestCompletion {
 }
 #[derive(Clone)]
 pub struct ShellServices {
+    output_size: Signal<crate::core::SizeF>,
     windows: Signal<Vec<ShellWindow>>,
     completions: Signal<Vec<ShellRequestCompletion>>,
     queue: Rc<RefCell<ServiceQueue>>,
@@ -68,6 +71,7 @@ pub(crate) struct WindowCommand {
 }
 pub(crate) struct ShellServiceHost {
     pub services: ShellServices,
+    output_size: SignalWriter<crate::core::SizeF>,
     _catalog_worker: super::applications::CatalogWorker,
     windows: SignalWriter<Vec<ShellWindow>>,
     completions: SignalWriter<Vec<ShellRequestCompletion>>,
@@ -131,11 +135,17 @@ impl ShellServiceHost {
             .cloned()
             .unwrap_or_default();
         let (applications, worker) = super::applications::start(config, size);
+        let (output_size, output_writer) = Signal::new(crate::core::SizeF {
+            width: 1.0,
+            height: 1.0,
+        });
         let (windows, writer) = Signal::new(Vec::new());
         let (completions, cwriter) = Signal::new(Vec::new());
         Self {
+            output_size: output_writer,
             _catalog_worker: worker,
             services: ShellServices {
+                output_size,
                 applications,
                 windows,
                 completions,
@@ -150,8 +160,14 @@ impl ShellServiceHost {
             completions: cwriter,
         }
     }
+    pub fn publish_output_size(&self, size: crate::core::SizeF) {
+        self.output_size.publish_if_changed(size);
+    }
     pub fn publish(&self, mut windows: Vec<ShellWindow>) {
         for window in &mut windows {
+            // Protocol focus may lag title-bar minimization. A hidden window must
+            // never be advertised as the active taskbar target.
+            window.active &= !window.minimized;
             window.application_id = self
                 .services
                 .applications
@@ -190,6 +206,7 @@ mod tests {
     use std::num::NonZeroU32;
     fn window(generation: u32) -> ShellWindow {
         ShellWindow {
+            preview_size: None,
             id: WindowId::new(
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU32::new(generation).unwrap(),
@@ -203,6 +220,28 @@ mod tests {
             minimized: false,
             maximized: false,
         }
+    }
+    #[test]
+    fn minimized_windows_are_inactive_even_when_protocol_focus_lags() {
+        let host = ShellServiceHost::new();
+        let mut value = window(1);
+        value.active = true;
+        host.publish(vec![value.clone()]);
+        assert!(host.services.windows().snapshot()[0].active);
+        value.minimized = true;
+        host.publish(vec![value.clone()]);
+        let snapshot = host.services.windows().snapshot();
+        assert!(snapshot[0].minimized);
+        assert!(!snapshot[0].active);
+        // Restoring is admitted immediately, without a preceding minimize request.
+        let windows = ShellContext::new(host.services.clone()).windows();
+        windows.activate(value.id).unwrap();
+        let commands = host.drain();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].action, ShellWindowAction::Activate);
+        value.minimized = false;
+        host.publish(vec![value]);
+        assert!(windows.open()[0].active);
     }
     #[test]
     fn requests_do_not_change_snapshot_and_retired_generations_fail() {
@@ -245,6 +284,10 @@ impl ShellContext {
     pub(crate) fn new(services: ShellServices) -> Self {
         Self { services }
     }
+    /// Selected output extent in logical units. Reads in view are reactive.
+    pub fn output_size(&self) -> crate::core::SizeF {
+        *super::context::observe(&self.services.output_size)
+    }
     pub fn windows(&self) -> ShellWindows {
         ShellWindows(self.services.clone())
     }
@@ -267,19 +310,27 @@ impl ShellWindows {
             .collect()
     }
     pub fn icon(&self, id: WindowId) -> crate::assets::ImageSource {
+        self.resolve_icon(id, super::applications::IconRequest::new())
+    }
+    /// Resolve catalog artwork at the rendered logical size and output density.
+    pub fn resolve_icon(
+        &self,
+        id: WindowId,
+        request: super::applications::IconRequest,
+    ) -> crate::assets::ImageSource {
         let windows = super::context::observe(&self.0.windows);
         if let Some(w) = windows.iter().find(|w| w.id == id) {
             if let Some(icon) = &w.icon {
                 return super::context::bind_image(icon.clone());
             }
             if let Some(name) = &w.icon_name {
-                let icon = self.0.applications.icon_named(name);
+                let icon = self.0.applications.resolve_named_icon(name, request);
                 if icon.image_id() != super::applications::fallback_image().image {
                     return icon;
                 }
             }
             if let Some(app) = self.0.applications.identify(&w.application_identity) {
-                return self.0.applications.icon(&app);
+                return self.0.applications.resolve_icon(&app, request);
             }
         }
         super::context::bind_image(super::applications::fallback_image())

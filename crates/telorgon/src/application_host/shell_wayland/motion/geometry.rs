@@ -149,6 +149,66 @@ mod tests {
         }
     }
     #[test]
+    fn eased_spring_softens_start_preserves_bounce_and_retarget_velocity() {
+        let motion = GeometryMotion::Spring(
+            Spring::new()
+                .easing(crate::Easing::EaseInOut)
+                .damping_ratio(0.6)
+                .settle_within_ms(700),
+        );
+        let mut track = GeometryTrack::new(Sample::at(rect(100)), rect(1000), motion, 0, false);
+        assert_eq!(track.sample(0).velocity, [0.0; 4]);
+        let mut overshot = false;
+        for milliseconds in 1..700 {
+            let value = track.sample(milliseconds * 1_000_000);
+            overshot |= value.position[2] > 1000.0;
+        }
+        assert!(overshot);
+        let now = 200_000_000;
+        let current = track.sample(now);
+        let before = track.sample(now - 1000);
+        let after = track.sample(now + 1000);
+        for i in 0..4 {
+            let numerical_velocity = (after.position[i] - before.position[i]) / 0.000002;
+            assert!((numerical_velocity - current.velocity[i]).abs() < 0.001);
+        }
+        let mut reversed = GeometryTrack::new(current, rect(100), motion, now, true);
+        let start = reversed.sample(now);
+        for i in 0..4 {
+            assert!((start.position[i] - current.position[i]).abs() < 1e-9);
+            assert!((start.velocity[i] - current.velocity[i]).abs() < 1e-9);
+        }
+        assert_eq!(track.sample(700_000_000).velocity, [0.0; 4]);
+        assert_eq!(track.sample(700_000_000).rect(), rect(1000));
+        let mut immediate = GeometryTrack::new(
+            Sample::at(rect(100)),
+            rect(1000),
+            motion.with_duration_ms(0),
+            0,
+            false,
+        );
+        assert_eq!(immediate.sample(0).rect(), rect(1000));
+    }
+
+    #[test]
+    fn spring_easing_derivatives_match_finite_differences() {
+        for easing in [
+            crate::Easing::Linear,
+            crate::Easing::EaseIn,
+            crate::Easing::EaseOut,
+            crate::Easing::EaseInOut,
+        ] {
+            for time in [0.01, 0.17, 0.35, 0.53, 0.69] {
+                let (_, rate) = spring_time(easing, time, 0.7);
+                let numerical = (spring_time(easing, time + 1e-7, 0.7).0
+                    - spring_time(easing, time - 1e-7, 0.7).0)
+                    / 2e-7;
+                assert!((rate - numerical).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "CPU sampler microbenchmark; run explicitly with --release --ignored --nocapture"]
     fn spring_sampler_cpu_throughput() {
         let mut track = GeometryTrack::new(Sample::at(rect(100)), rect(1000), spring(), 0, false);
@@ -187,6 +247,7 @@ impl Sample {
 enum Curve {
     Tween(WindowTween),
     Spring {
+        easing: crate::Easing,
         decay: f64,
         frequency: f64,
         a: [f64; 4],
@@ -234,6 +295,11 @@ impl GeometryTrack {
                 let a = std::array::from_fn(|i| from.position[i] - target[i]);
                 let b = std::array::from_fn(|i| (from.velocity[i] + decay * a[i]) / frequency);
                 Curve::Spring {
+                    easing: if inherit_velocity {
+                        crate::Easing::Linear
+                    } else {
+                        spring.easing
+                    },
                     decay,
                     frequency,
                     a,
@@ -302,11 +368,14 @@ impl GeometryTrack {
                     }
                 }
                 Curve::Spring {
+                    easing,
                     decay,
                     frequency,
                     a,
                     b,
                 } => {
+                    let (time, rate) =
+                        spring_time(easing, time, f64::from(self.duration_ms) * 0.001);
                     let envelope = (-decay * time).exp();
                     let (sin, cos) = (frequency * time).sin_cos();
                     let displacement: [f64; 4] = std::array::from_fn(|i| a[i] * cos + b[i] * sin);
@@ -315,7 +384,7 @@ impl GeometryTrack {
                             self.target[i] + envelope * displacement[i]
                         }),
                         velocity: std::array::from_fn(|i| {
-                            envelope
+                            rate * envelope
                                 * (frequency * (-a[i] * sin + b[i] * cos) - decay * displacement[i])
                         }),
                     }
@@ -337,4 +406,21 @@ impl GeometryTrack {
             self.pending = false;
         }
     }
+}
+
+// Return warped time and its exact derivative so interruption inherits physical velocity.
+fn spring_time(easing: crate::Easing, time: f64, duration: f64) -> (f64, f64) {
+    use crate::Easing;
+    if easing == Easing::Linear {
+        return (time, 1.0);
+    }
+    let t = (time / duration).clamp(0.0, 1.0);
+    let (progress, rate) = match easing {
+        Easing::Linear => unreachable!(),
+        Easing::EaseIn => (t * t * t, 3.0 * t * t),
+        Easing::EaseOut => (1.0 - (1.0 - t).powi(3), 3.0 * (1.0 - t).powi(2)),
+        Easing::EaseInOut if t < 0.5 => (4.0 * t * t * t, 12.0 * t * t),
+        Easing::EaseInOut => (1.0 - 4.0 * (1.0 - t).powi(3), 12.0 * (1.0 - t).powi(2)),
+    };
+    (duration * progress, rate)
 }

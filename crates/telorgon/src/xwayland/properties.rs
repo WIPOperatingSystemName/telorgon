@@ -208,9 +208,7 @@ impl PropertyReader {
             if end > words.len() {
                 return None;
             }
-            if best.is_none_or(|(w, h, _)| {
-                width.abs_diff(32) + height.abs_diff(32) < w.abs_diff(32) + h.abs_diff(32)
-            }) {
+            if best.is_none_or(|(w, h, _)| width.min(height) > w.min(h)) {
                 best = Some((width, height, offset));
             }
             offset = end;
@@ -567,6 +565,14 @@ mod tests {
         };
         let icon = PropertyReader::parse_icon(&icon_reply(&[1, 1, 0x80402010])).unwrap();
         assert_eq!(icon.pixels.as_ref(), &[0x40, 0x20, 0x10, 0x80]);
+        // Retain high-resolution client artwork instead of choosing the old 32px target.
+        let mut variants = vec![32, 32];
+        variants.extend(vec![0xff112233; 32 * 32]);
+        variants.extend([128, 128]);
+        variants.extend(vec![0xff445566; 128 * 128]);
+        let large = PropertyReader::parse_icon(&icon_reply(&variants)).unwrap();
+        assert_eq!(large.pixels.len(), 128 * 128 * 4);
+        assert_eq!(&large.pixels[..4], &[0x44, 0x55, 0x66, 0xff]);
         assert!(PropertyReader::parse_icon(&icon_reply(&[4096, 4096, 0])).is_none());
         assert!(PropertyReader::parse_icon(&icon_reply(&[0, 1])).is_none());
         let class = PropertyReader::new_text(
@@ -817,7 +823,7 @@ mod tests {
         reader.refresh(id).unwrap();
         let mut actions = Vec::new();
         reader
-            .completion(&response(41), &windows, &mut actions)
+            .completion(&response(42), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -830,7 +836,7 @@ mod tests {
             )
             .unwrap();
         reader
-            .completion(&response(42), &windows, &mut actions)
+            .completion(&response(43), &windows, &mut actions)
             .unwrap();
         assert!(
             matches!(actions.as_slice(), [Action::NormalHintsChanged(window)] if *window == id)
@@ -855,7 +861,7 @@ mod tests {
         reader.forget(id);
         actions.clear();
         reader
-            .completion(&response(43), &windows, &mut actions)
+            .completion(&response(44), &windows, &mut actions)
             .unwrap();
         assert!(actions.is_empty());
         assert_eq!(reader.normal_hints(id), None);
@@ -890,7 +896,7 @@ mod tests {
         );
         assert!(reader.pending.is_empty());
         let mut response = xproto::GetInputFocusReply {
-            sequence: 41,
+            sequence: 42,
             ..Default::default()
         }
         .serialize()
@@ -1002,7 +1008,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.pending.len(), 1);
         let mut actions = vec![];
-        p.completion(&reply(41, &[105, 106]), &w, &mut actions)
+        p.completion(&reply(42, &[105, 106]), &w, &mut actions)
             .unwrap();
         assert_eq!(p.get(id), None);
         assert!(actions.is_empty());
@@ -1013,14 +1019,14 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
-        p.completion(&reply(42, &[]), &w, &mut actions).unwrap();
+        p.completion(&reply(43, &[]), &w, &mut actions).unwrap();
         assert_eq!(p.get(id), Some(Protocols::default()));
         assert_eq!(actions, vec![Action::ProtocolsChanged(id)]);
     }
     #[test]
     fn invalid_or_incomplete_properties_grant_no_capabilities() {
         let p = PropertyReader::new(104, 105, 106);
-        let Completion::Reply(_, mut bytes) = reply(41, &[105]) else {
+        let Completion::Reply(_, mut bytes) = reply(42, &[105]) else {
             unreachable!()
         };
         assert_eq!(
@@ -1047,7 +1053,7 @@ mod tests {
             .unwrap();
         p.forget(id);
         let mut actions = vec![];
-        assert!(p.completion(&reply(41, &[105]), &w, &mut actions).unwrap());
+        assert!(p.completion(&reply(42, &[105]), &w, &mut actions).unwrap());
         assert!(actions.is_empty());
         assert_eq!(p.get(id), None);
     }

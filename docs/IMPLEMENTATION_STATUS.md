@@ -3845,6 +3845,10 @@ The shell environment now owns an optional configurable application catalog (sys
  default), exposed through inherited `ShellContext` alongside reactive cached window services.
 Desktop-entry discovery/search and PNG/SVG icon lookup/decoding run on a bounded worker, with two-second
 change polling. X11 WM_CLASS/_NET_WM_ICON use the asynchronous property reader; Wayland uses app IDs and
-xdg toplevel icons. The test taskbar renders reactive per-window icon buttons with activation/minimizing.
+xdg toplevel icons. The test taskbar groups reactive icons by application and opens a hover picker with fixed-size
+retained client previews, a bounded scrollable overflow list, and restore/close actions. Shell widget
+preview slots reuse existing scenes, include subsurfaces, and suppress stale/unready/locked content;
+selected-output logical metrics and wheel/hover-dismiss routing are implemented. See
+[Shell widgets](SHELL_WIDGETS.md) for API boundaries and headless evidence.
 Headless and compile evidence is documented in [Application catalog](APPLICATION_CATALOG.md); live
 appearance, automatic desktop-theme selection, XPM, and multi-output policy are not qualified.

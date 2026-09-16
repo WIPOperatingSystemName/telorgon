@@ -56,6 +56,7 @@ struct Tracking {
     frame_extents: BTreeMap<XWindow, [u32; 4]>,
     move_resize_requests: Vec<(XWindow, u32, u32)>,
     maximize_requests: Vec<(XWindow, u32)>,
+    minimize_requests: Vec<XWindow>,
     maximized: BTreeMap<XWindow, bool>,
     title: PropertyReader,
     legacy_title: PropertyReader,
@@ -623,6 +624,25 @@ impl Xwm {
             .collect()
     }
 
+    /// Consume authenticated ICCCM iconify requests for live managed windows.
+    pub fn take_minimize_requests(&mut self) -> Vec<u64> {
+        let Some(Phase::Tracking(tracking)) = &mut self.phase else {
+            return Vec::new();
+        };
+        let Some(windows) = &self.windows else {
+            return Vec::new();
+        };
+        std::mem::take(&mut tracking.minimize_requests)
+            .into_iter()
+            .filter_map(|id| {
+                windows
+                    .get(id.xid)
+                    .filter(|w| w.id == id && w.mapped && !w.override_redirect)?;
+                windows.presentable_surface(id)
+            })
+            .collect()
+    }
+
     /// Publish the shell's actual maximize state, including changes from compositor controls.
     /// Telorgon currently has one maximize mode, covering both axes.
     pub fn set_maximized_state(
@@ -1123,6 +1143,7 @@ impl Xwm {
                             frame_extents: BTreeMap::new(),
                             move_resize_requests: Vec::new(),
                             maximize_requests: Vec::new(),
+                            minimize_requests: Vec::new(),
                             maximized: BTreeMap::new(),
                             title,
                             app_icon,
@@ -1279,6 +1300,21 @@ impl Xwm {
                                         .map_err(|_| {
                                             Error("malformed frame extents request".into())
                                         })?;
+                                    if e.format == 32
+                                        && e.type_ == tracking.discovered.atoms["WM_CHANGE_STATE"]
+                                        && e.data.as_data32()[0] == 3
+                                        && tracking.minimize_requests.len() < 256
+                                    {
+                                        if let Some(w) = self
+                                            .windows
+                                            .as_ref()
+                                            .unwrap()
+                                            .get(e.window)
+                                            .filter(|w| w.mapped && !w.override_redirect)
+                                        {
+                                            tracking.minimize_requests.push(w.id);
+                                        }
+                                    }
                                     if e.format == 32
                                         && e.type_ == tracking.discovered.atoms["_NET_WM_STATE"]
                                     {
@@ -1661,7 +1697,7 @@ mod tests {
                 manager = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
             }
         }
-        for sequence in [43, 44] {
+        for sequence in [44, 45] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -1675,14 +1711,14 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 46,
+                sequence: 47,
                 ..Default::default()
             }
             .serialize(),
         );
         let create: [u8; 32] = xproto::CreateNotifyEvent {
             response_type: xproto::CREATE_NOTIFY_EVENT,
-            sequence: 46,
+            sequence: 47,
             parent: 1,
             window: 10,
             width: 640,
@@ -1693,7 +1729,7 @@ mod tests {
         peer.write_all(&create).unwrap();
         let timestamp: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 46,
+            sequence: 47,
             window: manager,
             atom: 110,
             time: 123,
@@ -1710,7 +1746,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 47 + index as u16,
+                        sequence: 48 + index as u16,
                         owner: manager,
                         ..Default::default()
                     }
@@ -1725,7 +1761,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 61,
+                sequence: 62,
                 ..Default::default()
             }
             .serialize(),
@@ -1735,7 +1771,7 @@ mod tests {
         assert_eq!(query[0], 15);
         assert_eq!(u32::from_ne_bytes(query[4..8].try_into().unwrap()), 1);
         let mut tree = xproto::QueryTreeReply {
-            sequence: 62,
+            sequence: 63,
             root: 1,
             parent: 0,
             children: vec![manager, 10],
@@ -1768,7 +1804,7 @@ mod tests {
                 assert_eq!(u32::from_ne_bytes(bytes[20..24].try_into().unwrap()), 800);
             }
         }
-        for sequence in [64, 66] {
+        for sequence in [65, 67] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -1783,7 +1819,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(10).unwrap().geometry.width, 640);
         let map: [u8; 32] = xproto::MapNotifyEvent {
             response_type: xproto::MAP_NOTIFY_EVENT,
-            sequence: 66,
+            sequence: 67,
             event: 1,
             window: 10,
             ..Default::default()
@@ -1792,7 +1828,7 @@ mod tests {
         peer.write_all(&map).unwrap();
         let configured: [u8; 32] = xproto::ConfigureNotifyEvent {
             response_type: xproto::CONFIGURE_NOTIFY_EVENT,
-            sequence: 66,
+            sequence: 67,
             event: 1,
             window: 10,
             x: -20,
@@ -1805,7 +1841,7 @@ mod tests {
         peer.write_all(&configured).unwrap();
         let serial: [u8; 32] = xproto::ClientMessageEvent {
             response_type: xproto::CLIENT_MESSAGE_EVENT | 128,
-            sequence: 66,
+            sequence: 67,
             format: 32,
             window: 10,
             type_: serial_atom,
@@ -1859,7 +1895,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 68,
+                sequence: 69,
                 ..Default::default()
             }
             .serialize(),
@@ -1880,7 +1916,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 70,
+                sequence: 71,
                 ..Default::default()
             }
             .serialize(),
@@ -1898,7 +1934,7 @@ mod tests {
             .flat_map(u32::to_ne_bytes)
             .collect();
         let protocol_reply = xproto::GetPropertyReply {
-            sequence: 71,
+            sequence: 72,
             format: 32,
             length: 2,
             type_: 4,
@@ -1933,7 +1969,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 73,
+                sequence: 74,
                 ..Default::default()
             }
             .serialize(),
@@ -1969,7 +2005,7 @@ mod tests {
             }
             .serialize()
         };
-        peer.write_all(&hints_reply(74, 1)).unwrap();
+        peer.write_all(&hints_reply(75, 1)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         // Leave capacity for one checked command, but not the complete focus pair.
         let (mut blocked_transport, mut blocked_requests, _, _blocked_peer, _) = ready();
@@ -2014,7 +2050,7 @@ mod tests {
         let (message, _) = xproto::ClientMessageEvent::try_parse(&take[12..]).unwrap();
         assert_eq!(message.data.as_data32(), [106, 124, 0, 0, 0]);
         assert_eq!(request(&mut peer)[0], 43);
-        for sequence in [76, 78] {
+        for sequence in [77, 79] {
             write_reply(
                 &mut peer,
                 &xproto::GetInputFocusReply {
@@ -2027,7 +2063,7 @@ mod tests {
         assert!(drive(&mut xwm, now).is_empty());
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 78,
+            sequence: 79,
             window: 10,
             atom: 35,
             time: 125,
@@ -2039,7 +2075,7 @@ mod tests {
         assert_eq!(xwm.input_hints(id), None);
         assert!(xwm.focus_window(id, 125, now).is_err());
         assert_eq!(request(&mut peer)[0], 20);
-        peer.write_all(&hints_reply(79, 0)).unwrap();
+        peer.write_all(&hints_reply(80, 0)).unwrap();
         assert_eq!(drive(&mut xwm, now), vec![Action::HintsChanged(id)]);
         assert_eq!(
             xwm.focus_window(id, 125, now).unwrap(),
@@ -2051,7 +2087,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 81,
+                sequence: 82,
                 ..Default::default()
             }
             .serialize(),
@@ -2065,7 +2101,7 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(normal[8..12].try_into().unwrap()), 40);
         assert_eq!(u32::from_ne_bytes(normal[12..16].try_into().unwrap()), 41);
         let normal_reply = xproto::GetPropertyReply {
-            sequence: 82,
+            sequence: 83,
             format: 32,
             type_: 41,
             length: 18,
@@ -2138,7 +2174,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 84,
+                sequence: 85,
                 ..Default::default()
             }
             .serialize(),
@@ -2147,7 +2183,7 @@ mod tests {
         assert_eq!(xwm.windows().unwrap().get(id.xid).unwrap().geometry, before);
         let changed: [u8; 32] = xproto::PropertyNotifyEvent {
             response_type: xproto::PROPERTY_NOTIFY_EVENT,
-            sequence: 84,
+            sequence: 85,
             window: id.xid,
             atom: 40,
             ..Default::default()
@@ -2160,7 +2196,7 @@ mod tests {
         assert_eq!(request(&mut peer)[0], 20);
         peer.write_all(
             &xproto::GetPropertyReply {
-                sequence: 85,
+                sequence: 86,
                 ..Default::default()
             }
             .serialize(),
@@ -2185,7 +2221,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 87,
+                sequence: 88,
                 ..Default::default()
             }
             .serialize(),
@@ -2229,7 +2265,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let notification: [u8; 32] = x11rb_protocol::protocol::xfixes::SelectionNotifyEvent {
             response_type: subscription.first_event,
-            sequence: 87,
+            sequence: 88,
             window: manager,
             owner: 77,
             selection: 1,
@@ -2293,7 +2329,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 89,
+                sequence: 90,
                 ..Default::default()
             }
             .serialize(),
@@ -2302,7 +2338,7 @@ mod tests {
         assert!(xwm.selection_watches_ready());
         let clock_sequence = xwm.request_focus_timestamp(id, now).unwrap();
         assert!(xwm.commands_pending(id));
-        assert_eq!(clock_sequence, 90);
+        assert_eq!(clock_sequence, 91);
         drive(&mut xwm, now);
         let marker = request(&mut peer);
         assert_eq!(marker[0], 18);
@@ -2329,7 +2365,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 91,
+                sequence: 92,
                 ..Default::default()
             }
             .serialize(),
@@ -2346,7 +2382,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 93,
+                sequence: 94,
                 ..Default::default()
             }
             .serialize(),
@@ -2355,7 +2391,7 @@ mod tests {
         assert!(!xwm.commands_pending(id));
         let clear: [u8; 32] = xproto::SelectionClearEvent {
             response_type: xproto::SELECTION_CLEAR_EVENT,
-            sequence: 93,
+            sequence: 94,
             time: 124,
             owner: manager,
             selection: wm_atom,

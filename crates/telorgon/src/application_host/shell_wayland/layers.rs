@@ -847,6 +847,8 @@ pub(super) fn prepare_desktop_layers(
     upper_widgets.sort_by_key(|w| (w.spec.layer, w.spec.order, w.id));
     for widget in upper_widgets {
         layers.push(widget.scene(session_locked));
+        let previews = widget.preview_layers(windows, &layers, session_locked);
+        layers.extend(previews);
     }
     if let Some(cursor) = cursor {
         match cursor {

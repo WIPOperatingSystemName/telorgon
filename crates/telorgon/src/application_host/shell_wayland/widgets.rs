@@ -1,5 +1,6 @@
 //! Shell surface lifetime and sampled geometry over the existing retained runtimes.
 use super::motion::geometry::{GeometryTrack, Sample};
+use super::scene::ShellLayerContent;
 use super::*;
 use crate::compose::{
     ShellAttachment, ShellDismissReason, ShellEdge, ShellFocus, ShellPointer, ShellReservation,
@@ -24,6 +25,7 @@ pub(super) struct WidgetLayer {
     initialized: bool,
     presented: bool,
     geometry_dirty: bool,
+    previous_previews: Vec<crate::compose::ShellWindowPreview>,
     pub parent_visible: bool,
     pub focused: bool,
     pub captured: bool,
@@ -67,6 +69,7 @@ impl WidgetLayer {
             initialized: false,
             presented: false,
             geometry_dirty: true,
+            previous_previews: Vec::new(),
             parent_visible: true,
             focused: false,
             captured: false,
@@ -210,6 +213,9 @@ impl WidgetLayer {
             now,
             false,
         )?;
+        let previews = self.binding.2.borrow().clone();
+        self.geometry_dirty |= self.previous_previews != previews;
+        self.previous_previews = previews;
         Ok(())
     }
     pub fn animating(&self) -> bool {
@@ -237,6 +243,137 @@ impl WidgetLayer {
         );
         scene.target = self.sampled;
         scene
+    }
+    pub fn preview_layers(
+        &self,
+        windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+        sources: &[ShellLayer],
+        locked: bool,
+    ) -> Vec<ShellLayer> {
+        if locked || !self.input_visible() {
+            return Vec::new();
+        }
+        let mut layers = Vec::new();
+        for (index, preview) in self.binding.2.borrow().iter().enumerate() {
+            let Some((owner, _)) = windows
+                .iter()
+                .find(|(_, w)| w.backend.is_some() && w.desktop_id == Some(preview.window))
+            else {
+                continue;
+            };
+            let Some(root) = sources
+                .iter()
+                .find(|s| s.key == ShellLayerKey::Surface(owner.get()))
+            else {
+                continue;
+            };
+            let r = preview.rect;
+            let extent = self.layer.runtime.extent();
+            // Only finite, in-surface slots are admitted. This also bounds coordinate conversion.
+            if ![r.x, r.y, r.width, r.height]
+                .into_iter()
+                .all(f32::is_finite)
+                || r.x < 0.0
+                || r.y < 0.0
+                || r.width <= 0.0
+                || r.height <= 0.0
+                || r.x + r.width > extent.width
+                || r.y + r.height > extent.height
+            {
+                continue;
+            }
+            let sx = self.sampled.width as f32 / extent.width.max(1.0);
+            let sy = self.sampled.height as f32 / extent.height.max(1.0);
+            let slot = RectI {
+                x: self.sampled.x.saturating_add((r.x * sx).round() as i32),
+                y: self.sampled.y.saturating_add((r.y * sy).round() as i32),
+                width: (r.width * sx).round() as i32,
+                height: (r.height * sy).round() as i32,
+            };
+            let Some(clip) = intersect_rect(slot, self.sampled) else {
+                continue;
+            };
+            let Some(fitted) = fit_preview(
+                SizeI {
+                    width: root.target.width,
+                    height: root.target.height,
+                },
+                slot,
+            ) else {
+                continue;
+            };
+            for source in sources {
+                let ShellLayerKey::Surface(raw) = source.key else {
+                    continue;
+                };
+                let Some(surface) = WaylandSurfaceId::from_raw(raw) else {
+                    continue;
+                };
+                if !preview_surface_belongs_to(windows, surface, *owner) {
+                    continue;
+                }
+                let ShellLayerContent::Image {
+                    scene,
+                    content_version,
+                    alpha_mode,
+                    pixel_format,
+                    ..
+                } = source.content
+                else {
+                    continue;
+                };
+                let target = map_preview_rect(source.target, root.target, fitted);
+                let source_clip = source
+                    .clip
+                    .map(|r| map_preview_rect(r, root.target, fitted))
+                    .unwrap_or(fitted);
+                let Some(clip) =
+                    intersect_rect(source_clip, clip).and_then(|r| intersect_rect(r, fitted))
+                else {
+                    continue;
+                };
+                // The normal client layer is the only producer. Unchanged reads its retained,
+                // already-admitted image and cannot consume updates or create another upload.
+                layers.push(ShellLayer::image(
+                    ShellLayerKey::WindowPreview(self.id, index as u32, raw),
+                    scene,
+                    content_version,
+                    ShellImageUpdate::Unchanged,
+                    source.source_extent,
+                    target,
+                    Some(clip),
+                    alpha_mode,
+                    pixel_format,
+                    true,
+                ));
+            }
+        }
+        layers
+    }
+    fn hover_contains(&self, p: PointF) -> bool {
+        if self.inside_bounds(p) {
+            return true;
+        }
+        let ShellAttachment::Parent { rect, .. } = self.spec.placement.attachment else {
+            return false;
+        };
+        let Some(parent) = self.parent_bounds else {
+            return false;
+        };
+        let anchor = rect.unwrap_or(crate::core::RectF {
+            x: 0.0,
+            y: 0.0,
+            width: parent.width as f32,
+            height: parent.height as f32,
+        });
+        let x = parent.x as f32 + anchor.x;
+        let y = parent.y as f32 + anchor.y;
+        // Keep the attachment and connecting gap traversable, including a clamped popup.
+        let left = x.min(self.sampled.x as f32);
+        let top = y.min(self.sampled.y as f32);
+        let right = (x + anchor.width).max((self.sampled.x + self.sampled.width) as f32);
+        let bottom = (y + anchor.height).max((self.sampled.y + self.sampled.height) as f32);
+        p.x >= left && p.x < right && p.y >= top && p.y < bottom
     }
     pub fn reservation(&self) -> Option<(ShellEdge, i32)> {
         let ShellAttachment::Edge(edge) = self.spec.placement.attachment else {
@@ -310,6 +447,58 @@ impl WidgetLayer {
         self.layer.runtime.dismiss_shell_widget(reason)
     }
 }
+fn preview_surface_belongs_to(
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+    mut surface: WaylandSurfaceId,
+    owner: WaylandSurfaceId,
+) -> bool {
+    // Include subsurface content (e.g. video), but not separate toplevels or popup menus.
+    for _ in 0..=windows.len() {
+        if surface == owner {
+            return true;
+        }
+        let Some(window) = windows.get(&surface) else {
+            return false;
+        };
+        if window.role != SurfaceRole::Subsurface {
+            return false;
+        }
+        let Some(parent) = window.parent else {
+            return false;
+        };
+        surface = parent;
+    }
+    false
+}
+fn map_preview_rect(rect: RectI, source: RectI, target: RectI) -> RectI {
+    let sx = target.width as f64 / source.width.max(1) as f64;
+    let sy = target.height as f64 / source.height.max(1) as f64;
+    RectI {
+        x: target
+            .x
+            .saturating_add(((rect.x as f64 - source.x as f64) * sx).round() as i32),
+        y: target
+            .y
+            .saturating_add(((rect.y as f64 - source.y as f64) * sy).round() as i32),
+        width: (rect.width as f64 * sx).round().max(1.0) as i32,
+        height: (rect.height as f64 * sy).round().max(1.0) as i32,
+    }
+}
+fn fit_preview(source: SizeI, slot: RectI) -> Option<RectI> {
+    if source.width <= 0 || source.height <= 0 || slot.width <= 0 || slot.height <= 0 {
+        return None;
+    }
+    let scale =
+        (slot.width as f64 / source.width as f64).min(slot.height as f64 / source.height as f64);
+    let width = (source.width as f64 * scale).round().max(1.0) as i32;
+    let height = (source.height as f64 * scale).round().max(1.0) as i32;
+    Some(RectI {
+        x: slot.x + (slot.width - width) / 2,
+        y: slot.y + (slot.height - height) / 2,
+        width,
+        height,
+    })
+}
 fn outside(mut r: RectI, output: SizeI, edge: Option<ShellEdge>) -> RectI {
     match edge {
         Some(ShellEdge::Top) => r.y = -r.height,
@@ -356,6 +545,15 @@ pub(super) fn widget_pointer_motion(
                 .into_iter()
                 .find(|i| widgets[*i].contains(p))
         });
+    for w in widgets.iter_mut() {
+        if w.input_visible()
+            && w.spec.dismiss_on_pointer_leave
+            && !w.captured
+            && !w.hover_contains(p)
+        {
+            w.dismiss(ShellDismissReason::PointerLeft)?;
+        }
+    }
     for (i, w) in widgets.iter_mut().enumerate() {
         let local = if Some(i) == hit {
             w.local(p)
@@ -373,6 +571,30 @@ pub(super) fn widget_pointer_motion(
         w.layer.pointer_motion(local, now);
     }
     Ok(hit.is_some())
+}
+pub(super) fn widget_pointer_scroll(
+    widgets: &mut [WidgetLayer],
+    p: PointF,
+    delta: PointF,
+    now: MonotonicInstant,
+    locked: bool,
+) -> AppResult<bool> {
+    if locked {
+        return Ok(false);
+    }
+    let Some(i) = ordered(widgets)
+        .into_iter()
+        .find(|i| widgets[*i].contains(p))
+    else {
+        return Ok(false);
+    };
+    let w = &mut widgets[i];
+    w.layer.pointer_motion(w.local(p), now);
+    let event = crate::input::InputEvent::mouse_scroll(delta);
+    w.layer.runtime.shell_input(event.clone())?;
+    w.layer.runtime.queue_input(event);
+    w.layer.runtime.flush_input(now);
+    Ok(true)
 }
 pub(super) fn widget_pointer_button(
     widgets: &mut [WidgetLayer],
@@ -452,10 +674,13 @@ pub(super) fn widget_key(
     if locked {
         return Ok(false);
     }
-    let Some(i) = ordered(widgets)
-        .into_iter()
-        .find(|i| widgets[*i].focused && widgets[*i].spec.visible)
-    else {
+    let escape = event.logical_key
+        == crate::input::LogicalKey::Named(crate::input::NamedKey::Escape)
+        && event.state == crate::input::ButtonState::Pressed;
+    let Some(i) = ordered(widgets).into_iter().find(|i| {
+        widgets[*i].input_visible()
+            && (widgets[*i].focused || escape && widgets[*i].spec.dismiss_on_escape)
+    }) else {
         return Ok(false);
     };
     let w = &mut widgets[i];
@@ -704,7 +929,11 @@ mod tests {
             self.dismissals.set(self.dismissals.get() + 1);
         }
         fn input(&mut self, event: crate::input::InputEvent) -> bool {
-            if matches!(event, crate::input::InputEvent::PointerMoved { .. }) {
+            if matches!(
+                event,
+                crate::input::InputEvent::PointerMoved { .. }
+                    | crate::input::InputEvent::Scroll { .. }
+            ) {
                 self.dismissals.set(self.dismissals.get() + 1);
             }
             false
@@ -748,6 +977,272 @@ mod tests {
         )
         .unwrap();
         (layer, writer, dismissals)
+    }
+    #[test]
+    fn preview_slots_use_live_generations_include_subsurfaces_and_obey_lock() {
+        use super::super::client::maximize_preview_tests::test_window;
+        use crate::compose::ShellWindowPreview;
+        use std::num::NonZeroU32;
+        let id =
+            crate::shell::WindowId::new(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let root_id = WaylandSurfaceId::from_raw(10).unwrap();
+        let child_id = WaylandSurfaceId::from_raw(11).unwrap();
+        let root_rect = RectI {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 200,
+        };
+        let child_rect = RectI {
+            x: 200,
+            y: 150,
+            width: 100,
+            height: 50,
+        };
+        let mut root = test_window(
+            SizeI {
+                width: 400,
+                height: 200,
+            },
+            PointI { x: 100, y: 100 },
+        );
+        root.desktop_id = Some(id);
+        root.minimized = true;
+        let mut child = test_window(
+            SizeI {
+                width: 100,
+                height: 50,
+            },
+            PointI { x: 200, y: 150 },
+        );
+        child.backend = None;
+        child.role = SurfaceRole::Subsurface;
+        child.parent = Some(root_id);
+        let mut windows = BTreeMap::from([(root_id, root), (child_id, child)]);
+        let image = |raw, rect: RectI| {
+            ShellLayer::image(
+                ShellLayerKey::Surface(raw),
+                ShellSceneKey::Surface(raw),
+                1,
+                ShellImageUpdate::Unchanged,
+                SizeI {
+                    width: rect.width,
+                    height: rect.height,
+                },
+                rect,
+                None,
+                ImageAlphaMode::Opaque,
+                ImagePixelFormat::Rgba8,
+                false,
+            )
+        };
+        let sources = vec![image(10, root_rect), image(11, child_rect)];
+        let (widget, _, _) = fixture(
+            ShellSurfaceSpec::new().placement(
+                WidgetPlacement::positioned(PointF { x: 20.0, y: 20.0 })
+                    .width(300.0)
+                    .height(200.0),
+            ),
+        );
+        let slot = crate::core::RectF {
+            x: 10.0,
+            y: 10.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        *widget.binding.2.borrow_mut() = vec![ShellWindowPreview::new(id, slot)];
+        let preview = widget.preview_layers(&windows, &sources, false);
+        assert_eq!(preview.len(), 2);
+        assert_eq!(
+            preview[0].target,
+            RectI {
+                x: 30,
+                y: 30,
+                width: 200,
+                height: 100
+            }
+        );
+        assert_eq!(
+            preview[1].target,
+            RectI {
+                x: 80,
+                y: 55,
+                width: 50,
+                height: 25
+            }
+        );
+        assert!(preview.iter().all(|p| p.visible
+            && matches!(
+                p.content,
+                ShellLayerContent::Image {
+                    update: ShellImageUpdate::Unchanged,
+                    ..
+                }
+            )));
+        assert!(widget.preview_layers(&windows, &sources, true).is_empty());
+        windows.get_mut(&child_id).unwrap().role = SurfaceRole::XdgPopup;
+        assert_eq!(widget.preview_layers(&windows, &sources, false).len(), 1);
+        windows.get_mut(&root_id).unwrap().desktop_id = Some(crate::shell::WindowId::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+        ));
+        assert!(widget.preview_layers(&windows, &sources, false).is_empty());
+        windows.get_mut(&root_id).unwrap().desktop_id = Some(id);
+        widget.binding.2.borrow_mut()[0].rect.x = f32::NAN;
+        assert!(widget.preview_layers(&windows, &sources, false).is_empty());
+        widget.binding.2.borrow_mut()[0].rect = crate::core::RectF {
+            width: 1000.0,
+            ..slot
+        };
+        assert!(widget.preview_layers(&windows, &sources, false).is_empty());
+    }
+    #[test]
+    fn changing_only_preview_slots_requests_a_new_frame() {
+        use std::num::NonZeroU32;
+        let (mut widget, _, _) = fixture(
+            ShellSurfaceSpec::new().placement(WidgetPlacement::center().width(300.0).height(200.0)),
+        );
+        widget.scene(false);
+        *widget.binding.2.borrow_mut() = vec![crate::compose::ShellWindowPreview::new(
+            crate::shell::WindowId::new(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap()),
+            crate::core::RectF {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 80.0,
+            },
+        )];
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 1)
+            .unwrap();
+        assert!(widget.dirty());
+        widget.scene(false);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 2)
+            .unwrap();
+        assert!(!widget.dirty());
+        widget.binding.2.borrow_mut()[0].rect.x = 20.0;
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 3)
+            .unwrap();
+        assert!(widget.dirty());
+    }
+    #[test]
+    fn hover_popup_keeps_anchor_and_gap_then_dismisses_outside() {
+        let spec = ShellSurfaceSpec::new()
+            .placement(
+                WidgetPlacement::attached_to(
+                    crate::core::RectF {
+                        x: 30.0,
+                        y: 0.0,
+                        width: 40.0,
+                        height: 48.0,
+                    },
+                    ShellEdge::Top,
+                )
+                .width(224.0)
+                .height(160.0)
+                .offset(0.0, -8.0),
+            )
+            .pointer(ShellPointer::Surface)
+            .dismiss_on_pointer_leave(true);
+        let (mut widget, _, dismissals) = fixture(spec);
+        widget.parent = Some(1);
+        widget.parent_bounds = Some(RectI {
+            x: 0,
+            y: 552,
+            width: 800,
+            height: 48,
+        });
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 1)
+            .unwrap();
+        assert!(widget.hover_contains(PointF { x: 45.0, y: 565.0 }));
+        assert!(widget.hover_contains(PointF { x: 45.0, y: 548.0 }));
+        assert!(widget.hover_contains(PointF { x: 45.0, y: 400.0 }));
+        assert!(!widget.hover_contains(PointF { x: 700.0, y: 300.0 }));
+        let before = dismissals.get();
+        widget_pointer_motion(
+            std::slice::from_mut(&mut widget),
+            PointF { x: 700.0, y: 300.0 },
+            MonotonicInstant::from_nanos(2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(dismissals.get(), before + 1);
+    }
+    #[test]
+    fn scroll_routes_only_to_hit_shell_and_never_while_locked() {
+        let (widget, _, count) = fixture(
+            ShellSurfaceSpec::new()
+                .placement(
+                    WidgetPlacement::positioned(PointF { x: 20.0, y: 20.0 })
+                        .width(200.0)
+                        .height(150.0),
+                )
+                .pointer(ShellPointer::Surface),
+        );
+        let mut widgets = vec![widget];
+        let now = MonotonicInstant::from_nanos(1);
+        let p = PointF { x: 50.0, y: 50.0 };
+        assert!(
+            widget_pointer_scroll(&mut widgets, p, PointF { x: 0.0, y: 15.0 }, now, false).unwrap()
+        );
+        assert_eq!(count.get(), 1);
+        assert!(
+            !widget_pointer_scroll(&mut widgets, p, PointF { x: 0.0, y: 15.0 }, now, true).unwrap()
+        );
+        assert!(
+            !widget_pointer_scroll(
+                &mut widgets,
+                PointF { x: 500.0, y: 500.0 },
+                PointF::default(),
+                now,
+                false
+            )
+            .unwrap()
+        );
+        assert_eq!(count.get(), 1);
+    }
+    #[test]
+    fn preview_fits_portrait_and_landscape_without_stretching() {
+        let slot = RectI {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 100,
+        };
+        assert_eq!(
+            fit_preview(
+                SizeI {
+                    width: 100,
+                    height: 200
+                },
+                slot
+            ),
+            Some(RectI {
+                x: 85,
+                y: 20,
+                width: 50,
+                height: 100
+            })
+        );
+        assert_eq!(
+            fit_preview(
+                SizeI {
+                    width: 400,
+                    height: 100
+                },
+                slot
+            ),
+            Some(RectI {
+                x: 10,
+                y: 45,
+                width: 200,
+                height: 50
+            })
+        );
+        assert_eq!(fit_preview(SizeI::default(), slot), None);
     }
     #[test]
     fn reactive_geometry_keeps_component_identity_and_retargets_motion() {
@@ -1172,6 +1667,7 @@ mod taskbar_context_tests {
     }
     fn window(slot: u32) -> ShellWindow {
         ShellWindow {
+            preview_size: None,
             id: crate::shell::WindowId::new(
                 NonZeroU32::new(slot).unwrap(),
                 NonZeroU32::new(1).unwrap(),
@@ -1294,6 +1790,7 @@ mod icon_publication_tests {
     fn icon_published_during_view_is_in_the_same_delta_as_its_draw() {
         let host = Rc::new(crate::compose::shell_services::ShellServiceHost::new());
         let mut window = ShellWindow {
+            preview_size: None,
             id: crate::shell::WindowId::new(
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU32::new(1).unwrap(),

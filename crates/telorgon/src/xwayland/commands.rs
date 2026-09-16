@@ -205,7 +205,7 @@ mod tests {
                     &Completion::Error(
                         RequestId {
                             generation: 1,
-                            sequence: 41
+                            sequence: 42
                         },
                         3
                     ),

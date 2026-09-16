@@ -19,7 +19,7 @@ pub(crate) mod shell_widget;
 pub use shell_widget::{
     ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
     ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-    ShellWidget, WidgetPlacement,
+    ShellWidget, ShellWindowPreview, WidgetPlacement,
 };
 pub mod style;
 

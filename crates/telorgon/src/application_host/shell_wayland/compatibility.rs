@@ -105,6 +105,12 @@ impl Compatibility {
             focus_result: None,
         })
     }
+    pub(super) fn take_minimize_requests(&mut self) -> Vec<u64> {
+        self.xwm
+            .as_mut()
+            .map(Xwm::take_minimize_requests)
+            .unwrap_or_default()
+    }
     pub(super) fn take_maximize_requests(&mut self) -> Vec<(u64, u32)> {
         self.xwm
             .as_mut()
@@ -895,7 +901,7 @@ fn raise_family(
     windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
     stacking: &mut Vec<WaylandSurfaceId>,
 ) -> bool {
-    let family: Vec<_> = stacking
+    let mut family: Vec<_> = stacking
         .iter()
         .copied()
         .filter(|candidate| {
@@ -912,6 +918,15 @@ fn raise_family(
             false
         })
         .collect();
+    // Minimize removes the owner from stacking. Restore must put it back,
+    // below any retained descendants, before raising the family.
+    if !family.contains(&surface)
+        && windows
+            .get(&surface)
+            .is_some_and(|window| !window.minimized)
+    {
+        family.insert(0, surface);
+    }
     if stacking.ends_with(&family) {
         return false;
     }
@@ -1059,5 +1074,44 @@ mod raise_tests {
         assert!(raise_family(ids[0], &windows, &mut order));
         assert_eq!(order, [ids[3], ids[0], ids[1], ids[2]]);
         assert!(!raise_family(ids[0], &windows, &mut order));
+    }
+
+    #[test]
+    fn restoring_minimized_owner_reinserts_it_below_retained_children() {
+        let ids = [10, 11, 12].map(|raw| WaylandSurfaceId::from_raw(raw).unwrap());
+        let mut windows = BTreeMap::new();
+        for id in ids {
+            windows.insert(
+                id,
+                test_window(
+                    SizeI {
+                        width: 100,
+                        height: 100,
+                    },
+                    PointI::default(),
+                ),
+            );
+        }
+        windows.get_mut(&ids[0]).unwrap().role = SurfaceRole::Xwayland;
+        windows.get_mut(&ids[1]).unwrap().parent = Some(ids[0]);
+        for has_child in [false, true] {
+            let mut order = if has_child {
+                vec![ids[1], ids[2]]
+            } else {
+                vec![ids[2]]
+            };
+            windows.get_mut(&ids[0]).unwrap().minimized = true;
+            // Taskbar activation clears minimized before the checked X11 focus completes.
+            windows.get_mut(&ids[0]).unwrap().minimized = false;
+            assert!(raise_family(ids[0], &windows, &mut order));
+            let expected = if has_child {
+                vec![ids[2], ids[0], ids[1]]
+            } else {
+                vec![ids[2], ids[0]]
+            };
+            assert_eq!(order, expected);
+            assert!(!raise_family(ids[0], &windows, &mut order));
+            assert_eq!(order, expected);
+        }
     }
 }

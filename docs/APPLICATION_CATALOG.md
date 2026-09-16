@@ -83,6 +83,10 @@ components, or obtained through `applications.icon(&id)`. For explicit sizing:
 applications.resolve_icon(&id, IconRequest::new().logical_size(48).scale(output_scale))
 ```
 
+For window icons, `windows.resolve_icon(id, IconRequest::new().logical_size(44))` requests
+catalog artwork at the rendered size and output scale. Client-supplied X11 and Wayland icons
+retain the largest available variant so larger taskbar buttons do not upscale a 32-pixel image.
+
 The default application-icon raster request is 32 logical units at the host's output scale. Explicit
 requests are capped at 256 physical pixels. Named icon lookup honors the configured theme's directories,
 size ranges, scale, inheritance, hicolor fallback, and unthemed icon/pixmap paths. The default theme is
@@ -103,11 +107,14 @@ and joined at environment shutdown.
 
 ## Test compositor
 
-The taskbar renders one icon button per managed window, keyed by WindowId. App names/window titles
-remain accessible labels; the active window has a distinct button background. Clicking an active
-window minimizes it; another entry activates/restores it. There are no Move panel or Search buttons.
-The existing search component also uses ShellContext. Grouping, pinning, application launching, and
-virtual shells remain outside this change.
+The taskbar renders one icon per resolved application (raw identity fallback, isolated unknown
+windows). Hover opens fixed-size client previews and switches to a scrollable title list when the
+row would exceed 92% of the output width. See [Shell widgets](SHELL_WIDGETS.md) for the preview API.
+App names/window titles remain accessible labels; active groups have a distinct icon background.
+Clicking a single-window icon toggles minimize/restore; clicking a grouped icon opens the picker.
+Selecting a picker entry restores and activates that window. There are no Move panel or Search
+buttons or window-search component. Pinning, application launching, and virtual shells remain
+outside this change.
 
 ## Evidence and limits
 

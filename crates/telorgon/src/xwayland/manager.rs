@@ -758,7 +758,7 @@ mod tests {
         write_reply(
             peer,
             &xproto::GetInputFocusReply {
-                sequence: 46,
+                sequence: 47,
                 ..Default::default()
             }
             .serialize(),
@@ -769,7 +769,7 @@ mod tests {
             peer,
             &xproto::PropertyNotifyEvent {
                 response_type: xproto::PROPERTY_NOTIFY_EVENT | if synthetic { 128 } else { 0 },
-                sequence: 46,
+                sequence: 47,
                 window: manager.window,
                 atom: manager.discovered.atoms["_NET_WM_NAME"],
                 time: 123,
@@ -886,7 +886,7 @@ mod tests {
     #[test]
     fn composite_barrier_is_required_even_with_timestamp_and_free_selections() {
         let (mut manager, mut peer, now) = start();
-        for sequence in [43, 44] {
+        for sequence in [44, 45] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -907,7 +907,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 46,
+                sequence: 47,
                 ..Default::default()
             }
             .serialize(),
@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn composite_conflict_fails_before_selection_acquisition() {
         let (mut manager, mut peer, now) = start();
-        for sequence in [43, 44] {
+        for sequence in [44, 45] {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
@@ -933,7 +933,7 @@ mod tests {
         }
         let mut error = [0u8; 32];
         error[1] = 10; // BadAccess: another client owns manual redirection.
-        error[2..4].copy_from_slice(&45u16.to_ne_bytes());
+        error[2..4].copy_from_slice(&46u16.to_ne_bytes());
         error[8..10].copy_from_slice(&2u16.to_ne_bytes());
         error[10] = 128;
         write_reply(&mut peer, &error);
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn metadata_error_prevents_completion() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 43, 0);
+        owners(&mut peer, 44, 0);
         timestamp(&manager, &mut peer, false);
         pump(&mut manager, now);
         for (index, opcode) in [22, 23, 22, 23].into_iter().enumerate() {
@@ -955,7 +955,7 @@ mod tests {
                 write_reply(
                     &mut peer,
                     &xproto::GetSelectionOwnerReply {
-                        sequence: 47 + index as u16,
+                        sequence: 48 + index as u16,
                         owner: manager.window,
                         ..Default::default()
                     }
@@ -968,7 +968,7 @@ mod tests {
         assert!(!manager.is_complete());
         let mut error = [0u8; 32];
         error[1] = 3; // BadWindow on the first metadata write.
-        error[2..4].copy_from_slice(&50u16.to_ne_bytes());
+        error[2..4].copy_from_slice(&51u16.to_ne_bytes());
         error[10] = 18;
         write_reply(&mut peer, &error);
         assert!(manager.dispatch(now).is_err());
@@ -977,7 +977,7 @@ mod tests {
     #[test]
     fn ownership_requires_timestamp_verification_and_checked_announcements() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 43, 0);
+        owners(&mut peer, 44, 0);
         pump(&mut manager, now);
         assert!(!manager.claiming);
         timestamp(&manager, &mut peer, true);
@@ -1001,7 +1001,7 @@ mod tests {
             write_reply(
                 &mut peer,
                 &xproto::GetSelectionOwnerReply {
-                    sequence: 48 + index as u16 * 2,
+                    sequence: 49 + index as u16 * 2,
                     owner: manager.window,
                     ..Default::default()
                 }
@@ -1044,7 +1044,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetInputFocusReply {
-                sequence: 61,
+                sequence: 62,
                 ..Default::default()
             }
             .serialize(),
@@ -1056,7 +1056,7 @@ mod tests {
             &mut peer,
             &xproto::SelectionClearEvent {
                 response_type: xproto::SELECTION_CLEAR_EVENT,
-                sequence: 61,
+                sequence: 62,
                 time: 124,
                 owner: manager.window,
                 selection: manager.selections[0],
@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn existing_owner_is_not_replaced_and_failure_is_terminal() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 43, 999);
+        owners(&mut peer, 44, 999);
         assert!(manager.dispatch(now).is_err());
         assert!(!manager.claiming);
         assert!(manager.dispatch(now).is_err());
@@ -1085,7 +1085,7 @@ mod tests {
     #[test]
     fn missing_timestamp_hits_original_startup_deadline() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 43, 0);
+        owners(&mut peer, 44, 0);
         pump(&mut manager, now);
         assert!(manager.dispatch(manager.deadline()).is_err());
         assert!(!manager.is_complete());
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn lost_claim_cannot_reach_announcements() {
         let (mut manager, mut peer, now) = start();
-        owners(&mut peer, 43, 0);
+        owners(&mut peer, 44, 0);
         timestamp(&manager, &mut peer, false);
         pump(&mut manager, now);
         for opcode in [22, 23, 22, 23] {
@@ -1102,7 +1102,7 @@ mod tests {
         write_reply(
             &mut peer,
             &xproto::GetSelectionOwnerReply {
-                sequence: 48,
+                sequence: 49,
                 owner: 999,
                 ..Default::default()
             }

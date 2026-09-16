@@ -40,6 +40,16 @@ is bounded to [-100, 100] and frequency to [0.1, 1000]; invalid/nonfinite builde
 (including during const evaluation). This version implements the specification's underdamped
 regime, not critical or overdamped springs. `settle_within_ms(0)` is immediate.
 
+Optional `Spring::new().easing(Easing::EaseInOut)` shapes the spring's elapsed time over
+its settling interval, keeping its damping and oscillation. `Linear` is the default and preserves
+existing physical sampling. `EaseIn` and `EaseInOut` start at zero actual velocity; the configured
+initial velocity remains the velocity in spring time. `EaseOut` starts at three times that velocity.
+The sampled velocity includes the time-curve derivative. Mid-flight retargets that inherit velocity
+use linear spring time to preserve position and momentum instead of restarting the ease-in.
+This is a time-shaped spring, not a change to the physical damping model. The cutoff can still snap
+if the spring has not settled. CPU tests cover the derivative, eased overshoot, zero duration, and
+interrupted-motion continuity; live appearance remains user-qualified.
+
 The cutoff is measured after the entry fade and forces exact destination geometry and zero velocity.
 It does not stretch the spring curve to fit a duration. Short cutoffs or highly oscillatory settings
 can therefore snap at the end. The default entry fade adds 50 ms before movement; app readiness can

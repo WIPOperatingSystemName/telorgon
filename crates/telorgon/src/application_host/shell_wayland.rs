@@ -541,6 +541,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         services,
         (32.0 * output_scale.get()).ceil() as u32,
     );
+    widget_services.publish_output_size(SizeF {
+        width: extent.width as f32,
+        height: extent.height as f32,
+    });
     let mut widgets = widgets
         .into_iter()
         .enumerate()
@@ -688,7 +692,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             .get(&1)
             .and_then(|s| s.keyboard_focus)
             .map(|f| f.surface)
-            .or(widget_saved_focus);
+            .and_then(|surface| window_backend::focus_owner(&windows, surface))
+            .filter(|surface| windows.get(surface).is_some_and(|w| !w.minimized));
         widget_services.publish(
             windows
                 .iter()
@@ -696,6 +701,12 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     w.backend?;
                     let id = w.desktop_id?;
                     Some(crate::compose::ShellWindow {
+                        preview_size: (w.presentation.size.width > 0
+                            && w.presentation.size.height > 0)
+                            .then_some(SizeF {
+                                width: w.presentation.size.width as f32,
+                                height: w.presentation.size.height as f32,
+                            }),
                         id,
                         application_id: None,
                         application_identity: wayland
@@ -709,12 +720,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             .and_then(|icon| {
                                 icon.images
                                     .iter()
-                                    .min_by_key(|i| {
-                                        i.image
-                                            .descriptor
-                                            .size
-                                            .width
-                                            .abs_diff((32.0 * output_scale.get()).ceil() as i32)
+                                    .max_by_key(|i| {
+                                        let size = i.image.descriptor.size;
+                                        size.width.min(size.height)
                                     })
                                     .and_then(|image| {
                                         let mut resource = shm_image_resource(
@@ -791,10 +799,18 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     } else if !stacking_order.contains(&surface) {
                         stacking_order.push(surface);
                     }
-                    if value && active_window == Some(surface) {
-                        wayland
-                            .set_keyboard_focus(1, None, display.next_serial())
-                            .map_err(app_error)?;
+                    if value {
+                        window_backend::unfocus_minimized(
+                            &display,
+                            &mut wayland,
+                            &windows,
+                            &mut configure_scheduler,
+                            &mut stacking_order,
+                            &mut widget_saved_focus,
+                            surface,
+                            #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                            compatibility.as_mut(),
+                        )?;
                     }
                     Ok(())
                 }
@@ -1437,6 +1453,20 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                                 .retain(|candidate| *candidate != surface);
                                             pointer_scene_dirty = true;
                                         }
+                                        window_backend::unfocus_minimized(
+                                            &display,
+                                            &mut wayland,
+                                            &windows,
+                                            &mut configure_scheduler,
+                                            &mut stacking_order,
+                                            &mut widget_saved_focus,
+                                            surface,
+                                            #[cfg(all(
+                                                feature = "shell-xwayland",
+                                                target_env = "gnu"
+                                            ))]
+                                            compatibility.as_mut(),
+                                        )?;
                                     }
                                     DecorationHit::ShellAction(action) => {
                                         invoke_shell_action(
@@ -1566,7 +1596,25 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     serial,
                                 )
                                 .map_err(app_error)?;
-                            if pressed && seat_pointer_focus.is_some() {
+                            let empty_desktop = !session_locked
+                                && seat_pointer_focus.is_none()
+                                && !wayland.drag_active(1)
+                                && hit_test_decoration(
+                                    &windows,
+                                    &stacking_order,
+                                    pointer_position,
+                                    &config,
+                                    &icon_layers,
+                                )
+                                .is_none();
+                            if pressed && (seat_pointer_focus.is_some() || empty_desktop) {
+                                if empty_desktop {
+                                    widget_saved_focus = None;
+                                    widget_focus_active = false;
+                                    for widget in &mut widgets {
+                                        widget.focused = false;
+                                    }
+                                }
                                 window_backend::focus(
                                     &display,
                                     &mut wayland,
@@ -1733,7 +1781,18 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         discrete_x,
                         discrete_y,
                     } => {
-                        if pointer_focus.is_some() {
+                        if widget_pointer_scroll(
+                            &mut widgets,
+                            pointer_position,
+                            PointF {
+                                x: horizontal as f32,
+                                y: vertical as f32,
+                            },
+                            schedule_now,
+                            session_locked,
+                        )? {
+                            repaint = true;
+                        } else if pointer_focus.is_some() {
                             let _ = wayland.pointer_axis(
                                 1, time, horizontal, vertical, discrete_x, discrete_y,
                             );
@@ -2073,6 +2132,32 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         latency_trace.phase("window_requests");
         #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
         if let Some(host) = &mut compatibility {
+            for raw in host.take_minimize_requests() {
+                let Some(surface) = u32::try_from(raw).ok().and_then(WaylandSurfaceId::from_raw)
+                else {
+                    continue;
+                };
+                if session_locked || window_interaction.is_some() {
+                    continue;
+                }
+                let Some(window) = windows.get_mut(&surface) else {
+                    continue;
+                };
+                window.minimized = true;
+                stacking_order.retain(|candidate| *candidate != surface);
+                window_backend::unfocus_minimized(
+                    &display,
+                    &mut wayland,
+                    &windows,
+                    &mut configure_scheduler,
+                    &mut stacking_order,
+                    &mut widget_saved_focus,
+                    surface,
+                    Some(host),
+                )?;
+                pointer_scene_dirty = true;
+                repaint = true;
+            }
             for (raw, action) in host.take_maximize_requests() {
                 let Some(surface) = u32::try_from(raw).ok().and_then(WaylandSurfaceId::from_raw)
                 else {
@@ -2685,6 +2770,17 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         pointer_scene_dirty = true;
                         repaint = true;
                     }
+                    window_backend::unfocus_minimized(
+                        &display,
+                        &mut wayland,
+                        &windows,
+                        &mut configure_scheduler,
+                        &mut stacking_order,
+                        &mut widget_saved_focus,
+                        surface,
+                        #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                        compatibility.as_mut(),
+                    )?;
                 }
                 CompositorAction::SessionLockRequested(lock) => {
                     shortcut_keys.suppress_held();

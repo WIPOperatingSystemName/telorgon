@@ -46,6 +46,7 @@ const ATOMS: &[&str] = &[
     "_NET_WM_STATE_MAXIMIZED_VERT",
     "_NET_WM_STATE_MAXIMIZED_HORZ",
     "_NET_WM_ICON",
+    "WM_CHANGE_STATE",
 ];
 const EXTENSIONS: &[&str] = &["Composite", "XFIXES", "SHAPE", "RANDR", "SYNC"];
 const DEADLINE: Duration = Duration::from_secs(10);

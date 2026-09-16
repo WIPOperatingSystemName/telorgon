@@ -255,16 +255,19 @@ impl ApplicationCatalogHandle {
         )
     }
     pub fn resolve_icon(&self, id: &ApplicationId, request: IconRequest) -> ImageSource {
+        self.get(id).and_then(|a| a.icon).map_or_else(
+            || context::bind_image(fallback_image()),
+            |icon| self.resolve_named_icon(&icon.0, request),
+        )
+    }
+    pub(crate) fn resolve_named_icon(&self, name: &str, request: IconRequest) -> ImageSource {
         let scale = request
             .scale
             .map_or(self.raster_size as f32 / 32.0, |s| s.get());
         let size = (request.logical_size as f32 * scale)
             .ceil()
             .clamp(1.0, 256.0) as u32;
-        self.get(id).and_then(|a| a.icon).map_or_else(
-            || context::bind_image(fallback_image()),
-            |icon| self.icon_named_at(&icon.0, size),
-        )
+        self.icon_named_at(name, size)
     }
     pub(crate) fn icon_named(&self, name: &str) -> ImageSource {
         self.icon_named_at(name, self.raster_size)

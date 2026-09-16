@@ -33,6 +33,7 @@ pub(crate) fn fixture() -> (Xwm, UnixStream, Instant, XWindow) {
         frame_extents: BTreeMap::new(),
         move_resize_requests: Vec::new(),
         maximize_requests: Vec::new(),
+        minimize_requests: Vec::new(),
         maximized: BTreeMap::new(),
         discovered,
         _ids: IdAllocator::new(0x200000, 0x1fffff).unwrap(),
@@ -363,4 +364,70 @@ fn maximize_state_wire_reports_both_axes_and_restore_and_coalesces() {
 
 pub(crate) fn wire_request(peer: &mut UnixStream) -> Vec<u8> {
     request(peer)
+}
+
+#[test]
+fn minimize_requests_validate_and_reject_stale_associations() {
+    let (mut xwm, mut peer, now, id) = fixture();
+    let (state, sequence) = match &xwm.phase {
+        Some(Phase::Tracking(t)) => (
+            t.discovered.atoms["WM_CHANGE_STATE"],
+            t.requests.last_sequence() as u16,
+        ),
+        _ => unreachable!(),
+    };
+    for (format, target, data, expected) in [
+        (32, id.xid, [3, 0, 0, 0, 0], 1),
+        (8, id.xid, [3, 0, 0, 0, 0], 1),
+        (32, 999, [3, 0, 0, 0, 0], 1),
+        (32, id.xid, [1, 0, 0, 0, 0], 1),
+        (32, id.xid, [0, 0, 0, 0, 0], 1),
+    ] {
+        let event: [u8; 32] = xproto::ClientMessageEvent {
+            response_type: xproto::CLIENT_MESSAGE_EVENT | 0x80,
+            format,
+            sequence,
+            window: target,
+            type_: state,
+            data: data.into(),
+        }
+        .into();
+        peer.write_all(&event).unwrap();
+        drive(&mut xwm, now);
+        match &xwm.phase {
+            Some(Phase::Tracking(t)) => assert_eq!(t.minimize_requests.len(), expected),
+            _ => unreachable!(),
+        }
+    }
+    // Authenticate the Wayland association before consuming requests.
+    let serial_atom = match &xwm.phase {
+        Some(Phase::Tracking(t)) => t.discovered.atoms["WL_SURFACE_SERIAL"],
+        _ => unreachable!(),
+    };
+    let event: [u8; 32] = xproto::ClientMessageEvent {
+        response_type: xproto::CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence,
+        window: id.xid,
+        type_: serial_atom,
+        data: [123, 0, 0, 0, 0].into(),
+    }
+    .into();
+    xwm.windows.as_mut().unwrap().event(&event).unwrap();
+    xwm.windows
+        .as_mut()
+        .unwrap()
+        .committed_surface(1, 50, 123)
+        .unwrap();
+    assert_eq!(xwm.take_minimize_requests(), vec![50]);
+    assert!(xwm.take_minimize_requests().is_empty());
+    if let Some(Phase::Tracking(t)) = &mut xwm.phase {
+        t.minimize_requests.push(id);
+    }
+    xwm.windows
+        .as_mut()
+        .unwrap()
+        .destroy_surface(1, 50)
+        .unwrap();
+    assert!(xwm.take_minimize_requests().is_empty());
 }

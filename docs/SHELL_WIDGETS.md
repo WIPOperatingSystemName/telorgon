@@ -111,7 +111,72 @@ The environment's `.service(adapter)` installs additional typed services, resolv
 without putting those operations in a surface descriptor. Missing services return Unavailable.
 This change does not implement native audio/brightness adapters, a notification daemon, tray
 protocols, or screenshot readback. Capture adapters must explicitly define whether shell overlays
-are included. The test compositor demonstrates window search, not an application index or IME editor.
+are included. The test compositor demonstrates grouped taskbar icons and a hover window picker.
+
+## Window preview slots and hover popups
+
+`ShellContext::output_size()` returns the selected host output's logical extent. Views subscribe to
+it just like cached window metadata, so responsive widget layout does not read native monitor handles.
+The current host still selects one output; this is not a multi-monitor extension.
+
+A widget can return `Vec<ShellWindowPreview>` from `window_previews()`. Each entry contains a live
+managed `WindowId` and a rectangle in the widget's local logical coordinates. The rectangle must fit
+entirely within the surface and contain finite positive dimensions. The host presents at most the
+first 64 entries, aspect-fits the client's retained scene and subsurfaces into each slot, and clips to
+the slot and surface. Slots follow the surface's sampled geometry during animation. They draw above
+that widget's UI; leave the preview area clear of captions and controls. Buttons under the slots
+remain the input targets. No input is forwarded to the depicted application.
+
+```rust,ignore
+fn window_previews(&self) -> Vec<ShellWindowPreview> {
+    vec![ShellWindowPreview::new(self.window, RectF {
+        x: 8.0, y: 40.0, width: 216.0, height: 128.0,
+    })]
+}
+```
+
+The normal client layer remains the only scene/image producer. Previews add placements referencing
+its admitted content, without screenshot readback, a second import, or a second upload. Visible
+clients update their previews as their retained content changes. Minimized clients show the last
+retained content; they are not resumed just for hover. Stale generations, destroyed windows, and
+unready content produce no preview draw. Widget slots never draw while session-locked. Server-side
+frames and separate popup menus are not included; the widget supplies its own caption/header.
+
+`dismiss_on_pointer_leave(true)` requests `PointerLeft` when the pointer leaves a popup and its
+attachment anchor/connecting gap. Hover does not take keyboard focus. Escape can dismiss the topmost
+visible surface requesting Escape dismissal even without keyboard focus. Mouse-wheel input is now
+routed to the hit shell widget before clients. `ShellWidget::input(InputEvent::Scroll { .. })` can
+implement a bounded list, while retained UI still receives scroll input.
+
+The test taskbar groups by resolved application ID, falling back to the raw application identity;
+windows with neither identity remain separate. Hover or clicking a multiple-window icon opens the
+picker. Its previews target a shared height of 128 logical units, with each card's width derived from
+`ShellWindow::preview_size` and capped at 320 units. Very wide content scales down proportionally
+within that cap; unknown sizes use a 216-unit fallback. Cards have no outer panel padding or gaps.
+The panel grows up to 92% of the
+output width, then switches to a title list with wheel scrolling and up/down controls. Selecting a
+card/list entry restores and activates it; the close button requests closing just that window.
+Outside press, Escape, and leaving the hover region dismiss the picker. A single-window icon keeps
+the existing minimize/restore toggle.
+
+### Preview implementation audit
+
+The adjacent `../other-rendering-libs` directory was unavailable for this change. No comparison of
+its source implementations is claimed. This change safely reuses Telorgon's existing retained scene
+placement and lifetime contracts: `shell_wayland/scene.rs` (`ImageScene`, `ShellComposition`, damage
+fanout), `renderer/vulkan.rs` (retained scene/materialization ownership), and `widgets.rs` (child
+surface lifetime and geometry). No GPU synchronization, external-image import, shader, or backend
+resource-lifetime code changed. A new graphics mechanism was deliberately avoided.
+
+The visual reference was the [Windows 11 thumbnail screenshot](https://image.itmedia.co.jp/ait/articles/2209/09/wi-win11taskbarlist01.png)
+from [this taskbar article](https://atmarkit.itmedia.co.jp/ait/articles/2209/09/news027.html).
+[Microsoft's DWM thumbnail contract](https://learn.microsoft.com/en-us/windows/win32/dwm/thumbnail-ovw)
+describes source/destination thumbnail relationships. It informed the visual-only slot boundary;
+Telorgon does not adopt DWM's API. Rejected alternatives were CPU screenshot copies and waking
+minimized applications to draw previews. Headless tests cover shared scene reuse without another
+upload, no unready-image draws, retained Vulkan delta validity, generational IDs, subsurface mapping,
+lock hiding, hover handoff, scroll routing, fixed card sizing and overflow thresholds. Hardware
+appearance and native pointer feel still require the user-run checks below.
 
 ## Reference audit
 
@@ -135,8 +200,11 @@ ownership, barriers, shaders, or graphics API contracts; no graphics specificati
 
 ## Manual verification
 
-Run the test compositor yourself on the normal test setup. Verify wallpaper under windows, taskbar
-buttons activating/restoring/minimizing windows, maximized windows respecting the panel, Move panel
-animating between edges, Search windows opening with keyboard focus and filtering titles, and Escape
-or outside press restoring client focus. Check click geometry during motion and session lock hiding
-all ordinary widgets. Hardware-presenting applications are intentionally not launched by the agent.
+Run the test compositor yourself on the normal test setup. Open several windows from one application
+and one from another. Verify one icon per application, hover thumbnails, aspect-ratio preservation,
+and single-click restoration after using the window's minimize button. Move from the icon across the
+gap into the picker; verify it stays open and closes after leaving, outside-clicking, or Escape.
+Open enough windows to exceed the 92% threshold, scroll the title list and select its last entry.
+Close windows while the picker is open. Repeat with native Wayland and Xwayland applications and at
+HiDPI. Check that session lock hides every ordinary widget and preview. Hardware-presenting
+applications are intentionally not launched by the agent.

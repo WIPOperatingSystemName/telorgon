@@ -383,7 +383,7 @@ mod tests {
         reply(
             peer,
             xproto::GetWindowAttributesReply {
-                sequence: 41,
+                sequence: 42,
                 class: xproto::WindowClass::INPUT_OUTPUT,
                 map_state: xproto::MapState::VIEWABLE,
                 override_redirect: true,
@@ -394,7 +394,7 @@ mod tests {
         reply(
             peer,
             xproto::GetGeometryReply {
-                sequence: 42,
+                sequence: 43,
                 root: 1,
                 width: 640,
                 height: 480,
@@ -407,7 +407,7 @@ mod tests {
         reply(
             peer,
             xproto::QueryTreeReply {
-                sequence: 43,
+                sequence: 44,
                 root: 1,
                 parent: 1,
                 children: vec![],
@@ -460,7 +460,7 @@ mod tests {
         reply(
             peer,
             xproto::QueryTreeReply {
-                sequence: 41,
+                sequence: 42,
                 root: 1,
                 parent: 0,
                 children,
@@ -489,7 +489,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::GetWindowAttributesReply {
-                sequence: 42,
+                sequence: 43,
                 class: xproto::WindowClass::INPUT_OUTPUT,
                 map_state: xproto::MapState::VIEWABLE,
                 ..Default::default()
@@ -499,7 +499,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::GetGeometryReply {
-                sequence: 43,
+                sequence: 44,
                 root: 1,
                 width: 640,
                 height: 480,
@@ -510,7 +510,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::QueryTreeReply {
-                sequence: 44,
+                sequence: 45,
                 root: 1,
                 parent: 1,
                 ..Default::default()
@@ -563,7 +563,7 @@ mod tests {
         assert!(!i.enumeration_complete());
         // Replies for one disappearing child free exactly three request slots.
         t.dispatch().unwrap();
-        for sequence in [42u16, 43, 44] {
+        for sequence in [43u16, 44, 45] {
             let mut error = [0u8; 32];
             error[1] = 3;
             error[2..4].copy_from_slice(&sequence.to_ne_bytes());
@@ -582,7 +582,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::GetWindowAttributesReply {
-                sequence: 41,
+                sequence: 42,
                 class: xproto::WindowClass::INPUT_OUTPUT,
                 map_state: xproto::MapState::VIEWABLE,
                 override_redirect: true,
@@ -595,7 +595,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::GetGeometryReply {
-                sequence: 42,
+                sequence: 43,
                 root: 1,
                 width: 640,
                 height: 480,
@@ -609,7 +609,7 @@ mod tests {
         reply(
             &mut peer,
             xproto::QueryTreeReply {
-                sequence: 43,
+                sequence: 44,
                 root: 1,
                 parent: 1,
                 ..Default::default()
