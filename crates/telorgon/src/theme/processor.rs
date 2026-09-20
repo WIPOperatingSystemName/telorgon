@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::{ColorRgba8, MonotonicInstant, PointF, Transform2D};
+use crate::foundation::{ColorRgba8, MonotonicInstant, PointF, Transform2D};
 use crate::ui::{
     Background, Border, BorderSide, CornerRadii, MountedUi, Outline, Shadow, ShadowList,
     StylePropertyPatch, StyleSlotId, ThemeScopeId, UiNodeId as NodeId,
@@ -51,7 +51,7 @@ impl StyleProcessor {
             .retain(|key, _| ui.nodes.contains(key.state_root) && ui.nodes.contains(key.node));
         let mut changed = {
             #[cfg(feature = "instrumentation")]
-            let _span = crate::profiler::span!("theme.motion");
+            let _span = crate::runtime::instrumentation::span!("theme.motion");
             self.sample_tracks(ui, now, preference)
         };
         self.binding_scratch.clear();

@@ -1,0 +1,76 @@
+schema_version = 1
+interface_major = 4
+interface_minor = 4
+target = "vulkan1.3-spirv1.6"
+
+[[shader]]
+name = "box_vertex"
+source = "source/ui/box.vert"
+artifact = "box.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "box_fragment"
+source = "source/ui/box.frag"
+artifact = "box.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "glyph_vertex"
+source = "source/ui/glyph.vert"
+artifact = "glyph.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "glyph_fragment"
+source = "source/ui/glyph.frag"
+artifact = "glyph.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "image_vertex"
+source = "source/ui/image.vert"
+artifact = "image.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "image_fragment"
+source = "source/ui/image.frag"
+artifact = "image.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "material_vertex"
+source = "source/ui/material.vert"
+artifact = "material.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "material_fragment"
+source = "source/ui/material.frag"
+artifact = "material.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "liquid_vertex"
+source = "source/effects/liquid.vert"
+artifact = "liquid.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "liquid_fragment"
+source = "source/effects/liquid.frag"
+artifact = "liquid.frag.spv"
+stage = "fragment"
+
+[[shader]]
+name = "blur_vertex"
+source = "source/effects/blur.vert"
+artifact = "blur.vert.spv"
+stage = "vertex"
+
+[[shader]]
+name = "blur_fragment"
+source = "source/effects/blur.frag"
+artifact = "blur.frag.spv"
+stage = "fragment"

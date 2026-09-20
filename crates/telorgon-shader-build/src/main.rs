@@ -19,12 +19,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bundle_path = crate_dir.join("bundle.toml");
     let renderer_dir = crate_dir
         .parent()
         .ok_or("shader-build package has no crates directory")?
-        .join("telorgon/src/renderer_vulkan");
-    let artifact_dir = renderer_dir.join("shaders/vulkan");
+        .join("telorgon/src/graphics/renderers/vulkan");
+    let shader_dir = renderer_dir.join("shaders");
+    let bundle_path = shader_dir.join("bundle.toml");
+    let generated_dir = shader_dir.join("generated");
+    let artifact_dir = generated_dir.join("spirv");
     fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
 
     let bundle_text = fs::read_to_string(&bundle_path).map_err(|error| error.to_string())?;
@@ -39,7 +41,7 @@ fn run() -> Result<(), String> {
     let mut generated = Vec::with_capacity(source.shader.len());
     let mut bundle_hasher = Sha256::new();
     for shader in &source.shader {
-        let source_path = crate_dir.join(&shader.source);
+        let source_path = shader_dir.join(&shader.source);
         let text = fs::read_to_string(&source_path).map_err(|error| error.to_string())?;
         let words = compile::compile(&text, &shader.source, &shader.stage)?;
         validate::validate(&words)?;
@@ -74,11 +76,11 @@ fn run() -> Result<(), String> {
         shader: generated,
     };
     let manifest_text = toml::to_string_pretty(&bundle).map_err(|error| error.to_string())?;
-    fs::write(artifact_dir.join("manifest.toml"), manifest_text)
+    fs::write(generated_dir.join("manifest.toml"), manifest_text)
         .map_err(|error| error.to_string())?;
-    let artifact_dir_from_source = Path::new("shaders/vulkan");
+    let artifact_dir_from_source = Path::new("spirv");
     fs::write(
-        renderer_dir.join("generated_shader_bundle.rs"),
+        generated_dir.join("metadata.rs"),
         generate_rust::source(&bundle, artifact_dir_from_source),
     )
     .map_err(|error| error.to_string())?;

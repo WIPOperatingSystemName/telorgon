@@ -5,8 +5,8 @@
 
 use std::num::NonZeroU32;
 
-use crate::core::{PointF, RectF};
-use crate::scene::NodeId as UiNodeId;
+use crate::foundation::{PointF, RectF};
+use crate::graphics::scene::NodeId as UiNodeId;
 
 use crate::ui::MountedUi;
 

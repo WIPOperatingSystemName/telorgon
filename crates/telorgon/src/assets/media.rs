@@ -6,8 +6,8 @@ use crate::assets::{
     AssetBundle, AssetEntry, AssetError, AssetKey, AssetKind, CursorAsset, IconAsset, ImageAsset,
     asset_image_id,
 };
-use crate::core::{ColorRgba8, SizeI};
-use crate::render::{ImageAlphaMode, ImageColorEncoding, ImagePixelFormat, ImageResource};
+use crate::foundation::{ColorRgba8, SizeI};
+use crate::graphics::render::{ImageAlphaMode, ImageColorEncoding, ImagePixelFormat, ImageResource};
 
 const MAX_DIMENSION: u32 = 4096;
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;

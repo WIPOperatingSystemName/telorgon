@@ -1,6 +1,6 @@
 mod timer;
 
-pub use crate::core::MonotonicInstant;
+pub use crate::foundation::MonotonicInstant;
 pub use timer::TimerHandle;
 pub(crate) use timer::{PendingTimerStart, TimerArena, TimerStart};
 

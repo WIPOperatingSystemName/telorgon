@@ -24,3 +24,5 @@ pub use request::{
     ReservedAreaId, ResizeEdge, SeatId, ShellRequestResult, SurfaceInputContact, SurfaceInputError,
     SurfaceInputEvent, SurfaceInputKind, SurfaceRequest, SystemRequest, WorkspaceRequest,
 };
+
+pub mod window_chrome;

@@ -35,3 +35,6 @@ pub use structure::SwitchBranch;
 pub use task::{LocalTaskSender, TaskHandle, TaskSendError, TaskSender};
 pub use task_host::{LocalTask, SendTask, TaskCancellation, TaskHost, UnsupportedTaskHost};
 pub use view::ViewRuntime;
+
+#[cfg(feature = "instrumentation")]
+pub mod instrumentation;

@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::core::MonotonicInstant;
+use crate::foundation::MonotonicInstant;
 use crate::ui::{ComponentStyleId, MountedUi, ThemeScopeId};
 
 use crate::theme::{
@@ -359,7 +359,7 @@ impl ThemeRuntime {
         preference: MotionPreference,
     ) -> ThemeUpdate {
         #[cfg(feature = "instrumentation")]
-        let _span = crate::profiler::span!("theme.resolve");
+        let _span = crate::runtime::instrumentation::span!("theme.resolve");
         let mut processor = std::mem::take(&mut self.processor);
         let mut update = processor.update(self, ui, now, preference);
         processor.diagnostics.entries_invalidated = processor
@@ -371,23 +371,23 @@ impl ThemeRuntime {
         update.diagnostics = processor.diagnostics;
         #[cfg(feature = "instrumentation")]
         {
-            crate::profiler::counter!(
+            crate::runtime::instrumentation::counter!(
                 "theme.bindings.evaluated",
                 update.diagnostics.bindings_evaluated
             );
-            crate::profiler::counter!(
+            crate::runtime::instrumentation::counter!(
                 "theme.bindings.skipped",
                 update.diagnostics.bindings_skipped
             );
-            crate::profiler::counter!(
+            crate::runtime::instrumentation::counter!(
                 "theme.entries.invalidated",
                 update.diagnostics.entries_invalidated
             );
-            crate::profiler::counter!(
+            crate::runtime::instrumentation::counter!(
                 "theme.animations.active",
                 update.diagnostics.active_animations
             );
-            crate::profiler::counter!("theme.retargets", update.diagnostics.retargets);
+            crate::runtime::instrumentation::counter!("theme.retargets", update.diagnostics.retargets);
         }
         self.processor = processor;
         update

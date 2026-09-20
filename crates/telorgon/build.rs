@@ -3,7 +3,7 @@
 mod wayland;
 
 #[cfg(feature = "shell-xwayland-embedded")]
-#[path = "src/xwayland/payload_format.rs"]
+#[path = "src/integrations/x11/payload_format.rs"]
 mod payload_format;
 
 fn main() {
@@ -11,7 +11,7 @@ fn main() {
     embed_xwayland();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build");
-    println!("cargo:rerun-if-changed=src/wayland_server/protocol.rs");
+    println!("cargo:rerun-if-changed=src/integrations/wayland/server/protocol.rs");
     #[cfg(feature = "shell-wayland-linux")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         if let Err(error) = wayland::generate() {
@@ -23,9 +23,9 @@ fn main() {
 #[cfg(feature = "shell-xwayland-embedded")]
 fn embed_xwayland() {
     println!("cargo:rerun-if-env-changed=TELORGON_XWAYLAND_PAYLOAD");
-    println!("cargo:rerun-if-changed=src/xwayland/payload_format.rs");
+    println!("cargo:rerun-if-changed=src/integrations/x11/payload_format.rs");
     let path = std::env::var_os("TELORGON_XWAYLAND_PAYLOAD")
-        .expect("shell-xwayland-embedded requires TELORGON_XWAYLAND_PAYLOAD; see packaging/xwayland/README.md");
+        .expect("shell-xwayland-embedded requires TELORGON_XWAYLAND_PAYLOAD; see packaging/linux/xwayland/README.md");
     let path = std::path::PathBuf::from(path);
     assert!(
         path.is_absolute(),

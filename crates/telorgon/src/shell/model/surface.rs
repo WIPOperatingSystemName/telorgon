@@ -4,7 +4,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::core::{RectF, RectI, SizeI};
+use crate::foundation::{RectF, RectI, SizeI};
 
 use crate::shell::{ApplicationId, SurfaceId};
 

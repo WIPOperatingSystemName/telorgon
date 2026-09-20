@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::core::MonotonicInstant;
+use crate::foundation::MonotonicInstant;
 
 use crate::runtime::{ComponentId, RuntimeError, RuntimeResult, routed_action::RoutedAction};
 

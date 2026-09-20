@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[path = "../src/wayland_server/protocol.rs"]
+#[path = "../src/integrations/wayland/server/protocol.rs"]
 pub mod profile;
 pub mod schema;
 use schema::{Interface, Protocol};

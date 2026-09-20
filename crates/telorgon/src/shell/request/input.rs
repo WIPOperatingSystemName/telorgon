@@ -3,7 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::core::PointF;
+use crate::foundation::PointF;
 use crate::input::{ButtonState, PointerButton};
 
 macro_rules! define_input_id {

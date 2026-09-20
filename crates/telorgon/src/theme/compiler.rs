@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::{ColorRgba8, EdgeInsets, PointF};
+use crate::foundation::{ColorRgba8, EdgeInsets, PointF};
 use crate::ui::{
     Background, Shadow, ShadowList, SizeRule, StylePropertyPatch, StyleSlotId, VariantAxisId,
     VariantValueId,

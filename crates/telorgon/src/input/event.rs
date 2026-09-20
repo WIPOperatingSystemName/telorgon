@@ -1,4 +1,4 @@
-use crate::core::PointF;
+use crate::foundation::PointF;
 
 use crate::input::{
     KeyEvent, PointerButton, PointerDeviceKind, PointerEvent, PointerId, ScrollEvent,

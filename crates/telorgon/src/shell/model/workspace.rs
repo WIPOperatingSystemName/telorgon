@@ -5,7 +5,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::core::RectF;
+use crate::foundation::RectF;
 
 use crate::shell::{OutputId, SurfaceId, WorkspaceId};
 

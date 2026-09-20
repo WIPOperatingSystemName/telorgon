@@ -31,9 +31,8 @@ The repository contains three Cargo packages:
 - `telorgon-shader-build` is an unpublished maintainer tool that regenerates the checked-in Vulkan
   shader bundle.
 
-See [the documentation index](docs/README.md) for architecture, implementation status, and
-qualification boundaries. Features described as operational are not necessarily
-production-qualified.
+See [the development specification](DEVELOPMENT_SPECIFICATION.md) for the target architecture and
+engineering standards. Consult the implementation and relevant tests for current behavior.
 
 ## Shell terminology
 
@@ -49,8 +48,8 @@ standard names.
 Linux builds with `shell-wayland-linux` require compatible Wayland development XML and
 `wayland-protocols` data during compilation. Protocol descriptors are generated as Rust tables;
 installed applications do not need protocol XML files. Other builds do not require that data.
-See [protocol build inputs and overrides](docs/WAYLAND_COMPOSITOR_ARCHITECTURE.md#protocol-source-and-advertisement-rules)
-for required versions, custom paths, and cross compilation. Native library dependencies still apply.
+Native library dependencies still apply. The build configuration and diagnostics describe required
+protocol inputs and supported overrides.
 
 ## License
 

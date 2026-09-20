@@ -521,25 +521,25 @@ mod tests {
             OutputId::from_raw(1).unwrap(),
             crate::shell::OutputRevision::INITIAL,
             crate::shell::OutputGeometry::new(
-                crate::core::RectF {
+                crate::foundation::RectF {
                     x: 0.0,
                     y: 0.0,
                     width: 100.0,
                     height: 100.0,
                 },
-                crate::core::RectF {
+                crate::foundation::RectF {
                     x: 0.0,
                     y: 0.0,
                     width: 100.0,
                     height: 100.0,
                 },
-                crate::core::SizeI {
+                crate::foundation::SizeI {
                     width: 100,
                     height: 100,
                 },
                 1.0,
                 crate::shell::OutputTransform::Normal,
-                crate::core::EdgeInsets::ZERO,
+                crate::foundation::EdgeInsets::ZERO,
                 crate::shell::OutputColorCapabilities::SRGB,
             )
             .unwrap(),

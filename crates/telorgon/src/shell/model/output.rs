@@ -3,7 +3,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::core::{EdgeInsets, RectF, SizeI};
+use crate::foundation::{EdgeInsets, RectF, SizeI};
 
 use crate::shell::OutputId;
 

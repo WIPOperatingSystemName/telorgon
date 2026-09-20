@@ -7,7 +7,7 @@
 use std::mem::size_of;
 use std::ops::{BitOr, BitOrAssign};
 
-use crate::scene::NodeId as UiNodeId;
+use crate::graphics::scene::NodeId as UiNodeId;
 
 use crate::ui::mounted::StringId;
 
