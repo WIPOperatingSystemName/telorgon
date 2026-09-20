@@ -11,6 +11,14 @@ impl ColorRgba8 {
         Self { r, g, b, a }
     }
 
+    /// Returns this color with a replacement alpha, preserving its RGB channels.
+    ///
+    /// `0` is fully transparent and `255` is fully opaque. Works in constants,
+    /// for example `const OVERLAY: ColorRgba8 = BASE.with_alpha(128);`.
+    pub const fn with_alpha(self, alpha: u8) -> Self {
+        Self { a: alpha, ..self }
+    }
+
     /// Blends the stored RGB channels toward white, preserving alpha.
     ///
     /// `0.0` leaves the color unchanged; `1.0` produces white. Amounts outside

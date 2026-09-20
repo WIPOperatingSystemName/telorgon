@@ -337,6 +337,21 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         }
     }
 
+    /// Register embedded font faces before layout. Hosts call this for catalog fonts automatically.
+    pub fn register_fonts(&mut self, assets: crate::AssetBundle) -> AppResult<()> {
+        for entry in assets
+            .iter()
+            .filter(|entry| entry.kind == crate::AssetKind::Font)
+        {
+            self.text
+                .load_embedded_font(entry.bytes)
+                .map_err(|error| AppError::new(format!("font {}: {error}", entry.key)))?;
+            self.compiler = SceneCompiler::default();
+            self.view.scheduler_mut().request();
+        }
+        Ok(())
+    }
+
     pub fn resize(&mut self, extent: SizeI) -> AppResult<()> {
         if extent.width <= 0 || extent.height <= 0 {
             return Err(AppError::new("runtime extent must be positive"));

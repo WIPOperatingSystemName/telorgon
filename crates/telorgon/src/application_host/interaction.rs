@@ -41,6 +41,7 @@ pub(crate) struct KeyRouting {
 #[derive(Clone, Copy, Debug, Default)]
 struct PointerRoute {
     position: PointF,
+    raw_hovered: Option<NodeId>,
     hovered: Option<NodeId>,
     captured: Option<NodeId>,
 }
@@ -96,6 +97,7 @@ impl InteractionRouter {
         {
             let route = self.pointers.entry(pointer).or_default();
             route.position = position;
+            route.raw_hovered = raw_hit;
             route.hovered = hit;
         }
 
@@ -122,6 +124,7 @@ impl InteractionRouter {
             }
         }
 
+        routing.changed |= self.publish_container_hover(ui);
         let Some(captured) = self.pointers.get(&pointer).and_then(|route| route.captured) else {
             return routing;
         };
@@ -275,10 +278,22 @@ impl InteractionRouter {
                 .handle_activation(ui, control, ActivationInput::ViewDeactivated)
                 .changed;
         }
+        // Clear the published state before discarding the route: subsequent motion
+        // otherwise has no previous owner whose hover flag it can remove.
+        let hovered: Vec<_> = self
+            .pointers
+            .values()
+            .filter_map(|route| route.hovered)
+            .collect();
+        for node in hovered {
+            changed |= self.publish_flag(ui, node, InteractionFlags::HOVERED, false);
+        }
         for route in self.pointers.values_mut() {
             route.captured = None;
             route.hovered = None;
+            route.raw_hovered = None;
         }
+        changed |= self.publish_container_hover(ui);
         let focus = self.set_focus(ui, None, false);
         changed | (focus.old != focus.new)
     }
@@ -397,7 +412,7 @@ impl InteractionRouter {
             changed |= focus.old != focus.new;
             self.diagnostics.stale_owners_rejected += 1;
         }
-        changed
+        changed | self.publish_container_hover(ui)
     }
 
     fn behavior(&self, ui: &MountedUi, node: NodeId) -> Option<ControlBehavior> {
@@ -501,6 +516,28 @@ impl InteractionRouter {
         changed
     }
 
+    fn publish_container_hover(&mut self, ui: &mut MountedUi) -> bool {
+        let containers: Vec<_> = ui.nodes.alive().iter().copied()
+            .filter(|node| ui.kinds.get(*node) == Some(&crate::NodeKind::Box)
+                && ui.interactions.get(*node).is_some_and(|interaction| {
+                    interaction.hover_within || interaction.flags.contains(InteractionFlags::HOVERED)
+                }))
+            .collect();
+        let mut changed = false;
+        for node in containers {
+            let enabled = ui.interactions.get(node).is_some_and(|interaction| {
+                interaction.hover_within && interaction.enabled && interaction.visible
+            });
+            let hovered = enabled && self.pointers.values().any(|route| {
+                route.raw_hovered.is_some_and(|hit| {
+                    ui.nodes.contains(hit) && ui.is_descendant_or_self(hit, node)
+                })
+            });
+            changed |= self.publish_flag(ui, node, InteractionFlags::HOVERED, hovered);
+        }
+        changed
+    }
+
     fn publish_flag(
         &mut self,
         ui: &mut MountedUi,
@@ -568,6 +605,47 @@ mod tests {
         ui.interactions
             .get(node)
             .is_some_and(|interaction| interaction.flags.contains(flag))
+    }
+
+    #[test]
+    fn hover_within_is_opt_in_and_independent_of_styles() {
+        let mut fixture = fixture();
+        let parent = fixture.ui.nodes.core(fixture.first).unwrap().parent.unwrap();
+        let mut router = InteractionRouter::default();
+        let pointer = PointerId::new(10);
+        router.pointer_moved(&mut fixture.ui, pointer, PointF::default(), Some(fixture.first_label));
+        assert!(!has(&fixture.ui, parent, InteractionFlags::HOVERED));
+
+        fixture.ui.set_hover_within(parent, true);
+        router.sync(&mut fixture.ui);
+        assert!(has(&fixture.ui, parent, InteractionFlags::HOVERED));
+        assert!(has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
+        assert!(!has(&fixture.ui, parent, InteractionFlags::PRESSED));
+
+        router.pointer_moved(&mut fixture.ui, pointer, PointF::default(), Some(fixture.second));
+        assert!(has(&fixture.ui, parent, InteractionFlags::HOVERED));
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
+        assert!(has(&fixture.ui, fixture.second, InteractionFlags::HOVERED));
+
+        fixture.ui.set_hover_within(parent, false);
+        router.sync(&mut fixture.ui);
+        assert!(!has(&fixture.ui, parent, InteractionFlags::HOVERED));
+        assert!(has(&fixture.ui, fixture.second, InteractionFlags::HOVERED));
+    }
+
+    #[test]
+    fn hover_within_tracks_multiple_pointers_and_clears_on_deactivation() {
+        let mut fixture = fixture();
+        let parent = fixture.ui.nodes.core(fixture.first).unwrap().parent.unwrap();
+        fixture.ui.set_hover_within(parent, true);
+        let mut router = InteractionRouter::default();
+        for (id, target) in [(11, fixture.first), (12, fixture.second)] {
+            router.pointer_moved(&mut fixture.ui, PointerId::new(id), PointF::default(), Some(target));
+        }
+        router.pointer_moved(&mut fixture.ui, PointerId::new(11), PointF::default(), None);
+        assert!(has(&fixture.ui, parent, InteractionFlags::HOVERED));
+        router.view_deactivated(&mut fixture.ui);
+        assert!(!has(&fixture.ui, parent, InteractionFlags::HOVERED));
     }
 
     #[test]
@@ -657,6 +735,30 @@ mod tests {
         );
         assert!(down.activation.is_none() && up.activation.is_none());
         assert!(!has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+    }
+
+    #[test]
+    fn deactivation_clears_hover_before_forgetting_pointer_routes() {
+        let mut fixture = fixture();
+        let mut router = InteractionRouter::default();
+        let pointer = PointerId::new(4);
+        router.pointer_moved(
+            &mut fixture.ui,
+            pointer,
+            PointF::default(),
+            Some(fixture.first),
+        );
+        assert!(has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
+        assert!(router.view_deactivated(&mut fixture.ui));
+        router.pointer_moved(&mut fixture.ui, pointer, PointF::default(), None);
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
+        router.pointer_moved(
+            &mut fixture.ui,
+            pointer,
+            PointF::default(),
+            Some(fixture.first),
+        );
+        assert!(has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
     }
 
     #[test]

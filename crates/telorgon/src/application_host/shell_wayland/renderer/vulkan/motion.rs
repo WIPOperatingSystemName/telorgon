@@ -3,36 +3,82 @@ use super::super::super::motion::{MotionFrame, SnapshotContent, image_scene};
 use super::*;
 use crate::renderer_vulkan::VulkanFrameContext;
 
+pub(super) struct MotionSnapshot {
+    pub target: VulkanMaterializationTarget,
+    pub extent: SizeI,
+}
+
 pub(super) fn record_motion(
     device: &VulkanDevice,
     scenes: &mut BTreeMap<ShellSceneKey, VulkanScene>,
-    snapshots: &mut BTreeMap<u64, VulkanMaterializationTarget>,
+    snapshots: &mut BTreeMap<u64, MotionSnapshot>,
     spares: &mut Vec<VulkanMaterializationTarget>,
     motion: &MotionFrame,
     glass: &BTreeMap<ShellSceneKey, crate::GlassStyle>,
+    borders: &BTreeMap<ShellSceneKey, crate::ui::Border>,
     live_glass: &mut super::motion_glass::MotionGlass,
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<bool> {
     let mut targets = Vec::new();
     for command in &motion.snapshots {
+        let body = super::motion_glass::extract_recipe_with_borders(
+            command,
+            glass,
+            borders,
+            &mut live_glass.recipes,
+        );
+        let empty =
+            super::motion_glass::body_is_empty(&command.content, &body, &live_glass.empty_bodies);
+        if empty {
+            live_glass.empty_bodies.insert(command.id);
+        } else {
+            live_glass.empty_bodies.remove(&command.id);
+        }
+        // Glass recipes are resolved separately. A transparent body needs no window-sized image.
+        let extent = if empty {
+            SizeI {
+                width: 1,
+                height: 1,
+            }
+        } else {
+            command.extent
+        };
         let target = if let Some(index) = spares
             .iter()
-            .position(|t| t.extent() == command.extent && t.can_recycle())
+            .position(|t| super::motion_glass::capacity_fits(t.extent(), extent) && t.can_recycle())
         {
             spares.swap_remove(index)
         } else {
-            match VulkanMaterializationTarget::new_traced(device, command.extent, &mut |_| {}) {
+            match VulkanMaterializationTarget::new_traced(
+                device,
+                if empty {
+                    extent
+                } else {
+                    super::motion_glass::target_capacity(extent)
+                },
+                &mut |_| {},
+            ) {
                 Ok(target) => target,
-                Err(_) => return Ok(false),
+                Err(error) => {
+                    eprintln!(
+                        "telorgon-motion: snapshot allocation failed id={} extent={:?}: {error:?}",
+                        command.id, command.extent
+                    );
+                    return Ok(false);
+                }
             }
         };
-        targets.push(target);
+        targets.push((target, body));
     }
-    for (command, mut target) in motion.snapshots.iter().zip(targets) {
-        let body = super::motion_glass::extract_recipe(command, glass, &mut live_glass.recipes);
+    for (command, (mut target, body)) in motion.snapshots.iter().zip(targets) {
         // Bound distinct optical endpoints during repeated interruptions just like snapshot
         // allocation. Immediate presentation is preferable to exhausting descriptor capacity.
         if live_glass.recipes[&command.id].len() > 16 {
+            eprintln!(
+                "telorgon-motion: optical endpoint limit exceeded snapshot={} endpoints={}",
+                command.id,
+                live_glass.recipes[&command.id].len()
+            );
             return Ok(false);
         }
 
@@ -44,7 +90,13 @@ pub(super) fn record_motion(
             store: TargetStore::Store,
             region: None,
         };
-        match &command.content {
+        let transparent = SnapshotContent::Capture(Vec::new());
+        let content = if live_glass.empty_bodies.contains(&command.id) {
+            &transparent
+        } else {
+            &command.content
+        };
+        match content {
             SnapshotContent::Capture(_) => {
                 let placements = &body;
                 let indices = scenes
@@ -56,9 +108,12 @@ pub(super) fn record_motion(
                     .iter()
                     .map(|p| {
                         Ok(VulkanCompositePlacement {
-                            scene_index: *indices
-                                .get(&p.scene)
-                                .ok_or_else(|| AppError::new("motion capture scene missing"))?,
+                            scene_index: *indices.get(&p.scene).ok_or_else(|| {
+                                AppError::new(format!(
+                                    "motion capture {} scene {:?} missing (layer {:?})",
+                                    command.id, p.scene, p.key
+                                ))
+                            })?,
                             target: p.target,
                             clip: p.clip,
                             rounded_clips: p.rounded_clips,
@@ -103,7 +158,20 @@ pub(super) fn record_motion(
         }
         // Subsequent passes in this same command buffer sample the final SHADER_READ state.
         target.mark_initialized();
-        snapshots.insert(command.id, target);
+        snapshots.insert(
+            command.id,
+            MotionSnapshot {
+                extent: if live_glass.empty_bodies.contains(&command.id) {
+                    SizeI {
+                        width: 1,
+                        height: 1,
+                    }
+                } else {
+                    command.extent
+                },
+                target,
+            },
+        );
     }
     for output in &motion.outputs {
         // Live glass is resolved at the displayed geometry after ordinary snapshots exist.
@@ -145,7 +213,7 @@ pub(super) fn record_motion(
         .copied()
         .collect::<Vec<_>>();
     for id in retired {
-        spares.push(snapshots.remove(&id).expect("retired snapshot"));
+        spares.push(snapshots.remove(&id).expect("retired snapshot").target);
     }
     trim_spares(spares);
     Ok(true)
@@ -160,7 +228,7 @@ pub(super) fn trim_spares(spares: &mut Vec<VulkanMaterializationTarget>) {
 
 pub(super) fn sample_scene(
     device: &VulkanDevice,
-    snapshots: &BTreeMap<u64, VulkanMaterializationTarget>,
+    snapshots: &BTreeMap<u64, MotionSnapshot>,
     extent: SizeI,
     inputs: &[(u64, f32)],
     additive: bool,
@@ -172,7 +240,7 @@ pub(super) fn sample_scene(
 pub(super) fn update_sample_scene(
     device: &VulkanDevice,
     scene: &mut VulkanScene,
-    snapshots: &BTreeMap<u64, VulkanMaterializationTarget>,
+    snapshots: &BTreeMap<u64, MotionSnapshot>,
     extent: SizeI,
     inputs: &[(u64, f32)],
     additive: bool,
@@ -182,6 +250,16 @@ pub(super) fn update_sample_scene(
         .enumerate()
         .map(|(i, (_, weight))| (ImageId(i as u32 + 1), *weight))
         .collect::<Vec<_>>();
+    let samples = inputs
+        .iter()
+        .zip(&images)
+        .map(|((id, _), (image, weight))| {
+            let snapshot = snapshots
+                .get(id)
+                .ok_or_else(|| AppError::new("motion snapshot missing"))?;
+            Ok((*image, *weight, snapshot.extent, snapshot.target.extent()))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
     let mut source = image_scene(extent, &images, additive);
     // Delta validation requires every referenced image to be bound already, just as
     // for client DMA-BUF scenes. Bind before publishing the sampled draw instances.
@@ -190,7 +268,7 @@ pub(super) fn update_sample_scene(
             .get(snapshot)
             .ok_or_else(|| AppError::new("motion snapshot missing"))?;
         scene
-            .bind_materialized_image(image, target, ImageAlphaMode::Premultiplied)
+            .bind_materialized_image(image, &target.target, ImageAlphaMode::Premultiplied)
             .map_err(app_error)?;
     }
     let mut delta = source.take_delta().expect("new motion image scene");
@@ -199,6 +277,9 @@ pub(super) fn update_sample_scene(
         .checked_add(1)
         .expect("motion scene epoch exhausted");
     device.apply_scene_delta(scene, &delta).map_err(app_error)?;
+    for (image, _, active, capacity) in samples {
+        scene.crop_materialized_image(image, active, capacity);
+    }
     Ok(())
 }
 
@@ -220,6 +301,18 @@ mod tests {
         let instance = VulkanInstance::load(&config, &[]).unwrap();
         let selection = DeviceSelection::best(&instance.adapters().unwrap()).unwrap();
         let device = VulkanDevice::create_owned(instance, &config, &selection, None).unwrap();
+        let format = VulkanMaterializationTarget::FORMAT;
+        device.prewarm_compositor_pipelines(&[format]).unwrap();
+        let warmed = device
+            .pipeline(format, crate::render::PipelineKind::Image, BlendMode::Alpha)
+            .unwrap();
+        device.prewarm_compositor_pipelines(&[format]).unwrap();
+        assert_eq!(
+            warmed,
+            device
+                .pipeline(format, crate::render::PipelineKind::Image, BlendMode::Alpha)
+                .unwrap()
+        );
         let extent = SizeI {
             width: 16,
             height: 16,
@@ -229,7 +322,15 @@ mod tests {
             .map(|id| {
                 (
                     id,
-                    VulkanMaterializationTarget::new_traced(&device, extent, &mut |_| {}).unwrap(),
+                    MotionSnapshot {
+                        target: VulkanMaterializationTarget::new_traced(
+                            &device,
+                            extent,
+                            &mut |_| {},
+                        )
+                        .unwrap(),
+                        extent,
+                    },
                 )
             })
             .collect();

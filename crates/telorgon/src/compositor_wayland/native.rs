@@ -1,3 +1,7 @@
+mod foreign_toplevel;
+mod capture;
+pub(crate) use capture::{DirectCaptureJob, DirectCaptureCompletion};
+mod capture_buffer;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_long, c_void};
@@ -86,6 +90,13 @@ const IMPLEMENTED_GLOBALS: &[(&str, ResourceKind, u32)] = &[
 
 #[derive(Clone, Copy, Debug)]
 enum ResourceKind {
+    ForeignToplevelList,
+    ForeignToplevelHandle,
+    ImageCopyCaptureManager,
+    ImageCopyCaptureSession(ProtocolObjectId),
+    ImageCopyCaptureFrame(ProtocolObjectId),
+    OutputCaptureSourceManager,
+    OutputCaptureSource(u32),
     Compositor,
     Surface(WaylandSurfaceId),
     Region(ProtocolObjectId),
@@ -152,6 +163,13 @@ enum ResourceKind {
 impl ResourceKind {
     fn object_kind(self) -> ProtocolObjectKind {
         match self {
+            Self::ForeignToplevelList => ProtocolObjectKind::ForeignToplevelList,
+            Self::ForeignToplevelHandle => ProtocolObjectKind::ForeignToplevelHandle,
+            Self::ImageCopyCaptureManager => ProtocolObjectKind::ImageCopyCaptureManager,
+            Self::ImageCopyCaptureSession(_) => ProtocolObjectKind::ImageCopyCaptureSession,
+            Self::ImageCopyCaptureFrame(_) => ProtocolObjectKind::ImageCopyCaptureFrame,
+            Self::OutputCaptureSourceManager => ProtocolObjectKind::OutputCaptureSourceManager,
+            Self::OutputCaptureSource(_) => ProtocolObjectKind::ImageCaptureSource,
             Self::Compositor => ProtocolObjectKind::Compositor,
             Self::Surface(_) => ProtocolObjectKind::Surface,
             Self::Region(_) => ProtocolObjectKind::Region,
@@ -515,7 +533,7 @@ impl XwaylandAccess {
             .display
             .set(display.native_handle().as_ptr() as usize);
         let policy = access.clone();
-        display.set_global_filter(move |client, candidate| {
+        display.add_global_filter(move |client, candidate| {
             (candidate != pointer && candidate != grab_pointer) || policy.allows(client)
         });
         Ok(access)
@@ -572,6 +590,9 @@ struct SuspendedFocus {
 }
 
 struct NativeState {
+    foreign_toplevel: foreign_toplevel::NativeForeignToplevelState,
+    capture: capture::NativeCaptureState,
+    capture_access: Option<Rc<super::CaptureAccess>>,
     xwayland: Option<Rc<XwaylandAccess>>,
     display: std::ptr::NonNull<ffi::wl_display>,
     protocol: NativeProtocol,
@@ -593,6 +614,8 @@ struct NativeState {
     committed_presentation_feedbacks: BTreeMap<(WaylandSurfaceId, u64), Vec<ProtocolObjectId>>,
     xdg_resources: BTreeMap<WaylandSurfaceId, ProtocolObjectId>,
     toplevels: BTreeMap<WaylandSurfaceId, XdgToplevelState>,
+    decoration_policy: crate::DecorationPolicy,
+    committed_decorations: BTreeMap<WaylandSurfaceId, crate::compositor_wayland::DecorationMode>,
     toplevel_icons: BTreeMap<ProtocolObjectId, NativeToplevelIcon>,
     pending_toplevel_icons: BTreeMap<WaylandSurfaceId, PendingToplevelIcon>,
     committed_toplevel_icons: BTreeMap<WaylandSurfaceId, ToplevelIconSnapshot>,
@@ -705,6 +728,9 @@ impl<'display> NativeCompositor<'display> {
         let protocol = NativeProtocol::desktop();
         let mut state = Box::new(NativeState {
             xwayland: None,
+            capture_access: None,
+            foreign_toplevel: foreign_toplevel::NativeForeignToplevelState::default(),
+            capture: capture::NativeCaptureState::default(),
             display: display.native_handle(),
             protocol,
             core: CompositorCore::new(limits).map_err(error)?,
@@ -724,6 +750,8 @@ impl<'display> NativeCompositor<'display> {
             committed_presentation_feedbacks: BTreeMap::new(),
             xdg_resources: BTreeMap::new(),
             toplevels: BTreeMap::new(),
+            decoration_policy: crate::DecorationPolicy::DEFAULT,
+            committed_decorations: BTreeMap::new(),
             toplevel_icons: BTreeMap::new(),
             pending_toplevel_icons: BTreeMap::new(),
             committed_toplevel_icons: BTreeMap::new(),
@@ -931,6 +959,7 @@ impl<'display> NativeCompositor<'display> {
             .find(|output| output.enabled)
             .map(|output| output.description.scale);
         self.state.core.outputs.extend(pending);
+        self.state.refresh_capture_sources()?;
         self.state.output_revision = revision;
         let current_scale = self
             .state
@@ -1521,14 +1550,26 @@ impl<'display> NativeCompositor<'display> {
             .map(|popup| (popup.parent, popup_geometry(popup.positioner)))
     }
 
+    /// Shell startup configuration; set before accepting client toplevels.
+    pub(crate) fn set_decoration_policy(&mut self, policy: crate::DecorationPolicy) {
+        self.state.decoration_policy = policy;
+    }
+
+    pub(crate) fn decoration_policy(&self) -> crate::DecorationPolicy {
+        self.state.decoration_policy
+    }
+
     pub fn decoration_mode(
         &self,
         surface: WaylandSurfaceId,
     ) -> Option<crate::compositor_wayland::DecorationMode> {
-        self.state
-            .toplevels
-            .get(&surface)
-            .map(|toplevel| toplevel.decoration)
+        self.state.toplevels.get(&surface).map(|_| {
+            self.state
+                .committed_decorations
+                .get(&surface)
+                .copied()
+                .unwrap_or(crate::compositor_wayland::DecorationMode::ServerSide)
+        })
     }
 
     /// Returns client-authored metadata used to compose server-side window chrome.
@@ -3306,6 +3347,7 @@ impl NativeState {
         version: u32,
         id: u32,
     ) -> Result<(), NativeCompositorError> {
+        self.check_capture_access(kind, client.identity())?;
         if matches!(
             kind,
             ResourceKind::XwaylandShell | ResourceKind::XwaylandKeyboardGrabManager
@@ -3321,6 +3363,9 @@ impl NativeState {
         let client_id = self.ensure_client(client)?;
         let resource =
             self.create_resource(client, client_id, interface, version, id, kind, true)?;
+        if matches!(kind, ResourceKind::ForeignToplevelList) {
+            self.bind_foreign_toplevel_list(resource)?;
+        }
         if interface == "wl_shm" {
             for format in [0_u32, 1_u32] {
                 self.post_event(
@@ -3681,6 +3726,7 @@ impl NativeState {
         kind: ResourceKind,
         request: &mut IncomingRequest<'_>,
     ) -> Result<DispatchOutcome, NativeCompositorError> {
+        self.check_capture_access(kind, resource.client().identity())?;
         let context = unsafe { &*context };
         if let ResourceKind::SessionLock(object) = kind
             && request.message().destructor
@@ -3694,6 +3740,13 @@ impl NativeState {
             });
         }
         match kind {
+            ResourceKind::ForeignToplevelList => self.dispatch_foreign_toplevel_list(resource, context, request),
+            ResourceKind::ForeignToplevelHandle => Err(unsupported_request(request)),
+            ResourceKind::ImageCopyCaptureManager => self.dispatch_copy_capture_manager(resource, context, request),
+            ResourceKind::ImageCopyCaptureSession(id) => self.dispatch_copy_capture_session(resource, context, id, request),
+            ResourceKind::ImageCopyCaptureFrame(id) => self.dispatch_copy_capture_frame(resource, id, request),
+            ResourceKind::OutputCaptureSourceManager => self.dispatch_output_capture_source(resource, context, request),
+            ResourceKind::OutputCaptureSource(_) => Err(unsupported_request(request)),
             ResourceKind::XwaylandShell => self.dispatch_xwayland_shell(resource, context, request),
             ResourceKind::XwaylandSurface(surface) => {
                 self.dispatch_xwayland_surface(resource, surface, request)
@@ -4534,8 +4587,14 @@ impl NativeState {
             "unset_mode" => crate::compositor_wayland::DecorationMode::ServerSide,
             _ => return Err(unsupported_request(request)),
         };
-        // Telorgon policy owns the final choice. The default policy honors an explicit client-side
-        // request and otherwise uses the configured Compose window-frame component.
+        let mode = if self
+            .decoration_policy
+            .server_decorated(mode == crate::compositor_wayland::DecorationMode::ServerSide)
+        {
+            crate::compositor_wayland::DecorationMode::ServerSide
+        } else {
+            crate::compositor_wayland::DecorationMode::ClientSide
+        };
         self.toplevels
             .get_mut(&surface)
             .ok_or_else(|| NativeCompositorError::new("unknown xdg_toplevel"))?
@@ -4552,6 +4611,17 @@ impl NativeState {
                 },
             }],
         )?;
+        if self.initial_configures.contains(&surface) {
+            let latest = self
+                .core
+                .xdg_surface_mut(surface)
+                .and_then(|xdg| xdg.latest_configure());
+            self.send_toplevel_configure(
+                surface,
+                latest.and_then(|configure| configure.size),
+                latest.map_or_else(Default::default, |configure| configure.states),
+            )?;
+        }
         Ok(DispatchOutcome::default())
     }
 
@@ -5221,6 +5291,7 @@ impl NativeState {
             self.post_event(lock_resource, "ext_session_lock_v1", "finished", &mut [])?;
         } else {
             self.active_session_lock = Some(object);
+            self.refresh_capture_sources()?;
             self.core
                 .queue_action(CompositorAction::SessionLockRequested(object));
         }
@@ -7067,6 +7138,9 @@ impl NativeState {
             .xdg_surface_mut(surface)
             .map(|xdg_surface| xdg_surface.commit_state())
         {
+            if let Some(configure) = acknowledged_configure {
+                self.committed_decorations.insert(surface, configure.decoration);
+            }
             self.surface_mut(surface)?
                 .apply_xdg_commit_state(acknowledged_configure, window_geometry);
         }
@@ -7281,7 +7355,10 @@ impl NativeState {
                 size: None,
                 bounds: None,
                 states: crate::compositor_wayland::ToplevelState::default(),
-                decoration: crate::compositor_wayland::DecorationMode::ServerSide,
+                decoration: self.toplevels.get(&surface).map_or(
+                    crate::compositor_wayland::DecorationMode::ServerSide,
+                    |toplevel| toplevel.decoration,
+                ),
             })
             .map_err(error)?;
         if self.toplevels.contains_key(&surface)
@@ -7980,6 +8057,13 @@ impl NativeState {
     }
 
     fn destroy_context(&mut self, context: &ResourceContext) {
+        match context.kind {
+            ResourceKind::ForeignToplevelList => { self.foreign_toplevel.lists.remove(&context.object); }
+            ResourceKind::ForeignToplevelHandle => { self.foreign_toplevel.handles.remove(&context.object); }
+            ResourceKind::ImageCopyCaptureSession(id) => { self.capture.sessions.remove(&id); }
+            ResourceKind::ImageCopyCaptureFrame(id) => { self.capture.frames.remove(&id); }
+            _ => {}
+        }
         self.resources.remove(&context.object);
         self.entered_outputs
             .retain(|(_, output)| *output != context.object);
@@ -8033,6 +8117,7 @@ impl NativeState {
                 self.initial_configures.remove(&surface);
                 self.xdg_resources.remove(&surface);
                 self.toplevels.remove(&surface);
+                self.committed_decorations.remove(&surface);
                 self.pending_toplevel_icons.remove(&surface);
                 self.committed_toplevel_icons.remove(&surface);
                 self.viewports.remove(&surface);
@@ -8113,6 +8198,7 @@ impl NativeState {
             }
             ResourceKind::XdgToplevel(surface) => {
                 self.toplevels.remove(&surface);
+                self.committed_decorations.remove(&surface);
                 self.pending_toplevel_icons.remove(&surface);
                 self.committed_toplevel_icons.remove(&surface);
             }
@@ -8492,6 +8578,135 @@ mod xwayland_wire_tests {
     }
     fn words(values: &[u32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    fn decoration_roundtrip(
+        display: &Display,
+        peer: &mut UnixStream,
+        callback: u32,
+    ) -> (Option<u32>, Option<u32>) {
+        send(peer, 1, 0, &words(&[callback]));
+        display.dispatch_and_flush(Some(Duration::ZERO)).unwrap();
+        let (mut mode, mut serial) = (None, None);
+        loop {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let mut body = vec![0; (word >> 16) as usize - 8];
+            peer.read_exact(&mut body).unwrap();
+            if object == callback {
+                return (mode, serial);
+            }
+            if object == 10 && word & 0xffff == 0 {
+                mode = Some(u32::from_ne_bytes(body[..4].try_into().unwrap()));
+            }
+            if object == 8 && word & 0xffff == 0 {
+                serial = Some(u32::from_ne_bytes(body[..4].try_into().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn decoration_policy_wire_configures_are_committed_atomically() {
+        use crate::compositor_wayland::DecorationMode;
+        use crate::{DecorationNegotiation, DecorationPolicy};
+        for (negotiation, initial_request) in [
+            (DecorationNegotiation::ClientPreference, None),
+            (DecorationNegotiation::ClientPreference, Some(1)),
+            (DecorationNegotiation::ClientPreference, Some(2)),
+            (DecorationNegotiation::PreferServer, Some(1)),
+        ] {
+            let display = Display::new().unwrap();
+            let (mut peer, socket) = UnixStream::pair().unwrap();
+            let client = display.create_client(socket).unwrap();
+            let mut native = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+            native.set_decoration_policy(DecorationPolicy {
+                negotiation,
+                ..Default::default()
+            });
+            let globals = registry(&display, &mut peer);
+            bind(&mut peer, &globals, "wl_compositor", 4);
+            bind(&mut peer, &globals, "xdg_wm_base", 5);
+            bind(&mut peer, &globals, "zxdg_decoration_manager_v1", 6);
+            send(&mut peer, 4, 0, &words(&[7]));
+            send(&mut peer, 5, 2, &words(&[8, 7]));
+            send(&mut peer, 8, 1, &words(&[9]));
+            send(&mut peer, 6, 1, &words(&[10, 9]));
+            if let Some(mode) = initial_request {
+                send(&mut peer, 10, 1, &words(&[mode]));
+            }
+            send(&mut peer, 7, 6, &[]);
+            let (mode, serial) = decoration_roundtrip(&display, &mut peer, 11);
+            let initial_mode = if negotiation == DecorationNegotiation::PreferServer {
+                2
+            } else {
+                initial_request.unwrap_or(2)
+            };
+            assert_eq!(mode, Some(initial_mode)); // absent preference defaults to server
+            send(&mut peer, 8, 4, &words(&[serial.unwrap()]));
+            send(&mut peer, 7, 6, &[]);
+            decoration_roundtrip(&display, &mut peer, 12);
+            let client_id = native.state.clients[&client.identity().unwrap()];
+            let surface = native.core().world.client_surfaces(client_id)[0];
+            assert_eq!(
+                native.decoration_mode(surface),
+                Some(if initial_mode == 2 {
+                    DecorationMode::ServerSide
+                } else {
+                    DecorationMode::ClientSide
+                })
+            );
+            for (index, request) in [Some(1), Some(2), Some(1), None].into_iter().enumerate() {
+                // A decoration-only configure must preserve an outstanding geometry/state request.
+                let size = crate::core::SizeI {
+                    width: 700,
+                    height: 500,
+                };
+                let states = crate::compositor_wayland::ToplevelState {
+                    activated: true,
+                    ..Default::default()
+                };
+                native
+                    .configure_toplevel(surface, Some(size), states)
+                    .unwrap();
+                let old = native.decoration_mode(surface);
+                match request {
+                    Some(mode) => send(&mut peer, 10, 1, &words(&[mode])),
+                    None => send(&mut peer, 10, 2, &[]),
+                }
+                let callback = 13 + index as u32 * 2;
+                let (mode, serial) = decoration_roundtrip(&display, &mut peer, callback);
+                let expected = if negotiation == DecorationNegotiation::PreferServer {
+                    2
+                } else {
+                    request.unwrap_or(2)
+                };
+                assert_eq!(mode, Some(expected));
+                assert_eq!(native.decoration_mode(surface), old);
+                let latest = native
+                    .state
+                    .core
+                    .xdg_surface_mut(surface)
+                    .unwrap()
+                    .latest_configure()
+                    .unwrap();
+                assert_eq!(latest.size, Some(size));
+                assert_eq!(latest.states, states);
+                send(&mut peer, 8, 4, &words(&[serial.unwrap()]));
+                send(&mut peer, 7, 6, &[]);
+                decoration_roundtrip(&display, &mut peer, callback + 1);
+                assert_eq!(
+                    native.decoration_mode(surface),
+                    Some(if expected == 2 {
+                        DecorationMode::ServerSide
+                    } else {
+                        DecorationMode::ClientSide
+                    })
+                );
+            }
+            assert!(client.is_alive());
+        }
     }
 
     #[test]

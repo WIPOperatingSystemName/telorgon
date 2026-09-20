@@ -1,8 +1,62 @@
 //! Live backdrop effects travel alongside immutable content snapshots, never inside them.
-use super::super::super::motion::{MotionFrame, SnapshotCommand, SnapshotContent, SnapshotOutput};
+use super::super::super::motion::{
+    MotionFrame, SnapshotCommand, SnapshotContent, SnapshotOutput, image_scene,
+};
 use super::super::super::scene::{ShellLayerKey, ShellPlacement};
 use super::*;
 use crate::renderer_vulkan::VulkanFrameContext;
+
+// Admit four full-output RGBA8 surfaces (e.g. two bordered endpoints), with a
+// small-output floor and a hard ceiling. This is an estimate of live target pixels;
+// completion pins and the separate snapshot/spare/backdrop budgets still apply.
+const MIN_RESOLVE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RESOLVE_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) fn target_capacity(extent: SizeI) -> SizeI {
+    let round = |value: i32| value.max(1).saturating_add(63) / 64 * 64;
+    SizeI {
+        width: round(extent.width),
+        height: round(extent.height),
+    }
+}
+pub(super) fn capacity_fits(capacity: SizeI, extent: SizeI) -> bool {
+    capacity.width >= extent.width
+        && capacity.height >= extent.height
+        && capacity.width <= extent.width.max(1).saturating_mul(2).max(64)
+        && capacity.height <= extent.height.max(1).saturating_mul(2).max(64)
+}
+/// Map only the active top-left portion of an overallocated image; never stretch capacity
+/// padding into the displayed content. Scene clipping bounds the draw to the active extent.
+fn capacity_image_scene(
+    extent: SizeI,
+    capacity: SizeI,
+    opacity: f32,
+    additive: bool,
+) -> RenderScene {
+    let mut scene = image_scene(extent, &[(ImageId(1), opacity)], additive);
+    let node = NodeId::new(1, 1);
+    let mut instance = *scene.images.get(node).expect("one image");
+    instance.rect.width = capacity.width as f32;
+    instance.rect.height = capacity.height as f32;
+    instance.view_bounds = instance.rect;
+    scene.images.upsert(node, instance);
+    scene
+}
+
+fn resolve_bytes(extent: SizeI, bordered_samples: usize) -> u64 {
+    (extent.width.max(0) as u64)
+        .saturating_mul(extent.height.max(0) as u64)
+        .saturating_mul(4)
+        .saturating_mul(1_u64.saturating_add(bordered_samples as u64))
+}
+fn resolve_budget(output: SizeI) -> u64 {
+    resolve_bytes(output, 0)
+        .saturating_mul(4)
+        .clamp(MIN_RESOLVE_BYTES, MAX_RESOLVE_BYTES)
+}
+#[cfg(test)]
+fn resolve_fits(output: SizeI, extent: SizeI, bordered_samples: usize, other_bytes: u64) -> bool {
+    resolve_bytes(extent, bordered_samples).saturating_add(other_bytes) <= resolve_budget(output)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct GlassSample {
@@ -10,6 +64,7 @@ pub(super) struct GlassSample {
     extent: SizeI,
     style: crate::GlassStyle,
     weight: f32,
+    border: Option<crate::ui::Border>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +78,13 @@ struct ResolveSignature {
 struct LensScene {
     description: RenderScene,
     scene: VulkanScene,
+    bordered: Option<BorderedLens>,
+    direct_border: Option<VulkanScene>,
+}
+struct BorderedLens {
+    target: VulkanMaterializationTarget,
+    border: VulkanScene,
+    sample: VulkanScene,
 }
 struct ResolvedGlass {
     signature: Option<ResolveSignature>,
@@ -37,18 +99,47 @@ struct ResolvedGlass {
 #[derive(Default)]
 pub(super) struct MotionGlass {
     pub(super) recipes: BTreeMap<u64, Vec<GlassSample>>,
+    pub(super) empty_bodies: std::collections::BTreeSet<u64>,
     // A stable output must not republish an identical scene every cursor-only frame:
     // its epoch is also a backdrop dependency for higher windows.
     pub(super) sampled: BTreeMap<u64, (u64, SizeI, f32)>,
     resolved: BTreeMap<u64, ResolvedGlass>,
 }
 
+/// Zero premultiplied pixels remain zero under scaling and any weighted mixture of zeros.
+pub(super) fn body_is_empty(
+    content: &SnapshotContent,
+    body: &[ShellPlacement],
+    empty: &std::collections::BTreeSet<u64>,
+) -> bool {
+    match content {
+        SnapshotContent::Capture(_) => body.is_empty(),
+        SnapshotContent::Mix(inputs) => inputs
+            .iter()
+            .all(|(id, weight)| *weight == 0.0 || empty.contains(id)),
+    }
+}
+
+fn can_resolve_directly(empty_body: bool, samples: &[GlassSample]) -> bool {
+    empty_body && samples.len() == 1 && samples[0].weight == 1.0
+}
+
 /// Return ordinary capture placements and retain the glass recipe separately. Mix weights
 /// compose linearly, including interrupted fades; coordinates stay relative to their original
 /// capture extent, so repeatedly mixing snapshots cannot accumulate geometry rounding.
+#[cfg(test)]
 pub(super) fn extract_recipe(
     command: &SnapshotCommand,
     styles: &BTreeMap<ShellSceneKey, crate::GlassStyle>,
+    recipes: &mut BTreeMap<u64, Vec<GlassSample>>,
+) -> Vec<ShellPlacement> {
+    extract_recipe_with_borders(command, styles, &BTreeMap::new(), recipes)
+}
+
+pub(super) fn extract_recipe_with_borders(
+    command: &SnapshotCommand,
+    styles: &BTreeMap<ShellSceneKey, crate::GlassStyle>,
+    borders: &BTreeMap<ShellSceneKey, crate::ui::Border>,
     recipes: &mut BTreeMap<u64, Vec<GlassSample>>,
 ) -> Vec<ShellPlacement> {
     let mut samples = Vec::<GlassSample>::new();
@@ -62,8 +153,11 @@ pub(super) fn extract_recipe(
                         extent: command.extent,
                         style: *style,
                         weight: 1.0,
+                        border: borders.get(&p.scene).copied(),
                     });
-                } else {
+                } else if !matches!(p.scene, ShellSceneKey::ResizePreviewBorder(id)
+                    if styles.contains_key(&ShellSceneKey::ResizeVeil(id)))
+                {
                     body.push(*p);
                 }
             }
@@ -80,6 +174,7 @@ pub(super) fn extract_recipe(
                         old.placement == sample.placement
                             && old.extent == sample.extent
                             && old.style == sample.style
+                            && old.border == sample.border
                     }) {
                         existing.weight += sample.weight;
                     } else {
@@ -206,6 +301,63 @@ fn render_into(
     Ok(())
 }
 
+fn update_border_scene(
+    device: &VulkanDevice,
+    scene: &mut VulkanScene,
+    lens: ShellPlacement,
+    output: ShellPlacement,
+    extent: SizeI,
+    border: crate::ui::Border,
+) -> AppResult<()> {
+    use crate::render::BoxInstance;
+    let rect = RectF {
+        x: (lens.target.x - output.target.x) as f32,
+        y: (lens.target.y - output.target.y) as f32,
+        width: lens.target.width as f32,
+        height: lens.target.height as f32,
+    };
+    let node = NodeId::new(0, 1);
+    let mut description = RenderScene::default();
+    description.extent = crate::SizeF {
+        width: extent.width as f32,
+        height: extent.height as f32,
+    };
+    description.boxes.upsert(
+        node,
+        BoxInstance {
+            node,
+            rect,
+            view_bounds: rect,
+            background: None,
+            border,
+            outline: Default::default(),
+            corner_radii: lens.rounded_clips[0].map_or(Default::default(), |c| c.radii),
+            shadows: Default::default(),
+            opacity: 1.0,
+            clip: ClipId(0),
+            spatial: SpatialId(0),
+        },
+    );
+    description.set_draw_order(vec![DrawItem {
+        kind: PrimitiveKind::Box,
+        index: 0,
+        batch: BatchKey {
+            pipeline: PipelineKind::AnalyticBox,
+            resource: 0,
+            clip: ClipId(0),
+            blend: BlendMode::Alpha,
+            target: 0,
+        },
+    }]);
+    let mut delta = description.take_delta().unwrap();
+    delta.epoch = scene
+        .epoch()
+        .checked_add(1)
+        .ok_or_else(|| AppError::new("preview border epoch exhausted"))?;
+    device.apply_scene_delta(scene, &delta).map_err(app_error)?;
+    Ok(())
+}
+
 fn publish_resolved(
     device: &VulkanDevice,
     scenes: &mut BTreeMap<ShellSceneKey, VulkanScene>,
@@ -223,9 +375,10 @@ fn publish_resolved(
             e.insert(device.create_scene().map_err(app_error)?)
         }
     };
-    let mut description = super::super::super::motion::image_scene(
+    let mut description = capacity_image_scene(
         output.extent,
-        &[(ImageId(1), output.opacity)],
+        resolved.target.extent(),
+        output.opacity,
         false,
     );
     scene
@@ -241,13 +394,68 @@ fn publish_resolved(
     Ok(())
 }
 
+/// Participating tiles sample one desktop behind the group, not one another's animated
+/// previews. Blur radius selects the cache; tint, refraction and fade weights stay per lens.
+#[derive(Default)]
+struct SharedBackdrop {
+    keys: BTreeMap<ShellSceneKey, ShellSceneKey>,
+    lower: Vec<ShellPlacement>,
+}
+fn shared_backdrop(
+    frame: &ShellFrame,
+    recipes: &BTreeMap<u64, Vec<GlassSample>>,
+) -> SharedBackdrop {
+    let members = &frame.motion.resize_group;
+    if members.len() < 2 {
+        return SharedBackdrop::default();
+    }
+    let belongs = |p: &ShellPlacement| {
+        matches!(p.key,
+        ShellLayerKey::Motion(id) | ShellLayerKey::MotionShadow(id) | ShellLayerKey::FrameShadow(id)
+        if members.contains(&id))
+    };
+    let first = frame
+        .placements
+        .iter()
+        .position(belongs)
+        .unwrap_or(frame.placements.len());
+    let mut plan = SharedBackdrop {
+        lower: frame.placements[..first].to_vec(),
+        ..Default::default()
+    };
+    let mut radii = BTreeMap::new();
+    let mut scene_radii = BTreeMap::new();
+    for endpoint in &frame.motion.outputs {
+        if !u32::try_from(endpoint.id).is_ok_and(|id| members.contains(&id)) {
+            continue;
+        }
+        for sample in recipes.get(&endpoint.source).into_iter().flatten() {
+            if !matches!(sample.placement.scene, ShellSceneKey::ResizeVeil(_)) {
+                continue;
+            }
+            let radius = glass::normalized_blur_radius(sample.style.blur_radius).to_bits();
+            // Interrupted style changes can retain two radii for one scene key. Such
+            // recipes require independent sequential preparation, not a shared alias.
+            if scene_radii
+                .insert(sample.placement.scene, radius)
+                .is_some_and(|old| old != radius)
+            {
+                return SharedBackdrop::default();
+            }
+            let key = *radii.entry(radius).or_insert(sample.placement.scene);
+            plan.keys.insert(sample.placement.scene, key);
+        }
+    }
+    plan
+}
+
 /// Resolve bottom to top, after content snapshots exist. Lower moving windows are already
 /// in their displayed geometry when an upper lens samples them. Allocation failure uses the
 /// existing immediate-presentation fallback, never a frozen backdrop in a snapshot.
 pub(super) fn record_output(
     device: &VulkanDevice,
     scenes: &mut BTreeMap<ShellSceneKey, VulkanScene>,
-    snapshots: &BTreeMap<u64, VulkanMaterializationTarget>,
+    snapshots: &BTreeMap<u64, motion::MotionSnapshot>,
     spares: &mut Vec<VulkanMaterializationTarget>,
     state: &mut MotionGlass,
     caches: &mut BTreeMap<ShellSceneKey, glass::GlassCache>,
@@ -262,12 +470,23 @@ pub(super) fn record_output(
         .map(|o| o.id)
         .collect::<std::collections::BTreeSet<_>>();
     state.resolved.retain(|id, _| active.contains(id));
+    let shared = shared_backdrop(frame, &state.recipes);
+    let cache_key = |key: ShellSceneKey| shared.keys.get(&key).copied().unwrap_or(key);
     let mut output = frame.placements.clone();
     let mut live_glass = frame
         .glass
         .keys()
         .copied()
+        .map(cache_key)
         .collect::<std::collections::BTreeSet<_>>();
+    // Retired lenses must release their cache owners before admitting replacements.
+    // Submission image pins still protect any previous GPU work.
+    for endpoint in &frame.motion.outputs {
+        for sample in state.recipes.get(&endpoint.source).into_iter().flatten() {
+            live_glass.insert(cache_key(sample.placement.scene));
+        }
+    }
+    caches.retain(|key, _| live_glass.contains(key));
     for index in 0..output.len() {
         let p = output[index];
         if frame.glass.contains_key(&p.scene) {
@@ -290,10 +509,11 @@ pub(super) fn record_output(
             continue;
         };
         for sample in samples {
-            live_glass.insert(sample.placement.scene);
+            live_glass.insert(cache_key(sample.placement.scene));
         }
         let owner = match p.key {
             ShellLayerKey::Motion(owner) => owner,
+            ShellLayerKey::Widget(_) => 0,
             _ => continue,
         };
         let signature = ResolveSignature {
@@ -301,32 +521,88 @@ pub(super) fn record_output(
             source: endpoint.source,
             placement: p,
             samples: samples.clone(),
-            lower: glass::backdrop_sources(owner, &output[..index], scenes, caches),
+            lower: glass::backdrop_sources(
+                owner,
+                if samples
+                    .iter()
+                    .all(|s| shared.keys.contains_key(&s.placement.scene))
+                {
+                    &shared.lower
+                } else {
+                    &output[..index]
+                },
+                scenes,
+                caches,
+            ),
         };
+        let other_bytes: u64 = state
+            .resolved
+            .iter()
+            .filter(|(key, _)| **key != id)
+            .map(|(_, r)| {
+                r.target.allocated_bytes()
+                    + r.lenses
+                        .iter()
+                        .filter_map(|l| l.bordered.as_ref())
+                        .map(|b| b.target.allocated_bytes())
+                        .sum::<u64>()
+            })
+            .sum();
+        let direct = can_resolve_directly(state.empty_bodies.contains(&endpoint.source), samples);
+        // Charge retained capacities (including Vulkan allocation padding), not just
+        // the smaller active rectangle after a shrink.
+        let previous = state.resolved.get(&id);
+        let allocation_bytes = |target: Option<&VulkanMaterializationTarget>| {
+            target
+                .filter(|t| capacity_fits(t.extent(), endpoint.extent))
+                .map_or_else(
+                    || resolve_bytes(target_capacity(endpoint.extent), 0),
+                    |t| t.allocated_bytes(),
+                )
+        };
+        let own_bytes = samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !direct && s.border.is_some())
+            .fold(
+                allocation_bytes(previous.map(|r| &r.target)),
+                |bytes, (index, _)| {
+                    bytes.saturating_add(allocation_bytes(
+                        previous
+                            .and_then(|r| r.lenses.get(index))
+                            .and_then(|l| l.bordered.as_ref())
+                            .map(|b| &b.target),
+                    ))
+                },
+            );
+        if own_bytes.saturating_add(other_bytes) > resolve_budget(frame.extent) {
+            eprintln!(
+                "telorgon-motion: resolve budget rejected output={id} extent={:?} other_allocated_bytes={other_bytes} budget_bytes={}",
+                endpoint.extent,
+                resolve_budget(frame.extent)
+            );
+            return Ok(None);
+        }
         if !state
             .resolved
             .get(&id)
-            .is_some_and(|r| r.target.extent() == endpoint.extent)
+            .is_some_and(|r| capacity_fits(r.target.extent(), endpoint.extent))
         {
-            let other_bytes = state
-                .resolved
-                .iter()
-                .filter(|(key, _)| **key != id)
-                .map(|(_, r)| r.target.allocated_bytes())
-                .sum::<u64>();
-            let bytes = endpoint.extent.width as u64 * endpoint.extent.height as u64 * 4;
-            if bytes + other_bytes > 64 * 1024 * 1024 {
-                return Ok(None);
-            }
             let target = if let Some(i) = spares
                 .iter()
-                .position(|t| t.extent() == endpoint.extent && t.can_recycle())
+                .position(|t| t.extent() == target_capacity(endpoint.extent) && t.can_recycle())
             {
                 spares.swap_remove(i)
             } else {
-                let Ok(target) =
-                    VulkanMaterializationTarget::new_traced(device, endpoint.extent, &mut |_| {})
-                else {
+                let Ok(target) = VulkanMaterializationTarget::new_traced(
+                    device,
+                    target_capacity(endpoint.extent),
+                    &mut |_| {},
+                ) else {
+                    eprintln!(
+                        "telorgon-motion: resolve allocation failed output={id} extent={:?}",
+                        endpoint.extent
+                    );
                     return Ok(None);
                 };
                 target
@@ -353,69 +629,103 @@ pub(super) fn record_output(
         }
         let resolved = state.resolved.get_mut(&id).unwrap();
         if resolved.signature.as_ref() != Some(&signature) {
-            // The captured/mixed image contains only window pixels and their fade weights.
-            if resolved.body.is_none() {
-                resolved.body = Some(device.create_scene().map_err(app_error)?);
-            }
-            let body = resolved.body.as_mut().unwrap();
-            let body_state = (endpoint.source, endpoint.extent);
-            if resolved.body_state != Some(body_state) {
-                motion::update_sample_scene(
+            if !direct {
+                // The captured/mixed image contains only window pixels and their fade weights.
+                if resolved.body.is_none() {
+                    resolved.body = Some(device.create_scene().map_err(app_error)?);
+                }
+                let body = resolved.body.as_mut().unwrap();
+                let body_state = (endpoint.source, endpoint.extent);
+                if resolved.body_state != Some(body_state) {
+                    motion::update_sample_scene(
+                        device,
+                        body,
+                        snapshots,
+                        endpoint.extent,
+                        &[(endpoint.source, 1.0)],
+                        true,
+                    )?;
+                    resolved.body_state = Some(body_state);
+                }
+                render_into(
                     device,
                     body,
-                    snapshots,
-                    endpoint.extent,
-                    &[(endpoint.source, 1.0)],
+                    VulkanCompositePlacement {
+                        scene_index: 0,
+                        target: full_rect(endpoint.extent),
+                        clip: None,
+                        rounded_clips: [None; 2],
+                    },
+                    &mut resolved.target,
                     true,
+                    context,
                 )?;
-                resolved.body_state = Some(body_state);
+            } else {
+                resolved.body = None;
+                resolved.body_state = None;
             }
-            render_into(
-                device,
-                body,
-                VulkanCompositePlacement {
-                    scene_index: 0,
-                    target: full_rect(endpoint.extent),
-                    clip: None,
-                    rounded_clips: [None; 2],
-                },
-                &mut resolved.target,
-                true,
-                context,
-            )?;
             for (sample_index, sample) in samples.iter().enumerate() {
-                let ShellSceneKey::ResizeVeil(glass_owner) = sample.placement.scene else {
+                if !matches!(
+                    sample.placement.scene,
+                    ShellSceneKey::ResizeVeil(_) | ShellSceneKey::TilePreview(_)
+                ) {
                     continue;
+                }
+                let lens = lens_placement(sample, p);
+                let region = if shared.keys.contains_key(&sample.placement.scene) {
+                    full_rect(frame.extent)
+                } else {
+                    glass::backdrop_region(frame.extent, lens.target, sample.style)
                 };
-                if !glass::prepare_backdrop(
+                let capture_extent = SizeI {
+                    width: region.width,
+                    height: region.height,
+                };
+                if !glass::prepare_backdrop_key(
                     device,
                     scenes,
                     caches,
                     frame.extent,
-                    glass_owner,
+                    region,
+                    cache_key(sample.placement.scene),
                     sample.style,
-                    &output[..index],
+                    if shared.keys.contains_key(&sample.placement.scene) {
+                        &shared.lower
+                    } else {
+                        &output[..index]
+                    },
                     context,
                 )? {
                     return Ok(None);
                 }
-                let lens = lens_placement(sample, p);
+
                 if resolved.lenses.len() <= sample_index {
                     resolved.lenses.push(LensScene {
                         description: RenderScene::default(),
                         scene: device.create_scene().map_err(app_error)?,
+                        bordered: None,
+                        direct_border: None,
                     });
                 }
-                let LensScene { description, scene } = &mut resolved.lenses[sample_index];
+                let LensScene {
+                    description,
+                    scene,
+                    bordered,
+                    direct_border,
+                } = &mut resolved.lenses[sample_index];
                 glass::update_lens_weighted(
                     description,
-                    frame.extent,
-                    lens,
+                    capture_extent,
+                    glass::localize(lens, region),
                     sample.style,
-                    sample.weight,
+                    if sample.border.is_some() {
+                        1.0
+                    } else {
+                        sample.weight
+                    },
                     BlendMode::Add,
                 );
-                glass::bind_backdrops(scene, &caches[&sample.placement.scene])?;
+                glass::bind_backdrops(scene, &caches[&cache_key(sample.placement.scene)])?;
                 if let Some(mut delta) = description.take_delta() {
                     delta.epoch = scene
                         .epoch()
@@ -423,14 +733,140 @@ pub(super) fn record_output(
                         .ok_or_else(|| AppError::new("motion lens epoch exhausted"))?;
                     device.apply_scene_delta(scene, &delta).map_err(app_error)?;
                 }
-                render_into(
-                    device,
-                    scene,
-                    lens_draw(lens, p, frame.extent),
-                    &mut resolved.target,
-                    false,
-                    context,
-                )?;
+                let mut lens_placement = lens_draw(lens, p, capture_extent);
+                lens_placement.target.x += region.x;
+                lens_placement.target.y += region.y;
+                if direct && sample.border.is_some() {
+                    // Body = 0 and lens weight = 1: border-over-glass can go straight
+                    // into the resolve, with no separately weighted intermediate.
+                    *bordered = None;
+                    if direct_border.is_none() {
+                        *direct_border = Some(device.create_scene().map_err(app_error)?);
+                    }
+                    render_into(
+                        device,
+                        scene,
+                        lens_placement,
+                        &mut resolved.target,
+                        true,
+                        context,
+                    )?;
+                    let border_scene = direct_border.as_mut().unwrap();
+                    update_border_scene(
+                        device,
+                        border_scene,
+                        lens,
+                        p,
+                        endpoint.extent,
+                        sample.border.unwrap(),
+                    )?;
+                    render_into(
+                        device,
+                        border_scene,
+                        VulkanCompositePlacement {
+                            scene_index: 0,
+                            target: full_rect(endpoint.extent),
+                            clip: None,
+                            rounded_clips: [None; 2],
+                        },
+                        &mut resolved.target,
+                        false,
+                        context,
+                    )?;
+                } else if let Some(border) = sample.border {
+                    *direct_border = None;
+
+                    if !bordered
+                        .as_ref()
+                        .is_some_and(|b| capacity_fits(b.target.extent(), endpoint.extent))
+                    {
+                        let Ok(target) = VulkanMaterializationTarget::new_traced(
+                            device,
+                            target_capacity(endpoint.extent),
+                            &mut |_| {},
+                        ) else {
+                            return Ok(None);
+                        };
+                        *bordered = Some(BorderedLens {
+                            target,
+                            border: device.create_scene().map_err(app_error)?,
+                            sample: device.create_scene().map_err(app_error)?,
+                        });
+                    }
+                    let bordered = bordered.as_mut().unwrap();
+                    render_into(
+                        device,
+                        scene,
+                        lens_placement,
+                        &mut bordered.target,
+                        true,
+                        context,
+                    )?;
+                    update_border_scene(
+                        device,
+                        &mut bordered.border,
+                        lens,
+                        p,
+                        endpoint.extent,
+                        border,
+                    )?;
+                    let placement = VulkanCompositePlacement {
+                        scene_index: 0,
+                        target: full_rect(endpoint.extent),
+                        clip: None,
+                        rounded_clips: [None; 2],
+                    };
+                    render_into(
+                        device,
+                        &mut bordered.border,
+                        placement,
+                        &mut bordered.target,
+                        false,
+                        context,
+                    )?;
+                    let mut desc = capacity_image_scene(
+                        endpoint.extent,
+                        bordered.target.extent(),
+                        sample.weight,
+                        true,
+                    );
+                    bordered
+                        .sample
+                        .bind_materialized_image(
+                            ImageId(1),
+                            &bordered.target,
+                            ImageAlphaMode::Premultiplied,
+                        )
+                        .map_err(app_error)?;
+                    let mut delta = desc.take_delta().unwrap();
+                    delta.epoch = bordered
+                        .sample
+                        .epoch()
+                        .checked_add(1)
+                        .ok_or_else(|| AppError::new("bordered glass epoch exhausted"))?;
+                    device
+                        .apply_scene_delta(&mut bordered.sample, &delta)
+                        .map_err(app_error)?;
+                    render_into(
+                        device,
+                        &mut bordered.sample,
+                        placement,
+                        &mut resolved.target,
+                        false,
+                        context,
+                    )?;
+                } else {
+                    *bordered = None;
+                    *direct_border = None;
+                    render_into(
+                        device,
+                        scene,
+                        lens_placement,
+                        &mut resolved.target,
+                        direct,
+                        context,
+                    )?;
+                }
             }
             resolved.lenses.truncate(samples.len());
             resolved.signature = Some(signature);
@@ -445,6 +881,7 @@ pub(super) fn record_output(
 
 pub(super) fn retire_recipes(state: &mut MotionGlass, motion: &MotionFrame) {
     state.recipes.retain(|id, _| motion.live.contains(id));
+    state.empty_bodies.retain(|id| motion.live.contains(id));
     state
         .sampled
         .retain(|id, _| motion.outputs.iter().any(|o| o.id == *id));

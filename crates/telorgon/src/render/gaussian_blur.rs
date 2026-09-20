@@ -1,7 +1,7 @@
 use crate::ui::ImageId;
 
 /// A separable Gaussian pass. Sigma and offsets use source pixels, not output fractions.
-/// The source must be an owned image; both axes must use the same full-resolution extent.
+/// The source must be an owned image; inverse_size and sigma use that pass’s source resolution.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct GaussianBlurMaterial {
     pub source: ImageId,

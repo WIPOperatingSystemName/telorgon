@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+pub(crate) mod capture;
+
 #[cfg(target_os = "linux")]
 mod linux;
 

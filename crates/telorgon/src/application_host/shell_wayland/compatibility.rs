@@ -35,6 +35,7 @@ pub(super) struct Compatibility {
     descendants: BTreeSet<WaylandSurfaceId>,
     desktop: super::x11_windows::X11Windows,
     policy_repaint: bool,
+    decoration_policy: crate::DecorationPolicy,
     closing: BTreeMap<crate::xwayland::association::XWindow, Option<u16>>,
     pending_focus: Option<(
         WaylandSurfaceId,
@@ -59,6 +60,7 @@ impl Compatibility {
         runtime: std::path::PathBuf,
         environment: crate::session::Environment,
         wake: EventNotifier,
+        decoration_policy: crate::DecorationPolicy,
     ) -> AppResult<Self> {
         let (send, receive) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -99,6 +101,7 @@ impl Compatibility {
             descendants: BTreeSet::new(),
             desktop: Default::default(),
             policy_repaint: false,
+            decoration_policy,
             closing: BTreeMap::new(),
             pending_focus: None,
             pending_raise: None,
@@ -263,22 +266,13 @@ impl Compatibility {
                 .collect();
             for (id, unmanaged) in targets {
                 let extents = measured.get(&id).copied().unwrap_or_else(|| {
-                    if unmanaged {
-                        [0; 4]
-                    } else {
-                        [
-                            config.window_border,
-                            config.window_border,
-                            config.window_border
-                                + if xwm.decorations(id) {
-                                    config.titlebar_height
-                                } else {
-                                    0
-                                },
-                            config.window_border,
-                        ]
-                        .map(|value| value.max(0).saturating_mul(density) as u32)
-                    }
+                    super::x11_windows::estimated_frame_extents(
+                        self.decoration_policy,
+                        xwm.decorations(id),
+                        unmanaged,
+                        density,
+                        config,
+                    )
                 });
                 if !xwm
                     .set_frame_extents(id, extents, Instant::now())
@@ -981,6 +975,7 @@ mod tests {
                 descendants: BTreeSet::new(),
                 desktop: Default::default(),
                 policy_repaint: false,
+                decoration_policy: crate::DecorationPolicy::DEFAULT,
                 closing: BTreeMap::new(),
                 pending_focus: None,
                 pending_raise: None,

@@ -1,6 +1,8 @@
 //! Telorgon-owned Wayland protocol state and Linux compositor runtime.
 
 mod buffer;
+mod capture;
+mod foreign_toplevel;
 mod core;
 mod data_device;
 mod id;
@@ -18,6 +20,10 @@ mod xdg;
 
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 mod native;
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+mod capture_access;
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+pub use capture_access::CaptureAccess;
 
 pub use buffer::{
     BufferDescriptor, BufferError, DmaBufDescriptor, DmaBufFlags, DmaBufPlane, ShmBuffer,
@@ -58,3 +64,6 @@ pub use xdg::{
     DecorationMode, ResizeEdge, ToplevelState, XdgConfigure, XdgError, XdgPopupState,
     XdgPositioner, XdgSurfaceState, XdgToplevelState,
 };
+
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+pub(crate) use native::{DirectCaptureJob, DirectCaptureCompletion};

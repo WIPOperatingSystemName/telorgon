@@ -9,6 +9,7 @@ use super::Alignment;
 /// authoring value into its retained text representation before mounting or patching a node.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextStyle {
+    pub font_family: Option<&'static str>,
     pub color: Option<ColorRgba8>,
     pub size: Option<f32>,
     pub line_height: Option<f32>,
@@ -16,9 +17,36 @@ pub struct TextStyle {
     pub text_align: Option<Alignment>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authored_family_is_interned_without_changing_other_text_properties() {
+        let style = TextStyle::new()
+            .font_family("Inter 18pt")
+            .size(19.0)
+            .weight(600)
+            .resolve_with(|family| {
+                assert_eq!(family, "Inter 18pt");
+                crate::ui::StringId(42)
+            });
+        assert_eq!(style.family, crate::ui::StringId(42));
+        assert_eq!(style.size, 19.0);
+        assert_eq!(style.weight, 600);
+        assert_eq!(
+            TextStyle::new()
+                .resolve_with(|_| panic!("default family needs no interning"))
+                .family,
+            crate::ui::StringId(1)
+        );
+    }
+}
+
 impl TextStyle {
     pub const fn new() -> Self {
         Self {
+            font_family: None,
             color: None,
             size: None,
             line_height: None,
@@ -30,6 +58,20 @@ impl TextStyle {
     pub const fn color(mut self, color: ColorRgba8) -> Self {
         self.color = Some(color);
         self
+    }
+    pub const fn font_family(mut self, family: &'static str) -> Self {
+        self.font_family = Some(family);
+        self
+    }
+    pub(crate) fn resolve_with(
+        self,
+        intern: impl FnOnce(&str) -> crate::ui::StringId,
+    ) -> RetainedTextStyle {
+        let mut style = self.resolve();
+        if let Some(family) = self.font_family {
+            style.family = intern(family);
+        }
+        style
     }
 
     pub const fn size(mut self, size: f32) -> Self {

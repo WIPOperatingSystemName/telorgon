@@ -18,8 +18,7 @@ use crate::renderer_vulkan::external_image::{
 };
 #[cfg(feature = "instrumentation")]
 use crate::renderer_vulkan::frame::{
-    PROFILER_TIMESTAMP_RENDER_BEGIN, PROFILER_TIMESTAMP_RENDER_END, PROFILER_TIMESTAMP_TOTAL_END,
-    PROFILER_TIMESTAMP_UPLOAD_END,
+    PROFILER_TIMESTAMP_RENDER_BEGIN, PROFILER_TIMESTAMP_RENDER_END, PROFILER_TIMESTAMP_UPLOAD_END,
 };
 use crate::renderer_vulkan::scene::{DrawBatch, validate_draw_order, validate_texture_count};
 use crate::renderer_vulkan::sync::{
@@ -368,11 +367,6 @@ impl RenderBackend for VulkanDevice {
                 );
             }
         }
-        #[cfg(feature = "instrumentation")]
-        frame.core.write_profiler_timestamp(
-            PROFILER_TIMESTAMP_TOTAL_END,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-        );
         frame.core.buffers.extend(scene.retained_buffers());
         frame.core.images.extend(scene.retained_images());
         frame.core.rendered = true;
@@ -475,18 +469,12 @@ fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult
         ));
     }
 
-    let mut boxes = scene.boxes.clone();
-    apply_local_patches(&mut boxes, &delta.boxes, delta.box_len);
-    let mut glyphs = scene.glyphs.clone();
-    apply_local_patches(&mut glyphs, &delta.glyphs, delta.glyph_len);
-    let mut images = scene.images.clone();
-    apply_local_patches(&mut images, &delta.images, delta.image_len);
-    let mut materials = scene.materials.clone();
-    apply_local_patches(&mut materials, &delta.materials, delta.material_len);
-    let mut clips = scene.clips.clone();
-    apply_local_patches(&mut clips, &delta.clips, delta.clip_len);
-    let mut spatial = scene.spatial.clone();
-    apply_local_patches(&mut spatial, &delta.spatial_nodes, delta.spatial_len);
+    let boxes = patched_view(&scene.boxes, &delta.boxes, delta.box_len);
+    let glyphs = patched_view(&scene.glyphs, &delta.glyphs, delta.glyph_len);
+    let images = patched_view(&scene.images, &delta.images, delta.image_len);
+    let materials = patched_view(&scene.materials, &delta.materials, delta.material_len);
+    let clips = patched_view(&scene.clips, &delta.clips, delta.clip_len);
+    let spatial = patched_view(&scene.spatial, &delta.spatial_nodes, delta.spatial_len);
     let draw_order = delta.draw_order.as_deref().unwrap_or(&scene.draw_order);
     validate_draw_order(draw_order).map_err(invalid_scene)?;
     validate_texture_count(draw_order).map_err(unsupported)?;
@@ -625,11 +613,15 @@ fn validate_delta(scene: &VulkanScene, delta: &RenderSceneDelta) -> RenderResult
                         || !image_resources.contains(&parameters.source.0)
                         || scene.has_external_image(parameters.source)
                     {
-                        return Err(invalid_scene("Gaussian blur requires valid parameters, its own pipeline and an owned source"));
+                        return Err(invalid_scene(
+                            "Gaussian blur requires valid parameters, its own pipeline and an owned source",
+                        ));
                     }
                 }
                 _ if draw.batch.pipeline == crate::render::PipelineKind::GaussianBlur => {
-                    return Err(invalid_scene("Gaussian blur pipeline requires Gaussian blur parameters"));
+                    return Err(invalid_scene(
+                        "Gaussian blur pipeline requires Gaussian blur parameters",
+                    ));
                 }
                 _ if draw.batch.pipeline == crate::render::PipelineKind::LiquidGlass => {
                     return Err(invalid_scene(
@@ -795,6 +787,49 @@ pub(crate) fn begin_external_image_uses(
     Ok(count.saturating_mul(2))
 }
 
+// Validation remains transactional: changed arrays are private copies, unchanged arrays
+// are read directly from the retained scene. Shrink-only updates can borrow a prefix.
+fn patched_view<'a, T: Clone>(
+    retained: &'a [T],
+    patches: &[RangePatch<T>],
+    final_len: usize,
+) -> std::borrow::Cow<'a, [T]> {
+    if patches.is_empty() && final_len <= retained.len() {
+        return std::borrow::Cow::Borrowed(&retained[..final_len]);
+    }
+    let mut values = retained.to_vec();
+    apply_local_patches(&mut values, patches, final_len);
+    std::borrow::Cow::Owned(values)
+}
+
+#[cfg(test)]
+mod patched_view_tests {
+    use super::*;
+    #[test]
+    fn validation_borrows_unchanged_storage_and_keeps_patches_transactional() {
+        let retained = vec![10, 20, 30];
+        let unchanged = patched_view(&retained, &[], 3);
+        assert_eq!(unchanged.as_ptr(), retained.as_ptr());
+        let shrunk = patched_view(&retained, &[], 2);
+        assert_eq!(shrunk.as_ptr(), retained.as_ptr());
+        assert_eq!(&*shrunk, &[10, 20]);
+        let patched = patched_view(
+            &retained,
+            &[RangePatch {
+                start: 1,
+                values: vec![99, 88, 77].into(),
+            }],
+            4,
+        );
+        assert_eq!(&*patched, &[10, 99, 88, 77]);
+        assert_eq!(
+            retained,
+            [10, 20, 30],
+            "validation must not mutate the committed scene"
+        );
+    }
+}
+
 fn apply_local_patches<T: Clone>(target: &mut Vec<T>, patches: &[RangePatch<T>], final_len: usize) {
     for patch in patches {
         let end = patch.start + patch.values.len();
@@ -941,9 +976,15 @@ fn bind_scene_descriptors(
                     || desired.textures[slot].views[binding as usize] != view
                     || desired.textures[slot].generations[binding as usize] != generation)
             {
-                image_ops.push((frame.descriptor_sets.textures[slot], binding,
-                    vk::DescriptorImageInfo { sampler, image_view: view,
-                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }));
+                image_ops.push((
+                    frame.descriptor_sets.textures[slot],
+                    binding,
+                    vk::DescriptorImageInfo {
+                        sampler,
+                        image_view: view,
+                        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    },
+                ));
                 desired.textures[slot].views[binding as usize] = view;
                 desired.textures[slot].generations[binding as usize] = generation;
             }

@@ -139,7 +139,8 @@ impl Journal {
                 }
                 let data: JournalData = toml::from_str(&data)
                     .map_err(|e| Error::Invalid(format!("invalid recovery journal: {e}")))?;
-                if data.version != 1 || data.entries.len() > 256 {
+                // Journal size is bounded in bytes; recovery offers do not consume process slots.
+                if data.version != 1 {
                     return Err(Error::Invalid(
                         "unsupported recovery journal version or size".into(),
                     ));

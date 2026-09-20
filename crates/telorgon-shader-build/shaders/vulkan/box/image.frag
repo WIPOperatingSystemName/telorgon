@@ -60,7 +60,10 @@ float clip_coverage(uint slot,vec2 p){
 void main(){
     GpuImageInstance item=images.values[instance_slot];
     // Texture sampling also needs uniform control flow for its implicit derivatives.
-    vec4 sampled=texture(source_texture,uv);
+    // Clamp to the active image's texel centers, not overallocated snapshot padding.
+    vec2 half_texel=0.5/vec2(textureSize(source_texture,0));
+    vec2 sample_uv=clamp(uv,item.uv_normalized.xy+half_texel,item.uv_normalized.zw-half_texel);
+    vec4 sampled=texture(source_texture,sample_uv);
     float clip_amount=clip_coverage(item.tint_spatial_clip_texture.z,view_position);
     float placement_amount=placement_coverage()*clip_amount;
     if(placement_amount<=0.0)discard;

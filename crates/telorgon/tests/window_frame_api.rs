@@ -89,17 +89,17 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
     motion: telorgon::WindowMotion::none(),
     active: WindowChromePalette {
         frame_background: ColorRgba8::rgba(23, 27, 38, 255),
-        frame_border: ColorRgba8::rgba(101, 119, 184, 255),
-        frame_border_width: 1.0,
+        frame_border: Border::all(1.0, ColorRgba8::rgba(101, 119, 184, 255)),
         title_color: ColorRgba8::rgba(245, 247, 255, 255),
         title_weight: 650,
+        shadow_color: None,
     },
     inactive: WindowChromePalette {
         frame_background: ColorRgba8::rgba(31, 34, 43, 255),
-        frame_border: ColorRgba8::rgba(65, 70, 85, 255),
-        frame_border_width: 1.0,
+        frame_border: Border::all(1.0, ColorRgba8::rgba(65, 70, 85, 255)),
         title_color: ColorRgba8::rgba(174, 179, 193, 255),
         title_weight: 450,
+        shadow_color: None,
     },
     normal: NORMAL,
     maximized: WindowChromeStateStyle {
@@ -124,6 +124,7 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
         resize_hit_slop: Insets::ZERO,
     },
     title_bar: WindowTitleBarStyle {
+        font_family: "sans-serif",
         height: 44.0,
         padding: Insets::symmetric(7.0, 8.0),
         gap: 8.0,
@@ -247,11 +248,11 @@ fn easy_frame_publishes_controls_and_all_resize_directions() {
     assert_eq!(slot.corner_radii.top_right, 0.0);
     assert_eq!(
         slot.corner_radii.bottom_left,
-        NORMAL.frame_radius - TEST_CHROME.active.frame_border_width
+        NORMAL.frame_radius - TEST_CHROME.active.frame_border.top.width
     );
     assert_eq!(
         slot.corner_radii.bottom_right,
-        NORMAL.frame_radius - TEST_CHROME.active.frame_border_width
+        NORMAL.frame_radius - TEST_CHROME.active.frame_border.top.width
     );
 
     assert!(
@@ -364,7 +365,7 @@ fn easy_frame_resize_hitboxes_track_the_border_without_spilling_inward() {
             ..NORMAL
         };
         let palette = WindowChromePalette {
-            frame_border_width: border,
+            frame_border: Border::all(border, TEST_CHROME.active.frame_border.top.color),
             ..TEST_CHROME.active
         };
         let design = WindowChromeDesign {
@@ -454,7 +455,7 @@ fn title_bar_height_and_visibility_derive_content_bounds_automatically() {
             };
             let snapshot =
                 chrome_snapshot(design, WindowChromeModel::new(11, "Layout").active(true));
-            let border = design.active.frame_border_width;
+            let border = design.active.frame_border.top.width;
             assert_eq!(snapshot.content.bounds.x, border);
             assert_eq!(
                 snapshot.content.bounds.y,
@@ -481,7 +482,7 @@ fn corner_resize_to_content_hover_changes_pointer_ownership() {
         };
         let snapshot = chrome_snapshot(design, WindowChromeModel::new(17, "Hover").active(true));
         let radius = NORMAL.frame_radius;
-        let border = design.active.frame_border_width;
+        let border = design.active.frame_border.top.width;
         let start = radius - (radius - border * 0.5) / 2.0_f32.sqrt();
         for (edge, right, bottom) in [
             (WindowResizeEdge::TopLeft, false, false),
@@ -571,7 +572,7 @@ fn resize_contours_do_not_capture_client_pixels_or_enable_disabled_edges() {
         TEST_CHROME,
         WindowChromeModel::new(12, "Round").active(true),
     );
-    let border = TEST_CHROME.active.frame_border_width;
+    let border = TEST_CHROME.active.frame_border.top.width;
     let outer = telorgon::render::RoundedClip::new(
         snapshot.frame.bounds,
         CornerRadii::all(NORMAL.frame_radius),
@@ -862,7 +863,7 @@ fn maximized_and_fullscreen_frames_fill_the_outer_bounds_without_a_border() {
     for border in [1.0, 2.0, 6.0] {
         for title_height in [24.0, 32.0, 48.0] {
             let mut design = TEST_CHROME;
-            design.active.frame_border_width = border;
+            design.active.frame_border = Border::all(border, design.active.frame_border.top.color);
             design.title_bar.height = title_height;
             for state in [WindowChromeState::Maximized, WindowChromeState::Fullscreen] {
                 let snapshot = chrome_snapshot(
@@ -944,4 +945,160 @@ fn fluid_motion_is_const_customizable_through_the_public_app_api() {
         GeometryMotion::Spring(_)
     ));
     assert_eq!(MOTION.maximize_transition(false).duration_ms(), 475);
+}
+
+#[test]
+fn asymmetric_palette_borders_drive_insets_corners_and_resize_hits() {
+    let border = Border {
+        top: BorderSide {
+            width: 1.5,
+            color: ColorRgba8::rgba(255, 0, 0, 255),
+        },
+        right: BorderSide {
+            width: 5.0,
+            color: ColorRgba8::rgba(0, 255, 0, 255),
+        },
+        bottom: BorderSide {
+            width: 3.0,
+            color: ColorRgba8::rgba(0, 0, 255, 255),
+        },
+        left: BorderSide {
+            width: 8.0,
+            color: ColorRgba8::rgba(255, 255, 0, 255),
+        },
+    };
+    for active in [false, true] {
+        for title_bar_visible in [false, true] {
+            let palette = WindowChromePalette {
+                frame_border: border,
+                ..TEST_CHROME.active
+            };
+            let mut design = TEST_CHROME;
+            if active {
+                design.active = palette;
+            } else {
+                design.inactive = palette;
+            }
+            design.normal.resize_edge = 6.0;
+            design.normal.resize_hit_slop = Insets::new(1.0, 2.0, 3.0, 4.0);
+            design.validate().unwrap();
+            let mut runtime = AppRuntimeCore::from_composed_with_extent(
+                easy_window_frame(design).compose(
+                    WindowChromeModel::new(10, "Asymmetric")
+                        .active(active)
+                        .title_bar_visible(title_bar_visible),
+                ),
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap();
+            runtime.prepare_frame(MonotonicInstant::ZERO, true).unwrap();
+            let snapshot =
+                telorgon::WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+            let root = &runtime
+                .ui()
+                .box_styles
+                .get(snapshot.frame.node)
+                .unwrap()
+                .decoration;
+            assert_eq!(
+                root.border, border,
+                "each side keeps its own width and color"
+            );
+            assert_eq!(snapshot.content.bounds.x, 8.0);
+            assert_eq!(
+                snapshot.content.bounds.y,
+                1.5 + if title_bar_visible {
+                    design.title_bar.height
+                } else {
+                    0.0
+                }
+            );
+            assert_eq!(snapshot.content.bounds.right(), 635.0);
+            assert_eq!(snapshot.content.bounds.bottom(), 477.0);
+            let slot = &runtime
+                .ui()
+                .box_styles
+                .get(snapshot.content.node)
+                .unwrap()
+                .decoration;
+            let r = design.normal.frame_radius;
+            assert_eq!(
+                slot.corner_radii,
+                CornerRadii {
+                    top_left: if title_bar_visible {
+                        0.0
+                    } else {
+                        (r - 8.0).max(0.0)
+                    },
+                    top_right: if title_bar_visible {
+                        0.0
+                    } else {
+                        (r - 5.0).max(0.0)
+                    },
+                    bottom_right: (r - 5.0).max(0.0),
+                    bottom_left: (r - 8.0).max(0.0),
+                }
+            );
+            for (edge, x, y, outside_x, outside_y) in [
+                (WindowResizeEdge::Top, 320.0, -5.25, 320.0, -5.75),
+                (WindowResizeEdge::Right, 642.75, 240.0, 643.25, 240.0),
+                (WindowResizeEdge::Bottom, 320.0, 485.75, 320.0, 486.25),
+                (WindowResizeEdge::Left, -3.75, 240.0, -4.25, 240.0),
+            ] {
+                assert_eq!(
+                    snapshot.hit_test(x, y),
+                    Some(WindowChromeRole::Action(WindowAction::BeginResize(edge)))
+                );
+                assert_eq!(snapshot.hit_test(outside_x, outside_y), None);
+            }
+            for (x, y) in [(8.25, 240.0), (634.75, 240.0), (320.0, 476.75)] {
+                assert_eq!(
+                    snapshot.hit_test(x, y),
+                    None,
+                    "resize bands must not enter client content"
+                );
+            }
+            for state in [WindowChromeState::Maximized, WindowChromeState::Fullscreen] {
+                let snapshot = chrome_snapshot(
+                    design,
+                    WindowChromeModel::new(10, "Borderless")
+                        .active(active)
+                        .state(state),
+                );
+                assert_eq!(snapshot.content.bounds.x, 0.0);
+                assert_eq!(snapshot.content.bounds.right(), 640.0);
+                assert_eq!(snapshot.content.bounds.bottom(), 480.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn palette_rejects_invalid_width_on_every_side_and_inactive_palette() {
+    for active in [false, true] {
+        for side in 0..4 {
+            for width in [-1.0, f32::NAN, f32::INFINITY] {
+                let mut design = TEST_CHROME;
+                let border = if active {
+                    &mut design.active.frame_border
+                } else {
+                    &mut design.inactive.frame_border
+                };
+                let sides = [
+                    &mut border.top,
+                    &mut border.right,
+                    &mut border.bottom,
+                    &mut border.left,
+                ];
+                sides.into_iter().nth(side).unwrap().width = width;
+                assert_eq!(
+                    design.validate(),
+                    Err(WindowChromeDesignError::InvalidFrameBorderWidth)
+                );
+            }
+        }
+    }
 }

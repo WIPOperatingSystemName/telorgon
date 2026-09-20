@@ -15,6 +15,7 @@ impl Layer {
         scale: crate::platform::ScaleFactor,
     ) -> AppResult<Self> {
         let mut runtime = ComposedAppRuntime::from_composition_driver(driver, extent)?;
+        runtime.register_fonts(assets)?;
         runtime.set_raster_scale(scale);
         let mut media = AssetMediaCache::new(assets).map_err(app_error)?;
         for resource in media.preload_render_resources().map_err(app_error)? {
@@ -135,6 +136,7 @@ pub(super) fn refresh_window_frames(
     config: &LinuxShellConfig,
     assets: AssetBundle,
     fallback_icon: &crate::AppIconProfile,
+    services: Option<&crate::compose::ShellServices>,
     wake: &EventNotifier,
     now: u64,
     scale: crate::platform::ScaleFactor,
@@ -151,6 +153,11 @@ pub(super) fn refresh_window_frames(
         return Ok(());
     };
 
+    for window in windows.values_mut().filter(|window| !window_has_frame(window)) {
+        window.chrome_outer = None;
+        window.chrome_content_offset = None;
+        window.chrome = None;
+    }
     frames.retain(|surface, _| {
         windows
             .get(surface)
@@ -188,6 +195,8 @@ pub(super) fn refresh_window_frames(
             WindowChromeState::Fullscreen
         } else if window.maximized {
             WindowChromeState::Maximized
+        } else if window.tile.is_some() {
+            WindowChromeState::Tiled
         } else {
             WindowChromeState::Normal
         };
@@ -222,6 +231,27 @@ pub(super) fn refresh_window_frames(
             .capabilities(capabilities)
             .state(state)
             .active(active == Some(surface));
+        if let Some(tile) = window.tile {
+            use crate::WindowEdgeMask as E;
+            let mut resize = if tile.target.left() {
+                E::RIGHT
+            } else {
+                E::LEFT
+            };
+            if let Some(bottom) = tile.target.row() {
+                resize |= if bottom { E::TOP } else { E::BOTTOM };
+            }
+            model = model.tiling(crate::WindowTilingState::new(
+                E::LEFT | E::RIGHT | E::TOP | E::BOTTOM,
+                if tile.shared_resize {
+                    resize
+                } else {
+                    E::default()
+                },
+            ));
+        }
+        model.frame_parts = window.decoration_policy.frame_parts(window.server_decorated);
+        model.desktop_window_id = window.desktop_id;
         if let Some(name) = icon_name {
             model = model.app_icon_name(name);
         }
@@ -231,6 +261,14 @@ pub(super) fn refresh_window_frames(
             model = model.app_icon(icon);
         }
         let content_style = factory.content_style(&model);
+        if content_style
+            .and_then(|style| style.resize_preview)
+            .is_some_and(|preview| !preview.border_is_valid())
+        {
+            return Err(AppError::new(
+                "resize preview border widths must be finite and nonnegative",
+            ));
+        }
         if content_style
             .is_some_and(|style| !style.corner_radius.is_finite() || style.corner_radius < 0.0)
         {
@@ -245,6 +283,9 @@ pub(super) fn refresh_window_frames(
         let created = !frames.contains_key(&surface);
         if created {
             let mut driver = factory.compose(model.clone());
+            if let Some(services) = services {
+                driver.connect_shell(services.clone());
+            }
             driver.set_wake({
                 let wake = wake.clone();
                 move || wake.notify()
@@ -288,7 +329,13 @@ pub(super) fn refresh_window_frames(
             }
             frame.icon_image = icon_image_id;
         }
-        let layout_key = (window.requested_size, window.maximized.then_some(work_area));
+        let layout_key = (
+            window.requested_size,
+            window
+                .tile
+                .map(|t| t.rect)
+                .or_else(|| window.maximized.then_some(work_area)),
+        );
         let unchanged = !created
             && frame.model == model
             && frame.content_style == content_style
@@ -309,7 +356,10 @@ pub(super) fn refresh_window_frames(
             &mut frame.layer,
             &mut frame.outer,
             window.requested_size,
-            window.maximized.then_some(work_area),
+            window
+                .tile
+                .map(|t| t.rect)
+                .or_else(|| window.maximized.then_some(work_area)),
             now,
             created,
         )?;
@@ -351,31 +401,38 @@ pub(super) fn refresh_window_frames(
 
     for (surface, outer, content_offset, snapshot) in updates {
         if let Some(window) = windows.get_mut(&surface) {
-            if window.maximized {
+            if window.maximized || window.tile.is_some() {
                 let content_size = SizeI {
                     width: snapshot.content.bounds.width.round().max(1.0) as i32,
                     height: snapshot.content.bounds.height.round().max(1.0) as i32,
                 };
                 if window.requested_size != content_size {
                     window.requested_size = content_size;
-                    // A measured custom-frame size supersedes the fallback configure. Keep
-                    // the placeholder until content for this new transaction is published.
-                    if window.backend == Some(WindowBackend::Wayland) {
-                        window.native_configure.resize_final =
-                            Some(FinalResizeConfigure::pending(content_size));
+                    // Measuring tiled chrome must not end an active divider grab: keep
+                    // the resize placeholder and its content-motion handoff until release.
+                    if window.resizing() {
+                        configure_scheduler.schedule_resize(surface, content_size);
+                    } else {
+                        // A measured custom-frame size supersedes the fallback configure. Keep
+                        // the placeholder until content for this new transaction is published.
+                        if window.backend == Some(WindowBackend::Wayland) {
+                            window.native_configure.resize_final =
+                                Some(FinalResizeConfigure::pending(content_size));
+                        }
+                        #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                        if matches!(window.backend, Some(WindowBackend::X11(_))) {
+                            // Measured chrome can supersede an earlier fallback size
+                            // even after that earlier client image has arrived.
+                            window.resize_preview.finish();
+                        }
+                        configure_scheduler.schedule_final(surface, content_size);
                     }
-                    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
-                    if matches!(window.backend, Some(WindowBackend::X11(_))) {
-                        // Measured chrome can supersede an earlier fallback size
-                        // even after that earlier client image has arrived.
-                        window.resize_preview.finish();
-                    }
-                    configure_scheduler.schedule_final(surface, content_size);
                 }
             }
             #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
             if matches!(window.backend, Some(WindowBackend::X11(_)))
                 && !window.maximized
+                && window.tile.is_none()
                 && !window.fullscreen
             {
                 // A newly composed/customized frame can differ from the estimated insets.
@@ -601,6 +658,15 @@ pub(super) fn prepare_desktop_layers(
         )
         .collect::<Vec<_>>();
     for surface in &order {
+        for widget in widgets
+            .iter_mut()
+            .filter(|w| w.spec.tiling.is_some() && w.tile_preview_owner == Some(*surface))
+        {
+            if let Some(material) = widget.tile_material(session_locked) {
+                layers.push(material);
+            }
+            layers.push(widget.scene(session_locked));
+        }
         let veil_owner = resize_veil_owner(windows, *surface);
         let veiled = veil_owner.is_some();
         // Only subsurfaces inherit their toplevel's clip. Popups are independent overlays and
@@ -719,6 +785,7 @@ pub(super) fn prepare_desktop_layers(
         if visible
             && !veiled
             && window_has_frame(window)
+            && window_is_decorated(window)
             && window.chrome.is_none()
             && window.backend.is_some()
         {
@@ -762,7 +829,7 @@ pub(super) fn prepare_desktop_layers(
             let mut preview = ShellLayer::solid(
                 ShellLayerKey::ResizeVeil(surface.get()),
                 ShellSceneKey::ResizeVeil(surface.get()),
-                appearance.color(),
+                appearance.fill.color(),
                 RectI {
                     x: position.x,
                     y: position.y,
@@ -770,13 +837,16 @@ pub(super) fn prepare_desktop_layers(
                     height: outer.height,
                 },
             );
-            if let crate::ResizePreview::Glass(style) = appearance {
+            if let crate::Fill::Glass(style) = appearance.fill {
                 preview.glass = Some(style.normalized());
             }
             if let Some(border) = frames.get(surface).and_then(|frame| frame.border.as_ref()) {
                 preview = preview.with_frame_outline(border, position);
             }
+            let border =
+                ShellLayer::resize_preview_border(surface.get(), &preview, appearance.border);
             layers.push(preview);
+            layers.extend(border);
         }
         let placement = surface_placement(window, position, config);
         let output_bounds = placement
@@ -840,15 +910,36 @@ pub(super) fn prepare_desktop_layers(
         ));
     }
 
+    // The mounted snap widget outlives its last window owner. Keep consuming its
+    // incremental scene stream while unowned, without drawing an orphan preview.
+    // Otherwise the renderer retires its baseline and rejects the next resize delta.
+    for widget in widgets.iter_mut().filter(|w| {
+        w.spec.tiling.is_some()
+            && !w
+                .tile_preview_owner
+                .is_some_and(|owner| order.contains(&owner))
+    }) {
+        let mut layer = widget.scene(session_locked);
+        layer.visible = false;
+        layers.push(layer);
+    }
+
+    let overlay_ids = widgets.iter()
+        .filter(|w| w.spec.layer == crate::ShellSurfaceLayer::Overlay)
+        .map(|w| w.id).collect::<std::collections::BTreeSet<_>>();
     let mut upper_widgets = widgets
         .iter_mut()
-        .filter(|w| w.spec.layer != crate::ShellSurfaceLayer::Background)
+        .filter(|w| w.spec.tiling.is_none() && w.spec.layer != crate::ShellSurfaceLayer::Background)
         .collect::<Vec<_>>();
     upper_widgets.sort_by_key(|w| (w.spec.layer, w.spec.order, w.id));
     for widget in upper_widgets {
+        // Build output thumbnails from the desktop below overlays. Copies never become
+        // sources themselves, so two preview widgets cannot recursively preview each other.
+        let output_previews = widget.output_preview_layers(&layers, &overlay_ids, session_locked);
         layers.push(widget.scene(session_locked));
         let previews = widget.preview_layers(windows, &layers, session_locked);
         layers.extend(previews);
+        layers.extend(output_previews);
     }
     if let Some(cursor) = cursor {
         match cursor {
@@ -944,6 +1035,103 @@ mod maximize_tests {
 
     #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
     #[test]
+    fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometry() {
+        use super::super::client::maximize_preview_tests::test_window;
+        use crate::{DecorationNegotiation, FramePartPolicy, ResizeRegionPolicy};
+        let declaration = crate::application_host::Compositor::new()
+            .cursor_theme(crate::CursorTheme::new())
+            .window_frame(|model: WindowChromeModel| TestFrame {
+                title_height: if model.title_bar_visible { 37.0 } else { 0.0 },
+            });
+        let display = Display::new().unwrap();
+        let wayland = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+        let config = LinuxShellConfig::default();
+        let wake = EventNotifier::new("decoration policy test").unwrap();
+        let area = RectI {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let mut windows = BTreeMap::new();
+        for index in 1..=3 {
+            let mut window = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI::default(),
+            );
+            if index == 2 {
+                window.role = SurfaceRole::Xwayland;
+                window.backend = Some(WindowBackend::X11(crate::xwayland::association::XWindow {
+                    generation: 1,
+                    xid: 10,
+                    incarnation: 1,
+                }));
+            } else if index == 3 {
+                window.role = SurfaceRole::XdgPopup;
+                window.backend = None;
+            }
+            window.server_decorated = false;
+            windows.insert(WaylandSurfaceId::from_raw(index).unwrap(), window);
+        }
+        let mut frames = BTreeMap::new();
+        let mut scheduler = ConfigureScheduler::default();
+        for phase in 0..5 {
+            for window in windows.values_mut() {
+                window.decoration_policy = crate::DecorationPolicy::DEFAULT;
+                if phase == 1 {
+                    window.decoration_policy.outer_frame.rounded_clip = FramePartPolicy::Always;
+                    window.decoration_policy.interaction.resize_regions =
+                        ResizeRegionPolicy::Enabled;
+                } else if phase == 2 {
+                    window.decoration_policy.negotiation = DecorationNegotiation::PreferServer;
+                }
+                window.fullscreen = phase == 3;
+            }
+            refresh_window_frames(
+                declaration.frame_template(),
+                &mut frames,
+                &mut windows,
+                &wayland,
+                &config,
+                AssetBundle::default(),
+                &crate::AppIconProfile::default(),
+                None,
+                &wake,
+                phase,
+                crate::platform::ScaleFactor::new(1.0).unwrap(),
+                area,
+                &mut scheduler,
+            )
+            .unwrap();
+            assert!(!frames.contains_key(&WaylandSurfaceId::from_raw(3).unwrap()));
+            if phase == 1 || phase == 2 {
+                assert_eq!(frames.len(), 2);
+                for frame in frames.values() {
+                    assert_eq!(frame.model.title_bar_visible, phase == 2);
+                    assert_eq!(frame.model.frame_parts.border, phase == 2);
+                    assert!(frame.model.frame_parts.rounded_clip);
+                    assert!(frame.model.frame_parts.resize_regions);
+                    assert_eq!(
+                        frame.snapshot.as_ref().unwrap().content.bounds.y,
+                        if phase == 2 { 37.0 } else { 0.0 }
+                    );
+                }
+            } else {
+                assert!(frames.is_empty());
+                for window in windows.values() {
+                    assert!(window.chrome.is_none());
+                    assert!(window.chrome_outer.is_none());
+                    assert_eq!(window_content_offset(window, &config), PointI::default());
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+    #[test]
     fn both_backends_draw_the_same_rgba_veil_and_hide_client_subtrees() {
         use super::super::client::maximize_preview_tests::test_window;
         use super::super::scene::ShellLayerContent;
@@ -951,7 +1139,7 @@ mod maximize_tests {
         let child = WaylandSurfaceId::from_raw(21).unwrap();
         let color = crate::core::ColorRgba8::rgba(20, 40, 60, 96);
         let config = LinuxShellConfig {
-            resize_preview: crate::ResizePreview::Color(color),
+            resize_preview: crate::ResizePreviewDesign::new(crate::Fill::Color(color)),
             ..Default::default()
         };
         for backend in [
@@ -1001,6 +1189,7 @@ mod maximize_tests {
                 &config,
                 AssetBundle::default(),
                 &crate::AppIconProfile::default(),
+                None,
                 &EventNotifier::new("whole window preview").unwrap(),
                 0,
                 crate::platform::ScaleFactor::new(1.0).unwrap(),
@@ -1161,6 +1350,7 @@ mod maximize_tests {
             &LinuxShellConfig::default(),
             AssetBundle::default(),
             &crate::AppIconProfile::default(),
+            None,
             &EventNotifier::new("frame parity").unwrap(),
             0,
             crate::platform::ScaleFactor::new(1.5).unwrap(),
@@ -1220,6 +1410,7 @@ mod maximize_tests {
             &LinuxShellConfig::default(),
             AssetBundle::default(),
             &crate::AppIconProfile::default(),
+            None,
             &EventNotifier::new("resize frame").unwrap(),
             1,
             crate::platform::ScaleFactor::new(1.5).unwrap(),
@@ -1284,6 +1475,7 @@ mod maximize_tests {
             &config,
             AssetBundle::default(),
             &crate::AppIconProfile::default(),
+            None,
             &EventNotifier::new("maximized veil").unwrap(),
             0,
             crate::platform::ScaleFactor::new(1.0).unwrap(),
@@ -1294,6 +1486,111 @@ mod maximize_tests {
         assert_eq!(windows[&surface].requested_size.height, 747);
         assert_eq!(resize_veil_owner(&windows, surface), Some(surface));
         assert!(windows[&surface].native_configure.resize_final.is_none());
+    }
+
+    #[test]
+    fn tile_outer_geometry_measures_the_actual_custom_content_slot() {
+        let backends = [
+            WindowBackend::Wayland,
+            #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+            WindowBackend::X11(crate::xwayland::association::XWindow {
+                generation: 1,
+                xid: 10,
+                incarnation: 1,
+            }),
+        ];
+        for backend in backends {
+            for interactive in [false, true] {
+                use super::super::client::maximize_preview_tests::test_window;
+                let declaration = crate::application_host::Compositor::new()
+                    .cursor_theme(crate::CursorTheme::new())
+                    .window_frame(|model: WindowChromeModel| {
+                        assert_eq!(model.state, WindowChromeState::Tiled);
+                        assert!(model.tiling.is_some());
+                        TestFrame { title_height: 53.0 }
+                    });
+                let display = Display::new().unwrap();
+                let wayland = NativeCompositor::new(&display, ClientLimits::default()).unwrap();
+                let surface = WaylandSurfaceId::from_raw(20).unwrap();
+                let rect = RectI {
+                    x: 0,
+                    y: 40,
+                    width: 600,
+                    height: 380,
+                };
+                let mut window = test_window(
+                    SizeI {
+                        width: 600,
+                        height: 350,
+                    },
+                    PointI { x: 0, y: 40 },
+                );
+                window.tile = Some(super::super::tiling::TilePlacement {
+                    target: crate::TileTarget::TopLeft,
+                    rect,
+                    shared_resize: true,
+                });
+                window.backend = Some(backend);
+                if interactive && backend == WindowBackend::Wayland {
+                    window.native_configure.resize_anchor = Some(ResizeAnchor::new(
+                        window.position,
+                        window.requested_size,
+                        ResizeEdge::BottomRight,
+                    ));
+                }
+                #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                if interactive && matches!(backend, WindowBackend::X11(_)) {
+                    window.resize_preview.begin(
+                        window.position,
+                        window.requested_size,
+                        ResizeEdge::BottomRight,
+                    );
+                }
+                let mut windows = BTreeMap::from([(surface, window)]);
+                let mut frames = BTreeMap::new();
+                refresh_window_frames(
+                    declaration.frame_template(),
+                    &mut frames,
+                    &mut windows,
+                    &wayland,
+                    &LinuxShellConfig::default(),
+                    AssetBundle::default(),
+                    &crate::AppIconProfile::default(),
+                    None,
+                    &EventNotifier::new("tiled frame").unwrap(),
+                    0,
+                    crate::platform::ScaleFactor::new(1.5).unwrap(),
+                    RectI {
+                        x: 0,
+                        y: 40,
+                        width: 1200,
+                        height: 760,
+                    },
+                    &mut ConfigureScheduler::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    windows[&surface].chrome_outer,
+                    Some(SizeI {
+                        width: 600,
+                        height: 380
+                    })
+                );
+                assert_eq!(
+                    windows[&surface].requested_size,
+                    SizeI {
+                        width: 600,
+                        height: 327
+                    }
+                );
+                assert_eq!(
+                    windows[&surface].native_configure.resize_final.is_some(),
+                    !interactive && backend == WindowBackend::Wayland
+                );
+                assert_eq!(windows[&surface].resizing(), interactive);
+                assert!(windows[&surface].resize_veil_active());
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,47 @@
 # Pinned wire ABI through each InterfaceSpec source_version.
 # Sorted: interface kind opcode name signature destructor argument-interface-list
 # A dash denotes an empty signature/type list or a primitive argument type.
+ext_foreign_toplevel_handle_v1 event 0 closed - false -
+ext_foreign_toplevel_handle_v1 event 1 done - false -
+ext_foreign_toplevel_handle_v1 event 2 title s false -
+ext_foreign_toplevel_handle_v1 event 3 app_id s false -
+ext_foreign_toplevel_handle_v1 event 4 identifier s false -
+ext_foreign_toplevel_handle_v1 request 0 destroy - true -
+ext_foreign_toplevel_image_capture_source_manager_v1 request 0 create_source no false ext_image_capture_source_v1,ext_foreign_toplevel_handle_v1
+ext_foreign_toplevel_image_capture_source_manager_v1 request 1 destroy - true -
+ext_foreign_toplevel_list_v1 event 0 toplevel n false ext_foreign_toplevel_handle_v1
+ext_foreign_toplevel_list_v1 event 1 finished - false -
+ext_foreign_toplevel_list_v1 request 0 stop - false -
+ext_foreign_toplevel_list_v1 request 1 destroy - true -
+ext_image_capture_source_v1 request 0 destroy - true -
+ext_image_copy_capture_cursor_session_v1 event 0 enter - false -
+ext_image_copy_capture_cursor_session_v1 event 1 leave - false -
+ext_image_copy_capture_cursor_session_v1 event 2 position ii false -,-
+ext_image_copy_capture_cursor_session_v1 event 3 hotspot ii false -,-
+ext_image_copy_capture_cursor_session_v1 request 0 destroy - true -
+ext_image_copy_capture_cursor_session_v1 request 1 get_capture_session n false ext_image_copy_capture_session_v1
+ext_image_copy_capture_frame_v1 event 0 transform u false -
+ext_image_copy_capture_frame_v1 event 1 damage iiii false -,-,-,-
+ext_image_copy_capture_frame_v1 event 2 presentation_time uuu false -,-,-
+ext_image_copy_capture_frame_v1 event 3 ready - false -
+ext_image_copy_capture_frame_v1 event 4 failed u false -
+ext_image_copy_capture_frame_v1 request 0 destroy - true -
+ext_image_copy_capture_frame_v1 request 1 attach_buffer o false wl_buffer
+ext_image_copy_capture_frame_v1 request 2 damage_buffer iiii false -,-,-,-
+ext_image_copy_capture_frame_v1 request 3 capture - false -
+ext_image_copy_capture_manager_v1 request 0 create_session nou false ext_image_copy_capture_session_v1,ext_image_capture_source_v1,-
+ext_image_copy_capture_manager_v1 request 1 create_pointer_cursor_session noo false ext_image_copy_capture_cursor_session_v1,ext_image_capture_source_v1,wl_pointer
+ext_image_copy_capture_manager_v1 request 2 destroy - true -
+ext_image_copy_capture_session_v1 event 0 buffer_size uu false -,-
+ext_image_copy_capture_session_v1 event 1 shm_format u false -
+ext_image_copy_capture_session_v1 event 2 dmabuf_device a false -
+ext_image_copy_capture_session_v1 event 3 dmabuf_format ua false -,-
+ext_image_copy_capture_session_v1 event 4 done - false -
+ext_image_copy_capture_session_v1 event 5 stopped - false -
+ext_image_copy_capture_session_v1 request 0 create_frame n false ext_image_copy_capture_frame_v1
+ext_image_copy_capture_session_v1 request 1 destroy - true -
+ext_output_image_capture_source_manager_v1 request 0 create_source no false ext_image_capture_source_v1,wl_output
+ext_output_image_capture_source_manager_v1 request 1 destroy - true -
 ext_session_lock_manager_v1 request 0 destroy - true -
 ext_session_lock_manager_v1 request 1 lock n false ext_session_lock_v1
 ext_session_lock_surface_v1 event 0 configure uuu false -,-,-

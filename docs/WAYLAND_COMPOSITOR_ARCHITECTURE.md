@@ -84,7 +84,8 @@ the client-content offset and hit regions; no fixed control placement is imposed
 The typed project asset bundle is shared by frames, normal shell composition, pointer themes, and
 the desktop fallback `AppIconProfile`. Client-provided `xdg_toplevel_icon_v1` name/buffer snapshots
 override that fallback. A permitted client-provided `wl_pointer` cursor surface overrides the
-configured pointer theme, and a client-side xdg-decoration request suppresses Telorgon's frame.
+configured pointer theme. [Decoration policy](DECORATION_POLICY.md) honors client-side requests by
+default, with independent server title-bar, border, clipping, shadow, and resize-region overrides.
 See [Custom windows, assets, icons, and pointers](CUSTOM_WINDOWS_ASSETS_AND_POINTERS.md) for the
 complete authoring API.
 

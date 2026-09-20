@@ -2,10 +2,10 @@
 
 use std::collections::BTreeMap;
 
-#[cfg(not(target_os = "linux"))]
-use super::shell_wayland_scene_tests::*;
 #[cfg(target_os = "linux")]
 use super::scene::*;
+#[cfg(not(target_os = "linux"))]
+use super::shell_wayland_scene_tests::*;
 use crate::core::{ColorRgba8, PointI, RectI, SizeF, SizeI};
 use crate::render::{ImageAlphaMode, ImagePixelFormat, RenderBackend, RenderScene};
 use crate::renderer_software::{
@@ -1012,5 +1012,95 @@ fn replaced_frame_nodes_update_the_same_border_scene_slot() {
     assert_eq!(
         frame.updates[0].deltas[0].box_len, 2,
         "one border plus scene clear slot"
+    );
+}
+
+#[test]
+fn resize_preview_border_overlays_fill_and_none_keeps_interior_clear() {
+    for fill in [
+        crate::Fill::None,
+        crate::Fill::Color(ColorRgba8::rgba(0, 0, 255, 255)),
+        crate::Fill::Glass(crate::GlassStyle {
+            tint: ColorRgba8::rgba(0, 0, 255, 255),
+            ..Default::default()
+        }),
+    ] {
+        let preview = ShellLayer::solid(
+            ShellLayerKey::ResizeVeil(9),
+            ShellSceneKey::ResizeVeil(9),
+            fill.color(),
+            CONTENT,
+        );
+        assert!(ShellLayer::resize_preview_border(9, &preview, Default::default()).is_none());
+        let border = ShellLayer::resize_preview_border(
+            9,
+            &preview,
+            crate::Border::all(2.0, ColorRgba8::rgba(255, 0, 0, 255)),
+        )
+        .unwrap();
+        assert_eq!(preview.target, border.target);
+        let mut raster = Raster::new();
+        raster.draw(vec![preview, border]);
+        assert_eq!(raster.pixel(7, 13), &[255, 0, 0, 255]);
+        assert_eq!(raster.pixel(5, 13), &[0, 255, 0, 255]);
+        assert_eq!(
+            raster.pixel(16, 13),
+            if fill == crate::Fill::None {
+                &[0, 255, 0, 255]
+            } else {
+                &[0, 0, 255, 255]
+            }
+        );
+    }
+}
+
+#[test]
+fn resize_preview_border_inherits_contour_and_scales_once() {
+    let mut preview = ShellLayer::solid(
+        ShellLayerKey::ResizeVeil(9),
+        ShellSceneKey::ResizeVeil(9),
+        ColorRgba8::rgba(0, 0, 0, 0),
+        CONTENT,
+    );
+    preview.rounded_clips[0] = Some(crate::render::RoundedClip::new(
+        crate::RectF {
+            x: CONTENT.x as f32,
+            y: CONTENT.y as f32,
+            width: CONTENT.width as f32,
+            height: CONTENT.height as f32,
+        },
+        crate::CornerRadii::all(4.0),
+    ));
+    let border = ShellLayer::resize_preview_border(
+        9,
+        &preview,
+        crate::Border::all(2.0, ColorRgba8::rgba(255, 0, 0, 255)),
+    )
+    .unwrap();
+    if let ShellLayerContent::Decoration { instance, .. } = &border.content {
+        assert_eq!(instance.corner_radii, crate::CornerRadii::all(4.0));
+        assert_eq!(instance.rect.x, 0.0);
+        assert_eq!(instance.border.top.width, 2.0);
+    } else {
+        panic!("expected analytic border");
+    }
+    #[cfg(target_os = "linux")]
+    assert_eq!(super::motion::surface_for_key(border.key), Some(9));
+    let mut composition = ShellComposition::new(EXTENT);
+    let frame = composition
+        .synchronize(EXTENT, vec![preview, border])
+        .unwrap();
+    let physical = frame.into_physical(
+        crate::platform::ScaleFactor::new(1.5).unwrap(),
+        SizeI {
+            width: 48,
+            height: 36,
+        },
+    );
+    assert_eq!(
+        physical.preview_borders[&ShellSceneKey::ResizeVeil(9)]
+            .top
+            .width,
+        3.0
     );
 }

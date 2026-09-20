@@ -1,4 +1,4 @@
-//! Full-resolution backdrop capture and separable Gaussian filtering with owned snapshot lifetime.
+//! Native sharp captures and scale-aware separable filtering with owned snapshot lifetime.
 //! No readback, extra submission, or timer: lower-scene revisions drive cache invalidation.
 use super::super::super::scene::{ShellLayerKey, ShellPlacement};
 use super::*;
@@ -7,19 +7,30 @@ use crate::render::{
 };
 use crate::renderer_vulkan::VulkanFrameContext;
 
-// Three full-resolution RGBA8 targets at 3840x2400 need 105.5 MiB per lens.
-// Admit two such backdrops; the former 96 MiB pyramid budget rejected even one.
-const BACKDROP_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+// Four simultaneous quadrant previews each own a sharp capture and two blur targets.
+// Reserve 25% headroom for Vulkan image padding/alignment while retaining a hard ceiling.
+const MAX_BACKDROP_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+fn backdrop_budget(output: SizeI) -> u64 {
+    (output.width.max(0) as u64)
+        .saturating_mul(output.height.max(0) as u64)
+        .saturating_mul(4 * 3 * 5)
+        .clamp(64 * 1024 * 1024, MAX_BACKDROP_BUDGET_BYTES)
+}
 
-fn backdrop_fits_budget(extents: &[SizeI], other_bytes: u64) -> bool {
+fn backdrop_fits_budget(output: SizeI, extents: &[SizeI], other_bytes: u64) -> bool {
     extents.iter().fold(other_bytes, |bytes, extent| {
-        bytes.saturating_add(extent.width as u64 * extent.height as u64 * 4)
-    }) <= BACKDROP_BUDGET_BYTES
+        bytes.saturating_add(
+            (extent.width.max(0) as u64)
+                .saturating_mul(extent.height.max(0) as u64)
+                .saturating_mul(4),
+        )
+    }) <= backdrop_budget(output)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Signature {
     extent: SizeI,
+    region: RectI,
     blur_radius: f32,
     // Scene epoch tracks lens geometry/optics; backdrop revision tracks texture contents.
     sources: Vec<(ShellPlacement, u64, u64)>,
@@ -27,7 +38,7 @@ struct Signature {
 
 impl Signature {
     fn same_capture(&self, other: &Self) -> bool {
-        self.extent == other.extent && self.sources == other.sources
+        self.extent == other.extent && self.region == other.region && self.sources == other.sources
     }
 }
 
@@ -35,8 +46,63 @@ pub(super) struct GlassCache {
     signature: Signature,
     pub(super) revision: u64,
     pub(super) targets: Vec<VulkanMaterializationTarget>,
+    filters: Vec<VulkanScene>,
     output: RenderScene,
     output_state: Option<(SizeI, ShellPlacement, crate::GlassStyle)>,
+}
+
+/// Pad for the finite Gaussian kernel, bounded optical displacement and reconstruction.
+/// Quantized outward edges avoid reallocating for every physical pointer pixel.
+pub(super) fn backdrop_region(output: SizeI, lens: RectI, style: crate::GlassStyle) -> RectI {
+    let margin = (normalized_blur_radius(style.blur_radius) * 1.5
+        + style.refraction.abs()
+        + style.dispersion.abs()
+        + 4.0)
+        .ceil() as i32;
+    let left = lens.x.saturating_sub(margin).max(0) / 64 * 64;
+    let top = lens.y.saturating_sub(margin).max(0) / 64 * 64;
+    let right = lens.right().saturating_add(margin).saturating_add(63) / 64 * 64;
+    let bottom = lens.bottom().saturating_add(margin).saturating_add(63) / 64 * 64;
+    intersect_rect(
+        RectI {
+            x: left,
+            y: top,
+            width: right.saturating_sub(left),
+            height: bottom.saturating_sub(top),
+        },
+        full_rect(output),
+    )
+    .unwrap_or_else(|| full_rect(output))
+}
+
+pub(super) fn localize(mut p: ShellPlacement, region: RectI) -> ShellPlacement {
+    p.target.x -= region.x;
+    p.target.y -= region.y;
+    if let Some(clip) = &mut p.clip {
+        clip.x -= region.x;
+        clip.y -= region.y;
+    }
+    for clip in p.rounded_clips.iter_mut().flatten() {
+        clip.rect.x -= region.x as f32;
+        clip.rect.y -= region.y as f32;
+    }
+    p
+}
+
+fn cropped_sources(
+    sources: Vec<(ShellPlacement, u64, u64)>,
+    region: RectI,
+) -> Vec<(ShellPlacement, u64, u64)> {
+    sources
+        .into_iter()
+        .filter(|(p, _, _)| {
+            let visible = match p.clip {
+                Some(clip) => intersect_rect(p.target, clip),
+                None => Some(p.target),
+            };
+            visible.is_some_and(|r| intersect_rect(r, region).is_some())
+        })
+        .collect()
 }
 
 pub(super) fn backdrop_sources(
@@ -54,6 +120,9 @@ pub(super) fn backdrop_sources(
                 ShellSceneKey::ResizeGlass(owner) => caches
                     .get(&ShellSceneKey::ResizeVeil(owner))
                     .map_or(0, |c| c.revision),
+                ShellSceneKey::TileGlass(owner) => caches
+                    .get(&ShellSceneKey::TilePreview(owner))
+                    .map_or(0, |c| c.revision),
                 _ => 0,
             };
             (*p, epoch, backdrop_revision)
@@ -61,7 +130,7 @@ pub(super) fn backdrop_sources(
         .collect()
 }
 
-fn normalized_blur_radius(radius: f32) -> f32 {
+pub(super) fn normalized_blur_radius(radius: f32) -> f32 {
     if radius.is_finite() {
         radius.clamp(0.0, 256.0)
     } else {
@@ -70,16 +139,35 @@ fn normalized_blur_radius(radius: f32) -> f32 {
 }
 
 fn backdrop_extents(extent: SizeI, radius: f32) -> Vec<SizeI> {
-    // Sharp capture, horizontal intermediate, vertical result. Resolution never depends
-    // on blur strength. A zero-radius lens needs only the original capture.
-    vec![
-        extent;
-        if normalized_blur_radius(radius) > 0.0 {
-            3
-        } else {
-            1
-        }
-    ]
+    let radius = normalized_blur_radius(radius);
+    if radius == 0.0 {
+        return vec![extent];
+    }
+    // Keep sharp optics at native resolution. Prefilter before reducing the broad blur;
+    // small kernels remain native to avoid softening detail beyond the requested radius.
+    if radius < 8.0 {
+        return vec![extent; 3];
+    }
+    let half = SizeI {
+        width: (extent.width + 1) / 2,
+        height: (extent.height + 1) / 2,
+    };
+    vec![extent, half, half, half]
+}
+
+fn filter_parameters(extents: &[SizeI], level: usize, radius: f32) -> (SizeI, f32, bool) {
+    let source = extents[level - 1];
+    if extents.len() == 4 && level == 1 {
+        // A zero-radius linear sample at half resolution averages a 2x2 footprint.
+        return (source, 0.0, true);
+    }
+    let horizontal = level == if extents.len() == 4 { 2 } else { 1 };
+    let ratio = if horizontal {
+        source.width as f32 / extents[0].width as f32
+    } else {
+        source.height as f32 / extents[0].height as f32
+    };
+    (source, radius * ratio, horizontal)
 }
 
 fn is_own_shadow(p: &ShellPlacement, id: u32) -> bool {
@@ -308,22 +396,31 @@ fn draw(
 }
 
 /// Capture only the currently displayed lower placements. The lens geometry is not cached here.
-pub(super) fn prepare_backdrop(
+pub(super) fn prepare_backdrop_key(
     device: &VulkanDevice,
     scenes: &mut BTreeMap<ShellSceneKey, VulkanScene>,
     caches: &mut BTreeMap<ShellSceneKey, GlassCache>,
     extent: SizeI,
-    id: u32,
+    region: RectI,
+    cache_key: ShellSceneKey,
     style: crate::GlassStyle,
     lower: &[ShellPlacement],
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<bool> {
-    let cache_key = ShellSceneKey::ResizeVeil(id);
+    let id = match cache_key {
+        ShellSceneKey::ResizeVeil(id) => id,
+        _ => 0,
+    };
     let radius = normalized_blur_radius(style.blur_radius);
-    let extents = backdrop_extents(extent, radius);
-    let sources = backdrop_sources(id, lower, scenes, caches);
+    let capture_extent = SizeI {
+        width: region.width,
+        height: region.height,
+    };
+    let extents = backdrop_extents(capture_extent, radius);
+    let sources = cropped_sources(backdrop_sources(id, lower, scenes, caches), region);
     let signature = Signature {
-        extent: extent,
+        extent,
+        region,
         blur_radius: radius,
         sources,
     };
@@ -350,15 +447,25 @@ pub(super) fn prepare_backdrop(
                 .flat_map(|(_, c)| &c.targets)
                 .map(|t| t.allocated_bytes())
                 .sum::<u64>();
-            if !backdrop_fits_budget(&extents, other_bytes) {
+            if !backdrop_fits_budget(extent, &extents, other_bytes) {
+                eprintln!(
+                    "telorgon-glass: backdrop budget rejected key={cache_key:?} output={extent:?} targets={extents:?} other_allocated_bytes={other_bytes} budget_bytes={}",
+                    backdrop_budget(extent)
+                );
                 return Ok(false);
             }
             let targets = extents
                 .iter()
                 .map(|extent| VulkanMaterializationTarget::new_traced(device, *extent, &mut |_| {}))
                 .collect::<Result<Vec<_>, _>>();
-            let Ok(targets) = targets else {
-                return Ok(false);
+            let targets = match targets {
+                Ok(targets) => targets,
+                Err(error) => {
+                    eprintln!(
+                        "telorgon-glass: backdrop allocation failed key={cache_key:?}: {error:?}"
+                    );
+                    return Ok(false);
+                }
             };
             let revision = caches.get(&cache_key).map_or(0, |cache| cache.revision);
             let (output, output_state) = caches
@@ -371,6 +478,7 @@ pub(super) fn prepare_backdrop(
                     signature: signature.clone(),
                     revision,
                     targets,
+                    filters: Vec::new(),
                     output,
                     output_state,
                 },
@@ -378,6 +486,7 @@ pub(super) fn prepare_backdrop(
         }
         let cache = caches.get_mut(&cache_key).unwrap();
         if capture_changed {
+            let gpu_scope = context.core.begin_gpu_scope("gpu.glass.capture");
             let indices = scenes
                 .keys()
                 .enumerate()
@@ -387,6 +496,7 @@ pub(super) fn prepare_backdrop(
                 .sources
                 .iter()
                 .map(|(p, _, _)| {
+                    let p = localize(*p, region);
                     Ok(VulkanCompositePlacement {
                         scene_index: *indices
                             .get(&p.scene)
@@ -408,18 +518,34 @@ pub(super) fn prepare_backdrop(
                 &mut cache.targets[0],
                 context,
             )?;
+            context.core.end_gpu_scope(gpu_scope);
+        }
+        if cache.filters.len() + 1 != cache.targets.len() || cache.signature.blur_radius != radius {
+            cache.filters.clear();
+            for level in 1..cache.targets.len() {
+                let (source_extent, filter_radius, horizontal) =
+                    filter_parameters(&extents, level, radius);
+                cache.filters.push(blur_scene(
+                    device,
+                    &cache.targets[level - 1],
+                    source_extent,
+                    filter_radius,
+                    horizontal,
+                )?);
+            }
         }
         for level in 1..cache.targets.len() {
-            let mut source = blur_scene(
-                device,
-                &cache.targets[level - 1],
-                extent,
-                radius,
-                level == 1,
-            )?;
+            let gpu_scope = context
+                .core
+                .begin_gpu_scope(if extents.len() == 4 && level == 1 {
+                    "gpu.glass.prefilter"
+                } else {
+                    "gpu.glass.blur"
+                });
+            let source = &mut cache.filters[level - 1];
             draw(
                 device,
-                &mut [VulkanCompositeScene { scene: &mut source }],
+                &mut [VulkanCompositeScene { scene: source }],
                 &[VulkanCompositePlacement {
                     scene_index: 0,
                     target: full_rect(extents[level]),
@@ -429,6 +555,7 @@ pub(super) fn prepare_backdrop(
                 &mut cache.targets[level],
                 context,
             )?;
+            context.core.end_gpu_scope(gpu_scope);
         }
         cache.signature = signature;
         cache.revision = cache.revision.wrapping_add(1).max(1);
@@ -451,15 +578,23 @@ pub(super) fn record_glass(
         let Some(style) = frame.glass.get(&placement.scene) else {
             continue;
         };
-        let ShellSceneKey::ResizeVeil(id) = placement.scene else {
-            continue;
+        let key = match placement.scene {
+            ShellSceneKey::ResizeVeil(id) => ShellSceneKey::ResizeGlass(id),
+            ShellSceneKey::TilePreview(id) => ShellSceneKey::TileGlass(id),
+            _ => continue,
         };
-        if !prepare_backdrop(
+        let region = backdrop_region(frame.extent, placement.target, *style);
+        let capture_extent = SizeI {
+            width: region.width,
+            height: region.height,
+        };
+        if !prepare_backdrop_key(
             device,
             scenes,
             caches,
             frame.extent,
-            id,
+            region,
+            placement.scene,
             *style,
             &output[..index],
             context,
@@ -467,7 +602,6 @@ pub(super) fn record_glass(
             continue;
         }
         let cache = caches.get_mut(&placement.scene).unwrap();
-        let key = ShellSceneKey::ResizeGlass(id);
         // A missing retained GPU scene needs a complete initial description.
         if !scenes.contains_key(&key) {
             cache.output = RenderScene::default();
@@ -475,7 +609,12 @@ pub(super) fn record_glass(
         }
         let state = (frame.extent, *placement, *style);
         if cache.output_state != Some(state) {
-            update_lens(&mut cache.output, frame.extent, *placement, *style);
+            update_lens(
+                &mut cache.output,
+                capture_extent,
+                localize(*placement, region),
+                *style,
+            );
             cache.output_state = Some(state);
         }
         let scene = match scenes.entry(key) {
@@ -494,7 +633,7 @@ pub(super) fn record_glass(
         }
         output[index] = ShellPlacement {
             scene: key,
-            target: full_rect(frame.extent),
+            target: region,
             clip: Some(
                 placement
                     .clip
@@ -511,23 +650,35 @@ pub(super) fn record_glass(
 mod tests {
     use super::*;
     #[test]
-    fn full_resolution_glass_budget_admits_two_3840_by_2400_backdrops() {
+    fn full_resolution_glass_budget_admits_four_3840_by_2400_backdrops() {
         // Regression: the real 200%-scale output exceeded the old budget for even
         // one lens, silently selecting flat tint and losing all refraction.
         let extent = SizeI {
             width: 3840,
             height: 2400,
         };
-        let targets = backdrop_extents(extent, 20.0);
+        let targets = vec![extent; 3];
         let one_lens_bytes = 3840_u64 * 2400 * 4 * 3;
         assert!(one_lens_bytes > 96 * 1024 * 1024);
-        assert!(backdrop_fits_budget(&targets, 0));
-        assert!(backdrop_fits_budget(&targets, one_lens_bytes));
-        assert!(!backdrop_fits_budget(&targets, one_lens_bytes * 2));
-        assert!(!backdrop_fits_budget(&targets, u64::MAX));
-        let remaining = BACKDROP_BUDGET_BYTES - one_lens_bytes;
-        assert!(backdrop_fits_budget(&targets, remaining));
-        assert!(!backdrop_fits_budget(&targets, remaining + 1));
+        assert!(backdrop_fits_budget(extent, &targets, 0));
+        assert!(backdrop_fits_budget(extent, &targets, one_lens_bytes));
+        assert!(backdrop_fits_budget(extent, &targets, one_lens_bytes * 2));
+        assert!(backdrop_fits_budget(extent, &targets, one_lens_bytes * 3));
+        // Previously even one byte of padding on the first three lenses rejected the fourth.
+        let padded_lens = one_lens_bytes + 3 * 1024 * 1024;
+        assert!(backdrop_fits_budget(extent, &targets, padded_lens * 3));
+        assert!(!backdrop_fits_budget(extent, &targets, one_lens_bytes * 4));
+        assert_eq!(
+            backdrop_budget(SizeI {
+                width: i32::MAX,
+                height: i32::MAX
+            }),
+            MAX_BACKDROP_BUDGET_BYTES
+        );
+        assert!(!backdrop_fits_budget(extent, &targets, u64::MAX));
+        let remaining = backdrop_budget(extent) - one_lens_bytes;
+        assert!(backdrop_fits_budget(extent, &targets, remaining));
+        assert!(!backdrop_fits_budget(extent, &targets, remaining + 1));
     }
 
     #[test]
@@ -749,11 +900,13 @@ mod tests {
             GlassCache {
                 signature: Signature {
                     extent,
+                    region: full_rect(extent),
                     blur_radius: 0.0,
                     sources: Vec::new(),
                 },
                 revision: 1,
                 targets: Vec::new(),
+                filters: Vec::new(),
                 output: RenderScene::default(),
                 output_state: None,
             },
@@ -946,6 +1099,7 @@ mod tests {
         };
         let before = Signature {
             extent,
+            region: full_rect(extent),
             blur_radius: 10.0,
             sources: vec![(test_placement(), 1, 1)],
         };
@@ -971,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn blur_strength_never_reduces_backdrop_resolution() {
+    fn broad_blur_reduces_only_filtered_targets_and_preserves_native_optics() {
         for extent in [
             SizeI {
                 width: 1920,
@@ -987,11 +1141,125 @@ mod tests {
             },
         ] {
             for radius in [0.01, 4.0, 10.0, 24.0, 256.0] {
-                assert_eq!(backdrop_extents(extent, radius), vec![extent; 3]);
+                let targets = backdrop_extents(extent, radius);
+                assert_eq!(targets[0], extent);
+                if radius < 8.0 {
+                    assert_eq!(targets, vec![extent; 3]);
+                } else {
+                    assert_eq!(targets.len(), 4);
+                    assert_eq!(targets[1].width, (extent.width + 1) / 2);
+                    assert_eq!(targets[1].height, (extent.height + 1) / 2);
+                }
             }
             assert_eq!(backdrop_extents(extent, 0.0), vec![extent]);
         }
     }
+    #[test]
+    fn cropped_capture_preserves_support_and_desktop_coordinates() {
+        let output = SizeI {
+            width: 1931,
+            height: 1081,
+        };
+        let lens = RectI {
+            x: 701,
+            y: 403,
+            width: 301,
+            height: 201,
+        };
+        let style = crate::GlassStyle {
+            blur_radius: 10.0,
+            refraction: 10.0,
+            dispersion: 0.2,
+            ..crate::GlassStyle::liquid()
+        };
+        let region = backdrop_region(output, lens, style);
+        assert!(region.x <= lens.x - 30 && region.y <= lens.y - 30);
+        assert!(region.right() >= lens.right() + 30);
+        assert!(region.bottom() >= lens.bottom() + 30);
+        assert!(region.width * region.height < output.width * output.height / 4);
+        let p = ShellPlacement {
+            key: ShellLayerKey::ResizeVeil(1),
+            scene: ShellSceneKey::ResizeVeil(1),
+            target: lens,
+            clip: Some(lens),
+            rounded_clips: [
+                Some(RoundedClip {
+                    rect: RectF {
+                        x: lens.x as f32,
+                        y: lens.y as f32,
+                        width: 301.0,
+                        height: 201.0,
+                    },
+                    radii: crate::ui::CornerRadii::all(12.0),
+                    inverted: false,
+                }),
+                None,
+            ],
+        };
+        let local = localize(p, region);
+        assert_eq!(local.target.x + region.x, lens.x);
+        assert_eq!(local.clip.unwrap().y + region.y, lens.y);
+        assert_eq!(
+            local.rounded_clips[0].unwrap().rect.x + region.x as f32,
+            lens.x as f32
+        );
+        let outside = ShellPlacement {
+            target: RectI {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            clip: None,
+            rounded_clips: [None; 2],
+            ..p
+        };
+        assert_eq!(
+            cropped_sources(vec![(outside, 1, 0), (p, 2, 0)], region),
+            vec![(p, 2, 0)]
+        );
+        let edge = backdrop_region(
+            output,
+            RectI {
+                x: 1850,
+                y: 1000,
+                width: 81,
+                height: 81,
+            },
+            style,
+        );
+        assert_eq!(edge.right(), output.width);
+        assert_eq!(edge.bottom(), output.height);
+    }
+
+    #[test]
+    fn half_resolution_blur_preserves_physical_kernel_width_on_odd_outputs() {
+        let extent = SizeI {
+            width: 1931,
+            height: 1081,
+        };
+        let targets = backdrop_extents(extent, 10.0);
+        assert_eq!(filter_parameters(&targets, 1, 10.0).1, 0.0);
+        for level in [2, 3] {
+            let (source, radius, horizontal) = filter_parameters(&targets, level, 10.0);
+            let scale = if horizontal {
+                extent.width as f32 / source.width as f32
+            } else {
+                extent.height as f32 / source.height as f32
+            };
+            assert!((radius * scale - 10.0).abs() < 0.00001);
+        }
+        let pixels: i64 = targets
+            .iter()
+            .map(|e| i64::from(e.width) * i64::from(e.height))
+            .sum();
+        let native_pixels = i64::from(extent.width) * i64::from(extent.height);
+        assert!(
+            pixels < native_pixels * 2,
+            "sharp plus filters use less than two native surfaces"
+        );
+    }
+
     #[test]
     fn invalid_blur_radii_are_normalized_before_caching() {
         assert_eq!(normalized_blur_radius(f32::NAN), 4.0);

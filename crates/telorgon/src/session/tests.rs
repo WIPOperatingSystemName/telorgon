@@ -527,3 +527,41 @@ fn deferred_recoverable_launch_survives_shutdown_without_a_process_identity() {
     assert!(!wait(restored.status()).unwrap().success());
     next.close();
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pending_recovery_does_not_exhaust_process_slots() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let env = Environment::inherited();
+    let (journal, _) = recovery::Journal::open(&fixture.config(), &env).unwrap().unwrap();
+    // More recovery offers than the live-process limit must survive journal reload.
+    let entries = (1..=257).map(|id| recovery::RecoveryEntry {
+        id,
+        spec: command("/bin/true").recover(true).spec,
+        pid: 0,
+        process_identity: None,
+        generation: id,
+    }).collect();
+    journal.write(entries).unwrap();
+    drop(journal);
+    let owner = SessionOwner::start(env, fixture.config()).unwrap();
+    assert_eq!(pending_recovery().unwrap().len(), 257);
+    let child = command("/bin/true").recover(true).spawn().unwrap();
+    assert!(wait(child.status()).unwrap().success());
+    assert_eq!(pending_recovery().unwrap().len(), 257);
+    owner.close();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "shell-xwayland"))]
+fn queued_launches_still_enforce_process_limit() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let owner = SessionOwner::start_waiting_for_x11(Environment::inherited(), fixture.config()).unwrap();
+    for _ in 0..256 {
+        command("/bin/true").spawn().unwrap();
+    }
+    assert!(matches!(command("/bin/true").spawn(), Err(Error::ProcessLimit)));
+    owner.close();
+}

@@ -74,9 +74,24 @@ focus group closes. Escape and outside presses call `dismissed(reason)`; the com
 by changing its state or an owner-provided visibility signal. The host does not overwrite it.
 The raw `input(event)` hook can implement selection gestures or simple keyboard-driven overlays;
 return true only when component state changed. Normal controls still receive retained UI input.
+A widget that loses the pointer receives one `PointerMoved` with an outside local position,
+including on lock, so it can cancel pending hover work.
 Native IME and full touch/pen routing are not provided by this hook.
 
 ## Motion and work area
+
+`ShellSurfaceSpec::visibility_motion(Minimize::shrink_and_fade(130))` opts into the
+same centered 92%-to-100% shrink and group fade used for window minimize/restore.
+The existing scalar motion sampler and snapshot-output compositor are shared with windows.
+The widget and its window-preview layers are captured together during the fade, so overlapping
+content is not independently alpha-blended. Once fully visible, ordinary live placements resume.
+Reduced motion (or a disabled motion renderer) snaps to the requested visibility.
+
+Removed keyed children with this effect release input/focus immediately and retain presentation
+until the exit finishes. Their component evaluation is frozen during retirement; unmount runs after
+the last pixels disappear. Removal requests `AnchorRemoved` dismissal at the start, allowing
+temporary desktop effects to clean up immediately. Reintroducing the same key and component type
+before the fade completes reuses the instance and reverses from its current opacity.
 
 Surface motion reuses the existing `GeometryMotion`, `WindowTween`, `Spring`, and analytic
 `GeometryTrack` used by window motion. The same host loop schedules it; no timer thread or second
@@ -200,6 +215,18 @@ ownership, barriers, shaders, or graphics API contracts; no graphics specificati
 
 ## Manual verification
 
+Visibility-motion audit: the adjacent source tree is still unavailable. Inspected upstream Qt
+`qquickpopup.cpp` (`prepareExitTransition`, `finalizeExitTransition`, destructor cleanup) and Flutter
+`overlay.dart` (`OverlayEntry.remove`, `dispose`, `_didUnmount`), at the URLs above. Qt separates
+focus release from final presentation removal; Flutter distinguishes logical removal from eventual
+unmount. The authoritative [Qt layer-opacity documentation](https://doc.qt.io/qt-6/qml-qtquick-item.html#layer-opacity-vs-item-opacity)
+also confirms why a subtree should be composited before applying opacity. Adopted invariants:
+no interaction during exit, deferred visual disposal, interruption continuity, and one opacity
+for the picker plus previews. Rejected per-item alpha (overlap artifacts), timer-driven removal,
+and a duplicate minimize implementation. Tests cover group membership/order, entry/exit/reversal,
+reduced motion, and keyed-child retirement/reopening. No shader, barrier, GPU resource ownership,
+or graphics API contract changes are introduced; existing snapshot lifetimes remain authoritative.
+
 Run the test compositor yourself on the normal test setup. Open several windows from one application
 and one from another. Verify one icon per application, hover thumbnails, aspect-ratio preservation,
 and single-click restoration after using the window's minimize button. Move from the icon across the
@@ -208,3 +235,8 @@ Open enough windows to exceed the 92% threshold, scroll the title list and selec
 Close windows while the picker is open. Repeat with native Wayland and Xwayland applications and at
 HiDPI. Check that session lock hides every ordinary widget and preview. Hardware-presenting
 applications are intentionally not launched by the agent.
+
+## Window tiling
+
+Register `.widget(WindowTiling::snap())` for halves, quadrants, configurable color/glass previews,
+and shared-divider resizing. See [Window tiling](WINDOW_TILING.md) for the API and host contract.

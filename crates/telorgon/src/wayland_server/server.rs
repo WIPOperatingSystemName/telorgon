@@ -15,7 +15,16 @@ use crate::wayland_server::{WaylandServerError, WaylandServerErrorKind};
 type ServerResult<T> = Result<T, WaylandServerError>;
 
 type FilterFn = dyn Fn(usize, *const ffi::wl_interface) -> bool;
-struct GlobalFilter(Box<FilterFn>);
+struct GlobalFilter(Vec<Box<FilterFn>>);
+
+impl GlobalFilter {
+    fn allows(&self, client: usize, interface: *const ffi::wl_interface) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.0.iter().all(|policy| policy(client, interface))
+        }))
+        .unwrap_or(false)
+    }
+}
 
 unsafe extern "C" fn filter_global(
     client: *const ffi::wl_client,
@@ -25,20 +34,23 @@ unsafe extern "C" fn filter_global(
     let filter = unsafe { &*data.cast::<GlobalFilter>() };
     let interface = unsafe { ffi::wl_global_get_interface(global) };
     // A policy panic must not unwind through C or accidentally grant access.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (filter.0)(client as usize, interface)
-    }))
-    .unwrap_or(false)
+    filter.allows(client as usize, interface)
 }
 
 pub struct Display {
+    identity: Rc<()>,
     raw: NonNull<ffi::wl_display>,
     filter: Option<Box<GlobalFilter>>,
     marker: PhantomData<Rc<()>>,
 }
 
 impl Display {
-    /// Install an owned owner-thread policy before creating protocol globals.
+    pub(crate) fn identity_token(&self) -> Rc<()> {
+        self.identity.clone()
+    }
+
+    /// Replace the owned owner-thread policy before creating protocol globals.
+    /// Use `add_global_filter` when independent subsystems contribute restrictions.
     /// libwayland applies it both to registry advertisements and bind requests.
     /// Interface pointers are opaque identities; this function grants no access
     /// to their storage. Panicking policies deny access. Native clients should
@@ -47,7 +59,7 @@ impl Display {
         &mut self,
         filter: impl Fn(usize, *const ffi::wl_interface) -> bool + 'static,
     ) {
-        let mut filter = Box::new(GlobalFilter(Box::new(filter)));
+        let mut filter = Box::new(GlobalFilter(vec![Box::new(filter)]));
         unsafe {
             ffi::wl_display_set_global_filter(
                 self.raw.as_ptr(),
@@ -57,6 +69,22 @@ impl Display {
         }
         self.filter = Some(filter);
     }
+    /// Add a restriction without replacing existing registry/bind policy. Every
+    /// policy must allow access. Install before creating globals or clients;
+    /// adding a policy does not revoke resources that clients already bound.
+    pub fn add_global_filter(
+        &mut self,
+        filter: impl Fn(usize, *const ffi::wl_interface) -> bool + 'static,
+    ) {
+        if let Some(existing) = &mut self.filter {
+            // The callback points at the boxed GlobalFilter, not this vector's
+            // allocation, so appending keeps libwayland's user-data address stable.
+            existing.0.push(Box::new(filter));
+        } else {
+            self.set_global_filter(filter);
+        }
+    }
+
     /// Register a compositor-created connection. The returned owner tracks
     /// libwayland destruction and is safe to retain beyond display teardown.
     /// Dropping it disconnects only this client. No credentials imply privilege;
@@ -100,6 +128,7 @@ impl Display {
             )
         })?;
         Ok(Self {
+            identity: Rc::new(()),
             raw,
             filter: None,
             marker: PhantomData,
@@ -671,6 +700,22 @@ fn native_zero(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composed_global_policies_preserve_both_restrictions_and_fail_closed() {
+        let mut policy = GlobalFilter(vec![Box::new(|client, _| client == 7)]);
+        let interface = std::ptr::null();
+        assert!(policy.allows(7, interface));
+        assert!(!policy.allows(8, interface));
+        policy.0.push(Box::new(|_, candidate| !candidate.is_null()));
+        assert!(!policy.allows(7, interface));
+        // Only opaque identity is used; no interface pointer is dereferenced.
+        let opaque = std::ptr::dangling::<ffi::wl_interface>();
+        assert!(policy.allows(7, opaque));
+        assert!(!policy.allows(8, opaque));
+        policy.0.push(Box::new(|_, _| panic!("policy fixture")));
+        assert!(!policy.allows(7, opaque));
+    }
+
     #[test]
     fn restricted_global_is_hidden_and_guessed_bind_is_rejected() {
         let mut display = Display::new().unwrap();

@@ -9,6 +9,17 @@ advanced component authors, but ordinary application composition uses the interf
 
 ## Minimal application
 
+Containers support `.inline_style(compiled_style)` for local appearance and
+`.hover_within(true)` to track hover over the container and its descendants. These are independent:
+an inline style does not enable hover tracking, and hover tracking does not require an inline style.
+Descendant tracking defaults to false. Child controls retain their own activation, focus, and hover
+behavior. Leaving the container, disabling tracking, or deactivating the view clears its hover state.
+Both settings can change during reconciliation without replacing the container.
+
+For example, `stack().inline_style(card_style()).hover_within(true)` keeps a card highlighted
+over its nested close button. `card_style()` is an application-defined helper returning the style.
+Use `.box_style(...)` for ordinary box properties; `.style(BoxStyle)` remains a deprecated alias.
+
 ```rust
 use telorgon::app::*;
 
@@ -239,6 +250,19 @@ atomic property patches, layout/spatial updates, and scene compilation. Renderer
 resolved sampled scene and never infer hover, focus, disabled, or sibling state.
 
 ## Advanced retained API
+
+### Bundled fonts
+
+Place `.ttf` or `.otf` faces under the asset catalog's `fonts/` directory. The catalog
+embeds them as typed `FontAsset` entries, and native and shell hosts register those faces
+before layout. Custom runtime hosts can call `AppRuntimeCore::register_fonts(bundle)`.
+Keep the font's license alongside your project.
+
+Select the font's embedded family name (which can differ from its filename) with
+`text("Title").font_family("Inter 18pt")`, `button("Title").font_family("Inter 18pt")`,
+or `TextStyle::new().font_family("Inter 18pt")`. These accept static strings, including
+shared constants. Size and weight are configured independently. Window chrome uses
+`WindowTitleBarStyle::font_family`; use `"sans-serif"` for the default family.
 
 The previous mount/action runtime remains in lower-level crates for existing first-party component
 catalog coverage and custom foundation work. It is exported as `MountedComponent` rather than

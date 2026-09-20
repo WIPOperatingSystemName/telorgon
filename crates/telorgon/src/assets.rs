@@ -36,6 +36,7 @@ impl fmt::Display for AssetKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AssetKind {
+    Font,
     Icon,
     Image,
     Cursor,
@@ -166,6 +167,7 @@ macro_rules! typed_asset {
 }
 
 typed_asset!(IconAsset, Icon);
+typed_asset!(FontAsset, Font);
 typed_asset!(ImageAsset, Image);
 typed_asset!(CursorAsset, Cursor);
 typed_asset!(CursorThemeAsset, CursorTheme);

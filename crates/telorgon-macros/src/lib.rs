@@ -49,6 +49,7 @@ struct CatalogFile {
 
 #[derive(Clone, Copy)]
 enum CatalogKind {
+    Font,
     Icon,
     Image,
     Cursor,
@@ -260,6 +261,7 @@ fn collect_catalog_files(
 fn classify_asset(top: Option<&str>, extension: &str) -> Option<CatalogKind> {
     let top = top.unwrap_or_default().to_ascii_lowercase();
     match top.as_str() {
+        "fonts" => matches!(extension, "ttf" | "otf").then_some(CatalogKind::Font),
         "icons" => matches!(extension, "svg" | "png" | "jpg" | "jpeg" | "webp" | "ico")
             .then_some(CatalogKind::Icon),
         "cursors" if extension == "toml" => Some(CatalogKind::CursorTheme),
@@ -275,6 +277,8 @@ fn classify_asset(top: Option<&str>, extension: &str) -> Option<CatalogKind> {
 
 fn media_type(extension: &str) -> Option<&'static str> {
     match extension {
+        "ttf" => Some("font/ttf"),
+        "otf" => Some("font/otf"),
         "svg" => Some("image/svg+xml"),
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -367,6 +371,10 @@ fn asset_tokens(
     crate_path: &proc_macro2::TokenStream,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     match kind {
+        CatalogKind::Font => (
+            quote!(#crate_path::FontAsset),
+            quote!(#crate_path::AssetKind::Font),
+        ),
         CatalogKind::Icon => (
             quote!(#crate_path::IconAsset),
             quote!(#crate_path::AssetKind::Icon),

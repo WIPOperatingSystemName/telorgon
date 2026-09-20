@@ -9,6 +9,9 @@ fn neutral_desktop_modules_do_not_depend_on_a_renderer() {
         include_str!("geometry.rs"),
     ];
     for source in modules {
+        // Backend validation fixtures in the trailing test module do not create
+        // a production dependency in the neutral desktop implementation.
+        let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         for forbidden in [
             "renderer_software",
             "renderer_vulkan",

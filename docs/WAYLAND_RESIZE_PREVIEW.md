@@ -1,7 +1,7 @@
 # Wayland solid resize preview
 
 See [Resize-preview glass](RESIZE_GLASS.md) for the color/glass API, Vulkan cache, and qualification limits.
-The color-specific rendering details below describe `ResizePreview::Color`; glass adds the documented GPU backdrop passes.
+The color-specific rendering details below describe `Fill::Color`; glass adds the documented GPU backdrop passes.
 
 Status: implemented with CPU regression and compile-time verification; interactive Linux visual and
 performance qualification remains user-run. This replaces the earlier stretched live-client preview.
@@ -24,9 +24,9 @@ including client-drawn decoration, popups, and subsurfaces, is hidden until the 
 Server-drawn title text and controls remain ordinary composed chrome. The first version switches
 directly; it does not add a fade, blur pass, readback, image resampling, or intermediate render target.
 
-Set `LinuxShellConfig::resize_preview` to `ResizePreview::Color(ColorRgba8::rgba(...))` and pass the configuration via
+Set `LinuxShellConfig::resize_preview` to `ResizePreviewDesign::new(Fill::Color(ColorRgba8::rgba(...)))` and pass the configuration via
 the desktop declaration's `.linux(config)` method. All alpha values are supported. Easy frames can
-override it with `WindowChromeDesign::resize_preview: Some(ResizePreview::Color(color))`; `None` inherits the host
+override it with `WindowChromeDesign::resize_preview: Some(ResizePreviewDesign::new(Fill::Color(color)))`; `None` inherits the host
 setting. `content_background` independently configures normal backing beneath the app. Set that
 backing's alpha to zero to let app-supplied transparency reveal lower desktop layers; opaque app
 pixels and XRGB buffers remain opaque. See the [easy-frame example](CUSTOM_WINDOWS_ASSETS_AND_POINTERS.md).
@@ -295,7 +295,7 @@ content slot. The composed slot's bottom radius is derived rather than independe
 
 Resize regions opt into `WindowChromeHitSpec::frame_border_outset`; snapshots derive geometric hit
 clips from the root's border style. A minimum grab thickness can exceed the painted outline, but
-only outward; its per-side extent is `max(resize_edge - frame_border_width, 0) + resize_hit_slop`.
+only outward; its per-side extent is `max(resize_edge - frame_border.side.width, 0) + resize_hit_slop.side`.
 Corner bounds cover the outer radius and are constrained to their quadrant, then exclude the inner
 curve just like edge regions. The host evaluates these targets before the outside-frame rejection,
 allows only resize actions outside, and retains fractional pointer coordinates. This changes resize

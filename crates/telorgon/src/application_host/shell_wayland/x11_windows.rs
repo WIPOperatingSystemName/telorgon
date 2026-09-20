@@ -432,6 +432,7 @@ impl X11Windows {
             let mut constrained_pixels = None;
             if !window.maximized && !window.fullscreen {
                 let hints = xwm.normal_hints(*id).unwrap_or_default();
+                window.tile_size_hints = Some(hints);
                 let logical = |size: SizeI| SizeI {
                     width: (size.width / density).max(1),
                     height: (size.height / density).max(1),
@@ -452,6 +453,7 @@ impl X11Windows {
                 let previous = window.requested_size;
                 window.requested_size = logical(size);
                 if previous != window.requested_size {
+                    if window.tile.take().is_some() { window.restore_geometry = None; }
                     if !window.resize_preview.active() {
                         window.resize_preview.begin(
                             window.position,
@@ -583,6 +585,18 @@ pub(super) fn apply_decorations(
     if window.server_decorated == decorated {
         return;
     }
+    let old_title = window
+        .decoration_policy
+        .title_bar_visible(window.server_decorated);
+    let new_title = window.decoration_policy.title_bar_visible(decorated);
+    let old_parts = window
+        .decoration_policy
+        .frame_parts(window.server_decorated);
+    let new_parts = window.decoration_policy.frame_parts(decorated);
+    if old_title == new_title && old_parts == new_parts {
+        window.server_decorated = decorated;
+        return;
+    }
     let old_offset = window_content_offset(window, config);
     let old_outer = if window_has_frame(window) {
         window
@@ -617,13 +631,38 @@ pub(super) fn apply_decorations(
     }
     if let Some((position, _)) = &mut window.restore_geometry {
         // Restore geometry describes a non-fullscreen frame, even when the current frame is hidden.
-        let title_delta = if decorated {
-            -config.titlebar_height
-        } else {
-            config.titlebar_height
-        };
-        position.y = position.y.saturating_add(title_delta);
+        let border_delta =
+            (i32::from(old_parts.border) - i32::from(new_parts.border)) * config.window_border;
+        position.x = position.x.saturating_add(border_delta);
+        position.y = position.y.saturating_add(
+            border_delta + (i32::from(old_title) - i32::from(new_title)) * config.titlebar_height,
+        );
     }
+}
+
+/// Pre-map estimate uses the same ownership policy as measured managed windows.
+pub(super) fn estimated_frame_extents(
+    policy: crate::DecorationPolicy,
+    decorated: bool,
+    unmanaged: bool,
+    density: i32,
+    config: &LinuxShellConfig,
+) -> [u32; 4] {
+    if unmanaged {
+        return [0; 4];
+    }
+    let border = if policy.frame_parts(decorated).border {
+        config.window_border
+    } else {
+        0
+    };
+    let title = if policy.title_bar_visible(decorated) {
+        config.titlebar_height
+    } else {
+        0
+    };
+    [border, border, border + title, border]
+        .map(|value| value.max(0).saturating_mul(density.max(1)) as u32)
 }
 
 pub(super) fn frame_extents(window: &ClientWindow, config: &LinuxShellConfig) -> [u32; 4] {
@@ -916,6 +955,12 @@ mod tests {
             },
             PointI { x: 100, y: 100 },
         );
+        window.decoration_policy.outer_frame = crate::OuterFramePolicy {
+            border: crate::FramePartPolicy::Always,
+            rounded_clip: crate::FramePartPolicy::Always,
+            shadow: crate::FramePartPolicy::Always,
+        };
+        window.decoration_policy.interaction.resize_regions = crate::ResizeRegionPolicy::Enabled;
         window.role = SurfaceRole::Xwayland;
         window.backend = Some(WindowBackend::X11(id()));
         apply_decorations(&mut window, false, &config);
@@ -945,6 +990,91 @@ mod tests {
     }
 
     #[test]
+    fn decoration_premap_extents_match_default_override_and_mixed_policy() {
+        let config = LinuxShellConfig::default();
+        for negotiation in [
+            crate::DecorationNegotiation::ClientPreference,
+            crate::DecorationNegotiation::PreferServer,
+        ] {
+            for border in [
+                crate::FramePartPolicy::Automatic,
+                crate::FramePartPolicy::Always,
+                crate::FramePartPolicy::Never,
+            ] {
+                for decorated in [false, true] {
+                    let mut window = test_window(
+                        SizeI {
+                            width: 640,
+                            height: 480,
+                        },
+                        PointI::default(),
+                    );
+                    window.role = SurfaceRole::Xwayland;
+                    window.backend = Some(WindowBackend::X11(id()));
+                    window.surface_scale = 3;
+                    window.server_decorated = decorated;
+                    window.decoration_policy.negotiation = negotiation;
+                    window.decoration_policy.outer_frame.border = border;
+                    assert_eq!(
+                        estimated_frame_extents(
+                            window.decoration_policy,
+                            decorated,
+                            false,
+                            3,
+                            &config
+                        ),
+                        frame_extents(&window, &config)
+                    );
+                    assert_eq!(
+                        estimated_frame_extents(
+                            window.decoration_policy,
+                            decorated,
+                            true,
+                            3,
+                            &config
+                        ),
+                        [0; 4]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoration_default_removes_csd_extents_and_server_override_preserves_geometry() {
+        for negotiation in [
+            crate::DecorationNegotiation::ClientPreference,
+            crate::DecorationNegotiation::PreferServer,
+        ] {
+            let config = LinuxShellConfig::default();
+            let mut window = test_window(
+                SizeI {
+                    width: 640,
+                    height: 480,
+                },
+                PointI { x: 100, y: 100 },
+            );
+            window.role = SurfaceRole::Xwayland;
+            window.backend = Some(WindowBackend::X11(id()));
+            window.decoration_policy.negotiation = negotiation;
+            let content = frame_geometry(&window, &config);
+            let extents = frame_extents(&window, &config);
+            apply_decorations(&mut window, false, &config);
+            assert_eq!(frame_geometry(&window, &config), content);
+            if negotiation == crate::DecorationNegotiation::ClientPreference {
+                assert_eq!(frame_extents(&window, &config), [0; 4]);
+                assert!(!window_has_frame(&window));
+            } else {
+                assert_eq!(frame_extents(&window, &config), extents);
+                assert!(window_is_decorated(&window));
+            }
+            apply_decorations(&mut window, true, &config);
+            assert_eq!(frame_geometry(&window, &config), content);
+            assert_eq!(frame_extents(&window, &config), extents);
+        }
+    }
+
+    #[test]
     fn decoration_changes_preserve_client_geometry_management_and_scaled_extents() {
         let config = LinuxShellConfig::default();
         let surface = WaylandSurfaceId::from_raw(1).unwrap();
@@ -956,6 +1086,13 @@ mod tests {
                 },
                 PointI { x: 100, y: 100 },
             );
+            window.decoration_policy.outer_frame = crate::OuterFramePolicy {
+                border: crate::FramePartPolicy::Always,
+                rounded_clip: crate::FramePartPolicy::Always,
+                shadow: crate::FramePartPolicy::Always,
+            };
+            window.decoration_policy.interaction.resize_regions =
+                crate::ResizeRegionPolicy::Enabled;
             window.role = SurfaceRole::Xwayland;
             window.surface_scale = density;
             let mut adapter = X11Windows::default();

@@ -30,7 +30,7 @@ pub(crate) const PROFILER_TIMESTAMP_RENDER_END: u32 = 3;
 #[cfg(feature = "instrumentation")]
 pub(crate) const PROFILER_TIMESTAMP_TOTAL_END: u32 = 4;
 #[cfg(feature = "instrumentation")]
-const PROFILER_TIMESTAMP_QUERY_COUNT: u32 = 5;
+const PROFILER_TIMESTAMP_QUERY_COUNT: u32 = 517;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrimitiveBindingState {
@@ -105,6 +105,8 @@ pub(crate) struct FrameCore {
     pub(crate) profiler_timestamp_mask: u32,
     #[cfg(feature = "instrumentation")]
     pub(crate) profiler_timestamps_complete: bool,
+    #[cfg(feature = "instrumentation")]
+    pub(crate) gpu_scopes: Vec<&'static str>,
 }
 
 #[cfg(feature = "instrumentation")]
@@ -127,6 +129,49 @@ impl FrameCore {
         if query == PROFILER_TIMESTAMP_TOTAL_END {
             self.profiler_timestamps_complete = true;
         }
+    }
+}
+
+impl FrameCore {
+    pub(crate) fn begin_gpu_scope(&mut self, label: &'static str) -> Option<u32> {
+        #[cfg(feature = "instrumentation")]
+        {
+            let pool = self.profiler_query_pool?;
+            let query = 5 + self.gpu_scopes.len() as u32 * 2;
+            if query + 1 >= PROFILER_TIMESTAMP_QUERY_COUNT {
+                return None;
+            }
+            self.gpu_scopes.push(label);
+            unsafe {
+                self.device.inner.raw.cmd_write_timestamp2(
+                    self.command_buffer,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    pool,
+                    query,
+                );
+            }
+            Some(query)
+        }
+        #[cfg(not(feature = "instrumentation"))]
+        {
+            let _ = label;
+            None
+        }
+    }
+    pub(crate) fn end_gpu_scope(&mut self, query: Option<u32>) {
+        #[cfg(feature = "instrumentation")]
+        if let (Some(query), Some(pool)) = (query, self.profiler_query_pool) {
+            unsafe {
+                self.device.inner.raw.cmd_write_timestamp2(
+                    self.command_buffer,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    pool,
+                    query + 1,
+                );
+            }
+        }
+        #[cfg(not(feature = "instrumentation"))]
+        let _ = query;
     }
 }
 
@@ -223,6 +268,7 @@ struct ProfilerTimestampQueries {
     period_ns: f32,
     pending: bool,
     frame: Option<crate::profiler::ProfileFrameId>,
+    scopes: Vec<&'static str>,
 }
 
 impl FrameSlot {
@@ -337,35 +383,37 @@ impl FrameSlot {
             );
         }
         #[cfg(feature = "instrumentation")]
-        let profiler_timestamps =
-            if crate::profiler::is_active() && device.profiler_timestamp_valid_bits > 0 {
-                match unsafe {
-                    device.raw.create_query_pool(
-                        &vk::QueryPoolCreateInfo::default()
-                            .query_type(vk::QueryType::TIMESTAMP)
-                            .query_count(PROFILER_TIMESTAMP_QUERY_COUNT),
-                        None,
-                    )
-                } {
-                    Ok(pool) => Some(ProfilerTimestampQueries {
-                        pool,
-                        valid_bits: device.profiler_timestamp_valid_bits,
-                        period_ns: device.profiler_timestamp_period_ns,
-                        pending: false,
-                        frame: None,
-                    }),
-                    Err(_) => {
-                        crate::profiler::record_diagnostic(
-                            "gpu.timestamp_pool.create_failed",
-                            crate::profiler::DiagnosticSeverity::Warning,
-                            1,
-                        );
-                        None
-                    }
+        let profiler_timestamps = if (crate::profiler::is_active() || frame_stats_enabled())
+            && device.profiler_timestamp_valid_bits > 0
+        {
+            match unsafe {
+                device.raw.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(PROFILER_TIMESTAMP_QUERY_COUNT),
+                    None,
+                )
+            } {
+                Ok(pool) => Some(ProfilerTimestampQueries {
+                    pool,
+                    valid_bits: device.profiler_timestamp_valid_bits,
+                    period_ns: device.profiler_timestamp_period_ns,
+                    pending: false,
+                    frame: None,
+                    scopes: Vec::new(),
+                }),
+                Err(_) => {
+                    crate::profiler::record_diagnostic(
+                        "gpu.timestamp_pool.create_failed",
+                        crate::profiler::DiagnosticSeverity::Warning,
+                        1,
+                    );
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         Ok(Self {
             device: device.raw.clone(),
             state: SlotState::Available,
@@ -400,6 +448,67 @@ impl Drop for FrameSlot {
 }
 
 #[cfg(feature = "instrumentation")]
+fn frame_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TELORGON_FRAME_STATS").as_deref() == Ok("1"))
+}
+
+#[cfg(feature = "instrumentation")]
+fn log_gpu_stats(total_ns: u64, samples: Vec<(&'static str, u64)>) {
+    if !frame_stats_enabled() {
+        return;
+    }
+    struct Stats {
+        start: std::time::Instant,
+        frames: u64,
+        total: u64,
+        stages: std::collections::BTreeMap<&'static str, (u64, u64, u64)>,
+    }
+    static STATS: std::sync::OnceLock<std::sync::Mutex<Stats>> = std::sync::OnceLock::new();
+    let Ok(mut stats) = STATS
+        .get_or_init(|| {
+            std::sync::Mutex::new(Stats {
+                start: std::time::Instant::now(),
+                frames: 0,
+                total: 0,
+                stages: std::collections::BTreeMap::new(),
+            })
+        })
+        .lock()
+    else {
+        return;
+    };
+    stats.frames += 1;
+    stats.total = stats.total.saturating_add(total_ns);
+    for (label, elapsed) in samples {
+        let stage = stats.stages.entry(label).or_default();
+        stage.0 = stage.0.saturating_add(elapsed);
+        stage.1 += 1;
+        stage.2 = stage.2.max(elapsed);
+    }
+    if stats.start.elapsed().as_secs_f32() >= 2.0 {
+        let frames = stats.frames as f64;
+        eprintln!(
+            "telorgon-gpu-stats: frames={} total_avg_ms={:.3}",
+            stats.frames,
+            stats.total as f64 / frames / 1e6
+        );
+        for (label, (elapsed, calls, max)) in &stats.stages {
+            eprintln!(
+                "telorgon-gpu-stats: stage={label} avg_per_frame_ms={:.3} calls_per_frame={:.2} max_call_ms={:.3}",
+                *elapsed as f64 / frames / 1e6,
+                *calls as f64 / frames,
+                *max as f64 / 1e6
+            );
+        }
+        stats.frames = 0;
+        stats.total = 0;
+        stats.stages.clear();
+        stats.start = std::time::Instant::now();
+    }
+}
+
+#[cfg(feature = "instrumentation")]
 fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
     let Some(timestamps) = slot.profiler_timestamps.as_mut() else {
         return;
@@ -409,7 +518,7 @@ fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
     }
     timestamps.pending = false;
     let frame = timestamps.frame.take();
-    let mut values = [0_u64; PROFILER_TIMESTAMP_QUERY_COUNT as usize];
+    let mut values = [0_u64; 5];
     let result = unsafe {
         slot.device.get_query_pool_results(
             timestamps.pool,
@@ -439,6 +548,33 @@ fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
             timestamps.period_ns,
         )
     };
+    let mut stage_samples = Vec::new();
+    if !timestamps.scopes.is_empty() {
+        let mut samples = vec![0_u64; timestamps.scopes.len() * 2];
+        let result = unsafe {
+            slot.device.get_query_pool_results(
+                timestamps.pool,
+                5,
+                &mut samples,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if result.is_ok() {
+            for (label, pair) in timestamps.scopes.iter().zip(samples.chunks_exact(2)) {
+                let start = ticks_to_ns(
+                    timestamp_delta(values[0], pair[0], timestamps.valid_bits),
+                    timestamps.period_ns,
+                );
+                let elapsed = ticks_to_ns(
+                    timestamp_delta(pair[0], pair[1], timestamps.valid_bits),
+                    timestamps.period_ns,
+                );
+                crate::profiler::record_gpu_span(label, frame, start, elapsed);
+                stage_samples.push((*label, elapsed));
+            }
+        }
+    }
+    log_gpu_stats(duration(0, 4), stage_samples);
     crate::profiler::record_gpu_span("gpu.total", frame, 0, duration(0, 4));
     crate::profiler::record_gpu_span("gpu.upload_copy", frame, 0, duration(0, 1));
     crate::profiler::record_gpu_span("gpu.render_pass", frame, relative(2), duration(2, 3));
@@ -633,6 +769,8 @@ impl FrameSlots {
                 profiler_timestamp_mask: 0,
                 #[cfg(feature = "instrumentation")]
                 profiler_timestamps_complete: false,
+                #[cfg(feature = "instrumentation")]
+                gpu_scopes: Vec::new(),
             },
         )))
     }
@@ -643,6 +781,7 @@ impl FrameSlots {
         frame_id: u64,
         descriptor_bindings: DescriptorBindingState,
         #[cfg(feature = "instrumentation")] profiler_timestamps_complete: bool,
+        #[cfg(feature = "instrumentation")] gpu_scopes: Vec<&'static str>,
     ) -> RenderResult<()> {
         let mut slots = self
             .slots
@@ -658,6 +797,7 @@ impl FrameSlots {
         #[cfg(feature = "instrumentation")]
         if let Some(timestamps) = slot.profiler_timestamps.as_mut() {
             timestamps.pending = profiler_timestamps_complete;
+            timestamps.scopes = gpu_scopes;
         }
         slot.state = SlotState::Recorded { frame_id };
         Ok(())
@@ -785,10 +925,16 @@ impl<'device> VulkanRecordingFrame<'device> {
     }
 
     pub fn finish(mut self) -> RenderResult<VulkanRecordedFrame> {
-        let core = self
+        #[allow(unused_mut)]
+        let mut core = self
             .core
             .take()
             .ok_or_else(|| internal("Vulkan frame was already finished"))?;
+        #[cfg(feature = "instrumentation")]
+        core.write_profiler_timestamp(
+            PROFILER_TIMESTAMP_TOTAL_END,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+        );
         if let Err(result) = unsafe {
             self.device
                 .inner
@@ -810,6 +956,8 @@ impl<'device> VulkanRecordingFrame<'device> {
             core.descriptor_bindings,
             #[cfg(feature = "instrumentation")]
             core.profiler_timestamps_complete,
+            #[cfg(feature = "instrumentation")]
+            std::mem::take(&mut core.gpu_scopes),
         ) {
             for external in &core.external_images {
                 external.cancel_use(core.frame_id);

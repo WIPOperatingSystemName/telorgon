@@ -584,6 +584,34 @@ impl VulkanScene {
         removed
     }
 
+    /// Apply after binding and publishing compositor-owned snapshot instances. The image
+    /// shader clamps to these texel bounds, so upscaling cannot sample capacity padding.
+    pub(crate) fn crop_materialized_image(
+        &mut self,
+        image: ImageId,
+        active: crate::SizeI,
+        capacity: crate::SizeI,
+    ) {
+        assert!(
+            active.width > 0
+                && active.height > 0
+                && active.width <= capacity.width
+                && active.height <= capacity.height
+        );
+        let uv = [
+            0.0,
+            0.0,
+            active.width as f32 / capacity.width as f32,
+            active.height as f32 / capacity.height as f32,
+        ];
+        for (index, instance) in self.images.iter().enumerate() {
+            if instance.image == image && self.gpu_images[index].uv_normalized != uv {
+                self.gpu_images[index].uv_normalized = uv;
+                self.image_dirty.add(index..index + 1);
+            }
+        }
+    }
+
     fn rebuild_external_instances(&mut self, image: ImageId) {
         let alpha = self
             .external_images
@@ -624,7 +652,9 @@ impl VulkanScene {
                 MaterialKind::LiquidGlass(parameters) => {
                     self.material_parameters.extend(parameters.words());
                 }
-                MaterialKind::GaussianBlur(parameters) => self.material_parameters.extend(parameters.words()),
+                MaterialKind::GaussianBlur(parameters) => {
+                    self.material_parameters.extend(parameters.words())
+                }
                 _ => self.material_parameters.extend(resource.colors.map(pack)),
             }
             offsets.insert(*id, (start, self.material_parameters.len() as u32 - start));
@@ -661,7 +691,8 @@ impl VulkanScene {
             self.gpu_materials = next_materials;
         }
         if self.material_parameters != previous_parameters {
-            self.material_parameter_dirty.add(0..self.material_parameters.len());
+            self.material_parameter_dirty
+                .add(0..self.material_parameters.len());
         }
     }
 
@@ -697,10 +728,13 @@ impl VulkanScene {
             .iter()
             .filter_map(|draw| match draw.kind {
                 PrimitiveKind::Image => Some((draw.batch.resource, None)),
-                PrimitiveKind::Material => self.material_resources
+                PrimitiveKind::Material => self
+                    .material_resources
                     .get(&draw.batch.resource)
                     .and_then(|r| match r.kind {
-                        MaterialKind::LiquidGlass(p) => Some((p.backdrop.0, Some(p.sharp_backdrop.0))),
+                        MaterialKind::LiquidGlass(p) => {
+                            Some((p.backdrop.0, Some(p.sharp_backdrop.0)))
+                        }
                         MaterialKind::GaussianBlur(p) => Some((p.source.0, None)),
                         _ => None,
                     }),
@@ -716,13 +750,20 @@ impl VulkanScene {
         match batch.kind {
             PrimitiveKind::Glyph => Some(0),
             PrimitiveKind::Image => self.texture_slots.get(&(batch.key.resource, None)).copied(),
-            PrimitiveKind::Material => self.material_resources
-                .get(&batch.key.resource)
-                .and_then(|r| match r.kind {
-                    MaterialKind::LiquidGlass(p) => self.texture_slots.get(&(p.backdrop.0, Some(p.sharp_backdrop.0))).copied(),
-                    MaterialKind::GaussianBlur(p) => self.texture_slots.get(&(p.source.0, None)).copied(),
-                    _ => None,
-                }),
+            PrimitiveKind::Material => {
+                self.material_resources
+                    .get(&batch.key.resource)
+                    .and_then(|r| match r.kind {
+                        MaterialKind::LiquidGlass(p) => self
+                            .texture_slots
+                            .get(&(p.backdrop.0, Some(p.sharp_backdrop.0)))
+                            .copied(),
+                        MaterialKind::GaussianBlur(p) => {
+                            self.texture_slots.get(&(p.source.0, None)).copied()
+                        }
+                        _ => None,
+                    })
+            }
             PrimitiveKind::Box => None,
         }
     }
@@ -796,7 +837,11 @@ impl VulkanScene {
             + u32::from(!self.gpu_images.is_empty() && !self.image_buffer.is_allocated())
             + u32::from(!self.gpu_materials.is_empty() && !self.material_buffer.is_allocated())
             + self.texture_count() as u32
-            + self.texture_slots.keys().filter(|(_, second)| second.is_some()).count() as u32
+            + self
+                .texture_slots
+                .keys()
+                .filter(|(_, second)| second.is_some())
+                .count() as u32
     }
 
     pub(crate) fn prepare_uploads(
@@ -1071,7 +1116,9 @@ impl VulkanScene {
     }
     pub(crate) fn texture(&self, slot: usize, binding: u32) -> Option<(vk::ImageView, u64)> {
         if slot == 0 {
-            if binding != 0 { return None; }
+            if binding != 0 {
+                return None;
+            }
             return self
                 .atlas_texture
                 .image
@@ -1082,7 +1129,11 @@ impl VulkanScene {
             .texture_slots
             .iter()
             .find_map(|(id, value)| (*value == slot).then_some(*id))?;
-        let image = ImageId(if binding == 0 { resource_id.0 } else { resource_id.1? });
+        let image = ImageId(if binding == 0 {
+            resource_id.0
+        } else {
+            resource_id.1?
+        });
         self.image_resources
             .get(&image)
             .and_then(|resource| {
@@ -1471,7 +1522,10 @@ pub(crate) fn validate_draw_order(order: &[DrawItem]) -> Result<(), &'static str
         };
         if draw.batch.pipeline != expected
             && !(draw.kind == PrimitiveKind::Material
-                && matches!(draw.batch.pipeline, PipelineKind::LiquidGlass | PipelineKind::GaussianBlur))
+                && matches!(
+                    draw.batch.pipeline,
+                    PipelineKind::LiquidGlass | PipelineKind::GaussianBlur
+                ))
         {
             return Err("Vulkan draw item primitive and pipeline kinds disagree");
         }
@@ -1485,7 +1539,11 @@ pub(crate) fn validate_texture_count(order: &[DrawItem]) -> Result<(), &'static 
     let images = order
         .iter()
         .filter(|draw| {
-            draw.kind == PrimitiveKind::Image || matches!(draw.batch.pipeline, PipelineKind::LiquidGlass | PipelineKind::GaussianBlur)
+            draw.kind == PrimitiveKind::Image
+                || matches!(
+                    draw.batch.pipeline,
+                    PipelineKind::LiquidGlass | PipelineKind::GaussianBlur
+                )
         })
         .map(|draw| (draw.kind as u8, draw.batch.resource))
         .collect::<BTreeSet<_>>()
@@ -1524,29 +1582,95 @@ mod tests {
         }
     }
     #[test]
+    fn snapshot_sampling_crops_capacity_and_clamps_upscaled_edges() {
+        let mut scene = VulkanScene::default();
+        let instance = ImageInstance {
+            node: crate::ui::UiNodeId::new(1, 1),
+            image: ImageId(7),
+            tint: None,
+            rect: RectF {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 180.0,
+            },
+            view_bounds: RectF::default(),
+            content_version: 0,
+            opacity: 0.5,
+            clip: ClipId(0),
+            spatial: SpatialId(0),
+        };
+        scene.images.push(instance);
+        scene.gpu_images.push(convert_image(
+            &instance,
+            Some(ImageAlphaMode::Premultiplied),
+        ));
+        scene.crop_materialized_image(
+            ImageId(7),
+            SizeI {
+                width: 101,
+                height: 63,
+            },
+            SizeI {
+                width: 128,
+                height: 64,
+            },
+        );
+        let uv = scene.gpu_images[0].uv_normalized;
+        assert_eq!(scene.gpu_images[0].rect, [0.0, 0.0, 300.0, 180.0]);
+        assert_eq!(uv, [0.0, 0.0, 101.0 / 128.0, 63.0 / 64.0]);
+        // Mirror sampler coordinates at the first/last output pixel. The last sample
+        // must clamp to the final active texel, never interpolate cleared padding.
+        for output in [51, 101, 300] {
+            for x in [0, output - 1] {
+                let u = ((x as f32 + 0.5) / output as f32 * uv[2])
+                    .clamp(0.5 / 128.0, uv[2] - 0.5 / 128.0);
+                let actual = u * 128.0 - 0.5;
+                let expected = ((x as f32 + 0.5) / output as f32 * 101.0 - 0.5).clamp(0.0, 100.0);
+                assert!((actual - expected).abs() < 0.00002);
+            }
+        }
+        assert!(!scene.image_dirty.ranges.is_empty());
+    }
+
+    #[test]
     fn glass_texture_slots_distinguish_sharp_sources_and_plain_images() {
         let mut scene = VulkanScene::default();
         for (id, sharp) in [(1, 8), (2, 9), (3, 8)] {
-            scene.material_resources.insert(id, MaterialResource {
-                material: crate::ui::MaterialId(id),
-                content_version: 1,
-                kind: MaterialKind::LiquidGlass(crate::render::LiquidGlassMaterial {
-                    backdrop: ImageId(7), sharp_backdrop: ImageId(sharp),
-                    radii: [0.0; 4], inverse_output_size: [0.01; 2],
-                    inverse_bevel: 1.0, blend_softness: 0.0, refraction: 1.0,
-                    dispersion: 0.0, fresnel: 0.0,
-                    tint: [0.0, 0.0, 0.0, 1.0],
-                }),
-                colors: [ColorRgba8::rgba(0, 0, 0, 0); 2],
-            });
+            scene.material_resources.insert(
+                id,
+                MaterialResource {
+                    material: crate::ui::MaterialId(id),
+                    content_version: 1,
+                    kind: MaterialKind::LiquidGlass(crate::render::LiquidGlassMaterial {
+                        backdrop: ImageId(7),
+                        sharp_backdrop: ImageId(sharp),
+                        radii: [0.0; 4],
+                        inverse_output_size: [0.01; 2],
+                        inverse_bevel: 1.0,
+                        blend_softness: 0.0,
+                        refraction: 1.0,
+                        dispersion: 0.0,
+                        fresnel: 0.0,
+                        tint: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    colors: [ColorRgba8::rgba(0, 0, 0, 0); 2],
+                },
+            );
         }
-        scene.draw_order = vec![draw(PrimitiveKind::Image, 7),
-            draw(PrimitiveKind::Material, 1), draw(PrimitiveKind::Material, 2),
-            draw(PrimitiveKind::Material, 3)];
+        scene.draw_order = vec![
+            draw(PrimitiveKind::Image, 7),
+            draw(PrimitiveKind::Material, 1),
+            draw(PrimitiveKind::Material, 2),
+            draw(PrimitiveKind::Material, 3),
+        ];
         scene.rebuild_texture_slots();
         assert_eq!(scene.texture_slots.len(), 3);
         let batches = build_batches(&scene.draw_order);
-        let slots: Vec<_> = batches.iter().map(|b| scene.texture_slot(b).unwrap()).collect();
+        let slots: Vec<_> = batches
+            .iter()
+            .map(|b| scene.texture_slot(b).unwrap())
+            .collect();
         assert_ne!(slots[0], slots[1]);
         assert_ne!(slots[1], slots[2]);
         assert_eq!(slots[1], slots[3]);

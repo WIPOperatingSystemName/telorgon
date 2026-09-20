@@ -146,6 +146,7 @@ pub struct WindowMotion {
     unminimize: Option<Minimize>,
     content: ContentFade,
     maximize_content: ContentFade,
+    close: Option<Minimize>,
 }
 impl Default for WindowMotion {
     fn default() -> Self {
@@ -161,6 +162,7 @@ impl WindowMotion {
             unminimize: None,
             content: ContentFade::new(90, 130),
             maximize_content: ContentFade::new(50, 130),
+            close: None,
         }
     }
     /// Fluid maximize/restore presets from the spring specification; other effects stay smooth.
@@ -189,6 +191,7 @@ impl WindowMotion {
             unminimize: None,
             content: ContentFade::new(0, 0),
             maximize_content: ContentFade::new(0, 0),
+            close: None,
         }
     }
     /// Sets both directions unless an explicit restore override is present.
@@ -215,6 +218,18 @@ impl WindowMotion {
     pub const fn unminimize(mut self, effect: Minimize) -> Self {
         self.unminimize = Some(effect);
         self
+    }
+    /// Overrides the close shrink-and-fade effect. Defaults to the configured minimize effect.
+    /// Zero duration removes the image immediately without delaying client shutdown.
+    pub const fn close(mut self, effect: Minimize) -> Self {
+        self.close = Some(effect);
+        self
+    }
+    pub const fn close_transition(self) -> WindowTween {
+        match self.close {
+            Some(effect) => effect.tween,
+            None => self.minimize.tween,
+        }
     }
     pub const fn resize_content(mut self, fade: ContentFade) -> Self {
         self.content = fade;
@@ -268,6 +283,7 @@ impl WindowMotion {
         [
             self.minimize_transition(true),
             self.minimize_transition(false),
+            self.close_transition(),
             self.content.entry,
             self.content.exit,
             self.maximize_content.entry,
@@ -281,6 +297,22 @@ impl WindowMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn close_is_const_independent_and_enables_close_only_motion() {
+        const CLOSE: WindowMotion = WindowMotion::none().close(Minimize::shrink_and_fade(180));
+        assert_eq!(CLOSE.close_transition(), tween_ms(180, Easing::EaseOut));
+        assert!(CLOSE.enabled());
+        let custom = Minimize::shrink_and_fade(320);
+        assert_eq!(
+            WindowMotion::smooth().minimize(custom).close_transition(),
+            custom.tween
+        );
+        assert_eq!(CLOSE.minimize(custom).close_transition().duration_ms, 180);
+        assert_eq!(CLOSE.content_transition(true).duration_ms, 0);
+        assert_eq!(WindowMotion::smooth().close_transition().duration_ms, 180);
+        assert_eq!(WindowMotion::fluid().close_transition().duration_ms, 180);
+        assert!(!CLOSE.close(Minimize::shrink_and_fade(0)).enabled());
+    }
     #[test]
     fn fluid_presets_and_mixed_overrides_are_const_and_independent() {
         const FLUID: WindowMotion = WindowMotion::fluid();

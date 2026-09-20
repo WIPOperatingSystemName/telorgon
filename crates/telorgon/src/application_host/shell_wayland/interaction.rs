@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum WindowInteraction {
     Move {
         surface: WaylandSurfaceId,
+        pointer_origin: PointF,
         pointer_start: PointF,
         position_start: PointI,
     },
@@ -31,6 +32,7 @@ impl WindowInteraction {
         }
         Some(Self::Move {
             surface,
+            pointer_origin: pointer_start,
             pointer_start,
             position_start: window.position,
         })
@@ -44,6 +46,9 @@ impl WindowInteraction {
         pointer_start: PointF,
     ) -> Option<Self> {
         let window = windows.get_mut(&surface)?;
+        if window.tile.is_some() || window.maximized || window.fullscreen {
+            return None;
+        }
         if window.backend == Some(WindowBackend::Wayland) {
             window.native_configure.resize_anchor = Some(ResizeAnchor::new(
                 window.position,
@@ -83,13 +88,14 @@ pub(super) fn apply_window_interaction(
     match *interaction {
         WindowInteraction::Move {
             surface,
+            pointer_origin,
             pointer_start,
             position_start,
         } => {
             let Some(window) = windows.get_mut(&surface) else {
                 return Ok(());
             };
-            if window.maximized {
+            if window.maximized || window.tile.is_some() {
                 // Keep a click (or small pointer jitter) from restoring the window.
                 if (pointer_position.x - pointer_start.x)
                     .hypot(pointer_position.y - pointer_start.y)
@@ -112,6 +118,7 @@ pub(super) fn apply_window_interaction(
                     .clamp(0.0, 1.0);
                 let grab_y = (pointer_start.y - window.position.y as f32).max(0.0);
                 window.maximized = false;
+                window.tile = None;
                 window.motion_veil_pending = window.motion_style.enabled();
                 #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
                 {
@@ -147,6 +154,7 @@ pub(super) fn apply_window_interaction(
                 // position rather than jumping back to the maximized origin.
                 *interaction = WindowInteraction::Move {
                     surface,
+                    pointer_origin,
                     pointer_start: pointer_position,
                     position_start: window.position,
                 };
@@ -300,9 +308,10 @@ pub(super) fn set_window_maximized(
     window.native_configure.resize_anchor = None;
     window.native_configure.resize_final = None;
     if maximized {
-        if !window.maximized && !window.fullscreen {
+        if !window.maximized && !window.fullscreen && window.tile.is_none() {
             window.restore_geometry = Some((window.position, window.requested_size));
         }
+        window.tile = None;
         window.maximized = true;
         window.fullscreen = false;
         window.minimized = false;
@@ -331,6 +340,7 @@ pub(super) fn set_window_maximized(
         // Custom frames are measured in their maximized state during refresh_window_frames;
         // that authoritative content extent supersedes this legacy fallback configure.
     } else {
+        window.tile = None;
         window.maximized = false;
         if let Some((position, size)) = window.restore_geometry.take() {
             window.position = position;
@@ -369,15 +379,17 @@ pub(super) fn set_window_fullscreen(
     window.native_configure.resize_anchor = None;
     window.native_configure.resize_final = None;
     if fullscreen {
-        if !window.maximized && !window.fullscreen {
+        if !window.maximized && !window.fullscreen && window.tile.is_none() {
             window.restore_geometry = Some((window.position, window.requested_size));
         }
         window.maximized = false;
+        window.tile = None;
         window.fullscreen = true;
         window.minimized = false;
         window.position = PointI::default();
         window.requested_size = output;
     } else {
+        window.tile = None;
         window.fullscreen = false;
         if let Some((position, size)) = window.restore_geometry.take() {
             window.position = position;
@@ -394,6 +406,10 @@ pub(super) fn window_toplevel_states(
     resizing: bool,
 ) -> ToplevelState {
     ToplevelState {
+        tiled_left: window.tile.is_some(),
+        tiled_right: window.tile.is_some(),
+        tiled_top: window.tile.is_some(),
+        tiled_bottom: window.tile.is_some(),
         maximized: window.maximized,
         fullscreen: window.fullscreen,
         resizing,

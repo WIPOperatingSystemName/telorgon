@@ -28,6 +28,11 @@ impl Text {
         self.element.style.size = Some(size);
         self
     }
+    /// Select a registered or system font family by its embedded family name.
+    pub fn font_family(mut self, family: &'static str) -> Self {
+        self.element.style.font_family = Some(family);
+        self
+    }
 
     pub fn line_height(mut self, line_height: f32) -> Self {
         self.element.style.line_height = Some(line_height);

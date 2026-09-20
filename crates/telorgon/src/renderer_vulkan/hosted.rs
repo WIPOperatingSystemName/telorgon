@@ -728,6 +728,8 @@ impl VulkanDevice {
             profiler_timestamp_mask: 0,
             #[cfg(feature = "instrumentation")]
             profiler_timestamps_complete: false,
+            #[cfg(feature = "instrumentation")]
+            gpu_scopes: Vec::new(),
         };
         Ok(VulkanHostedFrame {
             device: self,

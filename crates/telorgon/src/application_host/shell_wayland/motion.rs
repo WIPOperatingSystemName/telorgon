@@ -32,11 +32,14 @@ pub(super) struct MotionFrame {
     pub live: BTreeSet<u64>,
     pub hidden_revisions: BTreeSet<u32>,
     pub fallback: Vec<ShellPlacement>,
+    pub resize_group: BTreeSet<u32>,
+    pub divider_dragging: bool,
 }
 #[derive(Clone, Copy)]
 pub(super) struct WindowState {
     pub bounds: RectI,
     pub maximized: bool,
+    pub tiled: Option<crate::TileTarget>,
     pub interactive: bool,
     pub move_pointer: Option<crate::core::PointF>,
     pub minimized: bool,
@@ -45,15 +48,23 @@ pub(super) struct WindowState {
     pub corner_radii: crate::ui::CornerRadii,
     pub shadows: crate::ui::ShadowList,
 }
+impl WindowState {
+    fn arranged(self) -> bool {
+        self.maximized || self.tiled.is_some()
+    }
+    fn placement_changed(self, other: Self) -> bool {
+        self.maximized != other.maximized || self.tiled != other.tiled
+    }
+}
 #[derive(Clone, Copy, Debug)]
-struct Track {
+pub(super) struct Track {
     from: f32,
     to: f32,
     start: u64,
     tween: WindowTween,
 }
 impl Track {
-    fn fixed(value: f32) -> Self {
+    pub(super) fn fixed(value: f32) -> Self {
         Self {
             from: value,
             to: value,
@@ -61,7 +72,7 @@ impl Track {
             tween: crate::tween_ms(0, crate::Easing::Linear),
         }
     }
-    fn sample(self, now: u64) -> f32 {
+    pub(super) fn sample(self, now: u64) -> f32 {
         let duration = u64::from(self.tween.duration_ms) * 1_000_000;
         let t = if duration == 0 {
             1.0
@@ -70,11 +81,11 @@ impl Track {
         };
         self.from + (self.to - self.from) * self.tween.easing.sample(t)
     }
-    fn active(self, now: u64) -> bool {
+    pub(super) fn active(self, now: u64) -> bool {
         self.from != self.to
             && now.saturating_sub(self.start) < u64::from(self.tween.duration_ms) * 1_000_000
     }
-    fn retarget(&mut self, to: f32, tween: WindowTween, now: u64) {
+    pub(super) fn retarget(&mut self, to: f32, tween: WindowTween, now: u64) {
         *self = Self {
             from: self.sample(now),
             to,
@@ -95,10 +106,21 @@ struct WindowVisual {
     visibility: Track,
     content: Track,
     order: usize,
-    maximize_handoff: bool,
+    placement_handoff: bool,
     motion_radii: crate::ui::CornerRadii,
     motion_shadows: crate::ui::ShadowList,
     drag_restore: bool,
+    shared_resize: bool,
+    last_output: Option<(SnapshotOutput, ShellPlacement)>,
+    last_shadow: Option<(crate::render::BoxInstance, crate::core::PointI)>,
+    above: Vec<ShellLayerKey>,
+}
+struct ClosingWindow {
+    above: Vec<ShellLayerKey>,
+    shadow: Option<(crate::render::BoxInstance, crate::core::PointI)>,
+    output: SnapshotOutput,
+    placement: ShellPlacement,
+    opacity: Track,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VisualInput {
@@ -118,6 +140,7 @@ impl VisualInput {
 pub(super) struct WindowMotionController {
     inputs: BTreeMap<u32, VisualInput>,
     windows: BTreeMap<u32, WindowVisual>,
+    closing: BTreeMap<u32, ClosingWindow>,
     next_id: u64,
     shadows: Option<super::scene::ShellComposition>,
 }
@@ -125,11 +148,129 @@ fn next_id(next: &mut u64) -> u64 {
     *next = next.checked_add(1).expect("motion identity exhausted");
     *next
 }
+impl WindowMotionController {
+    /// Withdrawal, rather than a close request, is authoritative: clients may refuse to close.
+    pub(super) fn close(&mut self, id: u32, now: u64) {
+        self.inputs.remove(&id);
+        let Some(visual) = self.windows.remove(&id) else {
+            return;
+        };
+        let tween = visual.state.style.close_transition();
+        let Some((output, placement)) = visual.last_output else {
+            return;
+        };
+        if tween.duration_ms == 0 || output.opacity <= 0.0 || self.closing.len() >= 16 {
+            return;
+        }
+        let mut opacity = Track::fixed(output.opacity);
+        opacity.retarget(0.0, tween, now);
+        self.closing.insert(
+            id,
+            ClosingWindow {
+                shadow: visual.last_shadow,
+                output,
+                placement,
+                above: visual.above,
+                opacity,
+            },
+        );
+    }
+
+    pub(super) fn cancel_closing(&mut self) {
+        self.closing.clear();
+    }
+
+    /// Forget captures and input transforms after immediate presentation. Preserve monotonic
+    /// snapshot IDs and retained shadow epochs so the next frame can safely publish fresh data.
+    pub(super) fn reset_after_fallback(&mut self) {
+        self.inputs.clear();
+        self.closing.clear();
+        for visual in self.windows.values_mut() {
+            visual.last_output = None;
+            visual.captured = None;
+            visual.displayed = None;
+            visual.outgoing = None;
+            visual.placements.clear();
+            visual.geometry_from = visual.state.bounds;
+            visual.geometry = GeometryTrack::fixed(visual.state.bounds);
+            visual.visibility = Track::fixed(if visual.state.minimized { 0.0 } else { 1.0 });
+            visual.content = Track::fixed(1.0);
+            visual.placement_handoff = false;
+            visual.drag_restore = false;
+            visual.shared_resize = false;
+        }
+    }
+
+    /// Compose each fading widget and its live window previews once, then apply group opacity
+    /// through the same snapshot-output path as minimized windows.
+    pub(super) fn apply_widget_visibility(
+        &mut self,
+        frame: &mut ShellFrame,
+        widgets: &[(u32, f32)],
+    ) {
+        for &(id, opacity) in widgets {
+            if opacity >= 1.0 {
+                continue;
+            }
+            let belongs = |key| {
+                matches!(key,
+                ShellLayerKey::Widget(owner) | ShellLayerKey::TilePreview(owner) | ShellLayerKey::WindowPreview(owner, _, _) | ShellLayerKey::OutputPreview(owner, _, _) if owner == id)
+            };
+            let Some(index) = frame.placements.iter().position(|p| belongs(p.key)) else {
+                continue;
+            };
+            let bounds = frame.placements[index].target;
+            let local = frame
+                .placements
+                .iter()
+                .copied()
+                .filter(|p| belongs(p.key))
+                .map(|p| translated(p, bounds))
+                .collect();
+            let capture = next_id(&mut self.next_id);
+            let output = next_id(&mut self.next_id);
+            frame.motion.snapshots.push(SnapshotCommand {
+                id: capture,
+                extent: extent(bounds),
+                content: SnapshotContent::Capture(local),
+            });
+            frame.motion.live.insert(capture);
+            frame.motion.outputs.push(SnapshotOutput {
+                id: output,
+                source: capture,
+                extent: extent(bounds),
+                opacity,
+            });
+            frame.live_scenes.insert(ShellSceneKey::Motion(output));
+            frame.placements.retain(|p| !belongs(p.key));
+            frame.placements.insert(
+                index,
+                ShellPlacement {
+                    key: ShellLayerKey::Widget(id),
+                    scene: ShellSceneKey::Motion(output),
+                    target: bounds,
+                    clip: None,
+                    rounded_clips: [None; 2],
+                },
+            );
+        }
+    }
+}
 fn extent(r: RectI) -> SizeI {
     SizeI {
         width: r.width.max(1),
         height: r.height.max(1),
     }
+}
+pub(super) fn minimize_rect(mut target: RectI, opacity: f32) -> RectI {
+    let shrink = 0.92 + 0.08 * opacity;
+    let width = (target.width as f32 * shrink).round().max(1.0) as i32;
+    let height = (target.height as f32 * shrink).round().max(1.0) as i32;
+    target.x += (target.width - width) / 2;
+    target.y += (target.height - height) / 2;
+    target.width = width;
+    target.height = height;
+    target
 }
 fn map_rect(r: RectI, from: RectI, to: RectI) -> RectI {
     let sx = to.width as f32 / from.width.max(1) as f32;
@@ -163,6 +304,7 @@ pub(super) fn surface_for_key(key: ShellLayerKey) -> Option<u32> {
         | ShellLayerKey::ContentCorners(id)
         | ShellLayerKey::Surface(id)
         | ShellLayerKey::ResizeVeil(id)
+        | ShellLayerKey::ResizePreviewBorder(id)
         | ShellLayerKey::LegacyControl(id, _) => Some(id),
         _ => None,
     }
@@ -180,11 +322,12 @@ impl WindowMotionController {
         })
     }
     pub fn active(&self, _now: u64) -> bool {
-        self.windows.values().any(|v| {
-            v.geometry.pending()
-                || v.visibility.from != v.visibility.to
-                || v.content.from != v.content.to
-        })
+        !self.closing.is_empty()
+            || self.windows.values().any(|v| {
+                v.geometry.pending()
+                    || v.visibility.from != v.visibility.to
+                    || v.content.from != v.content.to
+            })
     }
     /// Frame transforms are rendering-only. Protocol readiness is supplied by the host.
     pub fn apply(
@@ -200,6 +343,7 @@ impl WindowMotionController {
         let was_active = self.active(now);
         if preference == MotionPreference::Reduced {
             self.windows.clear();
+            self.closing.clear();
             return;
         }
         self.windows
@@ -224,12 +368,74 @@ impl WindowMotionController {
         let mut shadow_orders = BTreeMap::new();
         // Conservative bound includes current, outgoing, mixed, and in-flight captures.
         let mut pixels = 0_u64;
+        // Closed clients own no input or protocol state. Only immutable renderer snapshots survive.
+        self.closing.retain(|id, closing| {
+            if states.contains_key(id) || !closing.opacity.active(now) {
+                return false;
+            }
+            let area = closing.output.extent.width.max(1) as u64
+                * closing.output.extent.height.max(1) as u64;
+            if pixels.saturating_add(area * 2) > 67_108_864 {
+                return false;
+            }
+            pixels += area * 2;
+            let order = closing
+                .above
+                .iter()
+                .find_map(|key| frame.placements.iter().position(|p| p.key == *key))
+                .unwrap_or(frame.placements.len());
+            let mut output = closing.output.clone();
+            output.opacity = closing.opacity.sample(now);
+            // Normalize against the last visible opacity to avoid a jump if closing interrupts minimize.
+            let remaining = output.opacity / closing.output.opacity;
+            let mut placement = closing.placement;
+            placement.target = minimize_rect(placement.target, remaining);
+            let from = closing.placement.target;
+            let to = placement.target;
+            let transform = |r: crate::core::RectF| crate::core::RectF {
+                x: to.x as f32 + (r.x - from.x as f32) * to.width as f32 / from.width as f32,
+                y: to.y as f32 + (r.y - from.y as f32) * to.height as f32 / from.height as f32,
+                width: r.width * to.width as f32 / from.width as f32,
+                height: r.height * to.height as f32 / from.height as f32,
+            };
+            placement.clip = placement.clip.map(|r| map_rect(r, from, to));
+            for clip in placement.rounded_clips.iter_mut().flatten() {
+                clip.rect = transform(clip.rect);
+            }
+            output.extent = extent(to);
+            if let Some((instance, position)) = &closing.shadow {
+                let mut instance = instance.clone();
+                instance.opacity = output.opacity;
+                let outer = transform(crate::core::RectF {
+                    x: position.x as f32,
+                    y: position.y as f32,
+                    width: instance.rect.width,
+                    height: instance.rect.height,
+                });
+                instance.rect.width = outer.width;
+                instance.rect.height = outer.height;
+                instance.view_bounds = instance.rect;
+                let position = crate::core::PointI {
+                    x: outer.x.round() as i32,
+                    y: outer.y.round() as i32,
+                };
+                if let Some(layer) = motion_shadow(*id, instance, position) {
+                    shadow_orders.insert(layer.key, order);
+                    shadow_layers.push(layer);
+                }
+            }
+            frame.motion.live.insert(output.source);
+            frame.live_scenes.insert(closing.placement.scene);
+            frame.motion.outputs.push(output);
+            outputs.push((order, placement));
+            true
+        });
         let mut candidates = states
             .into_iter()
             .filter(|(_, s)| s.style.enabled())
             .map(|(id, state)| {
                 let active = self.windows.get(&id).is_some_and(|v| {
-                    v.state.maximized != state.maximized
+                    v.state.placement_changed(state)
                         || v.state.minimized != state.minimized
                         || v.state.veiled != state.veiled
                         || v.geometry.pending()
@@ -290,30 +496,34 @@ impl WindowMotionController {
                 visibility: Track::fixed(if state.minimized { 0.0 } else { 1.0 }),
                 content: Track::fixed(1.0),
                 order: group.first().map_or(0, |(i, _)| *i),
-                maximize_handoff: false,
+                placement_handoff: false,
                 motion_radii: state.corner_radii,
                 motion_shadows: state.shadows,
                 drag_restore: false,
+                shared_resize: false,
+                last_output: None,
+                last_shadow: None,
+                above: Vec::new(),
             });
             let current_sample = visual.geometry.sample(now);
             let current_geometry = current_sample.rect();
-            if visual.state.maximized && !state.maximized && state.move_pointer.is_some() {
+            if visual.state.arranged() && !state.arranged() && state.move_pointer.is_some() {
                 visual.drag_restore = true;
             }
             if state.interactive && (!visual.drag_restore || state.move_pointer.is_none()) {
                 visual.drag_restore = false;
-                visual.maximize_handoff = false;
+                visual.placement_handoff = false;
                 visual.geometry_from = state.bounds;
                 visual.geometry = GeometryTrack::fixed(state.bounds);
-            } else if visual.state.maximized != state.maximized {
-                visual.maximize_handoff = state.veiled;
+            } else if visual.state.placement_changed(state) {
+                visual.placement_handoff = state.veiled;
                 // Use the restored frame's contour throughout movement, in physical pixels.
-                visual.motion_radii = if state.maximized {
+                visual.motion_radii = if state.arranged() {
                     visual.state.corner_radii
                 } else {
                     state.corner_radii
                 };
-                visual.motion_shadows = if state.maximized {
+                visual.motion_shadows = if state.arranged() {
                     visual.state.shadows
                 } else {
                     state.shadows
@@ -345,7 +555,7 @@ impl WindowMotionController {
                 }
                 // Interruptions preserve velocity immediately; do not freeze a moving spring
                 // for a second placeholder entry delay.
-                let delay = if visual.maximize_handoff && !continuing {
+                let delay = if visual.placement_handoff && !continuing {
                     u64::from(state.style.maximize_content_transition(true).duration_ms) * 1_000_000
                 } else {
                     0
@@ -353,7 +563,7 @@ impl WindowMotionController {
                 visual.geometry = GeometryTrack::new(
                     from,
                     state.bounds,
-                    state.style.maximize_transition(state.maximized),
+                    state.style.maximize_transition(state.arranged()),
                     now.saturating_add(delay),
                     continuing,
                 );
@@ -371,7 +581,7 @@ impl WindowMotionController {
                         state.bounds.y - visual.state.bounds.y,
                     );
                 } else {
-                    // Direct manipulation follows the pointer. A measured maximize target retargets.
+                    // Direct manipulation follows the pointer. A measured maximize/tile target retargets.
                     if visual.geometry.active(now) {
                         let start = visual.geometry.start.max(now);
                         let end = visual
@@ -385,7 +595,7 @@ impl WindowMotionController {
                             state.bounds,
                             state
                                 .style
-                                .maximize_transition(state.maximized)
+                                .maximize_transition(state.arranged())
                                 .with_duration_ms(remaining_ms),
                             start,
                             now >= visual.geometry.start,
@@ -406,7 +616,7 @@ impl WindowMotionController {
             // An early redraw cannot interrupt entry/movement. Keep the captured placeholder
             // until geometry reaches its destination, then start the ready-content fade.
             let hold_placeholder =
-                visual.maximize_handoff && visual.geometry.active(now) && !state.veiled;
+                visual.placement_handoff && visual.geometry.active(now) && !state.veiled;
             let mut presented_state = state;
             if hold_placeholder {
                 presented_state.veiled = true;
@@ -415,7 +625,7 @@ impl WindowMotionController {
             if content_changed && !state.minimized {
                 visual.outgoing = visual.displayed;
                 visual.content = Track::fixed(0.0);
-                let tween = if visual.maximize_handoff {
+                let tween = if visual.placement_handoff {
                     state
                         .style
                         .maximize_content_transition(presented_state.veiled)
@@ -426,7 +636,13 @@ impl WindowMotionController {
             }
             if !group.is_empty() {
                 visual.order = group[0].0;
-                if visual.maximize_handoff && state.veiled {
+                visual.above = frame
+                    .placements
+                    .iter()
+                    .skip(group.last().unwrap().0 + 1)
+                    .map(|p| p.key)
+                    .collect();
+                if visual.placement_handoff && state.veiled {
                     for p in &mut local {
                         if matches!(p.key, ShellLayerKey::ResizeVeil(_)) {
                             // Radius is applied at the displayed size instead of being baked
@@ -462,6 +678,7 @@ impl WindowMotionController {
             visual.state = presented_state;
             let opacity = visual.visibility.sample(now);
             if state.minimized && opacity <= 0.0 {
+                visual.last_output = None;
                 visual.captured = None;
                 visual.displayed = None;
                 visual.outgoing = None;
@@ -483,7 +700,7 @@ impl WindowMotionController {
                 frame.motion.snapshots.push(SnapshotCommand {
                     id: mix,
                     // Entry is still at the old geometry; avoid full-maximized-size mixing.
-                    extent: if visual.maximize_handoff && presented_state.veiled {
+                    extent: if visual.placement_handoff && presented_state.veiled {
                         extent(visual.geometry_from)
                     } else {
                         extent(visual.bounds)
@@ -498,14 +715,7 @@ impl WindowMotionController {
             visual.displayed = Some(displayed);
             frame.motion.live.extend([captured, displayed]);
             let geometry = visual.geometry.sample(now).rect();
-            let mut target = map_rect(visual.bounds, state.bounds, geometry);
-            let shrink = 0.92 + 0.08 * opacity;
-            let w = (target.width as f32 * shrink).round().max(1.0) as i32;
-            let h = (target.height as f32 * shrink).round().max(1.0) as i32;
-            target.x += (target.width - w) / 2;
-            target.y += (target.height - h) / 2;
-            target.width = w;
-            target.height = h;
+            let target = minimize_rect(map_rect(visual.bounds, state.bounds, geometry), opacity);
             let visual_outer = map_rect(state.bounds, visual.bounds, target);
             let float = |r: RectI| crate::core::RectF {
                 x: r.x as f32,
@@ -533,7 +743,7 @@ impl WindowMotionController {
                         .map(|(surface, _)| *surface),
                 );
             }
-            if visual.maximize_handoff
+            if visual.placement_handoff
                 && !presented_state.veiled
                 && !visual.geometry.active(now)
                 && !visual.content.active(now)
@@ -541,16 +751,27 @@ impl WindowMotionController {
                 // Publish the unclipped resting state in the final fully damaged frame.
                 // Clearing this after emitting the placement leaves the shadow clipped until
                 // a later partial hover repaint, making scanout slots disagree outside it.
-                visual.maximize_handoff = false;
+                visual.placement_handoff = false;
                 frame.damage = None;
             }
+            if state.tiled.is_some() && state.interactive && state.veiled {
+                visual.shared_resize = true;
+            }
+            if visual.shared_resize {
+                if state.tiled.is_some() && (state.veiled || visual.content.active(now)) {
+                    frame.motion.resize_group.insert(id);
+                } else {
+                    visual.shared_resize = false;
+                }
+            }
             let output = u64::from(id);
-            let separate_shadow = visual.maximize_handoff
+            let separate_shadow = visual.placement_handoff
                 || state.interactive
                 || state.veiled
                 || visual.content.active(now);
+            visual.last_shadow = None;
             if separate_shadow {
-                let moving = visual.maximize_handoff && visual.geometry.active(now);
+                let moving = visual.placement_handoff && visual.geometry.active(now);
                 let rect = crate::core::RectF {
                     x: 0.0,
                     y: 0.0,
@@ -578,20 +799,12 @@ impl WindowMotionController {
                     clip: crate::render::ClipId(0),
                     spatial: crate::render::SpatialId(0),
                 };
-                if let Some(mut layer) = super::scene::ShellLayer::frame_shadow(
-                    id,
-                    instance,
-                    crate::core::PointI {
-                        x: visual_outer.x,
-                        y: visual_outer.y,
-                    },
-                ) {
-                    layer.key = ShellLayerKey::MotionShadow(id);
-                    if let super::scene::ShellLayerContent::Decoration { scene, .. } =
-                        &mut layer.content
-                    {
-                        *scene = ShellSceneKey::MotionShadow(id);
-                    }
+                let position = crate::core::PointI {
+                    x: visual_outer.x,
+                    y: visual_outer.y,
+                };
+                visual.last_shadow = Some((instance.clone(), position));
+                if let Some(layer) = motion_shadow(id, instance, position) {
                     shadow_orders.insert(layer.key, visual.order);
                     shadow_layers.push(layer);
                 }
@@ -611,7 +824,7 @@ impl WindowMotionController {
                     target,
                     clip: None,
                     rounded_clips: if separate_shadow {
-                        let radii = if visual.maximize_handoff && visual.geometry.active(now) {
+                        let radii = if visual.placement_handoff && visual.geometry.active(now) {
                             visual.motion_radii
                         } else {
                             state.corner_radii
@@ -624,6 +837,10 @@ impl WindowMotionController {
                         [None; 2]
                     },
                 },
+            ));
+            visual.last_output = Some((
+                frame.motion.outputs.last().unwrap().clone(),
+                outputs.last().unwrap().1,
             ));
             replaced.extend(group.iter().map(|(i, _)| *i));
             visual.geometry.finish(now);
@@ -674,6 +891,19 @@ impl WindowMotionController {
         placements.extend(outputs.map(|(_, p)| p));
         frame.placements = placements;
     }
+}
+
+fn motion_shadow(
+    id: u32,
+    instance: crate::render::BoxInstance,
+    position: crate::core::PointI,
+) -> Option<super::scene::ShellLayer> {
+    let mut layer = super::scene::ShellLayer::frame_shadow(id, instance, position)?;
+    layer.key = ShellLayerKey::MotionShadow(id);
+    if let super::scene::ShellLayerContent::Decoration { scene, .. } = &mut layer.content {
+        *scene = ShellSceneKey::MotionShadow(id);
+    }
+    Some(layer)
 }
 
 /// One sampled image per input. Additive blending sums premultiplied weighted endpoints.
@@ -739,6 +969,60 @@ pub(super) fn image_scene(
 mod tests {
     use super::*;
     #[test]
+    fn widget_and_previews_share_one_opacity_group_without_capturing_other_layers() {
+        let bounds = RectI {
+            x: 100,
+            y: 200,
+            width: 200,
+            height: 100,
+        };
+        let placement = |key, scene| ShellPlacement {
+            key,
+            scene,
+            target: bounds,
+            clip: None,
+            rounded_clips: [None; 2],
+        };
+        let mut frame = ShellFrame {
+            glass_changed: Default::default(),
+            glass: Default::default(),
+            preview_borders: Default::default(),
+            motion: Default::default(),
+            extent: SizeI {
+                width: 800,
+                height: 600,
+            },
+            live_scenes: Default::default(),
+            updates: vec![],
+            placements: vec![
+                placement(ShellLayerKey::Surface(9), ShellSceneKey::Surface(9)),
+                placement(ShellLayerKey::TilePreview(1), ShellSceneKey::TilePreview(1)),
+                placement(ShellLayerKey::Widget(1), ShellSceneKey::Widget(1)),
+                placement(
+                    ShellLayerKey::WindowPreview(1, 0, 9),
+                    ShellSceneKey::Surface(9),
+                ),
+                placement(ShellLayerKey::OutputPreview(1, 0, 0), ShellSceneKey::Background),
+                placement(ShellLayerKey::Widget(2), ShellSceneKey::Widget(2)),
+            ],
+            surface_revisions: vec![],
+            damage: None,
+        };
+        WindowMotionController::default().apply_widget_visibility(&mut frame, &[(1, 0.5)]);
+        assert_eq!(frame.placements.len(), 3);
+        assert_eq!(frame.placements[0].key, ShellLayerKey::Surface(9));
+        assert_eq!(frame.placements[1].key, ShellLayerKey::Widget(1));
+        assert_eq!(frame.placements[2].key, ShellLayerKey::Widget(2));
+        assert_eq!(frame.motion.outputs.len(), 1);
+        assert_eq!(frame.motion.outputs[0].opacity, 0.5);
+        let SnapshotContent::Capture(group) = &frame.motion.snapshots[0].content else {
+            panic!()
+        };
+        assert_eq!(group.len(), 4);
+        assert_eq!(group[0].target.x, 0);
+        assert_eq!(group[1].target.y, 0);
+    }
+    #[test]
     fn later_surface_gets_animation_budget_before_idle_windows() {
         use super::super::scene::{ShellComposition, ShellLayer};
         let extent = SizeI {
@@ -753,6 +1037,7 @@ mod tests {
                 height: 2000,
             },
             maximized: false,
+            tiled: None,
             interactive: false,
             move_pointer: None,
             minimized: false,

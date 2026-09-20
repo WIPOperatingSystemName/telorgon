@@ -4,6 +4,7 @@
 //! handle, renderer resource, policy engine, event loop, application component, or background work.
 
 pub mod capability;
+pub mod capture;
 pub mod diagnostics;
 pub mod error;
 pub mod host;

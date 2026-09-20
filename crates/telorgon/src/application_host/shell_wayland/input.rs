@@ -400,7 +400,7 @@ pub(super) fn hit_test_decoration(
         if !inside_frame {
             continue;
         }
-        let border = config.window_border.max(1);
+        let border = window_border_width(window, config).max(0);
         let left = local.x < border;
         let right = local.x >= outer.width - border;
         let top = local.y < border;
@@ -416,7 +416,13 @@ pub(super) fn hit_test_decoration(
             (_, _, _, true) => Some(ResizeEdge::Bottom),
             _ => None,
         };
-        if let Some(edge) = edge {
+        if let Some(edge) = edge
+            && !window.maximized
+            && window
+                .decoration_policy
+                .frame_parts(window.server_decorated)
+                .resize_regions
+        {
             return Some((*surface, DecorationHit::Resize(edge)));
         }
         if window_is_decorated(window) && local.y < border + config.titlebar_height {
@@ -495,6 +501,12 @@ pub(super) fn decoration_pointer_request(
     icons: &[(String, Layer)],
 ) -> Option<PointerRequest> {
     let (surface, hit) = hit_test_decoration(windows, stacking_order, position, config, icons)?;
+    // Tiled resize cursors belong to the shared-divider controller, including wider hit regions.
+    if windows.get(&surface).is_some_and(|w| w.tile.is_some())
+        && matches!(hit, DecorationHit::Resize(_))
+    {
+        return Some(PointerRequest::Semantic(PointerIcon::Default));
+    }
     if let (Some(frame), Some(window)) = (frames.get(&surface), windows.get(&surface)) {
         let local = PointF {
             x: position.x - window.position.x as f32,

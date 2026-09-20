@@ -12,8 +12,8 @@ use crate::theme::{
     CompiledComponentStyle, CompiledSlotStyle, CompiledStateStyle, InteractionState, TransitionSpec,
 };
 use crate::ui::{
-    Background, BoxDecoration, ComponentStyleId, InteractionFlags, Shadow, SizeRule, SizeRule2D,
-    StylePropertyPatch, StyleSlotId, ThemeDomainId,
+    Background, Border, BoxDecoration, ComponentStyleId, InteractionFlags, Shadow, SizeRule,
+    SizeRule2D, StylePropertyPatch, StyleSlotId, ThemeDomainId,
 };
 use crate::window_chrome::{
     WindowAction, WindowChromeModel, WindowChromeState, WindowContentStyle, WindowEdgeMask,
@@ -25,11 +25,12 @@ use super::WindowChromeViewExt;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowChromePalette {
     pub frame_background: ColorRgba8,
-    pub frame_border: ColorRgba8,
-    /// Visible border in normal/tiled states; maximized and fullscreen frames are borderless.
-    pub frame_border_width: f32,
+    /// Per-side visible border in normal/tiled states; maximized and fullscreen frames are borderless.
+    pub frame_border: Border,
     pub title_color: ColorRgba8,
     pub title_weight: u16,
+    /// Overrides the state shadow color; states without shadows remain shadowless.
+    pub shadow_color: Option<ColorRgba8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,6 +48,7 @@ pub struct WindowChromeStateStyle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowTitleBarStyle {
+    pub font_family: &'static str,
     pub height: f32,
     pub padding: Insets,
     pub gap: f32,
@@ -110,16 +112,29 @@ pub struct WindowChromeDesign {
     /// reveal lower desktop layers. Opaque client buffers remain opaque.
     pub content_background: ColorRgba8,
     /// Resize placeholder appearance, independent of the normal content backing. `None`
-    /// inherits `LinuxShellConfig::resize_preview`. Color alpha zero is frame-only;
+    /// inherits `LinuxShellConfig::resize_preview`. Color alpha zero leaves only the preview border;
     /// glass tint alpha zero keeps the opaque blurred backdrop.
-    pub resize_preview: Option<crate::ResizePreview>,
+    pub resize_preview: Option<crate::ResizePreviewDesign>,
 }
 
 impl WindowChromeDesign {
     pub fn validate(self) -> Result<Self, WindowChromeDesignError> {
+        if self
+            .resize_preview
+            .is_some_and(|preview| !preview.border_is_valid())
+        {
+            return Err(WindowChromeDesignError::InvalidResizePreviewBorder);
+        }
         for palette in [self.active, self.inactive] {
-            finite_nonnegative(palette.frame_border_width)
-                .ok_or(WindowChromeDesignError::InvalidFrameBorderWidth)?;
+            for side in [
+                palette.frame_border.top,
+                palette.frame_border.right,
+                palette.frame_border.bottom,
+                palette.frame_border.left,
+            ] {
+                finite_nonnegative(side.width)
+                    .ok_or(WindowChromeDesignError::InvalidFrameBorderWidth)?;
+            }
             if !(1..=1000).contains(&palette.title_weight) {
                 return Err(WindowChromeDesignError::InvalidTitleWeight);
             }
@@ -214,6 +229,8 @@ fn validate_nonnegative_insets(insets: Insets) -> Option<Insets> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WindowChromeDesignError {
+    #[error("resize preview border widths must be finite and nonnegative")]
+    InvalidResizePreviewBorder,
     #[error("window chrome frame border width must be finite and nonnegative")]
     InvalidFrameBorderWidth,
     #[error("window chrome title weight must be between 1 and 1000")]
@@ -289,21 +306,40 @@ impl Component for EasyWindowFrameComponent {
             self.model.state,
             WindowChromeState::Maximized | WindowChromeState::Fullscreen
         ) {
-            palette.frame_border_width = 0.0;
+            palette.frame_border = Border::default();
         }
         let mut state = design.state(self.model.state);
         state.title_bar_visible &= self.model.title_bar_visible;
-        let inner_radius = (state.frame_radius - palette.frame_border_width).max(0.0);
+        if !self.model.frame_parts.border {
+            palette.frame_border = Border::default();
+        }
+        if !self.model.frame_parts.rounded_clip {
+            state.frame_radius = 0.0;
+        }
+        if !self.model.frame_parts.shadow {
+            state.shadow = None;
+        }
+        state.resize_regions &= self.model.frame_parts.resize_regions;
+        let border = palette.frame_border;
+        // Match the analytic box's inner contour: each corner subtracts its thicker adjacent side.
+        let inner_radii = crate::ui::CornerRadii {
+            top_left: (state.frame_radius - border.top.width.max(border.left.width)).max(0.0),
+            top_right: (state.frame_radius - border.top.width.max(border.right.width)).max(0.0),
+            bottom_right: (state.frame_radius - border.bottom.width.max(border.right.width))
+                .max(0.0),
+            bottom_left: (state.frame_radius - border.bottom.width.max(border.left.width)).max(0.0),
+        };
         let mut frame_decoration = BoxDecoration::new()
             .background(Background::Color(palette.frame_background))
-            .uniform_border(palette.frame_border_width, palette.frame_border)
+            .border(palette.frame_border)
             .corner_radius(state.frame_radius);
-        if let Some(shadow) = state.shadow {
+        if let Some(mut shadow) = state.shadow {
+            shadow.color = palette.shadow_color.unwrap_or(shadow.color);
             frame_decoration = frame_decoration.shadow(shadow);
         }
 
         let title_bar = build_title_bar(&self.model, design, palette, state);
-        let resize = build_resize_regions(&self.model, state, palette.frame_border_width);
+        let resize = build_resize_regions(&self.model, state, palette.frame_border);
 
         window_frame()
             .decoration(frame_decoration)
@@ -313,7 +349,7 @@ impl Component for EasyWindowFrameComponent {
                 // title bar. This keeps square controls inside the curved border at any bar height.
                 stack()
                     .overflow(crate::ui::Overflow::Clip)
-                    .decoration(BoxDecoration::new().corner_radius(inner_radius))
+                    .decoration(BoxDecoration::new().corner_radii(inner_radii))
                     .child(title_bar)
             }))
             .children(resize)
@@ -340,15 +376,15 @@ impl Component for EasyWindowFrameComponent {
                                 top_left: if state.title_bar_visible {
                                     0.0
                                 } else {
-                                    inner_radius
+                                    inner_radii.top_left
                                 },
                                 top_right: if state.title_bar_visible {
                                     0.0
                                 } else {
-                                    inner_radius
+                                    inner_radii.top_right
                                 },
-                                bottom_right: inner_radius,
-                                bottom_left: inner_radius,
+                                bottom_right: inner_radii.bottom_right,
+                                bottom_left: inner_radii.bottom_left,
                             }),
                     ),
             )
@@ -390,6 +426,7 @@ fn build_title_bar(
     }
 
     let title = text(&model.title)
+        .font_family(design.title_bar.font_family)
         .size(design.title_bar.title_size)
         .weight(palette.title_weight)
         .color(palette.title_color)
@@ -425,11 +462,22 @@ fn window_icon(model: &WindowChromeModel, style: WindowTitleBarStyle) -> Option<
     if !style.show_client_icon {
         return None;
     }
-    let source = model
-        .app_icon_image
-        .map(ImageSource::from)
-        .or_else(|| model.app_icon.map(ImageSource::from))
-        .or_else(|| style.fallback_app_icon.map(ImageSource::from))?;
+    let catalog_icon = model.desktop_window_id.and_then(|id| {
+        crate::compose::context::provided::<crate::compose::ShellContext>().map(|shell| {
+            shell.windows().resolve_icon(
+                id,
+                crate::compose::IconRequest::new()
+                    .logical_size(style.app_icon_size.round().max(1.0) as u32),
+            )
+        })
+    });
+    let source = catalog_icon.or_else(|| {
+        model
+            .app_icon_image
+            .map(ImageSource::from)
+            .or_else(|| model.app_icon.map(ImageSource::from))
+            .or_else(|| style.fallback_app_icon.map(ImageSource::from))
+    })?;
     let region = stack()
         .width(style.app_icon_region_size)
         .height(style.app_icon_region_size)
@@ -443,7 +491,10 @@ fn window_icon(model: &WindowChromeModel, style: WindowTitleBarStyle) -> Option<
         );
     Some(
         if style.app_icon_opens_system_menu && model.capabilities.system_menu {
-            region.window_system_menu()
+            crate::compose::PointerViewExt::pointer_icon(
+                region.window_system_menu(),
+                crate::PointerIcon::Default,
+            )
         } else {
             region.into_element()
         },
@@ -593,7 +644,7 @@ fn visual_icon_patch(visual: WindowControlVisual) -> StylePropertyPatch {
 fn build_resize_regions(
     model: &WindowChromeModel,
     style: WindowChromeStateStyle,
-    frame_border_width: f32,
+    border: Border,
 ) -> Vec<Element> {
     if !model.capabilities.resize || !style.resize_regions {
         return Vec::new();
@@ -601,20 +652,25 @@ fn build_resize_regions(
     let edges = model
         .tiling
         .map_or(WindowEdgeMask::ALL, |tiling| tiling.resizable_edges);
-    let extra = (style.resize_edge - frame_border_width).max(0.0);
     let slop = style.resize_hit_slop.0;
     let slop = Insets::new(
-        slop.top + extra,
-        slop.right + extra,
-        slop.bottom + extra,
-        slop.left + extra,
+        slop.top + (style.resize_edge - border.top.width).max(0.0),
+        slop.right + (style.resize_edge - border.right.width).max(0.0),
+        slop.bottom + (style.resize_edge - border.bottom.width).max(0.0),
+        slop.left + (style.resize_edge - border.left.width).max(0.0),
     );
     // The invisible boxes start at the root's inner edge. Outset restores the entire painted
     // border and adds tolerance outside it; the shared inner contour excludes app/title pixels.
-    let region = |view: Element, edge| resize_region(view, edge, slop, frame_border_width);
-    let corner = style
-        .frame_radius
-        .max(style.resize_edge.max(frame_border_width) * 2.0);
+    let region = |view: Element, edge| resize_region(view, edge, slop, border);
+    let corner = |a: f32, b: f32| {
+        style
+            .frame_radius
+            .max(style.resize_edge.max(a).max(b) * 2.0)
+    };
+    let top_right = corner(border.top.width, border.right.width);
+    let bottom_right = corner(border.bottom.width, border.right.width);
+    let bottom_left = corner(border.bottom.width, border.left.width);
+    let top_left = corner(border.top.width, border.left.width);
     let mut regions = Vec::with_capacity(8);
     if edges.contains(WindowEdgeMask::TOP) {
         regions.push(region(
@@ -655,7 +711,7 @@ fn build_resize_regions(
             row()
                 .child(spacer())
                 .child(region(
-                    stack().width(corner).height(corner).into_element(),
+                    stack().width(top_right).height(top_right).into_element(),
                     WindowResizeEdge::TopRight,
                 ))
                 .into_element(),
@@ -665,10 +721,15 @@ fn build_resize_regions(
         regions.push(
             column()
                 .child(spacer())
-                .child(row().height(corner).child(spacer()).child(region(
-                    stack().width(corner).height(corner).into_element(),
-                    WindowResizeEdge::BottomRight,
-                )))
+                .child(
+                    row().height(bottom_right).child(spacer()).child(region(
+                        stack()
+                            .width(bottom_right)
+                            .height(bottom_right)
+                            .into_element(),
+                        WindowResizeEdge::BottomRight,
+                    )),
+                )
                 .into_element(),
         );
     }
@@ -678,9 +739,12 @@ fn build_resize_regions(
                 .child(spacer())
                 .child(
                     row()
-                        .height(corner)
+                        .height(bottom_left)
                         .child(region(
-                            stack().width(corner).height(corner).into_element(),
+                            stack()
+                                .width(bottom_left)
+                                .height(bottom_left)
+                                .into_element(),
                             WindowResizeEdge::BottomLeft,
                         ))
                         .child(spacer()),
@@ -690,7 +754,7 @@ fn build_resize_regions(
     }
     if edges.contains(WindowEdgeMask::TOP | WindowEdgeMask::LEFT) {
         regions.push(region(
-            stack().width(corner).height(corner).into_element(),
+            stack().width(top_left).height(top_left).into_element(),
             WindowResizeEdge::TopLeft,
         ));
     }
@@ -701,50 +765,46 @@ fn resize_region(
     region: impl View,
     edge: WindowResizeEdge,
     hit_slop: Insets,
-    frame_border_width: f32,
+    border: Border,
 ) -> Element {
     region
         .window_resize(edge)
-        .window_hit_slop(outward_resize_hit_slop(edge, hit_slop, frame_border_width))
+        .window_hit_slop(outward_resize_hit_slop(edge, hit_slop, border))
         .with_window_chrome_border_hit(hit_slop.0)
 }
 
-fn outward_resize_hit_slop(
-    edge: WindowResizeEdge,
-    hit_slop: Insets,
-    frame_border_width: f32,
-) -> Insets {
+fn outward_resize_hit_slop(edge: WindowResizeEdge, hit_slop: Insets, border: Border) -> Insets {
     let hit_slop = hit_slop.0;
     match edge {
-        WindowResizeEdge::Top => Insets::new(hit_slop.top + frame_border_width, 0.0, 0.0, 0.0),
+        WindowResizeEdge::Top => Insets::new(hit_slop.top + border.top.width, 0.0, 0.0, 0.0),
         WindowResizeEdge::TopRight => Insets::new(
-            hit_slop.top + frame_border_width,
-            hit_slop.right + frame_border_width,
+            hit_slop.top + border.top.width,
+            hit_slop.right + border.right.width,
             0.0,
             0.0,
         ),
-        WindowResizeEdge::Right => Insets::new(0.0, hit_slop.right + frame_border_width, 0.0, 0.0),
+        WindowResizeEdge::Right => Insets::new(0.0, hit_slop.right + border.right.width, 0.0, 0.0),
         WindowResizeEdge::BottomRight => Insets::new(
             0.0,
-            hit_slop.right + frame_border_width,
-            hit_slop.bottom + frame_border_width,
+            hit_slop.right + border.right.width,
+            hit_slop.bottom + border.bottom.width,
             0.0,
         ),
         WindowResizeEdge::Bottom => {
-            Insets::new(0.0, 0.0, hit_slop.bottom + frame_border_width, 0.0)
+            Insets::new(0.0, 0.0, hit_slop.bottom + border.bottom.width, 0.0)
         }
         WindowResizeEdge::BottomLeft => Insets::new(
             0.0,
             0.0,
-            hit_slop.bottom + frame_border_width,
-            hit_slop.left + frame_border_width,
+            hit_slop.bottom + border.bottom.width,
+            hit_slop.left + border.left.width,
         ),
-        WindowResizeEdge::Left => Insets::new(0.0, 0.0, 0.0, hit_slop.left + frame_border_width),
+        WindowResizeEdge::Left => Insets::new(0.0, 0.0, 0.0, hit_slop.left + border.left.width),
         WindowResizeEdge::TopLeft => Insets::new(
-            hit_slop.top + frame_border_width,
+            hit_slop.top + border.top.width,
             0.0,
             0.0,
-            hit_slop.left + frame_border_width,
+            hit_slop.left + border.left.width,
         ),
     }
 }
@@ -754,6 +814,88 @@ mod tests {
     use super::*;
     use crate::assets::AssetKey;
     use crate::theme::Easing;
+
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+    #[test]
+    fn shell_catalog_icon_is_centered_and_focus_changes_shadow_color() {
+        use crate::application_host::AppRuntimeCore;
+        use crate::core::{MonotonicInstant, SizeI};
+        use crate::runtime::CompositionDriver;
+        use crate::window_chrome::{WindowChromeRole, WindowChromeSnapshot};
+        let host = crate::compose::shell_services::ShellServiceHost::new();
+        let mut model = WindowChromeModel::new(42, "Editor");
+        model.desktop_window_id = Some(crate::shell::WindowId::new(
+            std::num::NonZeroU32::new(42).unwrap(),
+            std::num::NonZeroU32::new(1).unwrap(),
+        ));
+        let mut design = DESIGN;
+        design.normal.shadow = Some(Shadow {
+            offset: crate::PointF { x: 0.0, y: 4.0 },
+            blur: 12.0,
+            spread: 2.0,
+            color: ColorRgba8::rgba(0, 0, 0, 130),
+        });
+        design.active.shadow_color = Some(ColorRgba8::rgba(0, 0, 0, 210));
+        design.inactive.shadow_color = Some(ColorRgba8::rgba(0, 0, 0, 90));
+        let mut driver = CompositionDriver::new(easy_window_frame(design).compose(model.clone()));
+        driver.connect_shell(host.services.clone());
+        let mut runtime = AppRuntimeCore::from_composition_driver(
+            driver,
+            SizeI {
+                width: 640,
+                height: 480,
+            },
+        )
+        .unwrap();
+        for (index, (active, state)) in [
+            (false, WindowChromeState::Normal),
+            (true, WindowChromeState::Normal),
+            (true, WindowChromeState::Maximized),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model.active = active;
+            model.state = state;
+            runtime
+                .update_composition_root(Box::new(easy_window_frame(design).compose(model.clone())))
+                .unwrap();
+            runtime
+                .prepare_frame(MonotonicInstant::from_nanos(index as u64), true)
+                .unwrap();
+            let snapshot = WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+            let icon = snapshot
+                .regions
+                .iter()
+                .find(|r| r.role == WindowChromeRole::AppIcon)
+                .expect("catalog fallback icon is visible");
+            let border = if state == WindowChromeState::Maximized {
+                0.0
+            } else {
+                design.inactive.frame_border.top.width
+            };
+            assert!(
+                (icon.bounds.y + icon.bounds.height / 2.0
+                    - (border + design.title_bar.height / 2.0))
+                    .abs()
+                    < 0.01
+            );
+            let decoration = runtime
+                .ui()
+                .box_styles
+                .get(snapshot.frame.node)
+                .unwrap()
+                .decoration;
+            let expected = if state == WindowChromeState::Maximized {
+                crate::ui::ShadowList::default()
+            } else {
+                let mut shadow = design.normal.shadow.unwrap();
+                shadow.color = design.palette(active).shadow_color.unwrap();
+                crate::ui::ShadowList::one(shadow)
+            };
+            assert_eq!(decoration.shadows, expected);
+        }
+    }
 
     const fn icon(path: &'static str) -> IconAsset {
         IconAsset::new(AssetKey::new(path))
@@ -786,17 +928,17 @@ mod tests {
         motion: crate::WindowMotion::none(),
         active: WindowChromePalette {
             frame_background: ColorRgba8::rgba(20, 24, 32, 255),
-            frame_border: ColorRgba8::rgba(80, 90, 120, 255),
-            frame_border_width: 1.0,
+            frame_border: Border::all(1.0, ColorRgba8::rgba(80, 90, 120, 255)),
             title_color: ColorRgba8::rgba(255, 255, 255, 255),
             title_weight: 600,
+            shadow_color: None,
         },
         inactive: WindowChromePalette {
             frame_background: ColorRgba8::rgba(30, 34, 42, 255),
-            frame_border: ColorRgba8::rgba(60, 65, 80, 255),
-            frame_border_width: 1.0,
+            frame_border: Border::all(1.0, ColorRgba8::rgba(60, 65, 80, 255)),
             title_color: ColorRgba8::rgba(180, 180, 190, 255),
             title_weight: 400,
+            shadow_color: None,
         },
         normal: STATE,
         maximized: WindowChromeStateStyle {
@@ -817,6 +959,7 @@ mod tests {
             resize_hit_slop: Insets::ZERO,
         },
         title_bar: WindowTitleBarStyle {
+            font_family: "sans-serif",
             height: 42.0,
             padding: Insets::symmetric(6.0, 8.0),
             gap: 6.0,
@@ -856,18 +999,36 @@ mod tests {
     }
 
     #[test]
+    fn resize_preview_border_validation_is_independent_of_frame_border() {
+        for width in [-1.0, f32::NAN, f32::INFINITY] {
+            let mut preview = crate::ResizePreviewDesign::new(crate::Fill::None);
+            preview.border.left.width = width;
+            let design = WindowChromeDesign {
+                resize_preview: Some(preview),
+                ..DESIGN
+            };
+            assert_eq!(
+                design.validate(),
+                Err(WindowChromeDesignError::InvalidResizePreviewBorder)
+            );
+        }
+    }
+
+    #[test]
     fn content_style_preserves_alpha_preview_inheritance_and_state_radius() {
         for alpha in [0, 128, 255] {
             for preview in [
                 None,
-                Some(crate::ResizePreview::Color(ColorRgba8::rgba(
-                    30, 40, 50, alpha,
+                Some(crate::ResizePreviewDesign::new(crate::Fill::Color(
+                    ColorRgba8::rgba(30, 40, 50, alpha),
                 ))),
-                Some(crate::ResizePreview::Glass(crate::GlassStyle {
-                    tint: ColorRgba8::rgba(30, 40, 50, alpha),
-                    blur_radius: 24.0,
-                    ..crate::GlassStyle::liquid()
-                })),
+                Some(crate::ResizePreviewDesign::new(crate::Fill::Glass(
+                    crate::GlassStyle {
+                        tint: ColorRgba8::rgba(30, 40, 50, alpha),
+                        blur_radius: 24.0,
+                        ..crate::GlassStyle::liquid()
+                    },
+                ))),
             ] {
                 let design = WindowChromeDesign {
                     content_background: ColorRgba8::rgba(0, 0, 0, alpha),
@@ -922,7 +1083,8 @@ mod tests {
                         ColorRgba8::rgba(255, 255, 255, 255),
                     ] {
                         let mut design = DESIGN;
-                        design.active.frame_border_width = border;
+                        design.active.frame_border =
+                            Border::all(border, design.active.frame_border.top.color);
                         design.title_bar.height = title_height;
                         design.content_background = color;
                         let mut runtime = AppRuntimeCore::from_composed_with_extent(
@@ -1000,6 +1162,73 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+    #[test]
+    fn decoration_parts_independently_control_geometry_style_and_resize_hits() {
+        use crate::application_host::AppRuntimeCore;
+        use crate::core::{MonotonicInstant, SizeI};
+        use crate::window_chrome::{WindowAction, WindowChromeRole, WindowChromeSnapshot};
+        for bits in 0..16 {
+            let parts = crate::WindowFrameParts {
+                border: bits & 1 != 0,
+                rounded_clip: bits & 2 != 0,
+                shadow: bits & 4 != 0,
+                resize_regions: bits & 8 != 0,
+            };
+            for state in [WindowChromeState::Normal, WindowChromeState::Maximized] {
+                let mut model = WindowChromeModel::new(42, "Firefox")
+                    .title_bar_visible(false)
+                    .state(state);
+                model.frame_parts = parts;
+                let mut design = DESIGN;
+                design.normal.shadow = Some(Shadow {
+                    offset: crate::PointF::default(),
+                    blur: 8.0,
+                    spread: 0.0,
+                    color: ColorRgba8::rgba(0, 0, 0, 100),
+                });
+                let mut runtime = AppRuntimeCore::from_composed_with_extent(
+                    easy_window_frame(design).compose(model),
+                    SizeI {
+                        width: 640,
+                        height: 480,
+                    },
+                )
+                .unwrap();
+                runtime
+                    .prepare_frame(MonotonicInstant::from_nanos(0), true)
+                    .unwrap();
+                let snapshot =
+                    WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+                let normal = state == WindowChromeState::Normal;
+                let inset = if parts.border && normal { 1.0 } else { 0.0 };
+                assert_eq!(snapshot.content.bounds.x, inset);
+                assert_eq!(snapshot.content.bounds.y, inset);
+                assert_eq!(snapshot.content.bounds.width, 640.0 - 2.0 * inset);
+                let style = runtime.ui().box_styles.get(snapshot.frame.node).unwrap();
+                assert_eq!(
+                    style.decoration.corner_radii,
+                    crate::ui::CornerRadii::all(if parts.rounded_clip && normal {
+                        12.0
+                    } else {
+                        0.0
+                    })
+                );
+                assert_eq!(
+                    style.decoration.shadows.as_slice().is_empty(),
+                    !(parts.shadow && normal)
+                );
+                assert_eq!(
+                    snapshot.regions.iter().any(|region| matches!(
+                        region.role,
+                        WindowChromeRole::Action(WindowAction::BeginResize(_))
+                    )),
+                    parts.resize_regions && normal
+                );
             }
         }
     }
@@ -1270,8 +1499,7 @@ mod tests {
         };
         for (radius, border) in [(14.0, 2.0), (14.0, 0.0), (0.0, 2.0)] {
             let mut design = DESIGN;
-            design.active.frame_border_width = border;
-            design.active.frame_border = ColorRgba8::rgba(255, 0, 0, 255);
+            design.active.frame_border = Border::all(border, ColorRgba8::rgba(255, 0, 0, 255));
             design.active.frame_background = ColorRgba8::rgba(0, 255, 0, 255);
             design.normal.frame_radius = radius;
             design.normal.shadow = None;

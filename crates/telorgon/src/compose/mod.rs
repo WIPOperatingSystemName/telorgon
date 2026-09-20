@@ -19,7 +19,7 @@ pub(crate) mod shell_widget;
 pub use shell_widget::{
     ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
     ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-    ShellWidget, ShellWindowPreview, WidgetPlacement,
+    ShellWidget, ShellWindowPreview, ShellOutputPreview, WidgetPlacement,
 };
 pub mod style;
 
@@ -80,3 +80,6 @@ pub use applications::{
     ApplicationId, ApplicationMetadata, ApplicationQuery, ApplicationVisibility, IconRequest,
 };
 pub use shell_services::{ShellContext, ShellWindows};
+
+pub(crate) mod window_tiling;
+pub use window_tiling::{TilePreviewDesign, TilePreviewMotion, TileTarget, WindowTiling};

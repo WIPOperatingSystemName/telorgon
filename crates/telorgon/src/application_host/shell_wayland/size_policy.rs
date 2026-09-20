@@ -86,13 +86,18 @@ pub(super) fn apply(
             width: (area.width - overhead.width).max(1),
             height: (area.height - overhead.height).max(1),
         };
-        keep_reachable(window, area, config.titlebar_height);
+        if window.tile.is_none() {
+            keep_reachable(window, area, config.titlebar_height);
+        }
         if window.backend != Some(WindowBackend::Wayland) {
             continue;
         }
         if let Some(metadata) = wayland.toplevel_metadata(*surface) {
             window.size_policy.minimum = metadata.minimum_size;
             window.size_policy.maximum = metadata.maximum_size;
+        }
+        if window.tile.is_some() {
+            continue;
         }
         let size = window.size_policy.resolve(window.requested_size);
         if size == window.requested_size || window.last_policy_request == Some(size) {
@@ -102,7 +107,9 @@ pub(super) fn apply(
         if let Some(anchor) = window.native_configure.resize_anchor {
             window.position = anchor.reconcile_position(window.position, size);
         }
-        keep_reachable(window, area, config.titlebar_height);
+        if window.tile.is_none() {
+            keep_reachable(window, area, config.titlebar_height);
+        }
         if window.native_configure.resize_anchor.is_none()
             || window.native_configure.resize_final.is_some()
         {

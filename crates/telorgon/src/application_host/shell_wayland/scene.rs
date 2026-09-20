@@ -45,6 +45,7 @@ pub(super) fn frame_content_clips(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) enum ShellLayerKey {
+    TilePreview(u32),
     MotionShadow(u32),
     Motion(u32),
     Background,
@@ -55,10 +56,12 @@ pub(super) enum ShellLayerKey {
     ContentCorners(u32),
     Surface(u32),
     ResizeVeil(u32),
+    ResizePreviewBorder(u32),
     LegacyControl(u32, u8),
     LegacyControlSource(u8),
     Widget(u32),
     WindowPreview(u32, u32, u32),
+    OutputPreview(u32, u32, u32),
     DragIcon(u32),
     Cursor,
     ComposedPointerSource,
@@ -73,6 +76,8 @@ pub(super) enum ShellLayerKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) enum ShellSceneKey {
+    TilePreview(u32),
+    TileGlass(u32),
     ResizeGlass(u32),
     MotionShadow(u32),
     Motion(u64),
@@ -81,6 +86,7 @@ pub(super) enum ShellSceneKey {
     Frame(u32),
     Surface(u32),
     ResizeVeil(u32),
+    ResizePreviewBorder(u32),
     ContentBackground(u32),
     ContentBorder(u32),
     ContentCorners(u32),
@@ -156,6 +162,60 @@ pub(super) struct ShellLayer {
 }
 
 impl ShellLayer {
+    /// Overlay the preview border using the same contour, without changing its layout or input.
+    pub(super) fn resize_preview_border(
+        surface: u32,
+        preview: &Self,
+        border: crate::ui::Border,
+    ) -> Option<Self> {
+        if ![border.top, border.right, border.bottom, border.left]
+            .iter()
+            .any(|side| side.width > 0.0 && side.color.a > 0)
+        {
+            return None;
+        }
+        let rect = RectF {
+            x: 0.0,
+            y: 0.0,
+            width: preview.source_extent.width as f32,
+            height: preview.source_extent.height as f32,
+        };
+        let contour = preview.rounded_clips[0];
+        let instance = BoxInstance {
+            node: NodeId::new(0, 1),
+            rect: contour.map_or(rect, |clip| RectF {
+                x: clip.rect.x - preview.target.x as f32,
+                y: clip.rect.y - preview.target.y as f32,
+                ..clip.rect
+            }),
+            view_bounds: rect,
+            background: None,
+            border,
+            outline: Default::default(),
+            corner_radii: contour.map_or(Default::default(), |clip| clip.radii),
+            shadows: Default::default(),
+            opacity: 1.0,
+            clip: ClipId(0),
+            spatial: SpatialId(0),
+        };
+        let mut layer = Self::retained(
+            ShellLayerKey::ResizePreviewBorder(surface),
+            ShellSceneKey::ResizePreviewBorder(surface),
+            Vec::new(),
+            preview.source_extent,
+            PointI {
+                x: preview.target.x,
+                y: preview.target.y,
+            },
+            true,
+        );
+        layer.content = ShellLayerContent::Decoration {
+            scene: ShellSceneKey::ResizePreviewBorder(surface),
+            instance,
+        };
+        Some(layer)
+    }
+
     pub(super) fn frame_shadow(
         surface: u32,
         mut instance: BoxInstance,
@@ -518,6 +578,7 @@ pub(super) struct ShellPlacement {
 pub(super) struct ShellFrame {
     pub glass_changed: BTreeSet<ShellSceneKey>,
     pub glass: BTreeMap<ShellSceneKey, crate::GlassStyle>,
+    pub preview_borders: BTreeMap<ShellSceneKey, crate::ui::Border>,
     pub motion: super::motion::MotionFrame,
     pub extent: SizeI,
     pub live_scenes: BTreeSet<ShellSceneKey>,
@@ -548,6 +609,16 @@ impl ShellFrame {
                 &mut style.dispersion,
             ] {
                 *distance *= scale.get();
+            }
+        }
+        for border in self.preview_borders.values_mut() {
+            for side in [
+                &mut border.top,
+                &mut border.right,
+                &mut border.bottom,
+                &mut border.left,
+            ] {
+                side.width *= scale.get();
             }
         }
         self.damage = self.damage.and_then(|rect| {
@@ -785,11 +856,16 @@ struct PlacementState {
 
 #[derive(Default)]
 struct RetainedSceneAdapter {
+    epoch_offset: u64,
     draw_order: Arc<[DrawItem]>,
 }
 
 impl RetainedSceneAdapter {
     fn adapt(&mut self, mut delta: RenderSceneDelta) -> RenderSceneDelta {
+        delta.epoch = delta
+            .epoch
+            .checked_add(self.epoch_offset)
+            .expect("retained scene epoch exhausted");
         if let Some(order) = &delta.draw_order {
             self.draw_order = Arc::clone(order);
         }
@@ -882,6 +958,7 @@ impl ShellComposition {
         let extent_changed = self.extent != extent;
         self.extent = extent;
         let mut glass = BTreeMap::new();
+        let mut preview_borders = BTreeMap::new();
         let mut live_scenes = BTreeSet::new();
         let mut updates = BTreeMap::<ShellSceneKey, Vec<RenderSceneDelta>>::new();
         let mut placements = Vec::new();
@@ -892,6 +969,9 @@ impl ShellComposition {
         for mut layer in layers.into_iter().filter(valid_layer) {
             let scene = match layer.content {
                 ShellLayerContent::Decoration { scene, instance } => {
+                    if let ShellSceneKey::ResizePreviewBorder(id) = scene {
+                        preview_borders.insert(ShellSceneKey::ResizeVeil(id), instance.border);
+                    }
                     let source = self.solid_scenes.entry(scene).or_default();
                     let extent = size_f(layer.source_extent);
                     let transparent = ColorRgba8::rgba(0, 0, 0, 0);
@@ -989,13 +1069,28 @@ impl ShellComposition {
                     }
                     scene
                 }
-                ShellLayerContent::Retained { scene, deltas } => {
-                    if !deltas.is_empty() {
+                ShellLayerContent::Retained { scene, mut deltas } => {
+                    // An empty retained scene is still a valid capture source. Publish its
+                    // identity once even if the producer has no initial draw delta; otherwise
+                    // renderers never create it and a later motion capture references a hole.
+                    let unpublished = !self.retained_scenes.contains_key(&scene);
+                    let bootstrap = unpublished && deltas.is_empty();
+                    if bootstrap {
+                        let mut empty = RenderScene::default();
+                        empty.extent = size_f(layer.source_extent);
+                        deltas.extend(empty.take_delta());
+                    }
+                    if unpublished || !deltas.is_empty() {
                         let adapter = self.retained_scenes.entry(scene).or_default();
                         updates
                             .entry(scene)
                             .or_default()
                             .extend(deltas.into_iter().map(|delta| adapter.adapt(delta)));
+                        // The synthetic initial delta consumes epoch 1; preserve the producer's
+                        // first real epoch instead of having the backend reject it as stale.
+                        if bootstrap {
+                            adapter.epoch_offset = 1;
+                        }
                     }
                     scene
                 }
@@ -1197,6 +1292,7 @@ impl ShellComposition {
         Some(ShellFrame {
             glass_changed,
             glass,
+            preview_borders,
             motion: Default::default(),
             extent,
             live_scenes,
@@ -1470,6 +1566,7 @@ mod tests {
         let frame = ShellFrame {
             glass_changed: BTreeSet::new(),
             glass: BTreeMap::new(),
+            preview_borders: BTreeMap::new(),
             motion: Default::default(),
             extent: SizeI {
                 width: 1280,

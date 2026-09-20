@@ -9,7 +9,7 @@ use crate::compositor_wayland::{
     BufferTransform, DmaBufFormat, DmaBufImage, ViewportSource, ViewportState, WaylandBufferId,
     WaylandSurfaceId,
 };
-use crate::core::{Affine2D, ColorRgba8, RectF, RectI, SizeF, SizeI};
+use crate::core::{Affine2D, ColorRgba8, PointI, RectF, RectI, SizeF, SizeI};
 use crate::presenter_vulkan_kms::GbmBuffer;
 use crate::render::{
     BatchKey, BlendMode, ClipId, DrawItem, ImageAlphaMode, ImageId, ImageInstance,
@@ -29,16 +29,21 @@ mod motion;
 mod motion_glass;
 mod resources;
 use super::super::scene::{ShellFrame, ShellSceneKey};
+use super::capture::{CaptureBuffer, CaptureJob, CaptureView, CaptureSubmitFailure};
 use crate::application_host::{AppError, AppResult};
 use resources::{MaterializationResources, RetirementWorker, TargetAllocator, trim_spares};
 
 pub(in crate::application_host::shell_wayland) struct VulkanCompletion {
+    pub(in crate::application_host::shell_wayland) direct: Option<crate::compositor_wayland::DirectCaptureCompletion>,
+    pub(in crate::application_host::shell_wayland) capture_pending: Option<SubmissionReceipt>,
+    pub(in crate::application_host::shell_wayland) capture: Option<CaptureJob>,
     pub(in crate::application_host::shell_wayland) slot_index: usize,
     pub(in crate::application_host::shell_wayland) result: Result<(), String>,
     pub(in crate::application_host::shell_wayland) dma_bufs: Vec<DmaBufRetirement>,
 }
 
 struct VulkanCompletionRequest {
+    capture: Option<CaptureJob>,
     slot_index: usize,
     receipt: SubmissionReceipt,
     dma_bufs: Vec<DmaBufRetirement>,
@@ -147,12 +152,34 @@ impl VulkanCompletionWorker {
                 while let Ok(mut request) = request_rx.recv() {
                     #[cfg(feature = "profiler")]
                     let _wait = crate::profiler::span!("vulkan.scanout.completion_wait.worker");
-                    let result = request
-                        .receipt
-                        .wait(Duration::from_secs(2))
-                        .map_err(|error| error.to_string());
+                    let waited = request.receipt.wait(Duration::from_secs(2));
+                    let pending = request.capture.is_some() && waited.as_ref().is_err_and(|error|
+                        error.kind() != crate::render::RenderErrorKind::DeviceLost);
+                    let mut result = waited.map_err(|error| error.to_string());
+                    if result.is_ok() && let Some(capture) = &mut request.capture {
+                        result = capture.buffer.slot.try_copy_into(&mut request.receipt, &mut capture.buffer.pixels)
+                            .map_err(|error| error.to_string())
+                            .and_then(|ready| if ready { Ok(()) } else { Err("capture did not complete with its submission".into()) });
+                    }
+                    // Keep the destination with the exact GPU job through wait timeouts.
+                    // Delivery starts only after readback has completed or definitively failed.
+                    let direct = if !pending {
+                        request.capture.as_mut().and_then(|capture| {
+                            capture.direct.take().map(|(job, timestamp_ns, transform)| {
+                                if result.is_ok() {
+                                    job.write(&capture.buffer.pixels, timestamp_ns, transform)
+                                } else {
+                                    job.fail()
+                                }
+                            })
+                        })
+                    } else { None };
+                    let capture_pending = pending.then_some(request.receipt);
                     if completion_tx
                         .send(VulkanCompletion {
+                            direct,
+                            capture_pending,
+                            capture: request.capture,
                             slot_index: request.slot_index,
                             result,
                             dma_bufs: request.dma_bufs,
@@ -196,10 +223,17 @@ impl VulkanCompletionWorker {
             .as_ref()
             .ok_or_else(|| AppError::new("Vulkan completion worker is stopped"))?
             .send(VulkanCompletionRequest {
+                capture: None,
                 slot_index,
                 receipt,
                 dma_bufs,
             })
+            .map_err(|_| AppError::new("Vulkan completion worker stopped unexpectedly"))
+    }
+
+    fn submit_capture(&self, receipt: SubmissionReceipt, capture: CaptureJob) -> AppResult<()> {
+        self.requests.as_ref().ok_or_else(|| AppError::new("Vulkan completion worker is stopped"))?
+            .send(VulkanCompletionRequest { capture: Some(capture), slot_index: 0, receipt, dma_bufs: Vec::new() })
             .map_err(|_| AppError::new("Vulkan completion worker stopped unexpectedly"))
     }
 
@@ -269,9 +303,13 @@ pub(in crate::application_host::shell_wayland) struct VulkanShellRenderer {
     spares: VecDeque<MaterializationResources>,
     device: VulkanDevice,
     scenes: BTreeMap<ShellSceneKey, VulkanScene>,
-    motion_snapshots: BTreeMap<u64, VulkanMaterializationTarget>,
+    capture_placements: Vec<super::super::scene::ShellPlacement>,
+    capture_cursor_scene: Option<VulkanScene>,
+    capture_cursor_placement: Option<super::super::scene::ShellPlacement>,
+    capture_revisions: super::capture::CaptureRevisions,
+    motion_snapshots: BTreeMap<u64, motion::MotionSnapshot>,
     motion_spares: Vec<VulkanMaterializationTarget>,
-    motion_disabled: bool,
+    motion_failed: bool,
     motion_glass: motion_glass::MotionGlass,
     glass_caches: BTreeMap<ShellSceneKey, glass::GlassCache>,
     targets: Vec<VulkanDmaBufScanoutTarget>,
@@ -286,13 +324,136 @@ pub(in crate::application_host::shell_wayland) struct VulkanShellRenderer {
 }
 
 impl VulkanShellRenderer {
+    pub(super) fn clear_capture_cursor(&mut self) {
+        let had_scene = self.capture_cursor_scene.take().is_some();
+        let had_placement = self.capture_cursor_placement.take().is_some();
+        if had_scene || had_placement { self.capture_revisions.cursor_changed(); }
+    }
+
+    pub(super) fn capture_revision(&self, cursor: crate::shell::capture::CaptureCursorMode) -> u64 {
+        self.capture_revisions.get(cursor)
+    }
+
+    pub(super) fn update_capture_cursor(&mut self, frame: ShellFrame) -> AppResult<()> {
+        self.capture_revisions.cursor_changed();
+        self.capture_cursor_placement = None;
+        if !frame.live_scenes.contains(&ShellSceneKey::CursorImage) {
+            // Reappearing sources start a fresh epoch in the CPU adapter too.
+            self.capture_cursor_scene = None;
+            return Ok(());
+        }
+        if self.capture_cursor_scene.is_none() {
+            self.capture_cursor_scene = Some(self.device.create_scene().map_err(app_error)?);
+        }
+        let scene = self.capture_cursor_scene.as_mut().expect("cursor scene created");
+        for update in &frame.updates {
+            if update.key != ShellSceneKey::CursorImage {
+                return Err(AppError::new("unexpected scene in capture cursor update"));
+            }
+            for delta in &update.deltas {
+                if let Err(error) = self.device.apply_scene_delta(scene, delta) {
+                    self.capture_cursor_scene = None;
+                    return Err(app_error(error));
+                }
+            }
+        }
+        self.capture_cursor_placement = frame.placements.first().copied();
+        Ok(())
+    }
+
+    pub(super) fn allocate_capture(&self, layout: crate::shell::capture::CaptureLayout) -> AppResult<CaptureBuffer> {
+        if layout.stride() != layout.width().saturating_mul(4) || layout.width() > 8192 || layout.height() > 8192 {
+            return Err(AppError::new("unsupported capture dimensions or stride"));
+        }
+        Ok(CaptureBuffer {
+            layout,
+            slot: crate::compositor_render::capture::VulkanCaptureSlot::new(&self.device, SizeI {
+                width: layout.width() as i32, height: layout.height() as i32,
+            }).map_err(app_error)?,
+            pixels: vec![0; layout.byte_len()],
+        })
+    }
+
+    pub(super) fn submit_capture_recoverable(&mut self, mut job: CaptureJob) -> Result<(), CaptureSubmitFailure> {
+        let recorded: AppResult<crate::renderer_vulkan::VulkanRecordedFrame> = (|| {
+        // Capture final desktop placements, then append the independently prepared cursor. This
+        // works with either hardware or composited desktop cursors and never duplicates one.
+        let indices = self.scenes.keys().copied().enumerate()
+            .map(|(index, key)| (key, index)).collect::<BTreeMap<_, _>>();
+        let (source, cursor_origin) = match &job.view {
+            CaptureView::Output => (self.capture_placements.as_slice(), PointI::default()),
+            #[cfg(feature = "shell-screencast-linux")]
+            CaptureView::Window(window) => {
+                if window.layout != job.buffer.layout {
+                    return Err(AppError::new("window capture generation has a stale layout"));
+                }
+                (window.placements.as_slice(), window.origin)
+            }
+        };
+        let mut placements = source.iter()
+            .filter(|placement| placement.key != super::super::scene::ShellLayerKey::Cursor)
+            .map(|placement| Ok(VulkanCompositePlacement {
+                scene_index: *indices.get(&placement.scene).ok_or_else(|| AppError::new("capture scene was retired"))?,
+                target: placement.target, clip: placement.clip, rounded_clips: placement.rounded_clips,
+            })).collect::<AppResult<Vec<_>>>()?;
+        let mut scenes = self.scenes.values_mut().map(|scene| VulkanCompositeScene { scene }).collect::<Vec<_>>();
+        if job.cursor == crate::shell::capture::CaptureCursorMode::Embedded
+            && let (Some(scene), Some(placement)) = (&mut self.capture_cursor_scene, self.capture_cursor_placement)
+        {
+            placements.push(VulkanCompositePlacement {
+                scene_index: scenes.len(), target: RectI {
+                    x: placement.target.x.checked_sub(cursor_origin.x).ok_or_else(|| AppError::new("capture cursor coordinate overflow"))?,
+                    y: placement.target.y.checked_sub(cursor_origin.y).ok_or_else(|| AppError::new("capture cursor coordinate overflow"))?,
+                    ..placement.target
+                }, clip: Some(RectI { x: 0, y: 0, width: job.buffer.layout.width() as i32, height: job.buffer.layout.height() as i32 }),
+                rounded_clips: placement.rounded_clips,
+            });
+            scenes.push(VulkanCompositeScene { scene });
+        }
+        let mut frame = self.device.begin_owned_frame().map_err(app_error)?;
+        {
+            let mut context = frame.context_mut();
+            job.buffer.slot.record(&self.device, &mut scenes, &placements, &mut context).map_err(app_error)?;
+        }
+        frame.finish().map_err(app_error)
+        })();
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => return Err(CaptureSubmitFailure { error, rejected: Some(Box::new(job)) }),
+        };
+        let receipt = recorded.submit().map_err(|error| CaptureSubmitFailure {
+            error: app_error(error), rejected: None,
+        })?;
+        self.completion_worker.submit_capture(receipt, job).map_err(|error| CaptureSubmitFailure { error, rejected: None })
+    }
+
+    pub(super) fn retry_capture(&self, receipt: SubmissionReceipt, job: CaptureJob) -> AppResult<()> {
+        self.completion_worker.submit_capture(receipt, job)
+    }
+
     pub(super) fn motion_enabled(&self) -> bool {
-        !self.motion_disabled
+        !self.motion_failed
+    }
+    /// Acknowledge a failed frame after the host has discarded its matching motion state.
+    /// The next frame can seed fresh snapshots instead of referencing the discarded captures.
+    pub(super) fn take_motion_failure(&mut self) -> bool {
+        std::mem::take(&mut self.motion_failed)
     }
     fn from_targets(
         device: VulkanDevice,
-        targets: Vec<VulkanDmaBufScanoutTarget>,
+        mut targets: Vec<VulkanDmaBufScanoutTarget>,
     ) -> AppResult<Self> {
+        // Compile every desktop/offscreen variant before accepting interactive frames.
+        let mut formats = vec![VulkanMaterializationTarget::FORMAT];
+        for target in &mut targets {
+            let format = target.target().format;
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+        device
+            .prewarm_compositor_pipelines(&formats)
+            .map_err(app_error)?;
         let target_count = targets.len();
         let dma_buf_importer = DmaBufImporter::new(&device).ok();
         let completion_worker = VulkanCompletionWorker::new()?;
@@ -303,9 +464,13 @@ impl VulkanShellRenderer {
         Ok(Self {
             device,
             scenes: BTreeMap::new(),
+            capture_placements: Vec::new(),
+            capture_cursor_scene: None,
+            capture_cursor_placement: None,
+            capture_revisions: super::capture::CaptureRevisions::default(),
             motion_snapshots: BTreeMap::new(),
             motion_spares: Vec::new(),
-            motion_disabled: false,
+            motion_failed: false,
             motion_glass: motion_glass::MotionGlass::default(),
             glass_caches: BTreeMap::new(),
             targets,
@@ -549,9 +714,7 @@ impl VulkanShellRenderer {
         trace.phase("vulkan_scene_updates");
         let materialized_scenes = materializations
             .iter()
-            .map(|materialization| {
-                ShellSceneKey::Surface(materialization.retirement.surface.get())
-            })
+            .map(|materialization| ShellSceneKey::Surface(materialization.retirement.surface.get()))
             .collect::<std::collections::BTreeSet<_>>();
         for update in &frame.updates {
             let scene = match self.scenes.entry(update.key) {
@@ -568,10 +731,18 @@ impl VulkanShellRenderer {
             for delta in &update.deltas {
                 self.device
                     .apply_scene_delta(scene, delta)
-                    .map_err(app_error)?;
+                    .map_err(|error| {
+                        AppError::new(format!(
+                            "Vulkan scene update {:?} epoch {} (retained epoch {}): {error}",
+                            update.key,
+                            delta.epoch,
+                            scene.epoch()
+                        ))
+                    })?;
             }
         }
         self.scenes.retain(|key, _| frame.live_scenes.contains(key)
+            || matches!(key, ShellSceneKey::TileGlass(id) if frame.glass.contains_key(&ShellSceneKey::TilePreview(*id)))
             || matches!(key, ShellSceneKey::ResizeGlass(id) if frame.glass.contains_key(&ShellSceneKey::ResizeVeil(*id))));
         let stale = self
             .materialized
@@ -588,7 +759,7 @@ impl VulkanShellRenderer {
             .target_versions
             .get(target_index)
             .ok_or_else(|| AppError::new("Vulkan scanout target index is invalid"))?;
-        let render_damage = accumulated_damage(
+        let mut render_damage = accumulated_damage(
             previous_target_version,
             self.content_version,
             &self.damage_history,
@@ -640,7 +811,8 @@ impl VulkanShellRenderer {
                 } else {
                     &frame.motion.fallback
                 };
-                let mut motion_ok = !self.motion_disabled
+                let capture_scope = context.core.begin_gpu_scope("gpu.motion.snapshots");
+                let mut motion_ok = !self.motion_failed
                     && motion::record_motion(
                         &self.device,
                         &mut self.scenes,
@@ -648,9 +820,18 @@ impl VulkanShellRenderer {
                         &mut self.motion_spares,
                         &frame.motion,
                         &frame.glass,
+                        &frame.preview_borders,
                         &mut self.motion_glass,
                         &mut context,
                     )?;
+                context.core.end_gpu_scope(capture_scope);
+                let effect_scope = context
+                    .core
+                    .begin_gpu_scope(if frame.motion.divider_dragging {
+                        "gpu.tile_divider.resolve"
+                    } else {
+                        "gpu.motion.resolve"
+                    });
                 let live_output = if motion_ok {
                     motion_glass::record_output(
                         &self.device,
@@ -665,12 +846,19 @@ impl VulkanShellRenderer {
                 } else {
                     None
                 };
+                context.core.end_gpu_scope(effect_scope);
                 motion_ok &= live_output.is_some();
-                if !motion_ok && !self.motion_disabled {
+                if !motion_ok && !self.motion_failed {
                     eprintln!(
-                        "Telorgon: window motion disabled after snapshot/effect resource exhaustion; using immediate presentation"
+                        "Telorgon: window motion fell back after snapshot/effect resource exhaustion; discarding this transition and retrying with fresh snapshots"
                     );
-                    self.motion_disabled = true;
+                    self.motion_failed = true;
+                    // Immediate geometry can uncover pixels outside the animated damage.
+                    // Record full damage for this slot and the other scanout slots too.
+                    render_damage = None;
+                    if let Some((_, damage)) = self.damage_history.back_mut() {
+                        *damage = None;
+                    }
                     self.motion_snapshots.clear();
                     self.motion_spares.clear();
                     self.motion_glass = motion_glass::MotionGlass::default();
@@ -696,6 +884,9 @@ impl VulkanShellRenderer {
                     .enumerate()
                     .map(|(index, key)| (key, index))
                     .collect::<BTreeMap<_, _>>();
+                self.capture_placements.clear();
+                self.capture_placements.extend_from_slice(&output_placements);
+                self.capture_revisions.output_changed();
                 let placements = output_placements
                     .iter()
                     .map(|placement| {
@@ -718,6 +909,7 @@ impl VulkanShellRenderer {
                     .map(|scene| VulkanCompositeScene { scene })
                     .collect::<Vec<_>>();
 
+                let composite_scope = context.core.begin_gpu_scope("gpu.desktop.compose");
                 self.device
                     .render_composite(
                         &mut scenes,
@@ -741,6 +933,7 @@ impl VulkanShellRenderer {
                         },
                     )
                     .map_err(app_error)?;
+                context.core.end_gpu_scope(composite_scope);
             }
             trace.phase("vulkan_submit");
             recording

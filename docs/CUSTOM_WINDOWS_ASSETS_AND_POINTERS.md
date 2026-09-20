@@ -257,15 +257,13 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
     motion: WindowMotion::none(),
     active: WindowChromePalette {
         frame_background: ColorRgba8::rgba(23, 27, 38, 255),
-        frame_border: ColorRgba8::rgba(101, 119, 184, 255),
-        frame_border_width: 1.0,
+        frame_border: Border::all(1.0, ColorRgba8::rgba(101, 119, 184, 255)),
         title_color: ColorRgba8::rgba(245, 247, 255, 255),
         title_weight: 650,
     },
     inactive: WindowChromePalette {
         frame_background: ColorRgba8::rgba(31, 34, 43, 255),
-        frame_border: ColorRgba8::rgba(65, 70, 85, 255),
-        frame_border_width: 1.0,
+        frame_border: Border::all(1.0, ColorRgba8::rgba(65, 70, 85, 255)),
         title_color: ColorRgba8::rgba(174, 179, 193, 255),
         title_weight: 450,
     },
@@ -310,7 +308,7 @@ const TEST_CHROME: WindowChromeDesign = WindowChromeDesign {
         gap: 6.0,
     },
     content_background: ColorRgba8::rgba(15, 18, 26, 255),
-    resize_preview: None, // Inherit LinuxShellConfig; Some(ResizePreview::Color(rgba(...))) overrides it.
+    resize_preview: None, // Inherit LinuxShellConfig; Some(ResizePreviewDesign::new(Fill::Color(rgba(...)))) overrides it.
 };
 
 #[component]
@@ -349,8 +347,15 @@ use `height: Dimension::FILL` for each control and zero vertical title-bar paddi
 padding; fixed and percentage heights are centered within the remaining height. Chrome controls
 have no inherited 32px minimum, so compact bars can use smaller buttons; keep icons small enough to fit.
 
-Maximized and fullscreen easy frames suppress `frame_border_width`; normal and tiled frames
-retain it. Maximized custom frames fill the shell work area, and the host derives the client size
+`WindowChromePalette::frame_border` is a `Border`, shared with preview and box styling.
+Migrate the old color/width pair to `frame_border: Border::all(width, color)`.
+For asymmetric frames, use `Border { top, right, bottom, left }` with `BorderSide { width, color }`.
+Each width must be finite and nonnegative, including inactive palettes. Each inner corner uses
+`max(frame_radius - max(the two adjacent widths), 0)`, matching the analytic box contour.
+Uniform borders preserve the previous layout, clipping, and resize behavior.
+
+Maximized and fullscreen easy frames suppress every side of `frame_border`; normal and tiled frames
+retain the palette border. Maximized custom frames fill the shell work area, and the host derives the client size
 from their laid-out content slot. See [Maximized window geometry](MAXIMIZED_WINDOW_GEOMETRY.md).
 
 Controls participate directly in the title-bar row. Percentage widths resolve against the bar's
@@ -359,12 +364,12 @@ shrink widths leave the spacer to push controls to the right. The title-bar heig
 a pixel metric because it also determines the client content inset.
 
 Easy-frame layout is derived from the actual border and title bar. The app content begins at
-`(frame_border_width, frame_border_width + title_bar.height)` when the bar is visible, and at
-`(frame_border_width, frame_border_width)` when it is hidden. Right and bottom insets equal the border
-width; the layout engine applies that border once. There is no separate decorative margin band.
+`(frame_border.left.width, frame_border.top.width + title_bar.height)` when the bar is visible, and at
+`(frame_border.left.width, frame_border.top.width)` when it is hidden. Right and bottom insets use
+`frame_border.right.width` and `frame_border.bottom.width`; the layout engine applies that border once. There is no separate decorative margin band.
 
 Migration: remove `content_margin` and `content_radius` from `WindowChromeStateStyle` literals.
-Use `title_bar.height` for the bar, `frame_border_width` for the visible outline, and `frame_radius`
+Use `title_bar.height` for the bar, `frame_border: Border::all(width, color)` for the visible outline, and `frame_radius`
 for its outer curve. The inner radius follows the inset border automatically. Increase the actual
 border width if a thicker surround is wanted; do not use resize hit width as visible padding.
 Custom `WindowFrameTemplate` layouts can still use margins and independent aperture rounding.
@@ -376,7 +381,7 @@ let chrome = WindowChromeDesign {
     // Allow transparent application pixels to reveal the desktop or lower windows.
     content_background: ColorRgba8::rgba(0, 0, 0, 0),
     // A translucent slate resize placeholder; 0 alpha gives a frame-only preview.
-    resize_preview: Some(ResizePreview::Color(ColorRgba8::rgba(38, 42, 48, 160))),
+    resize_preview: Some(ResizePreviewDesign::new(Fill::Color(ColorRgba8::rgba(38, 42, 48, 160)))),
     ..TEST_CHROME
 };
 let frame = easy_window_frame(chrome);
@@ -397,7 +402,7 @@ background to the host. Painting that background in the slot as well lets fracti
 metrics leak a thin strip outside the host's integer client cutout. Fractional outline widths remain
 unchanged, and backing, client placement, and the cutout share the host's content rectangle.
 Client pixels, backing, and resize preview are clipped to the inner frame-border contour. For a
-uniform border the inner radius is `max(frame_radius - frame_border_width, 0)`, with its rectangle
+uniform border the inner radius is `max(frame_radius - border_width, 0)`, with its rectangle
 inset by the border width. Zero-radius frames still clip to their rectangular interior; zero-width
 borders use the outer curve. Easy frames use this one full-window inner contour, not another rounded
 rectangle around the app: the title-bar seam stays square and the bottom corners follow the actual
@@ -457,7 +462,7 @@ until exactly one `WindowContentSlot` has been supplied. All visuals remain ordi
 `EasyWindowFrame` uses the actual rounded border as its resize target, excluding the inner contour
 from both edge and corner handles. `resize_edge` is the minimum total grab thickness, including the
 visible border; any extra width extends outward. Per-side outside tolerance is
-`max(resize_edge - frame_border_width, 0) + resize_hit_slop.side`. The Wayland host checks published
+`max(resize_edge - frame_border.side.width, 0) + resize_hit_slop.side`. The Wayland host checks published
 resize targets before rejecting points outside the window; arbitrary outside controls are not
 activated. Four edge and four corner regions intersect the shared rounded band; corner spans cover
 the radius and are bounded to their window quadrant. App/title pixels inside the inner curve are
@@ -668,7 +673,7 @@ without launching an application or server.
 ### Flush controls and the inner window curve
 
 Easy-frame title-bar children are clipped by a full-window container inside the root border,
-with radius `max(frame_radius - frame_border_width, 0)`. Square, full-height controls can therefore
+with each inner corner radius equal to `max(frame_radius - max(adjacent border widths), 0)`. Square, full-height controls can therefore
 sit flush against the right edge without covering the curved border. The contour uses the inner
 window extent rather than the title-bar extent so a short bar does not flatten a larger radius.
 Resize regions remain outside this visual-only container.
@@ -759,8 +764,29 @@ Custom frame templates should omit title bars, move regions and window-control b
 false, leave the content slot the full inner frame area, and keep their outer border, radius, colors,
 shadows and resize regions. `EasyWindowFrame` does this automatically, including rounding all inner
 content corners when the title bar is omitted. State-specific design rules (such as maximized border
-width or radius) still apply. The desktop currently uses this mode for managed X11 clients requesting
-client decorations; fullscreen and unmanaged popup windows do not receive an outer frame.
+width or radius) still apply. The desktop supports this mode for native and X11 clients through
+[decoration policy](DECORATION_POLICY.md). Custom templates must also honor `model.frame_parts`;
+`easy_window_frame` does so automatically. Fullscreen and unmanaged popup windows do not receive an outer frame.
 
 See [Desktop window motion](WINDOW_MOTION.md) to enable `WindowMotion::smooth()` and customize
 maximize, minimize, and resize-content fades on the chrome design.
+
+
+### Managed title-bar artwork and focus styling
+
+Managed frame compositions inherit `ShellContext`. `WindowChromeModel::desktop_window_id`
+identifies their catalog window independently from the protocol-facing `window_id`.
+The easy frame uses the same reactive `windows.resolve_icon` lookup as shell widgets,
+including client artwork, desktop-entry icons, and the generic fallback. Existing explicit
+model artwork still works outside a shell provider. `WindowTitleBarStyle::app_icon_size`
+sets artwork size, `app_icon_region_size` sets its centered region, and `padding` controls
+its inset from the bar. `show_client_icon` hides the region.
+
+`WindowChromePalette::shadow_color` optionally overrides the current state's shadow color.
+It preserves shadow geometry and never creates a shadow for shadowless maximized/fullscreen
+states. Use the active/inactive palettes for focus styling without changing `title_weight`.
+
+This wiring reuses the existing shell context, asynchronous icon lookup, and image binding
+lifecycle; it adds no renderer or image ownership mechanism. The adjacent reference source
+library was unavailable during this change. Regression coverage checks catalog fallback artwork,
+vertical centering, focus-dependent shadow color, and shadowless maximization.

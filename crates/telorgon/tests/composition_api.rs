@@ -537,6 +537,43 @@ fn keyed_component_reorder_preserves_local_state_and_control_identity() {
 }
 
 #[component]
+struct DuplicateLabelButtons {}
+
+impl Component for DuplicateLabelButtons {
+    fn view(&self) -> impl View {
+        row()
+            .child(KeyedItem::new("Same").keyed("first"))
+            .child(KeyedItem::new("Same").keyed("second"))
+    }
+}
+
+#[test]
+fn buttons_with_equal_labels_do_not_share_mutable_accessible_names() {
+    let mut runtime = ViewRuntime::from_composed(DuplicateLabelButtons {}).unwrap();
+    let buttons = runtime
+        .ui()
+        .semantics
+        .iter()
+        .filter_map(|(node, semantic)| {
+            (semantic.role == telorgon::SemanticRole::Button).then_some(node)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(buttons.len(), 2);
+    let name = |runtime: &ViewRuntime<telorgon::CompositionDriver>, node| {
+        let semantic = runtime.ui().semantics.get(node).unwrap();
+        let telorgon::SemanticName::Text(text) = semantic.name else {
+            panic!("button has no name");
+        };
+        runtime.ui().string(text).unwrap().to_owned()
+    };
+    assert_eq!(name(&runtime, buttons[0]), "Same: 0");
+    assert_eq!(name(&runtime, buttons[1]), "Same: 0");
+    assert!(runtime.dispatch_action(buttons[0]));
+    assert_eq!(name(&runtime, buttons[0]), "Same: 1");
+    assert_eq!(name(&runtime, buttons[1]), "Same: 0");
+}
+
+#[component]
 struct MountedUpdate {
     #[state]
     value: u32,

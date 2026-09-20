@@ -63,6 +63,8 @@ pub use hosted::{
     HostedVulkanDeviceDescriptor, VulkanHostedFrame,
 };
 pub use readback::{PendingVulkanReadback, VulkanReadback};
+pub(crate) use readback::CaptureReadbackBuffer;
 pub use scene::{VulkanScene, VulkanSceneMetrics};
 pub(crate) use target::VulkanMaterializationTarget;
+pub(crate) use target::VulkanCaptureTarget;
 pub use target::{OffscreenVulkanTarget, VulkanTarget};

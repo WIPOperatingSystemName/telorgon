@@ -197,3 +197,17 @@ availability = "logical-output-description"
 [[understood_source]]
 name = "xdg-output-unstable-v1"
 path = "unstable/xdg-output/xdg-output-unstable-v1.xml"
+
+# Capture XML is pinned; runtime capture globals remain disabled until adapters are complete.
+
+[[understood_source]]
+name = "ext-foreign-toplevel-list-v1"
+path = "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"
+
+[[understood_source]]
+name = "ext-image-capture-source-v1"
+path = "staging/ext-image-capture-source/ext-image-capture-source-v1.xml"
+
+[[understood_source]]
+name = "ext-image-copy-capture-v1"
+path = "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"

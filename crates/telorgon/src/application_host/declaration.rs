@@ -107,7 +107,7 @@ pub struct LinuxShellConfig {
     /// Only the preview geometry changes during the drag; the client receives its final size on
     /// release. Color alpha reveals lower desktop layers; glass alpha controls tint strength.
     /// Frame templates can override this through [`WindowFrameTemplate::content_style`].
-    pub resize_preview: crate::ResizePreview,
+    pub resize_preview: crate::ResizePreviewDesign,
     /// Default pointer size in logical units.
     pub pointer_extent: SizeI,
 }
@@ -134,7 +134,9 @@ impl Default for LinuxShellConfig {
                 height: 200,
             },
             titlebar_height: 32,
-            resize_preview: crate::ResizePreview::Color(ColorRgba8::rgba(38, 42, 48, 255)),
+            resize_preview: crate::ResizePreviewDesign::new(crate::Fill::Color(ColorRgba8::rgba(
+                38, 42, 48, 255,
+            ))),
             pointer_extent: SizeI {
                 width: 32,
                 height: 32,
@@ -145,6 +147,11 @@ impl Default for LinuxShellConfig {
 
 impl LinuxShellConfig {
     fn validate(&self) -> AppResult<()> {
+        if !self.resize_preview.border_is_valid() {
+            return Err(AppError::new(
+                "resize preview border widths must be finite and nonnegative",
+            ));
+        }
         self.output_scale.validate()?;
         self.keyboard.validate()?;
         self.session
@@ -195,6 +202,7 @@ impl Application {
     /// Begins one Linux shell-environment declaration.
     pub fn shell_environment(name: impl Into<String>) -> ShellEnvironment {
         ShellEnvironment {
+            capture: super::Capture::new(),
             services: Default::default(),
             name: name.into(),
             renderer: Renderer::Auto,
@@ -495,7 +503,7 @@ pub(crate) struct RegisteredShellWidget {
     pub(crate) surface: crate::compose::shell_widget::SurfaceBinding,
 }
 impl RegisteredShellWidget {
-    fn new<W: crate::compose::ShellWidget>(widget: W) -> Self {
+    pub(crate) fn new<W: crate::compose::ShellWidget>(widget: W) -> Self {
         let (root, surface) = crate::compose::shell_widget::erase(widget);
         Self {
             content: CompositionDriver::from_erased_for_target(root, RuntimeTarget::ShellWidget),
@@ -696,6 +704,9 @@ pub(crate) type ShellKeyHandler = Box<dyn FnMut(ShellKeyEvent) -> ShellKeyAction
 /// Incomplete compositor declaration.
 pub struct MissingCursorTheme;
 
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub(crate) type CaptureChooserFactory = Box<dyn FnOnce(crate::CaptureUi) -> RegisteredShellWidget>;
+
 /// Compositor declaration; cursor_theme is required before desktop admission.
 ///
 /// ```compile_fail
@@ -710,7 +721,10 @@ pub struct MissingCursorTheme;
 /// ```
 pub struct Compositor<C = MissingCursorTheme> {
     cursor_theme: C,
+    #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+    capture_chooser: Option<CaptureChooserFactory>,
     client_cursor_mode: ClientCursorMode,
+    decoration_policy: crate::DecorationPolicy,
     window_frame: Option<WindowFrameFactory>,
     icons: Vec<CompositorVisual>,
     shell_actions: Vec<ShellActionHandler>,
@@ -727,7 +741,10 @@ impl Compositor {
     pub const fn new() -> Self {
         Self {
             cursor_theme: MissingCursorTheme,
+            #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+            capture_chooser: None,
             client_cursor_mode: ClientCursorMode::Allow,
+            decoration_policy: crate::DecorationPolicy::DEFAULT,
             window_frame: None,
             icons: Vec::new(),
             shell_actions: Vec::new(),
@@ -737,6 +754,34 @@ impl Compositor {
 }
 
 impl<C> Compositor<C> {
+    /// Replace the default capture chooser with a shell widget. The host retains consent
+    /// authority and the standard sharing indicator/stop controls. The factory runs once on
+    /// the compositor owner thread after the screencast backend is ready to be assembled.
+    #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+    pub fn capture_chooser<W: crate::compose::ShellWidget>(
+        mut self,
+        factory: impl FnOnce(crate::CaptureUi) -> W + 'static,
+    ) -> Self {
+        self.capture_chooser = Some(Box::new(move |ui| RegisteredShellWidget::new(factory(ui))));
+        self
+    }
+
+    #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+    pub(crate) fn take_capture_chooser(&mut self) -> Option<CaptureChooserFactory> {
+        self.capture_chooser.take()
+    }
+
+    /// Selects startup decoration ownership and independent frame parts.
+    /// Custom templates receive resolved policy through `WindowChromeModel`.
+    pub fn decoration_policy(mut self, policy: crate::DecorationPolicy) -> Self {
+        self.decoration_policy = policy;
+        self
+    }
+
+    pub fn configured_decoration_policy(&self) -> crate::DecorationPolicy {
+        self.decoration_policy
+    }
+
     /// Supplies the composed server-side frame for each window and each relevant model change.
     pub fn window_frame<T>(mut self, template: T) -> Self
     where
@@ -875,6 +920,7 @@ impl Compositor<CursorTheme> {
 
 /// Shell-environment declaration that still requires its compositor.
 pub struct ShellEnvironment {
+    capture: super::Capture,
     services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
@@ -884,6 +930,17 @@ pub struct ShellEnvironment {
 }
 
 impl ShellEnvironment {
+    /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
+    pub fn capture(mut self, capture: super::Capture) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// Returns the declarative capture configuration without starting a backend.
+    pub const fn configured_capture(&self) -> super::Capture {
+        self.capture
+    }
+
     /// Configures the environment-owned installed application catalog.
     pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
         self.services.insert(catalog);
@@ -919,6 +976,7 @@ impl ShellEnvironment {
 
     pub fn compositor(self, compositor: ReadyCompositor) -> ShellEnvironmentWithCompositor {
         ShellEnvironmentWithCompositor {
+            capture: self.capture,
             services: self.services,
             name: self.name,
             renderer: self.renderer,
@@ -944,6 +1002,7 @@ impl fmt::Debug for ShellEnvironment {
 
 /// Shell-environment declaration that still requires its first shell widget.
 pub struct ShellEnvironmentWithCompositor {
+    capture: super::Capture,
     services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
@@ -954,6 +1013,17 @@ pub struct ShellEnvironmentWithCompositor {
 }
 
 impl ShellEnvironmentWithCompositor {
+    /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
+    pub fn capture(mut self, capture: super::Capture) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// Returns the declarative capture configuration without starting a backend.
+    pub const fn configured_capture(&self) -> super::Capture {
+        self.capture
+    }
+
     /// Configures the environment-owned installed application catalog.
     pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
         self.services.insert(catalog);
@@ -996,6 +1066,7 @@ impl ShellEnvironmentWithCompositor {
 
     fn into_ready(self) -> ReadyShellEnvironment {
         ReadyShellEnvironment {
+            capture: self.capture,
             services: self.services,
             name: self.name,
             renderer: self.renderer,
@@ -1023,6 +1094,7 @@ impl fmt::Debug for ShellEnvironmentWithCompositor {
 
 /// Complete shell-environment declaration.
 pub struct ReadyShellEnvironment {
+    capture: super::Capture,
     services: crate::compose::shell_services::ShellServiceRegistry,
     name: String,
     renderer: Renderer,
@@ -1034,6 +1106,17 @@ pub struct ReadyShellEnvironment {
 }
 
 impl ReadyShellEnvironment {
+    /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
+    pub fn capture(mut self, capture: super::Capture) -> Self {
+        self.capture = capture;
+        self
+    }
+
+    /// Returns the declarative capture configuration without starting a backend.
+    pub const fn configured_capture(&self) -> super::Capture {
+        self.capture
+    }
+
     /// Configures the environment-owned installed application catalog.
     pub fn applications(mut self, catalog: crate::compose::ApplicationCatalog) -> Self {
         self.services.insert(catalog);
@@ -1098,6 +1181,11 @@ impl ReadyShellEnvironment {
         PointerConfiguration,
         AppIconProfile,
     )> {
+        self.capture.validate(
+            self.renderer,
+            self.linux.session.publish_user_service_environment,
+            self.shell_widgets.len(),
+        )?;
         validate_application_name(&self.name)?;
         self.assets
             .validate()
@@ -1152,6 +1240,37 @@ mod tests {
     use crate::compose::{ComponentFields, View, text};
 
     #[test]
+    fn capture_startup_validation_precedes_device_and_session_creation() {
+        let invalid = Application::shell_environment("Invalid capture")
+            .capture(super::super::Capture::new().internal(super::super::InternalCapture::new()))
+            .compositor(Compositor::new().cursor_theme(CursorTheme::new()))
+            .into_ready()
+            .into_parts()
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("InternalCapture"));
+        assert!(!invalid.contains("cursor"));
+    }
+
+    #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+    #[test]
+    fn custom_capture_factory_survives_cursor_configuration_and_runs_once() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let invoked = calls.clone();
+        let mut compositor = Compositor::new()
+            .capture_chooser(move |ui| {
+                invoked.set(invoked.get() + 1);
+                crate::shell_components::capture::CapturePicker::new(ui)
+            })
+            .cursor_theme(CursorTheme::new());
+        assert_eq!(calls.get(), 0);
+        let factory = compositor.take_capture_chooser().unwrap();
+        assert!(compositor.take_capture_chooser().is_none());
+        let _widget = factory(crate::CaptureUi::default());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn cursor_validation_propagates_through_desktop_startup() {
         let error = Application::shell_environment("Invalid cursors")
             .compositor(Compositor::new().cursor_theme(CursorTheme::new()))
@@ -1181,11 +1300,22 @@ mod tests {
     fn resize_preview_accepts_the_full_alpha_range() {
         let mut config = LinuxShellConfig::default();
         config.drm_device = Some(std::env::current_dir().unwrap().join("card0"));
-        assert_eq!(config.resize_preview.color().a, 255);
+        assert_eq!(config.resize_preview.fill.color().a, 255);
         for alpha in [0, 128, 255] {
-            config.resize_preview =
-                crate::ResizePreview::Color(ColorRgba8::rgba(20, 40, 60, alpha));
+            config.resize_preview = crate::ResizePreviewDesign::new(crate::Fill::Color(
+                ColorRgba8::rgba(20, 40, 60, alpha),
+            ));
             assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn resize_preview_rejects_invalid_border_widths() {
+        for width in [-1.0, f32::NAN, f32::INFINITY] {
+            let mut config = LinuxShellConfig::default();
+            config.resize_preview.border =
+                crate::Border::all(width, ColorRgba8::rgba(255, 255, 255, 255));
+            assert!(config.validate().is_err());
         }
     }
 
@@ -1266,8 +1396,8 @@ mod tests {
                 Some(WindowContentStyle {
                     background: ColorRgba8::rgba(0, 0, 0, 0),
                     corner_radius: 4.0,
-                    resize_preview: model.active.then_some(crate::ResizePreview::Color(
-                        ColorRgba8::rgba(40, 50, 60, 128),
+                    resize_preview: model.active.then_some(crate::ResizePreviewDesign::new(
+                        crate::Fill::Color(ColorRgba8::rgba(40, 50, 60, 128)),
                     )),
                 })
             }
@@ -1455,10 +1585,13 @@ impl<C> Compositor<C> {
         Compositor {
             cursor_theme: theme,
             client_cursor_mode: self.client_cursor_mode,
+            decoration_policy: self.decoration_policy,
             window_frame: self.window_frame,
             icons: self.icons,
             shell_actions: self.shell_actions,
             keyboard_shortcut_handler: self.keyboard_shortcut_handler,
+            #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+            capture_chooser: self.capture_chooser,
         }
     }
 

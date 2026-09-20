@@ -39,6 +39,7 @@ shell-wayland-linux = [
     "dep:gpu-allocator",
     "dep:sha2",
 ]
+shell-screencast-linux = ["shell-wayland-linux", "dep:pipewire", "dep:async-channel", "dep:async-io"]
 # Compatibility components; does not start a server or change native defaults.
 shell-xwayland = [
     "shell-wayland-linux",
@@ -100,6 +101,9 @@ windows = { workspace = true, optional = true }
 windows-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-channel = { version = "2.5", optional = true }
+async-io = { version = "2.6", optional = true }
+pipewire = { version = "=0.10.1", features = ["v0_3_34"], optional = true }
 zbus.workspace = true
 signal-hook-registry.workspace = true
 

@@ -7,6 +7,46 @@ use crate::text::atlas::{AtlasPageUpdate, GLYPH_FILTER_GUTTER_PX, GlyphAtlas, Gl
 use crate::text::glyph::{AtlasGlyph, glyph_image_alpha};
 use crate::text::{ResolvedTextStyle, TextError, TextResult};
 
+// Discover installed fonts once. Database clones share immutable font sources while each
+// engine keeps its shaping caches, raster scale and glyph atlas independent.
+fn system_font_seed() -> &'static (String, cosmic_text::fontdb::Database) {
+    static SEED: std::sync::OnceLock<(String, cosmic_text::fontdb::Database)> =
+        std::sync::OnceLock::new();
+    SEED.get_or_init(|| {
+        let fonts = FontSystem::new();
+        (fonts.locale().to_owned(), fonts.db().clone())
+    })
+}
+
+fn embedded_faces(
+    bytes: &'static [u8],
+) -> TextResult<std::sync::Arc<Vec<cosmic_text::fontdb::FaceInfo>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Faces = Arc<Vec<cosmic_text::fontdb::FaceInfo>>;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(usize, usize), Faces>>> =
+        OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| TextError::new("embedded font cache lock poisoned"))?;
+    let key = (bytes.as_ptr() as usize, bytes.len());
+    if let Some(faces) = cache.get(&key) {
+        return Ok(Arc::clone(faces));
+    }
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_font_data(bytes.to_vec());
+    let faces: Faces = Arc::new(db.faces().cloned().collect());
+    if faces.is_empty() {
+        return Err(TextError::new("font bytes did not add any font faces"));
+    }
+    // Embedded storage is static, so pointer identity cannot be recycled. Bound metadata
+    // retention for applications registering many independent asset catalogs.
+    if cache.len() < 64 {
+        cache.insert(key, Arc::clone(&faces));
+    }
+    Ok(faces)
+}
+
 const DEFAULT_ATLAS_SIZE: i32 = 1024;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,8 +91,9 @@ impl TextEngine {
     }
 
     pub fn with_atlas_size(width_px: i32, height_px: i32) -> TextResult<Self> {
+        let (locale, database) = system_font_seed();
         Ok(Self {
-            font_system: FontSystem::new(),
+            font_system: FontSystem::new_with_locale_and_db(locale.clone(), database.clone()),
             swash_cache: SwashCache::new(),
             atlas: GlyphAtlas::new(width_px, height_px)?,
             raster_scale: Default::default(),
@@ -68,6 +109,16 @@ impl TextEngine {
             self.raster_scale = scale;
             self.atlas.clear();
         }
+    }
+
+    pub(crate) fn load_embedded_font(&mut self, bytes: &'static [u8]) -> TextResult<()> {
+        let faces = embedded_faces(bytes)?;
+        let db = self.font_system.db_mut();
+        for face in faces.iter() {
+            db.push_face_info(face.clone());
+        }
+        self.atlas.clear();
+        Ok(())
     }
 
     pub fn load_font_bytes(&mut self, bytes: Vec<u8>) -> TextResult<()> {
@@ -241,6 +292,39 @@ mod tests {
     use crate::core::ColorRgba8;
 
     use crate::text::{ResolvedTextStyle, TextEngine, TextLayoutRequest};
+
+    #[test]
+    fn font_seed_and_embedded_faces_are_shared_but_atlases_are_independent() {
+        let mut first = TextEngine::with_atlas_size(128, 128).unwrap();
+        let mut second = TextEngine::with_atlas_size(256, 256).unwrap();
+        let seed = super::system_font_seed();
+        assert_eq!(first.font_system.db().len(), seed.1.len());
+        let face = seed.1.faces().next().expect("system test font").id;
+        let bytes = seed
+            .1
+            .with_face_data(face, |data, _| data.to_vec())
+            .unwrap();
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let a = super::embedded_faces(bytes).unwrap();
+        let b = super::embedded_faces(bytes).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        first.load_embedded_font(bytes).unwrap();
+        assert_eq!(second.font_system.db().len(), seed.1.len());
+        second.load_embedded_font(bytes).unwrap();
+        let request = TextLayoutRequest {
+            text: "Shared fonts",
+            style: ResolvedTextStyle::new(ColorRgba8::rgba(255, 255, 255, 255), 16),
+            max_width_px: None,
+            max_height_px: None,
+        };
+        let untouched = second.atlas().pixels_a8.to_vec();
+        let left = first.prepare_text(request.clone()).unwrap();
+        assert_eq!(second.atlas().pixels_a8, untouched.as_slice());
+        let right = second.prepare_text(request).unwrap();
+        assert_eq!(left.advance_width_px, right.advance_width_px);
+        assert_eq!(left.glyphs.len(), right.glyphs.len());
+        assert!(super::embedded_faces(b"not a font").is_err());
+    }
 
     #[test]
     fn density_changes_raster_detail_without_changing_wrapping_or_line_spacing() {

@@ -60,6 +60,8 @@ pub mod accessibility;
 pub mod application_components;
 pub mod application_host;
 pub use application_host::request_exit;
+pub use application_host::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
+    WaylandCapture, CaptureProtocols, DirectCaptureAccess, InternalCapture};
 pub mod application_primitives;
 pub mod assets;
 #[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
@@ -114,6 +116,10 @@ pub mod renderer_software;
 pub mod renderer_vulkan;
 pub mod runtime;
 pub mod scene;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub(crate) mod portal_linux;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub(crate) mod screencast_linux;
 pub mod session;
 pub mod shell;
 pub mod shell_components;
@@ -138,7 +144,7 @@ pub use assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
     AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,
     AssetMediaError, AssetRasterSize, ClientCursorMode, CursorAsset, CursorGraphic, CursorTheme,
-    CursorThemeAsset, CursorThemeError, DecodedAssetImage, Icon, IconAsset, ImageAsset,
+    CursorThemeAsset, CursorThemeError, DecodedAssetImage, FontAsset, Icon, IconAsset, ImageAsset,
     ImageSource, PointerConfiguration, PointerFrame, PointerHotspot, PointerRequest,
     PointerResolution, PointerTheme, PointerThemeFallback, PointerThemeOverrides,
     REQUIRED_CURSOR_ROLES, asset_image_id, cursor, resolve_pointer,
@@ -146,8 +152,13 @@ pub use assets::{
 #[cfg(feature = "embedded-profiler")]
 pub use profiler as embedded_profiler_events;
 pub use telorgon_macros::{asset_catalog, component};
+pub mod fill;
+pub use fill::{Fill, GlassStyle};
+
 pub use window_chrome::{
-    ContentFade, GeometryMotion, GlassStyle, Minimize, ResizePreview, ShellActionId, Spring,
+    DecorationPolicy, DecorationNegotiation, TitleBarPolicy, OuterFramePolicy, FramePartPolicy,
+    FrameInteractionPolicy, ResizeRegionPolicy, WindowFrameParts,
+    ContentFade, GeometryMotion, Minimize, ResizePreviewDesign, ShellActionId, Spring,
     WindowAction, WindowChromeCapabilities, WindowChromeError, WindowChromeHitSpec,
     WindowChromeModel, WindowChromeRegion, WindowChromeRole, WindowChromeSnapshot,
     WindowChromeState, WindowContentStyle, WindowEdgeMask, WindowMotion, WindowResizeEdge,
@@ -159,6 +170,7 @@ pub use window_chrome::{
 /// This module is intentionally private: application authors should import one of the entry-point
 /// modules instead, such as `use telorgon::app::*`.
 mod authoring {
+    pub use crate::fill::{Fill, GlassStyle};
     pub use crate::compose::{
         Button, Checkbox, Container, EasyWindowFrame, Image, PointerViewExt, Slider, Switch, Text,
         WindowChromeDesign, WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle,
@@ -166,14 +178,14 @@ mod authoring {
         WindowControlVisual, WindowControlsDesign, WindowFrame, WindowTitleBarStyle,
     };
     pub use crate::window_chrome::{
-        ContentFade, GeometryMotion, GlassStyle, Minimize, ResizePreview, Spring, WindowMotion,
+        ContentFade, GeometryMotion, Minimize, ResizePreviewDesign, Spring, WindowMotion,
         WindowTween, tween_ms,
     };
     pub use crate::{
         Alignment, AppIconProfile, AssetBundle, AssetCatalog, AssetKey, Background, Border,
         BorderSide, BoxDecoration, BoxDecorationError, BoxSizing, BoxStyle, ColorRgba8, Component,
         ComponentFields, ComponentInstanceId, CornerRadii, CrossAxisAlignment, Dimension,
-        EdgeInsets, Element, EventContext, EventHandler, Flow, Icon, IconAsset, ImageAsset,
+        EdgeInsets, Element, EventContext, EventHandler, Flow, FontAsset, Icon, IconAsset, ImageAsset,
         ImageSource, InputsChangedContext, Insets, Key, LayoutStyle, MainAxisAlignment,
         MountContext, Outline, Overflow, PointF, RectF, Result, RuntimeTarget, SemanticCheckState,
         Shadow, ShadowList, ShellActionId, Signal, SignalSnapshot, SignalWriter, SizeF, SizeI,
@@ -190,6 +202,11 @@ mod authoring {
 /// A single `use telorgon::app::*` imports the component macro and traits, composition builders,
 /// common style/geometry values, the two `Application` constructors, and Telorgon's `Result` alias.
 pub mod app {
+    pub use crate::application_host::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
+        WaylandCapture, CaptureProtocols, DirectCaptureAccess, InternalCapture};
+    pub use crate::{DecorationPolicy, DecorationNegotiation, TitleBarPolicy, OuterFramePolicy,
+        FramePartPolicy, FrameInteractionPolicy, ResizeRegionPolicy, WindowFrameParts};
+    pub use crate::compose::{WindowTiling, TileTarget, TilePreviewDesign, TilePreviewMotion};
     pub use super::authoring::*;
     pub use crate::application_host::{
         Application, Compositor, KeyBindings, KeyChord, LinuxShellConfig, OutputScale, Renderer,
@@ -205,7 +222,7 @@ pub mod app {
     pub use crate::compose::{
         ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
         ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-        ShellWidget, ShellWindowPreview, WidgetPlacement,
+        ShellWidget, ShellWindowPreview, ShellOutputPreview, WidgetPlacement,
     };
     pub use crate::session;
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
@@ -595,7 +612,7 @@ pub use ui::{
 pub use crate::compose::{
     ShellAttachment, ShellChild, ShellDismissReason, ShellEdge, ShellExtent, ShellFocus,
     ShellPlacementBounds, ShellPointer, ShellReservation, ShellSurfaceLayer, ShellSurfaceSpec,
-    ShellWidget, ShellWindowPreview, WidgetPlacement,
+    ShellWidget, ShellWindowPreview, ShellOutputPreview, WidgetPlacement,
 };
 
 pub use crate::compose::{
@@ -604,3 +621,5 @@ pub use crate::compose::{
     ShellContext, ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices,
     ShellWindow, ShellWindowAction, ShellWindows,
 };
+
+pub use compose::{WindowTiling, TileTarget, TilePreviewDesign, TilePreviewMotion};

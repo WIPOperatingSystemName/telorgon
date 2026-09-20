@@ -2,9 +2,13 @@ use super::renderer::DmaBufRetirement;
 use super::*;
 
 pub(super) struct ClientWindow {
+    pub(super) tile: Option<super::tiling::TilePlacement>,
+    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+    pub(super) tile_size_hints: Option<crate::xwayland::normal_hints::NormalHints>,
     pub(super) motion_style: crate::WindowMotion,
     /// Shared presentation latch: protocol completion may precede the first placeholder frame.
     pub(super) motion_veil_pending: bool,
+    pub(super) tile_resize_hold: bool,
     pub(super) motion_input: Option<super::motion::VisualInput>,
     pub(super) size_policy: super::size_policy::SizePolicy,
     pub(super) last_policy_request: Option<SizeI>,
@@ -18,6 +22,7 @@ pub(super) struct ClientWindow {
     pub(super) parent: Option<WaylandSurfaceId>,
     pub(super) offset: PointI,
     pub(super) server_decorated: bool,
+    pub(super) decoration_policy: crate::DecorationPolicy,
     pub(super) position: PointI,
     pub(super) window_geometry: RectI,
     pub(super) requested_size: SizeI,
@@ -171,7 +176,7 @@ impl ClientWindow {
     }
 
     pub(super) fn resize_veil_active(&self) -> bool {
-        if self.motion_veil_pending {
+        if self.motion_veil_pending || self.tile_resize_hold {
             return true;
         }
         #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
@@ -442,7 +447,9 @@ pub(super) fn apply_surface_publication(
         if let Some(anchor) = resize_anchor.take() {
             reconciled_position = anchor.reconcile_position(position, committed_window_extent);
         }
-        requested_size = committed_window_extent;
+        if previous_window.is_none_or(|w| w.tile.is_none()) {
+            requested_size = committed_window_extent;
+        }
         retained_resize_final = None;
     }
     let (
@@ -537,8 +544,12 @@ pub(super) fn apply_surface_publication(
         windows.insert(
             surface,
             ClientWindow {
+                tile: None,
+                #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                tile_size_hints: None,
                 motion_style: crate::WindowMotion::none(),
                 motion_veil_pending: false,
+                tile_resize_hold: false,
                 motion_input: None,
                 size_policy: Default::default(),
                 last_policy_request: None,
@@ -556,6 +567,7 @@ pub(super) fn apply_surface_publication(
                 parent,
                 offset,
                 server_decorated,
+                decoration_policy: wayland.decoration_policy(),
                 position: reconciled_position,
                 window_geometry,
                 requested_size,
@@ -849,8 +861,12 @@ pub(super) mod maximize_preview_tests {
         position: PointI,
     ) -> ClientWindow {
         ClientWindow {
+            tile: None,
+            #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+            tile_size_hints: None,
             motion_style: crate::WindowMotion::none(),
             motion_veil_pending: false,
+            tile_resize_hold: false,
             motion_input: None,
             size_policy: Default::default(),
             last_policy_request: None,
@@ -864,6 +880,7 @@ pub(super) mod maximize_preview_tests {
             parent: None,
             offset: PointI::default(),
             server_decorated: true,
+            decoration_policy: crate::DecorationPolicy::DEFAULT,
             position,
             window_geometry: RectI {
                 x: 0,

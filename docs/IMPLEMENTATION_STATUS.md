@@ -1,7 +1,66 @@
 # Telorgon Implementation Status
 
+Optional screen sharing now has a connected monitor/window capture/consent/ScreenCast-backend/PipeWire
+path under `shell-screencast-linux`. Portable lifecycle and generated-wire/buffer tests pass; live
+sharing remains unqualified. Embedded cursor composition is implemented with portable tests;
+window selection and generation-aware resizing are connected, while X11 popup ownership, live
+window qualification, direct capture protocols and DMA-BUF delivery remain incomplete. See the [screencast work log](SCREENCAST_IMPLEMENTATION_STATUS.md)
+for exact implemented scope and remaining gates.
+
+Interactive setup work now reuses a process-wide font database seed and embedded font metadata,
+capacity-bucketed motion snapshots with edge-safe UV cropping, and borrowed unchanged validation
+arrays. Shell Vulkan pipeline combinations are prewarmed at renderer initialization. Headless
+coverage passes; hardware timing and visual qualification remain pending. See the
+[setup-work audit](GLASS_PIPELINE_OPTIMIZATION.md#removing-interactive-setup-work).
+
+Snap preview scenes now remain retained invisibly while their mounted widget has no live window
+owner. This prevents partial spatial updates from reaching a newly recreated renderer scene after
+owner closure and fast edge reentry. A headless test reproduces the former Vulkan validation error.
+See [Window tiling](WINDOW_TILING.md#preview-owner-lifetime).
+
+Coordinated tile resize now shares backdrop capture/filtering by blur radius through the return
+fade. Independent glass captures are padded and cropped; broad blur uses half-resolution filtering
+with native sharp optics. Filter scenes persist and resolves reuse bounded capacity. Empty-body
+snapshots use a transparent pixel; fully weighted single lenses bypass border intermediates. Optional GPU
+stage timestamps include the complete command buffer and are logged with `TELORGON_FRAME_STATS=1`.
+Headless regression coverage is available; visual quality and hardware speed remain unqualified.
+See [glass pipeline optimization](GLASS_PIPELINE_OPTIMIZATION.md).
+
+Tiling placement transitions reuse the window motion design: maximize effects for snap/tile
+changes and restore effects for floating, with the existing preview/readiness handoff.
+Divider resizing stays direct. Headless motion and host coverage is available; live qualification
+remains pending. See [Window tiling](WINDOW_TILING.md).
+
+Motion resolve budgets now include bordered-glass intermediates at native output resolution
+(64–256 MiB). Resource fallback discards the current transition and permits subsequent motion,
+with fresh captures and preserved scene identities. Headless regressions cover 4K admission
+and maximize/restore recovery; live GPU qualification remains pending.
+
+Window chrome palettes now use `frame_border: Border`, including per-side colors and widths.
+Easy-frame content insets, inner corner contours, and outward resize tolerance follow each side;
+maximized/fullscreen frames remain borderless. See [window chrome](CUSTOM_WINDOWS_ASSETS_AND_POINTERS.md).
+
+Preview materials now share `Fill::{None, Color, Glass}`. Window resize previews use
+`ResizePreviewDesign { fill, border }`; tile previews retain their independent shape and motion.
+Ordinary widget backgrounds remain separate. Border/fill headless coverage is available;
+live GPU visual qualification remains pending. See [Resize-preview glass](RESIZE_GLASS.md).
+
+Window motion supports configurable `.close(Minimize::shrink_and_fade(...))` on surface withdrawal,
+inheriting the configured minimize shrink/fade by default,
+using the last composed snapshot with immediate input/protocol removal and bounded retirement.
+Headless lifecycle/framebuffer coverage is available; live close appearance remains unqualified.
+See [Desktop window motion](WINDOW_MOTION.md).
+
+`WindowTiling` snap-widget integration is implemented for the selected Linux output: halves,
+quadrants, shared dividers, color/glass preview design and motion, and shell snap/float requests.
+Shared dividers preserve interactive resize through custom-frame measurement and reuse each
+window’s resize-content fades; final client readiness gates the return from the placeholder.
+Headless coverage is available; hardware/pointer qualification remains pending. See
+[Window tiling](WINDOW_TILING.md).
+
+
 > Resize previews support flat color or Vulkan liquid glass with smooth distortion matched to the rounded window outline, bounded
-> refraction, optional dispersion, full-resolution Gaussian blur and a separately retained sharp rim backdrop. GPU ABI 4.4 packs optics into 60 bytes, including an independent inner blend softness. Rim lighting and specular highlights are removed; Fresnel remains.
+> refraction, optional dispersion, scale-aware Gaussian blur and a separately retained sharp rim backdrop. GPU ABI 4.4 packs optics into 60 bytes, including an independent inner blend softness. Rim lighting and specular highlights are removed; Fresnel remains.
 > Glass remains outside immutable motion captures; maximize/minimize resolve it at the current
 > displayed geometry, with weighted content fades and animated lower-window backdrop inputs.
 > Software uses the tint fallback. See [Resize-preview glass](RESIZE_GLASS.md) and the
@@ -49,8 +108,9 @@
 > and pre-map initial state hints remain unsupported. Live Firefox validation is pending.
 
 > X11 decoration ownership now follows `_MOTIF_WM_HINTS`, with live updates and default
-> title bars for absent/invalid hints. Managed X11 client-decorated windows retain
-> the template's outer border, radius and colors while omitting Telorgon title controls. `_NET_FRAME_EXTENTS` and pre-map extent requests are
+> title bars for absent/invalid hints. Managed X11 and native client-decorated windows can retain
+> independently selected outer styling through [decoration policy](DECORATION_POLICY.md). The default
+> omits server visuals for explicit client-side requests. `_NET_FRAME_EXTENTS` and pre-map extent requests are
 > supported; measurements include X11 density and custom chrome. Partial Motif masks
 > choose compositor or application title controls; per-button/function restrictions remain unsupported.
 > Protocol and geometry tests cover this behavior; live Firefox switching awaits user testing.
@@ -3852,3 +3912,15 @@ selected-output logical metrics and wheel/hover-dismiss routing are implemented.
 [Shell widgets](SHELL_WIDGETS.md) for API boundaries and headless evidence.
 Headless and compile evidence is documented in [Application catalog](APPLICATION_CATALOG.md); live
 appearance, automatic desktop-theme selection, XPM, and multi-output policy are not qualified.
+
+See [Capture configuration](CAPTURE_API.md) for explicit portal opt-in and source/session policy.
+Direct/internal configuration variants report unsupported startup errors until their adapters are complete.
+
+## Visual screen-sharing picker
+
+The default portal picker now presents screen/window thumbnails, source selection followed by explicit
+Share, cancellation, bounded paging and keyboard selection. The sharing indicator is content-sized
+and reports startup/failure state. Output previews reuse retained desktop scenes while excluding
+overlays and recursive copies. See [implementation and verification](SCREENCAST_PICKER.md).
+Physical multi-output hosting/hotplug and live Discord/Vulkan qualification remain outstanding;
+the current host still presents and captures one KMS output.

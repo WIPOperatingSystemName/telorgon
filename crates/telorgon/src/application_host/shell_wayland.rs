@@ -48,6 +48,15 @@ use crate::application_host::{
 // Keep this root focused on assembling resources and running the single Wayland/KMS owner loop.
 // Each stateful or policy-heavy subsystem below owns its own invariants and focused tests.
 mod client;
+mod capture;
+mod capture_direct;
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_streams;
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_portal;
+mod capture_cursor;
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_window;
 mod window_backend;
 use window_backend::WindowBackend;
 mod window_identity;
@@ -74,6 +83,7 @@ mod shm_copy;
 mod shortcuts;
 mod size_policy;
 mod state;
+mod tiling;
 
 use client::{
     ClientWindow, PreparedClientImage, apply_surface_publication, discard_replaced_shm_copy,
@@ -110,6 +120,7 @@ use state::{
 const MAX_DEFERRED_SHM_COPIES: usize = 64;
 
 pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
+    let capture_config = application.configured_capture();
     let _profiler = crate::application_host::profiler::ManagedProfiler::start(
         crate::application_host::profiler::ProfileTarget::ShellEnvironment,
     )?;
@@ -134,6 +145,11 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let runtime_directory = launch_environment.runtime_directory().map_err(app_error)?;
     let pointer_theme = pointer_config.load_theme(assets).map_err(app_error)?;
     let mut pointer_media = AssetMediaCache::new(assets).map_err(app_error)?;
+    #[cfg(feature = "shell-screencast-linux")]
+    let mut compositor = compositor;
+    #[cfg(feature = "shell-screencast-linux")]
+    let capture_chooser = compositor.take_capture_chooser();
+    let decoration_policy = compositor.configured_decoration_policy();
     let (window_frame, mut pointer, mut icons, shell_actions, mut keyboard_shortcut_handler) =
         compositor.into_runtime_parts();
 
@@ -160,6 +176,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         .resolve(physical_extent, connector.physical_millimeters)?;
     let selected_output = output_state(connector, mode_index, output_scale)?;
     let extent = selected_output.logical_size();
+    #[cfg(feature = "shell-screencast-linux")]
+    let capture_output_label = format!("{} ({} × {})", selected_output.description.name, physical_extent.width, physical_extent.height);
     eprintln!(
         "telorgon-kms: {}x{} pixels, {}x{} mm, {:.0}% scale, {}x{} logical units ({:?})",
         physical_extent.width,
@@ -218,6 +236,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         .map(|(index, framebuffer)| FrameSlot::new(index, framebuffer.id()))
         .collect::<Vec<_>>();
     let mut desktop_scene = ShellComposition::new(extent);
+    let mut capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
+    let mut capture_cursor_visual = None;
     let mut window_motion = motion::WindowMotionController::default();
     let mut frame_surface_revisions = vec![Vec::<(u32, u64)>::new(); frame_slots.len()];
     let cursor_plane = topology.planes.iter().find(|candidate| {
@@ -258,6 +278,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     #[cfg(not(all(feature = "shell-xwayland", target_env = "gnu")))]
     let mut wayland =
         NativeCompositor::new(&display, ClientLimits::default()).map_err(app_error)?;
+    wayland.set_decoration_policy(decoration_policy);
     wayland
         .add_output(&display, 1, selected_output)
         .map_err(app_error)?;
@@ -348,6 +369,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             runtime_directory.clone(),
             launch_environment.clone(),
             runtime_wake.clone(),
+            decoration_policy,
         ) {
             Ok(host) => compatibility = Some(host),
             Err(error) => {
@@ -576,6 +598,36 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut touch_targets = BTreeMap::<i32, WaylandSurfaceId>::new();
     let mut windows = BTreeMap::<WaylandSurfaceId, ClientWindow>::new();
     let mut window_identities = WindowIdentities::default();
+    let mut capture_sessions = capture::CaptureSessions::new(capture::CaptureLimits::default());
+    let mut direct_captures = capture_direct::DirectCaptures::default();
+    let mut direct_capture_turn = true;
+    #[cfg(feature = "shell-screencast-linux")]
+    let mut capture_streams = capture_streams::CaptureStreams::default();
+    #[cfg(feature = "shell-screencast-linux")]
+    let mut capture_portal = if let Some(portal_config) = capture_config.configured_portal() {
+        if !desktop_renderer.is_vulkan() {
+            return Err(AppError::new("portal capture requested, but the selected renderer is not Vulkan"));
+        }
+        if widgets.len() > 254 {
+            return Err(AppError::new("portal capture needs two free shell surface slots"));
+        }
+        let wake = runtime_wake.clone();
+        let (portal, controls) = capture_portal::CapturePortal::new(
+            Arc::new(move || wake.notify()),
+            capture_chooser,
+            capture_config.configured_sources().bits(),
+            portal_config.activates_frontend(config.session.publish_user_service_environment),
+            capture_output_label,
+        )?;
+        for widget in controls {
+            widgets.push(WidgetLayer::new(next_widget_id, widget, extent, assets, output_scale,
+                &runtime_wake, widget_services.services.clone())?);
+            next_widget_id += 1;
+        }
+        Some(portal)
+    } else {
+        None
+    };
     let mut pending_shm_buffers =
         BTreeMap::<crate::compositor_wayland::WaylandBufferId, usize>::new();
     let mut pending_shm_surfaces = BTreeMap::<WaylandSurfaceId, usize>::new();
@@ -587,6 +639,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut session_locked = false;
     let mut pending_session_lock = None;
     let mut window_interaction = None;
+    let mut tiling = tiling::TilingController::default();
     let mut decoration_click = DecorationClick::default();
     let mut configure_scheduler = ConfigureScheduler::default();
     let mut resize_configure_budget = true;
@@ -770,6 +823,25 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 continue;
             }
             let result = match command.action {
+                Action::Snap(target) => {
+                    if !tiling.snap(
+                        &mut windows,
+                        &mut configure_scheduler,
+                        surface,
+                        target,
+                        &config,
+                    ) {
+                        widget_services.complete(command.id, Outcome::Denied);
+                        continue;
+                    }
+                    Ok(())
+                }
+                Action::Float => {
+                    if let Some(w) = windows.get_mut(&surface) {
+                        tiling::float_window(w, surface, &mut configure_scheduler);
+                    }
+                    Ok(())
+                }
                 Action::Activate => {
                     if let Some(w) = windows.get_mut(&surface) {
                         w.minimized = false;
@@ -861,9 +933,30 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             extent,
             work,
             schedule_now.as_nanos(),
-            config.motion_preference,
+            if desktop_renderer.motion_enabled() {
+                config.motion_preference
+            } else {
+                crate::theme::MotionPreference::Reduced
+            },
         )?;
         work_area = shell_work_area(extent, &widgets);
+        tiling.sync(
+            &mut widgets,
+            &mut windows,
+            &mut configure_scheduler,
+            work_area,
+            &config,
+            session_locked,
+        )?;
+        tiling.preview(
+            &mut widgets,
+            &windows,
+            window_interaction,
+            pointer_position,
+            extent,
+            &config,
+            session_locked,
+        );
         if work_area != previous_work_area {
             let maximized = windows
                 .iter()
@@ -937,6 +1030,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         } else {
             None
         };
+        let wait = if direct_captures.pending() && seat.state() == SeatState::Enabled {
+            Some(wait.unwrap_or(refresh_period).min(refresh_period))
+        } else { wait };
         let wait = if shutdown_started.is_some() {
             Some(
                 wait.unwrap_or(Duration::from_millis(50))
@@ -957,6 +1053,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             ],
         );
         latency_trace.phase("wayland_wait_dispatch");
+        #[cfg(feature = "shell-screencast-linux")]
+        let wait = capture_streams.wait(wait);
         display.dispatch_and_flush(wait).map_err(app_error)?;
         latency_trace.phase("xwm_dispatch");
         owner_stats_start = frame_stats.as_ref().map(|_| Instant::now());
@@ -989,6 +1087,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
         if seat.disable_pending() {
             // Close input device FDs before acknowledging access revocation.
+            tiling.finish(&mut windows, &mut configure_scheduler);
             input.suspend();
             if !input_suspended {
                 resume_keyboard_focus = wayland
@@ -1106,7 +1205,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         // Libinput motion is normalized mouse movement, not KMS pixels.
                         // Apply it in logical units so pointer speed is stable across densities;
                         // preserve the device's unaccelerated vector for relative-pointer clients.
-                        let scene_follows_pointer = window_interaction.is_some()
+                        let scene_follows_pointer = tiling.dragging()
+                            || window_interaction.is_some()
                             || (wayland.drag_active(1) && wayland.drag_touch_slot(1).is_none());
                         other_work_seen |= scene_follows_pointer;
                         let constraint =
@@ -1139,6 +1239,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                             );
                             if window_interaction.is_none()
+                                && !tiling.dragging()
                                 && wayland
                                     .core()
                                     .seats
@@ -1164,6 +1265,18 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 repaint = true;
                                 continue;
                             }
+                            if tiling.dragging() {
+                                tiling.update(
+                                    pointer_position,
+                                    &mut windows,
+                                    &mut configure_scheduler,
+                                    &config,
+                                );
+                                pointer_scene_dirty = true;
+                                repaint = true;
+                                cursor_position_dirty = true;
+                                continue;
+                            }
                             if let Some(interaction) = window_interaction.as_mut() {
                                 apply_window_interaction(
                                     &mut windows,
@@ -1173,6 +1286,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     extent,
                                     &config,
                                 )?;
+                                tiling.preview(
+                                    &mut widgets,
+                                    &windows,
+                                    window_interaction,
+                                    pointer_position,
+                                    extent,
+                                    &config,
+                                    session_locked,
+                                );
                             } else {
                                 route_pointer_motion(
                                     &display,
@@ -1237,7 +1359,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         }
                     }
                     LinuxInputEventKind::PointerAbsolute { normalized } => {
-                        let scene_follows_pointer = window_interaction.is_some()
+                        let scene_follows_pointer = tiling.dragging()
+                            || window_interaction.is_some()
                             || (wayland.drag_active(1) && wayland.drag_touch_slot(1).is_none());
                         other_work_seen |= scene_follows_pointer;
                         let proposed = PointF {
@@ -1267,6 +1390,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                             );
                             if window_interaction.is_none()
+                                && !tiling.dragging()
                                 && wayland
                                     .core()
                                     .seats
@@ -1292,6 +1416,18 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 repaint = true;
                                 continue;
                             }
+                            if tiling.dragging() {
+                                tiling.update(
+                                    pointer_position,
+                                    &mut windows,
+                                    &mut configure_scheduler,
+                                    &config,
+                                );
+                                pointer_scene_dirty = true;
+                                repaint = true;
+                                cursor_position_dirty = true;
+                                continue;
+                            }
                             if let Some(interaction) = window_interaction.as_mut() {
                                 apply_window_interaction(
                                     &mut windows,
@@ -1301,6 +1437,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     extent,
                                     &config,
                                 )?;
+                                tiling.preview(
+                                    &mut widgets,
+                                    &windows,
+                                    window_interaction,
+                                    pointer_position,
+                                    extent,
+                                    &config,
+                                    session_locked,
+                                );
                             } else {
                                 route_pointer_motion(
                                     &display,
@@ -1347,6 +1492,14 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         }
                     }
                     LinuxInputEventKind::PointerButton { button, pressed } => {
+                        if tiling.dragging() {
+                            if button == 0x110 && !pressed {
+                                tiling.finish(&mut windows, &mut configure_scheduler);
+                            }
+                            pointer_scene_dirty = true;
+                            repaint = true;
+                            continue;
+                        }
                         let widget_now = MonotonicInstant::from_nanos(
                             start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         );
@@ -1382,6 +1535,33 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             continue;
                         }
 
+                        if button == 0x110
+                            && pressed
+                            && !session_locked
+                            && window_interaction.is_none()
+                            && !wayland.drag_active(1)
+                            && wayland
+                                .core()
+                                .seats
+                                .get(&1)
+                                .is_some_and(|seat| seat.pressed_buttons().is_empty())
+                            && let Some(divider) =
+                                tiling.hover(&windows, &stacking_order, pointer_position, &config)
+                        {
+                            tiling.begin(
+                                divider,
+                                pointer_position,
+                                &mut windows,
+                                &mut configure_scheduler,
+                            );
+                            wayland
+                                .set_pointer_focus(1, None, pointer_position, display.next_serial())
+                                .map_err(app_error)?;
+                            pointer_focus = None;
+                            pointer_scene_dirty = true;
+                            repaint = true;
+                            continue;
+                        }
                         if button == 0x110
                             && !pressed
                             && !session_locked
@@ -1566,7 +1746,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             .get(&1)
                             .and_then(|seat| seat.pointer_focus)
                             .map(|focus| focus.surface);
-                        if window_interaction.is_some() {
+                        if window_interaction.is_some() || tiling.dragging() {
                             wayland
                                 .core_mut()
                                 .seats
@@ -1661,10 +1841,25 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 .is_some_and(|seat| seat.pressed_buttons().is_empty())
                             && let Some(interaction) = window_interaction.take()
                         {
+                            tiling.commit(
+                                &mut windows,
+                                &mut configure_scheduler,
+                                interaction,
+                                &config,
+                            );
                             finish_window_interaction(
                                 &mut windows,
                                 &mut configure_scheduler,
                                 interaction,
+                            );
+                            tiling.preview(
+                                &mut widgets,
+                                &windows,
+                                None,
+                                pointer_position,
+                                extent,
+                                &config,
+                                session_locked,
                             );
                             pointer_scene_dirty = true;
                             repaint = true;
@@ -1694,6 +1889,31 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         }
                     }
                     LinuxInputEventKind::KeyboardKey { keycode, pressed } => {
+                        if pressed
+                            && keycode == 1
+                            && (window_interaction.is_some() || tiling.dragging())
+                        {
+                            if let Some(interaction) = window_interaction.take() {
+                                finish_window_interaction(
+                                    &mut windows,
+                                    &mut configure_scheduler,
+                                    interaction,
+                                );
+                            }
+                            tiling.finish(&mut windows, &mut configure_scheduler);
+                            tiling.preview(
+                                &mut widgets,
+                                &windows,
+                                None,
+                                pointer_position,
+                                extent,
+                                &config,
+                                session_locked,
+                            );
+                            repaint = true;
+                            pointer_scene_dirty = true;
+                            continue;
+                        }
                         let direction = if pressed {
                             KeyDirection::Down
                         } else {
@@ -2114,6 +2334,36 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             // must not trigger another otherwise unchanged desktop preparation.
             repaint |= desktop_renderer.poll_allocations(&mut latency_trace)?;
             for completion in desktop_renderer.drain_completions() {
+                if let Some(direct) = completion.direct {
+                    wayland.complete_direct_capture(direct).map_err(app_error)?;
+                }
+                if let Some(capture) = completion.capture {
+                    #[cfg(feature = "shell-screencast-linux")]
+                    if let Some(portal) = &capture_portal { portal.revoke_cancelled(&mut capture_sessions); }
+                    if let Some(receipt) = completion.capture_pending {
+                        // Timeout is not completion. Retain the exact receipt and job while retrying.
+                        desktop_renderer.retry_capture(receipt, capture)?;
+                        continue;
+                    }
+                    if direct_captures.owns(capture.ticket.session()) {
+                        direct_captures.complete(&mut capture_sessions, capture, completion.result.is_ok());
+                        continue;
+                    }
+                    #[cfg(feature = "shell-screencast-linux")]
+                    {
+                        let sampled = capture_streams.complete(&mut capture_sessions, capture, completion.result.is_ok());
+                        let time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+                        for (surface, revision) in sampled {
+                            if let Some(surface) = WaylandSurfaceId::from_raw(surface) {
+                                // Capture completion paces an obscured client without claiming KMS presentation.
+                                wayland.surface_occluded_frame_ready(surface, revision, time).map_err(app_error)?;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "shell-screencast-linux"))]
+                    let _ = capture_sessions.finish_frame(capture.ticket, completion.result.is_ok());
+                    continue;
+                }
                 completion.result.map_err(AppError::new)?;
                 for retirement in completion.dma_bufs {
                     retire_submitted_dma_buf(&mut wayland, &mut pending_dma_bufs, retirement)?;
@@ -2137,7 +2387,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 else {
                     continue;
                 };
-                if session_locked || window_interaction.is_some() {
+                if session_locked || window_interaction.is_some() || tiling.dragging() {
                     continue;
                 }
                 let Some(window) = windows.get_mut(&surface) else {
@@ -2166,7 +2416,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 let Some(window) = windows.get(&surface) else {
                     continue;
                 };
-                if session_locked || window_interaction.is_some() {
+                if session_locked || window_interaction.is_some() || tiling.dragging() {
                     continue;
                 }
                 let maximized = match action {
@@ -2212,7 +2462,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     }
                     continue;
                 }
-                if window_interaction.is_some() {
+                if window_interaction.is_some() || tiling.dragging() {
                     continue;
                 }
                 let Some(seat) = wayland.core().seats.get(&1) else {
@@ -2247,7 +2497,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     }
                     _ => None,
                 };
-                if window_interaction.is_some() {
+                if window_interaction.is_some() || tiling.dragging() {
                     wayland
                         .set_pointer_focus(1, None, pointer_position, display.next_serial())
                         .map_err(app_error)?;
@@ -2598,6 +2848,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     repaint = true;
                 }
                 CompositorAction::WithdrawSurface(surface) => {
+                    if let Some(id) = windows.get(&surface).and_then(|window| window.desktop_id) {
+                        capture_sessions.withdraw_source(crate::shell::capture::CaptureSource::Window(id));
+                        wayland.unmap_foreign_toplevel(id).map_err(app_error)?;
+                    }
                     #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
                     if let Some(host) = &mut compatibility {
                         if let Some(state) = wayland.core().world.surface(surface) {
@@ -2639,6 +2893,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             .set_keyboard_focus(1, None, display.next_serial())
                             .map_err(app_error)?;
                     }
+                    window_motion.close(
+                        surface.get(),
+                        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    );
                     windows.remove(&surface);
                     if wayland.core().world.surface(surface).is_none() {
                         window_identities.destroy(surface);
@@ -2701,7 +2959,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     {
                         window_interaction =
                             WindowInteraction::begin_move(&windows, surface, pointer_position);
-                        if window_interaction.is_some() {
+                        if window_interaction.is_some() || tiling.dragging() {
                             wayland
                                 .set_pointer_focus(1, None, pointer_position, display.next_serial())
                                 .map_err(app_error)?;
@@ -2726,7 +2984,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             edge,
                             pointer_position,
                         );
-                        if window_interaction.is_some() {
+                        if window_interaction.is_some() || tiling.dragging() {
                             wayland
                                 .set_pointer_focus(1, None, pointer_position, display.next_serial())
                                 .map_err(app_error)?;
@@ -2783,12 +3041,14 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     )?;
                 }
                 CompositorAction::SessionLockRequested(lock) => {
+                    capture_sessions.set_locked(true);
                     shortcut_keys.suppress_held();
                     wayland.cancel_keyboard_input(1).map_err(app_error)?;
                     if wayland.drag_active(1) {
                         wayland.cancel_drag(1).map_err(app_error)?;
                     }
                     session_locked = true;
+                    tiling.finish(&mut windows, &mut configure_scheduler);
                     decoration_click.cancel();
                     for frame in frame_layers.values_mut() {
                         frame
@@ -2870,6 +3130,33 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
 
         latency_trace.phase("window_policy_cursor");
+        capture_sessions.set_locked(session_locked || wayland.session_locked());
+        capture_sessions.sync_sources(
+            std::iter::once(crate::shell::capture::CaptureSource::Output(crate::shell::OutputId::MIN))
+                .chain(windows.values().filter_map(|window| {
+                    // Only managed, currently mapped content is a selectable window.
+                    // The shared desktop identity handles both native and X11 incarnations.
+                    if window.backend.is_none() || window.minimized
+                        || window.presentation.revision == 0
+                    { return None; }
+                    window.desktop_id.map(crate::shell::capture::CaptureSource::Window)
+                })).filter(|source| capture_config.allows(*source)),
+        );
+        wayland.sync_foreign_toplevels(windows.values().filter_map(|window| {
+            // Minimized windows remain mapped and discoverable. Unmap actions above
+            // retire the mapping immediately, even if remapping occurs in this batch.
+            if window.backend.is_none() || window.presentation.revision == 0 { return None; }
+            window.desktop_id.map(|id| (id, window.frame_title.as_deref().unwrap_or(""), window.application_identity.as_str()))
+        })).map_err(app_error)?;
+        direct_captures.retire(&mut capture_sessions, &mut wayland)?;
+        #[cfg(feature = "shell-screencast-linux")]
+        capture_streams.poll(&mut capture_sessions, desktop_renderer,
+            capture_portal::capture_layout(physical_extent));
+        #[cfg(feature = "shell-screencast-linux")]
+        if let Some(portal) = &mut capture_portal {
+            portal.poll(&mut capture_sessions, &mut capture_streams, desktop_renderer,
+                physical_extent, extent, output_scale, session_locked || wayland.session_locked());
+        }
         // Resume frame-callback-paced clients after release even when the veil itself no longer
         // changes (so there may be no new KMS frame). Hidden intermediate images are not presented;
         // do not misreport presentation feedback while asking the client for its final redraw.
@@ -2922,6 +3209,27 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             compatibility.as_mut(),
         )?;
 
+        tiling.preview(
+            &mut widgets,
+            &windows,
+            window_interaction,
+            pointer_position,
+            extent,
+            &config,
+            session_locked,
+        );
+        if !session_locked
+            && window_interaction.is_none()
+            && !wayland.drag_active(1)
+            && !widgets.iter_mut().any(|w| w.contains(pointer_position))
+            && let Some(divider) =
+                tiling.hover(&windows, &stacking_order, pointer_position, &config)
+        {
+            if let Some(seat) = wayland.core_mut().seats.get_mut(&1) {
+                seat.cursor =
+                    pointer_request_cursor_image(PointerRequest::Semantic(divider.icon()));
+            }
+        }
         let cursor_image = wayland
             .core()
             .seats
@@ -3202,11 +3510,11 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 [ready_scanout.len() as u64, 0, 0, 0],
             );
         }
-        if repaint
-            && seat.state() == SeatState::Enabled
-            && let Some(scanout_index) = available_scanout
-            && primary_render_ready
-        {
+        'primary_render: {
+            if !repaint || seat.state() != SeatState::Enabled || !primary_render_ready {
+                break 'primary_render;
+            }
+            let Some(scanout_index) = available_scanout else { break 'primary_render; };
             latency_trace.phase("render_chrome");
             let frame_stats_start = frame_stats.as_ref().map(|_| Instant::now());
             #[cfg(feature = "profiler")]
@@ -3255,6 +3563,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     &config,
                     assets,
                     &app_icon_profile,
+                    Some(&widget_services.services),
                     &runtime_wake,
                     now,
                     output_scale,
@@ -3274,6 +3583,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     compatibility.as_mut(),
                 )?;
             }
+            tiling.release_ready_group(&mut windows);
             let cursor_image = wayland
                 .core()
                 .seats
@@ -3350,6 +3660,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 window.presentation.content_ready = ready.contains(surface);
             }
             latency_trace.phase("render_layers");
+            let widget_frame_changed = widgets.iter().any(|w| w.dirty() || w.animating());
             let layers = prepare_desktop_layers(
                 session_locked,
                 extent,
@@ -3369,12 +3680,22 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 pointer_position,
                 &config,
             )?;
+            #[cfg(feature = "shell-screencast-linux")]
+            if capture_streams.refresh_windows(&capture_sessions, &windows, &layers, output_scale,
+                capture_portal.as_ref().is_some_and(|portal| portal.wants_window_sources())) {
+                runtime_wake.notify();
+            }
             latency_trace.phase("render_scene_sync");
-            let Some(frame) =
-                desktop_scene.synchronize_with_force(extent, layers, window_motion.active(now))
-            else {
+            capture_cursor_visual = rendered_cursor;
+            let Some(frame) = desktop_scene.synchronize_with_force(
+                extent,
+                layers,
+                window_motion.active(now) || widget_frame_changed,
+            ) else {
                 repaint = false;
-                continue;
+                // A capture request still needs its initial/explicit frame from the
+                // retained scene even when the desktop itself has no new damage.
+                break 'primary_render;
             };
             let mut frame = frame.into_physical(output_scale, physical_extent);
             let mut motion_states = BTreeMap::new();
@@ -3403,7 +3724,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     height: outer.height,
                                 }),
                                 maximized: window.maximized,
-                                interactive: matches!(window_interaction, Some(WindowInteraction::Move {surface:target,..} | WindowInteraction::Resize {surface:target,..}) if target == *surface),
+                                tiled: window.tile.map(|tile| tile.target),
+                                interactive: (tiling.dragging() && window.tile.is_some()) || matches!(window_interaction, Some(WindowInteraction::Move {surface:target,..} | WindowInteraction::Resize {surface:target,..}) if target == *surface),
                                 move_pointer: matches!(window_interaction, Some(WindowInteraction::Move {surface:target,..}) if target == *surface)
                                     .then_some(PointF { x: pointer_position.x * output_scale.get(), y: pointer_position.y * output_scale.get() }),
                                 minimized: window.minimized,
@@ -3438,6 +3760,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     .get(&surface.get())
                     .map_or(crate::WindowMotion::none(), |state| state.style);
             }
+            if session_locked {
+                window_motion.cancel_closing();
+            }
             window_motion.apply(
                 &mut frame,
                 motion_states,
@@ -3449,7 +3774,16 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     crate::theme::MotionPreference::Reduced
                 },
             );
+            frame.motion.divider_dragging = tiling.dragging();
             let mut consumed_motion_veil = false;
+            if desktop_renderer.motion_enabled() {
+                let fades: Vec<_> = widgets
+                    .iter()
+                    .filter(|w| w.spec.visibility_motion.is_some())
+                    .map(|w| (w.id, w.opacity))
+                    .collect();
+                window_motion.apply_widget_visibility(&mut frame, &fades);
+            }
             for (surface, window) in &mut windows {
                 consumed_motion_veil |= std::mem::take(&mut window.motion_veil_pending);
                 window.motion_input = motion_owners
@@ -3478,9 +3812,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 .begin_render(frame_id)
                 .map_err(app_error)?;
             latency_trace.phase("render_backend");
+            let fallback_revisions = (!frame.motion.hidden_revisions.is_empty())
+                .then(|| frame.surface_revisions.clone());
             let rendered = desktop_renderer.render(scanout_index, frame, &mut latency_trace)?;
-            if !desktop_renderer.motion_enabled() {
-                window_motion = Default::default();
+            if desktop_renderer.take_motion_failure() {
+                window_motion.reset_after_fallback();
+                // Fallback presented ordinary surfaces, including ones an animation would hide.
+                if let Some(revisions) = fallback_revisions {
+                    frame_surface_revisions[scanout_index] = revisions;
+                }
                 for window in windows.values_mut() {
                     window.motion_input = None;
                 }
@@ -3557,6 +3897,40 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 }
             }
             repaint = consumed_motion_veil;
+        }
+        if !first_modeset && !session_locked && seat.state() == SeatState::Enabled {
+            let needs_cursor = wayland.direct_capture_needs_cursor();
+            #[cfg(feature = "shell-screencast-linux")]
+            let needs_cursor = needs_cursor || capture_streams.needs_embedded_cursor(&capture_sessions);
+            let cursor = needs_cursor.then_some(capture_cursor_visual.as_ref()).flatten();
+            let prepared = capture_cursor.synchronize(cursor, pointer_position, output_scale, physical_extent)
+                .and_then(|frame| frame.map_or(Ok(()), |frame| desktop_renderer.update_capture_cursor(frame)));
+            if let Err(error) = prepared {
+                eprintln!("telorgon-capture: cursor preparation failed: {error}");
+                #[cfg(feature = "shell-screencast-linux")]
+                capture_streams.fail_embedded_cursor(&mut capture_sessions);
+                wayland.stop_direct_cursor_capture().map_err(app_error)?;
+                desktop_renderer.clear_capture_cursor();
+                capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
+            }
+            let capture_was_busy = capture_sessions.has_pending_frame();
+            let capture_now = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            if direct_capture_turn {
+                direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
+            }
+            #[cfg(feature = "shell-screencast-linux")]
+            capture_streams.schedule(&mut capture_sessions, desktop_renderer, capture_now)?;
+            if !direct_capture_turn {
+                direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
+            }
+            if !capture_was_busy && capture_sessions.has_pending_frame() {
+                direct_capture_turn = !direct_capture_turn;
+            }
+        }
+        if session_locked {
+            desktop_renderer.clear_capture_cursor();
+            capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
+            capture_cursor_visual = None;
         }
     }
 }

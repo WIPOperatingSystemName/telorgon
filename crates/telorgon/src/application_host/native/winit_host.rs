@@ -277,6 +277,7 @@ impl NativeRuntimeSource for CompositionSource {
 
     fn mount(self, extent: SizeI) -> AppResult<AppRuntimeCore<Self::Driver>> {
         let mut runtime = AppRuntimeCore::from_composition_driver(self.driver, extent)?;
+        runtime.register_fonts(self.assets)?;
         let mut media =
             AssetMediaCache::new(self.assets).map_err(|error| AppError::new(error.to_string()))?;
         for resource in media

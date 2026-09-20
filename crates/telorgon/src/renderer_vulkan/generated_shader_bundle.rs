@@ -3,7 +3,7 @@
 pub(crate) const BUNDLE_INTERFACE_MAJOR: u32 = 4;
 pub(crate) const BUNDLE_INTERFACE_MINOR: u32 = 4;
 pub(crate) const BUNDLE_HASH: &str =
-    "ab9c3ac5f9e76f1543698418d3b4e32b27fc2a5e52a3bf544238767eace4f549";
+    "c4c478599e885620ac28b87f0f69c38db7d1ba4b03669c202eaffce3e6d2cd7f";
 pub(crate) const BOX_VERTEX_HASH: &str =
     "74a5ca1a74dade29acd48781047899fd7ae626e32c39ccd49862134b011ecbfe";
 pub(crate) const BOX_VERTEX: &[u8] = include_bytes!("shaders/vulkan/box.vert.spv");
@@ -20,7 +20,7 @@ pub(crate) const IMAGE_VERTEX_HASH: &str =
     "0e78d740032e2754466bc6750bdca100dde5fbd0411e2a98b6bea5e9852babb3";
 pub(crate) const IMAGE_VERTEX: &[u8] = include_bytes!("shaders/vulkan/image.vert.spv");
 pub(crate) const IMAGE_FRAGMENT_HASH: &str =
-    "801d011e7836d1e2d9c3bf42912c4778146eec05730bd501035568535f387e12";
+    "c517924d1dd1d086e8f041d9966e683d78258f0018668ee524a40f05c46586b8";
 pub(crate) const IMAGE_FRAGMENT: &[u8] = include_bytes!("shaders/vulkan/image.frag.spv");
 pub(crate) const MATERIAL_VERTEX_HASH: &str =
     "783af7da04c758dc2db03d1187818f7a77548101504d07d1f29a8314a806fe3c";

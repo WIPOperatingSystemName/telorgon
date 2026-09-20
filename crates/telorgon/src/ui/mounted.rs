@@ -609,6 +609,8 @@ pub struct ImageVisual {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct InteractionSnapshot {
     pub flags: InteractionFlags,
+    /// Include descendants when the input router computes hover for this node.
+    pub hover_within: bool,
     pub enabled: bool,
     pub visible: bool,
     pub focusable: bool,
@@ -623,6 +625,7 @@ impl Default for InteractionSnapshot {
     fn default() -> Self {
         Self {
             flags: InteractionFlags::default(),
+            hover_within: false,
             enabled: true,
             visible: true,
             focusable: false,
@@ -1181,6 +1184,31 @@ impl MountedUi {
         if self.style_bindings.contains(&binding) {
             return false;
         }
+        // Promote the foundation root binding to the complete component contract.
+        // Keeping both creates competing tracks for the same root slot, and later
+        // reconciliation updates only the first binding, leaving stale inline state.
+        let root_slot = StyleSlotBinding {
+            slot: StyleSlotId::named("root"),
+            node: state_root,
+        };
+        if binding.slots.contains(&root_slot)
+            && let Some(index) = self.style_bindings.iter().position(|existing| {
+                existing.state_root == state_root
+                    && existing.scope == binding.scope
+                    && existing.component_style == binding.component_style
+                    && existing.slots.as_slice() == [root_slot]
+                    && existing.local_style.is_none()
+                    && existing.local_overrides.is_empty()
+                    && existing.variants.is_empty()
+            })
+        {
+            self.style_bindings[index] = binding;
+            self.enqueue_style_binding(index);
+            if let Some(core) = self.nodes.core_mut(state_root) {
+                core.style_revision = core.style_revision.wrapping_add(1).max(1);
+            }
+            return true;
+        }
         let index = self.style_bindings.len();
         let next = self.style_binding_head_by_state.get(state_root).copied();
         self.style_bindings.push(binding);
@@ -1655,6 +1683,25 @@ impl MountedUi {
             cursor = self.nodes.core(current).and_then(|core| core.parent);
         }
         false
+    }
+
+    pub fn set_hover_within(&mut self, node: NodeId, enabled: bool) -> bool {
+        if !self.nodes.contains(node) {
+            return false;
+        }
+        if self.interactions.get(node).is_none() {
+            if !enabled {
+                return false;
+            }
+            self.interactions.insert(node, InteractionSnapshot::default());
+        }
+        let interaction = self.interactions.get_mut(node).unwrap();
+        if interaction.hover_within == enabled {
+            return false;
+        }
+        interaction.hover_within = enabled;
+        interaction.revision = interaction.revision.wrapping_add(1).max(1);
+        true
     }
 
     pub fn set_control_behavior(&mut self, node: NodeId, behavior: ControlBehavior) -> bool {
@@ -2391,6 +2438,11 @@ impl<'a, A> MountWriter<'a, A> {
     pub fn intern(&mut self, text: impl AsRef<str>) -> StringId {
         self.ui.intern(text)
     }
+    /// Reuse a label owned by the same control subtree. Global interning can return another
+    /// node's mutable text slot, which may be cleared while replacing that node.
+    pub(crate) fn text_content(&self, node: NodeId) -> Option<StringId> {
+        self.ui.texts.get(node).map(|text| text.content)
+    }
     pub fn root(
         &mut self,
         style: BoxStyle,
@@ -3078,6 +3130,9 @@ impl<'a, A> MountWriter<'a, A> {
     }
     pub fn style_id(&mut self, node: NodeId, style: ComponentStyleId) -> bool {
         self.ui.set_style_id(node, style)
+    }
+    pub fn hover_within(&mut self, node: NodeId, enabled: bool) -> bool {
+        self.ui.set_hover_within(node, enabled)
     }
     pub fn style_override(
         &mut self,

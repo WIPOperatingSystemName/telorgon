@@ -75,8 +75,8 @@ pub(super) fn window_content_offset(window: &ClientWindow, config: &LinuxShellCo
         PointI::default()
     } else {
         window.chrome_content_offset.unwrap_or(PointI {
-            x: config.window_border,
-            y: config.window_border
+            x: window_border_width(window, config),
+            y: window_border_width(window, config)
                 + if window_is_decorated(window) {
                     config.titlebar_height
                 } else {
@@ -109,9 +109,9 @@ fn content_rect(position: PointI, offset: PointI, size: SizeI) -> RectI {
 
 pub(super) fn legacy_window_outer(window: &ClientWindow, config: &LinuxShellConfig) -> SizeI {
     SizeI {
-        width: window.requested_size.width + config.window_border * 2,
+        width: window.requested_size.width + window_border_width(window, config) * 2,
         height: window.requested_size.height
-            + config.window_border * 2
+            + window_border_width(window, config) * 2
             + if window_is_decorated(window) {
                 config.titlebar_height
             } else {
@@ -133,20 +133,39 @@ pub(super) fn wayland_resize_edge(edge: WindowResizeEdge) -> ResizeEdge {
     }
 }
 
-/// Frame appearance and application title-bar ownership are independent for managed X11 windows.
 pub(super) fn window_has_frame(window: &ClientWindow) -> bool {
-    if window.fullscreen {
+    if window.fullscreen || window.backend.is_none() {
         return false;
     }
-    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
-    if matches!(window.backend, Some(WindowBackend::X11(_))) {
-        return true;
-    }
+    let parts = window
+        .decoration_policy
+        .frame_parts(window.server_decorated);
     window_is_decorated(window)
+        || parts.border
+        || parts.rounded_clip
+        || parts.shadow
+        || parts.resize_regions
 }
 
 pub(super) fn window_is_decorated(window: &ClientWindow) -> bool {
-    window.server_decorated && !window.fullscreen
+    !window.fullscreen
+        && window.backend.is_some()
+        && window
+            .decoration_policy
+            .title_bar_visible(window.server_decorated)
+}
+
+pub(super) fn window_border_width(window: &ClientWindow, config: &LinuxShellConfig) -> i32 {
+    if window_has_frame(window)
+        && window
+            .decoration_policy
+            .frame_parts(window.server_decorated)
+            .border
+    {
+        config.window_border
+    } else {
+        0
+    }
 }
 
 pub(super) fn surface_local_position(

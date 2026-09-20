@@ -57,6 +57,17 @@ impl RetainedTextSystem {
     pub fn raster_scale(&self) -> crate::platform::ScaleFactor {
         self.engine.raster_scale()
     }
+    pub(crate) fn load_embedded_font(&mut self, bytes: &'static [u8]) -> TextResult<()> {
+        self.engine.load_embedded_font(bytes)?;
+        self.clear();
+        Ok(())
+    }
+
+    pub fn load_font_bytes(&mut self, bytes: Vec<u8>) -> TextResult<()> {
+        self.engine.load_font_bytes(bytes)?;
+        self.clear();
+        Ok(())
+    }
 
     pub fn set_raster_scale(&mut self, scale: crate::platform::ScaleFactor) {
         if self.engine.raster_scale() != scale {

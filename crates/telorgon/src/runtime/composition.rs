@@ -613,6 +613,8 @@ impl CompositionDriver {
             element.into_parts();
         let mut mounted = match kind {
             ElementKind::Container(ContainerElement {
+                inline_style,
+                hover_within,
                 style,
                 layout,
                 children,
@@ -626,6 +628,15 @@ impl CompositionDriver {
                 let children = mounted_children
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
+                writer.hover_within(node, hover_within);
+                if let Some(style) = inline_style {
+                    writer.style_id(node, style.id);
+                    writer.style_binding(
+                        StyleBinding::new(node, ThemeScopeId::new(0, 1), style.id)
+                            .slot(StyleSlotId::named("root"), node)
+                            .local_style(style),
+                    );
+                }
                 MountedElement {
                     key: None,
                     kind: MountedKind::Container {
@@ -637,9 +648,10 @@ impl CompositionDriver {
                 }
             }
             ElementKind::Text(props) => {
+                let style = props.style.resolve_with(|family| writer.intern(family));
                 let text = writer.dynamic_text(
                     props.content.clone(),
-                    props.style.resolve(),
+                    style,
                     props.box_style,
                     props.layout,
                 );
@@ -681,6 +693,10 @@ impl CompositionDriver {
                 }
             }
             ElementKind::Button(props) => {
+                let mut label_style = props.label_style;
+                if let Some(family) = props.font_family {
+                    label_style.family = writer.intern(family);
+                }
                 let mut icon_node = None;
                 let mut label_node = None;
                 let control = writer.button_node(props.style, |writer| {
@@ -699,7 +715,7 @@ impl CompositionDriver {
                         writer
                             .dynamic_text(
                                 props.label.clone(),
-                                props.label_style,
+                                label_style,
                                 button_label_box_style(&props),
                                 crate::ui::LayoutStyle::default(),
                             )
@@ -727,7 +743,9 @@ impl CompositionDriver {
                 }
                 writer.disabled(control.node, !props.enabled);
                 writer.busy(control.node, props.busy);
-                let name = writer.intern(&props.label);
+                let name = writer
+                    .text_content(label_node)
+                    .ok_or(ViewError::MissingButtonLabel)?;
                 writer
                     .semantic_node(control.node, button_semantics(name, &props))
                     .map_err(|_| ViewError::MissingButtonLabel)?;
@@ -1232,6 +1250,18 @@ impl CompositionDriver {
             ) => {
                 ui.set_box_style(*node, candidate.style);
                 ui.set_layout_style(*node, candidate.layout);
+                ui.set_hover_within(*node, candidate.hover_within);
+                if let Some(style) = candidate.inline_style.as_ref() {
+                    ui.set_style_id(*node, style.id);
+                    if !ui.style_bindings().iter().any(|binding| binding.state_root == *node) {
+                        ui.register_style_binding(
+                            StyleBinding::new(*node, ThemeScopeId::new(0, 1), style.id)
+                                .slot(StyleSlotId::named("root"), *node)
+                                .local_style(style.clone()),
+                        );
+                    }
+                }
+                ui.set_local_component_style(*node, candidate.inline_style.clone());
                 *style = candidate.style;
                 *layout = candidate.layout;
                 let previous = std::mem::take(children);
@@ -1247,7 +1277,8 @@ impl CompositionDriver {
             }
             (MountedKind::Text { node, props }, ElementKind::Text(candidate)) => {
                 ui.set_dynamic_text(*node, &candidate.content);
-                ui.set_text_style(*node, candidate.style.resolve());
+                let style = candidate.style.resolve_with(|family| ui.intern(family));
+                ui.set_text_style(*node, style);
                 ui.set_box_style(*node, candidate.box_style);
                 ui.set_layout_style(*node, candidate.layout);
                 *props = candidate;
@@ -1304,14 +1335,20 @@ impl CompositionDriver {
                 );
                 ui.set_box_style(*icon_node, button_icon_style(&candidate));
                 ui.set_dynamic_text(*label_node, &candidate.label);
-                ui.set_text_style(*label_node, candidate.label_style);
+                let mut label_style = candidate.label_style;
+                if let Some(family) = candidate.font_family {
+                    label_style.family = ui.intern(family);
+                }
+                ui.set_text_style(*label_node, label_style);
                 ui.set_box_style(*label_node, button_label_box_style(&candidate));
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_busy(*node, candidate.busy);
                 ui.set_style_id(*node, candidate.style_id);
                 ui.set_style_override(*node, StyleSlotId::named("root"), candidate.style_override);
                 ui.set_local_component_style(*node, candidate.inline_style.clone());
-                let name = ui.intern(&candidate.label);
+                let Some(name) = ui.texts.get(*label_node).map(|text| text.content) else {
+                    return Err((old, ViewError::MissingButtonLabel));
+                };
                 let _ = ui.set_semantics(*node, button_semantics(name, &candidate));
                 match &candidate.on_press {
                     Some(handler) => {

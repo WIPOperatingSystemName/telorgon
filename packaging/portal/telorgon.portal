@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.telorgon
+Interfaces=org.freedesktop.impl.portal.ScreenCast;
+UseIn=telorgon;

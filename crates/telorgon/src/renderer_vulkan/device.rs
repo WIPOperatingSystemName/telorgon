@@ -656,6 +656,26 @@ impl VulkanDevice {
         )
     }
 
+    pub(crate) fn prewarm_compositor_pipelines(&self, formats: &[vk::Format]) -> RenderResult<()> {
+        use crate::render::{BlendMode, PipelineKind};
+        let kinds = [
+            PipelineKind::AnalyticBox,
+            PipelineKind::Glyph,
+            PipelineKind::Image,
+            PipelineKind::Material,
+            PipelineKind::GaussianBlur,
+            PipelineKind::LiquidGlass,
+        ];
+        for &format in formats {
+            for kind in kinds {
+                for blend in [BlendMode::Opaque, BlendMode::Alpha, BlendMode::Add] {
+                    self.pipeline(format, kind, blend)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn pipeline(
         &self,
         format: vk::Format,

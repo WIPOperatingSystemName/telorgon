@@ -9,6 +9,8 @@ use crate::compose::{Alignment, Dimension, Element, ElementKind, Insets, Key, Vi
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ContainerElement {
+    pub inline_style: Option<std::sync::Arc<crate::theme::CompiledComponentStyle>>,
+    pub hover_within: bool,
     pub style: BoxStyle,
     pub layout: LayoutStyle,
     pub children: Vec<Element>,
@@ -22,6 +24,21 @@ pub struct Container {
 }
 
 impl Container {
+    /// Installs a code-defined state style without registering it in the application theme.
+    /// Styling alone does not enable descendant hover tracking.
+    pub fn inline_style(mut self, style: std::sync::Arc<crate::theme::CompiledComponentStyle>) -> Self {
+        self.element.inline_style = Some(style);
+        self
+    }
+
+    /// Tracks hover over this container and its descendants. Defaults to false.
+    /// Child controls retain their own hover, focus, and activation behavior.
+    /// Works independently of whether an inline style is installed.
+    pub fn hover_within(mut self, enabled: bool) -> Self {
+        self.element.hover_within = enabled;
+        self
+    }
+
     pub fn child(mut self, child: impl View) -> Self {
         self.element.children.push(child.into_element());
         self
@@ -192,6 +209,8 @@ fn container(flow: Flow) -> Container {
     Container {
         key: None,
         element: ContainerElement {
+            inline_style: None,
+            hover_within: false,
             style: BoxStyle {
                 width: SizeRule::Fill(1.0),
                 height: SizeRule::Fill(1.0),

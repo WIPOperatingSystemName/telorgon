@@ -28,8 +28,7 @@ use super::{VulkanDevice, VulkanFrameContext, VulkanTarget};
 
 #[cfg(feature = "instrumentation")]
 use super::frame::{
-    PROFILER_TIMESTAMP_RENDER_BEGIN, PROFILER_TIMESTAMP_RENDER_END, PROFILER_TIMESTAMP_TOTAL_END,
-    PROFILER_TIMESTAMP_UPLOAD_END,
+    PROFILER_TIMESTAMP_RENDER_BEGIN, PROFILER_TIMESTAMP_RENDER_END, PROFILER_TIMESTAMP_UPLOAD_END,
 };
 
 pub struct VulkanCompositeScene<'scene> {
@@ -443,11 +442,6 @@ impl VulkanDevice {
                 );
             }
         }
-        #[cfg(feature = "instrumentation")]
-        frame.core.write_profiler_timestamp(
-            PROFILER_TIMESTAMP_TOTAL_END,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-        );
 
         let mut upload_bytes = 0_u64;
         let mut allocations = 0_u32;
@@ -578,11 +572,22 @@ fn write_descriptors(
         }
     }
     let image_ops = (0..scene.texture_count())
-        .flat_map(|slot| (0..2).filter_map(move |binding| {
-            scene.texture(slot, binding).map(|(view, _)| (sets.textures[slot], binding,
-                vk::DescriptorImageInfo { sampler, image_view: view,
-                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }))
-        })).collect::<Vec<_>>();
+        .flat_map(|slot| {
+            (0..2).filter_map(move |binding| {
+                scene.texture(slot, binding).map(|(view, _)| {
+                    (
+                        sets.textures[slot],
+                        binding,
+                        vk::DescriptorImageInfo {
+                            sampler,
+                            image_view: view,
+                            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        },
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     let buffer_infos = buffer_ops
         .iter()
         .map(|(_, _, _, info)| [*info])

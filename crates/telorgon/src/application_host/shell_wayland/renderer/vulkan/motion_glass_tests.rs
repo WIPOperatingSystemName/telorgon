@@ -87,6 +87,7 @@ fn glass_pixels_never_enter_capture_or_interrupted_mix_snapshots() {
 #[test]
 fn a_shared_screen_pixel_keeps_its_backdrop_uv_while_the_lens_moves_and_resizes() {
     let sample = GlassSample {
+        border: None,
         placement: veil(),
         extent: capture(1).extent,
         style: crate::GlassStyle::liquid(),
@@ -183,6 +184,7 @@ fn window() -> WindowState {
             height: 300,
         },
         maximized: false,
+        tiled: None,
         minimized: false,
         veiled: false,
         interactive: false,
@@ -298,6 +300,16 @@ fn early_ready_maximize_and_minimize_keep_live_glass_without_protocol_veil_metad
 #[test]
 #[ignore = "requires TELORGON_TEST_MODE=developer-hardware and a Vulkan adapter"]
 fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
+    live_motion_glass_fixture(false);
+}
+
+#[test]
+#[ignore = "requires TELORGON_TEST_MODE=developer-hardware and a Vulkan adapter"]
+fn bordered_motion_glass_composes_border_before_weighted_fade() {
+    live_motion_glass_fixture(true);
+}
+
+fn live_motion_glass_fixture(bordered: bool) {
     use crate::render::{ReadbackFormat, ReadbackRequest};
     use crate::renderer_vulkan::OffscreenVulkanTarget;
     assert_eq!(
@@ -378,6 +390,12 @@ fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
             .unwrap();
         if step == 0 {
             frame.glass.insert(ShellSceneKey::ResizeVeil(1), style);
+            if bordered {
+                frame.preview_borders.insert(
+                    ShellSceneKey::ResizeVeil(1),
+                    crate::Border::all(3.0, ColorRgba8::rgba(0, 0, 0, 255)),
+                );
+            }
             frame.motion.snapshots.push(SnapshotCommand {
                 id: 1,
                 extent: SizeI {
@@ -438,6 +456,7 @@ fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
                 &mut spares,
                 &frame.motion,
                 &frame.glass,
+                &frame.preview_borders,
                 &mut state,
                 &mut recording.context_mut()
             )
@@ -504,6 +523,24 @@ fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
             .wait(Duration::from_secs(10))
             .unwrap()
             .pixels;
+        if bordered {
+            let x = (target.x + 1) as usize;
+            let border_pixel = &pixels[(16 * 64 + x) * 4..(16 * 64 + x) * 4 + 4];
+            if step == 1 {
+                assert!(
+                    border_pixel[0] > 170
+                        && border_pixel[0] < 205
+                        && border_pixel[1] < 5
+                        && border_pixel[2] < 5,
+                    "half-faded black border must blend with the red desktop: {border_pixel:?}"
+                );
+            } else {
+                assert!(
+                    border_pixel[..3].iter().all(|v| *v < 5),
+                    "opaque border must cover glass: {border_pixel:?}"
+                );
+            }
+        }
         let left = &pixels[(20 * 64 + 25) * 4..(20 * 64 + 25) * 4 + 4];
         let right = &pixels[(20 * 64 + 35) * 4..(20 * 64 + 35) * 4 + 4];
         assert!(
@@ -539,6 +576,7 @@ fn live_motion_glass_keeps_stripes_aligned_and_refreshes_without_recapture() {
 #[test]
 fn live_glass_uses_current_frame_bounds_instead_of_old_snapshot_shadow_padding() {
     let sample = GlassSample {
+        border: None,
         placement: ShellPlacement {
             target: RectI {
                 x: 60,
@@ -604,4 +642,347 @@ fn live_glass_uses_current_frame_bounds_instead_of_old_snapshot_shadow_padding()
         })
     );
     assert_eq!(draw.rounded_clips, [None; 2]);
+}
+
+#[test]
+fn tiling_widget_glass_uses_an_independent_live_recipe() {
+    let mut material = veil();
+    material.key = ShellLayerKey::TilePreview(1);
+    material.scene = ShellSceneKey::TilePreview(1);
+    let mut command = capture(9);
+    command.content = SnapshotContent::Capture(vec![material]);
+    let styles = BTreeMap::from([(material.scene, crate::GlassStyle::liquid())]);
+    let mut recipes = BTreeMap::new();
+    assert!(extract_recipe(&command, &styles, &mut recipes).is_empty());
+    assert_eq!(
+        recipes[&9][0].placement.scene,
+        ShellSceneKey::TilePreview(1)
+    );
+    assert_ne!(recipes[&9][0].placement.scene, veil().scene);
+}
+
+#[test]
+fn glass_preview_border_travels_with_optical_recipe_through_interrupted_fades() {
+    let border = crate::Border::all(2.0, ColorRgba8::rgba(120, 180, 255, 128));
+    let borders = BTreeMap::from([(veil().scene, border)]);
+    let mut command = capture(1);
+    command.content = SnapshotContent::Capture(vec![
+        veil(),
+        ShellPlacement {
+            key: ShellLayerKey::ResizePreviewBorder(1),
+            scene: ShellSceneKey::ResizePreviewBorder(1),
+            ..veil()
+        },
+    ]);
+    let mut recipes = BTreeMap::new();
+    assert!(extract_recipe_with_borders(&command, &styles(), &borders, &mut recipes).is_empty());
+    assert_eq!(recipes[&1][0].border, Some(border));
+    let mixed = SnapshotCommand {
+        id: 2,
+        extent: command.extent,
+        content: SnapshotContent::Mix(vec![(1, 0.4), (99, 0.6)]),
+    };
+    extract_recipe_with_borders(&mixed, &BTreeMap::new(), &BTreeMap::new(), &mut recipes);
+    assert_eq!(recipes[&2][0].border, Some(border));
+    assert!((recipes[&2][0].weight - 0.4).abs() < 1e-6);
+    // Color/fallback captures must retain the ordinary border scene.
+    assert_eq!(
+        extract_recipe_with_borders(&command, &BTreeMap::new(), &borders, &mut recipes).len(),
+        2
+    );
+}
+
+#[test]
+fn motion_resolve_budget_admits_bordered_4k_and_remains_bounded() {
+    let output = SizeI {
+        width: 3840,
+        height: 2400,
+    };
+    let bordered = resolve_bytes(output, 1);
+    assert!(
+        bordered > 64 * 1024 * 1024,
+        "reproduce the old failure at native output density"
+    );
+    assert!(resolve_fits(output, output, 1, 0));
+    assert!(
+        resolve_fits(output, output, 2, 0),
+        "interrupted border fade"
+    );
+    assert!(
+        resolve_fits(output, output, 1, bordered),
+        "two simultaneous bordered windows"
+    );
+    assert!(!resolve_fits(output, output, 2, bordered));
+    assert_eq!(
+        resolve_budget(SizeI {
+            width: 1280,
+            height: 720
+        }),
+        MIN_RESOLVE_BYTES
+    );
+    assert_eq!(
+        resolve_budget(SizeI {
+            width: 7680,
+            height: 4800
+        }),
+        MAX_RESOLVE_BYTES
+    );
+    assert!(!resolve_fits(output, output, usize::MAX, u64::MAX));
+    assert!(
+        resolve_fits(output, output, 1, 0),
+        "rejected admission must not poison later attempts"
+    );
+}
+
+#[test]
+fn fallback_discards_old_captures_and_later_maximize_restore_still_animate() {
+    let mut composition = ShellComposition::new(SizeI {
+        width: 1000,
+        height: 800,
+    });
+    let mut controller = WindowMotionController::default();
+    let restored = WindowState {
+        shadows: crate::ui::ShadowList::one(crate::ui::Shadow {
+            offset: crate::PointF { x: 0.0, y: 2.0 },
+            blur: 4.0,
+            spread: 0.0,
+            color: ColorRgba8::rgba(0, 0, 0, 128),
+        }),
+        ..window()
+    };
+    let maximized = WindowState {
+        maximized: true,
+        veiled: true,
+        bounds: RectI {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 800,
+        },
+        ..restored
+    };
+    advance(&mut composition, &mut controller, restored, 0);
+    let failed = advance(&mut composition, &mut controller, maximized, 10);
+    assert!(controller.active(10_000_000));
+    let last_id = failed.motion.snapshots.iter().map(|s| s.id).max().unwrap();
+    let shadow_epoch = failed
+        .updates
+        .iter()
+        .find(|update| update.key == ShellSceneKey::MotionShadow(1))
+        .unwrap()
+        .deltas
+        .last()
+        .unwrap()
+        .epoch;
+    controller.reset_after_fallback();
+    assert!(!controller.active(10_000_000));
+    assert!(controller.input(1, 1.0).is_none());
+    let restore = advance(
+        &mut composition,
+        &mut controller,
+        WindowState {
+            veiled: true,
+            ..restored
+        },
+        1100,
+    );
+    let recovered_shadow_epoch = restore
+        .updates
+        .iter()
+        .find(|update| update.key == ShellSceneKey::MotionShadow(1))
+        .unwrap()
+        .deltas
+        .last()
+        .unwrap()
+        .epoch;
+    assert!(
+        recovered_shadow_epoch > shadow_epoch,
+        "recovery must not rewind retained shadow epochs"
+    );
+    assert!(!restore.motion.snapshots.is_empty());
+    assert!(restore.motion.snapshots.iter().all(|s| s.id > last_id));
+    assert!(
+        restore
+            .motion
+            .snapshots
+            .iter()
+            .all(|s| matches!(s.content, SnapshotContent::Capture(_))),
+        "a restore immediately after fallback must never mix discarded captures"
+    );
+    assert!(controller.active(1_100_000_000));
+    let placement = restore
+        .placements
+        .iter()
+        .find(|p| p.key == ShellLayerKey::Motion(1))
+        .unwrap();
+    assert_eq!(placement.target.width, maximized.bounds.width);
+    advance(&mut composition, &mut controller, restored, 2000);
+    advance(&mut composition, &mut controller, restored, 2100);
+    let maximize_again = advance(&mut composition, &mut controller, maximized, 2200);
+    assert!(controller.active(2_200_000_000));
+    let placement = maximize_again
+        .placements
+        .iter()
+        .find(|p| p.key == ShellLayerKey::Motion(1))
+        .unwrap();
+    assert_eq!(placement.target.width, restored.bounds.width);
+}
+
+#[test]
+fn shared_resize_backdrop_is_stable_under_divider_motion_and_keeps_blur_styles_separate() {
+    let size = SizeI {
+        width: 800,
+        height: 600,
+    };
+    let mut frame = ShellComposition::new(size)
+        .synchronize_with_force(
+            size,
+            vec![ShellLayer::solid(
+                ShellLayerKey::Background,
+                ShellSceneKey::Background,
+                ColorRgba8::rgba(1, 2, 3, 255),
+                full_rect(size),
+            )],
+            true,
+        )
+        .unwrap();
+    let mut recipes = BTreeMap::new();
+    for id in 1..=4_u32 {
+        let mut p = veil();
+        p.key = ShellLayerKey::Motion(id);
+        p.scene = ShellSceneKey::Motion(u64::from(id));
+        frame.placements.push(p);
+        frame.motion.resize_group.insert(id);
+        frame.motion.outputs.push(SnapshotOutput {
+            id: u64::from(id),
+            source: u64::from(id),
+            extent: size,
+            opacity: 1.0,
+        });
+        let mut capture = capture(u64::from(id));
+        let SnapshotContent::Capture(ref mut placements) = capture.content else {
+            unreachable!()
+        };
+        placements[0].key = ShellLayerKey::ResizeVeil(id);
+        placements[0].scene = ShellSceneKey::ResizeVeil(id);
+        let mut style = crate::GlassStyle::liquid();
+        style.tint = ColorRgba8::rgba(id as u8, 0, 0, 128);
+        let scene = placements[0].scene;
+        extract_recipe(&capture, &BTreeMap::from([(scene, style)]), &mut recipes);
+    }
+    let plan = shared_backdrop(&frame, &recipes);
+    assert_eq!(plan.lower.len(), 1);
+    assert_eq!(plan.keys.len(), 4);
+    assert!(
+        plan.keys
+            .values()
+            .all(|key| *key == ShellSceneKey::ResizeVeil(1))
+    );
+    frame.placements[1].target.width += 13;
+    frame.placements[2].target.x += 13;
+    assert_eq!(shared_backdrop(&frame, &recipes).lower, plan.lower);
+    recipes.get_mut(&4).unwrap()[0].style.blur_radius += 1.0;
+    let distinct = shared_backdrop(&frame, &recipes);
+    assert_ne!(
+        distinct.keys[&ShellSceneKey::ResizeVeil(4)],
+        distinct.keys[&ShellSceneKey::ResizeVeil(1)]
+    );
+    let mut conflicting = recipes[&1][0].clone();
+    conflicting.style.blur_radius += 2.0;
+    recipes.get_mut(&1).unwrap().push(conflicting);
+    assert!(
+        shared_backdrop(&frame, &recipes).keys.is_empty(),
+        "interrupted radius changes must not alias incompatible caches"
+    );
+    frame.motion.resize_group.clear();
+    assert!(shared_backdrop(&frame, &recipes).keys.is_empty());
+}
+
+#[test]
+fn capacity_reuse_crops_pixels_without_stretching_and_releases_large_shrinks() {
+    let extent = SizeI {
+        width: 701,
+        height: 403,
+    };
+    let capacity = target_capacity(extent);
+    assert_eq!(
+        capacity,
+        SizeI {
+            width: 704,
+            height: 448
+        }
+    );
+    assert!(capacity_fits(
+        capacity,
+        SizeI {
+            width: 650,
+            height: 400
+        }
+    ));
+    assert!(!capacity_fits(
+        capacity,
+        SizeI {
+            width: 705,
+            height: 400
+        }
+    ));
+    assert!(!capacity_fits(
+        capacity,
+        SizeI {
+            width: 300,
+            height: 200
+        }
+    ));
+    let scene = capacity_image_scene(extent, capacity, 0.5, true);
+    let image = scene.images.get(NodeId::new(1, 1)).unwrap();
+    assert_eq!(scene.extent.width, extent.width as f32);
+    assert_eq!(image.rect.width, capacity.width as f32);
+    // The logical right edge samples the same physical texel, not the padded edge.
+    let uv = extent.width as f32 / image.rect.width;
+    assert!((uv * capacity.width as f32 - extent.width as f32).abs() < 0.001);
+}
+
+#[test]
+fn transparent_body_reduction_preserves_interrupted_mix_algebra() {
+    let empty = std::collections::BTreeSet::from([1, 2]);
+    assert!(body_is_empty(
+        &SnapshotContent::Capture(vec![veil()]),
+        &[],
+        &empty
+    ));
+    assert!(!body_is_empty(
+        &SnapshotContent::Capture(vec![veil()]),
+        &[veil()],
+        &empty
+    ));
+    assert!(body_is_empty(
+        &SnapshotContent::Mix(vec![(1, 0.3), (2, 0.7), (9, 0.0)]),
+        &[],
+        &empty
+    ));
+    assert!(!body_is_empty(
+        &SnapshotContent::Mix(vec![(1, 0.99), (9, 0.01)]),
+        &[],
+        &empty
+    ));
+    assert!(!body_is_empty(
+        &SnapshotContent::Mix(vec![(9, f32::NAN)]),
+        &[],
+        &empty
+    ));
+}
+
+#[test]
+fn direct_resolve_requires_zero_body_and_one_fully_weighted_lens() {
+    let mut recipes = BTreeMap::new();
+    extract_recipe(&capture(1), &styles(), &mut recipes);
+    let samples = recipes.get_mut(&1).unwrap();
+    assert!(can_resolve_directly(true, samples));
+    assert!(!can_resolve_directly(false, samples));
+    samples[0].weight = 0.5;
+    assert!(!can_resolve_directly(true, samples));
+    samples[0].weight = 1.0;
+    samples.push(samples[0].clone());
+    assert!(!can_resolve_directly(true, samples));
+    assert!(!can_resolve_directly(true, &[]));
 }

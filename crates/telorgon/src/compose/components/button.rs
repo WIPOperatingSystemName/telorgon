@@ -13,6 +13,7 @@ use crate::compose::{Component, ComponentCallback, Element, ElementKind, Insets,
 #[derive(Clone, Debug)]
 pub struct ButtonElement {
     pub label: String,
+    pub font_family: Option<&'static str>,
     pub enabled: bool,
     pub busy: bool,
     pub style: BoxStyle,
@@ -33,6 +34,10 @@ pub struct Button {
 }
 
 impl Button {
+    pub fn font_family(mut self, family: &'static str) -> Self {
+        self.element.font_family = Some(family);
+        self
+    }
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self
@@ -185,6 +190,7 @@ pub fn button(label: impl Into<String>) -> Button {
         key: None,
         element: ButtonElement {
             label: label.into(),
+            font_family: None,
             enabled: true,
             busy: false,
             style,

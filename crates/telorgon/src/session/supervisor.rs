@@ -240,7 +240,8 @@ impl SessionHandle {
         if state.phase != SessionPhase::Ready {
             return Err(Error::Closing);
         }
-        if state.children.len() + state.pending.len() + state.deferred.len() >= 256 {
+        // Recovery offers are metadata, not running or queued processes.
+        if state.children.len() + state.deferred.len() >= 256 {
             return Err(Error::ProcessLimit);
         }
         if command.spec.program.is_empty()

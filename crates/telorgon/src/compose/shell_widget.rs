@@ -21,6 +21,12 @@ pub trait ShellWidget: Component {
     fn window_previews(&self) -> Vec<ShellWindowPreview> {
         Vec::new()
     }
+    /// Aspect-fitted desktop previews. The host excludes overlay widgets and preview copies,
+    /// admits only available outputs, and hides all previews while locked. No capture permission
+    /// or client input is granted. At most eight slots are admitted per widget.
+    fn output_previews(&self) -> Vec<ShellOutputPreview> {
+        Vec::new()
+    }
     fn connected(&mut self, _services: super::ShellServices) {}
     fn input(&mut self, _event: crate::input::InputEvent) -> bool {
         false
@@ -38,6 +44,18 @@ pub struct ShellWindowPreview {
 impl ShellWindowPreview {
     pub const fn new(window: crate::shell::WindowId, rect: RectF) -> Self {
         Self { window, rect }
+    }
+}
+
+/// A visual-only reference to a hosted output, in widget-local logical coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShellOutputPreview {
+    pub output: crate::shell::OutputId,
+    pub rect: RectF,
+}
+impl ShellOutputPreview {
+    pub const fn new(output: crate::shell::OutputId, rect: RectF) -> Self {
+        Self { output, rect }
     }
 }
 
@@ -352,6 +370,8 @@ impl WidgetPlacement {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShellSurfaceSpec {
+    /// Host-managed snap policy; set by the WindowTiling widget.
+    pub tiling: Option<super::WindowTiling>,
     /// None selects the host primary output. An unavailable explicit output hides the surface.
     pub output: Option<crate::shell::OutputId>,
     pub placement: WidgetPlacement,
@@ -368,6 +388,8 @@ pub struct ShellSurfaceSpec {
     pub movement: crate::GeometryMotion,
     pub enter_from: Option<ShellEdge>,
     pub exit_to: Option<ShellEdge>,
+    /// Group fade and centered shrink, shared with window minimize/restore motion.
+    pub visibility_motion: Option<crate::Minimize>,
 }
 impl Default for ShellSurfaceSpec {
     fn default() -> Self {
@@ -377,6 +399,7 @@ impl Default for ShellSurfaceSpec {
 impl ShellSurfaceSpec {
     pub const fn new() -> Self {
         Self {
+            tiling: None,
             output: None,
             placement: WidgetPlacement::center(),
             layer: ShellSurfaceLayer::Panel,
@@ -391,6 +414,7 @@ impl ShellSurfaceSpec {
             movement: crate::GeometryMotion::Tween(crate::tween_ms(0, crate::Easing::Linear)),
             enter_from: None,
             exit_to: None,
+            visibility_motion: None,
         }
     }
     pub const fn output(mut self, output: crate::shell::OutputId) -> Self {
@@ -435,6 +459,10 @@ impl ShellSurfaceSpec {
     }
     pub const fn exit_to(mut self, value: ShellEdge) -> Self {
         self.exit_to = Some(value);
+        self
+    }
+    pub const fn visibility_motion(mut self, value: crate::Minimize) -> Self {
+        self.visibility_motion = Some(value);
         self
     }
     pub const fn dismiss_on_escape(mut self, value: bool) -> Self {
@@ -527,6 +555,7 @@ pub(crate) struct SurfaceBinding(
     pub Rc<RefCell<Option<ShellSurfaceSpec>>>,
     pub Rc<RefCell<Option<Vec<ShellChild>>>>,
     pub Rc<RefCell<Vec<ShellWindowPreview>>>,
+    pub Rc<RefCell<Vec<ShellOutputPreview>>>,
 );
 /// A keyed child surface owned by the declaring widget. It is not a second application root.
 pub struct ShellChild {
@@ -575,13 +604,14 @@ impl<W: ShellWidget> ErasedComponent for WidgetRoot<W> {
         self.widget.update_from(incoming)
     }
     fn render(&self, owner: ComponentInstanceId, target: RuntimeTarget) -> RenderedView {
-        let ((element, surface, children, previews), signals) =
+        let ((element, surface, children, previews, outputs), signals) =
             super::context::evaluate::<W, _>(owner, target, || {
                 (
                     self.widget.view().into_element(),
                     self.widget.surface(),
                     self.widget.children(),
                     self.widget.window_previews(),
+                    self.widget.output_previews(),
                 )
             });
         *self.binding.0.borrow_mut() = Some(surface);
@@ -598,6 +628,11 @@ impl<W: ShellWidget> ErasedComponent for WidgetRoot<W> {
                     && r.height > 0.0
             })
             .collect();
+        *self.binding.3.borrow_mut() = outputs.into_iter().take(8).filter(|preview| {
+            let r = preview.rect;
+            [r.x, r.y, r.width, r.height].into_iter().all(f32::is_finite)
+                && r.width > 0.0 && r.height > 0.0
+        }).collect();
         RenderedView { element, signals }
     }
     fn mounted_erased(&mut self, owner: ComponentInstanceId) -> bool {

@@ -4,6 +4,9 @@
 compile_error!("feature `shell-wayland-linux` is supported only for Linux targets");
 
 mod declaration;
+mod capture_config;
+pub use capture_config::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
+    WaylandCapture, CaptureProtocols, DirectCaptureAccess, InternalCapture};
 mod output_scale;
 pub use output_scale::OutputScale;
 mod delta_queue;
@@ -44,6 +47,9 @@ mod shell_wayland_state_tests;
 #[path = "shell_wayland/transparency_tests.rs"]
 mod shell_wayland_transparency_tests;
 mod task_host;
+#[cfg(all(test, not(feature = "shell-wayland-linux")))]
+#[path = "shell_wayland/capture.rs"]
+mod capture_tests;
 mod window;
 
 pub use crate::input::{
@@ -99,3 +105,5 @@ pub use crate::compose::{
     ShellContext, ShellRequestCompletion, ShellRequestOutcome, ShellServiceError, ShellServices,
     ShellWindow, ShellWindowAction, ShellWindows,
 };
+
+pub use crate::compose::{TilePreviewDesign, TilePreviewMotion, TileTarget, WindowTiling};

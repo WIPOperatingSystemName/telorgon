@@ -155,6 +155,25 @@ pub const LINUX_DMABUF_INTERFACES: &[InterfaceSpec] = &[
     InterfaceSpec::new("zwp_linux_dmabuf_feedback_v1", 5, 5),
 ];
 
+// Capture descriptors are available to adapters; this does not register capture globals.
+pub const EXT_FOREIGN_TOPLEVEL_LIST_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("ext_foreign_toplevel_list_v1", 1, 1),
+    InterfaceSpec::new("ext_foreign_toplevel_handle_v1", 1, 1),
+];
+
+pub const EXT_IMAGE_CAPTURE_SOURCE_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("ext_image_capture_source_v1", 1, 1),
+    InterfaceSpec::new("ext_output_image_capture_source_manager_v1", 1, 1),
+    InterfaceSpec::new("ext_foreign_toplevel_image_capture_source_manager_v1", 1, 1),
+];
+
+pub const EXT_IMAGE_COPY_CAPTURE_INTERFACES: &[InterfaceSpec] = &[
+    InterfaceSpec::new("ext_image_copy_capture_manager_v1", 1, 1),
+    InterfaceSpec::new("ext_image_copy_capture_session_v1", 1, 1),
+    InterfaceSpec::new("ext_image_copy_capture_frame_v1", 1, 1),
+    InterfaceSpec::new("ext_image_copy_capture_cursor_session_v1", 1, 1),
+];
+
 pub const DESKTOP_PROTOCOLS: &[ProtocolSpec] = &[
     ProtocolSpec {
         name: "xwayland-shell-v1",
@@ -272,6 +291,24 @@ pub const DESKTOP_PROTOCOLS: &[ProtocolSpec] = &[
         stage: ProtocolStage::Unstable,
         source: "unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml",
         interfaces: EXPLICIT_SYNC_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "ext-foreign-toplevel-list-v1",
+        stage: ProtocolStage::Staging,
+        source: "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml",
+        interfaces: EXT_FOREIGN_TOPLEVEL_LIST_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "ext-image-capture-source-v1",
+        stage: ProtocolStage::Staging,
+        source: "staging/ext-image-capture-source/ext-image-capture-source-v1.xml",
+        interfaces: EXT_IMAGE_CAPTURE_SOURCE_INTERFACES,
+    },
+    ProtocolSpec {
+        name: "ext-image-copy-capture-v1",
+        stage: ProtocolStage::Staging,
+        source: "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml",
+        interfaces: EXT_IMAGE_COPY_CAPTURE_INTERFACES,
     },
 ];
 

@@ -157,6 +157,44 @@ pub struct OffscreenVulkanTarget {
     info: RenderTargetInfo,
 }
 
+/// Retained SDR capture destination, independently owned from KMS scanout.
+pub(crate) struct VulkanCaptureTarget {
+    image: std::sync::Arc<AllocatedImage>,
+    info: RenderTargetInfo,
+}
+
+impl VulkanCaptureTarget {
+    pub(crate) fn new(device: &VulkanDevice, extent: SizeI) -> RenderResult<Self> {
+        // Reuse the existing sRGB attachment/transfer format qualification and allocator.
+        let source = VulkanMaterializationTarget::new_traced(device, extent, &mut |_| {})?;
+        Ok(Self {
+            image: source.image,
+            info: source.info,
+        })
+    }
+
+    pub(crate) fn image(&self) -> std::sync::Arc<AllocatedImage> {
+        std::sync::Arc::clone(&self.image)
+    }
+
+    pub(crate) fn target(&self) -> VulkanTarget<'_> {
+        VulkanTarget {
+            device_id: self.image.device_id(),
+            image: self.image.raw(),
+            view: self.image.view(),
+            format: self.image.format,
+            extent: self.image.extent,
+            info: self.info,
+            // Every capture is complete, so the previous target contents are discarded.
+            initial_state: VulkanImageState::UNDEFINED,
+            final_state: VulkanImageState::COLOR_ATTACHMENT,
+            initial_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            final_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            _borrow: PhantomData,
+        }
+    }
+}
+
 impl OffscreenVulkanTarget {
     pub fn new(device: &VulkanDevice, extent: SizeI) -> RenderResult<Self> {
         if extent.width <= 0 || extent.height <= 0 {

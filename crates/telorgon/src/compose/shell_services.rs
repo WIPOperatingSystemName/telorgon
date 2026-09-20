@@ -26,6 +26,8 @@ pub struct ShellWindow {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellWindowAction {
+    Snap(super::TileTarget),
+    Float,
     Activate,
     SetMinimized(bool),
     SetMaximized(bool),
@@ -334,6 +336,12 @@ impl ShellWindows {
             }
         }
         super::context::bind_image(super::applications::fallback_image())
+    }
+    pub fn snap(&self, id: WindowId, target: super::TileTarget) -> Result<u64, ShellServiceError> {
+        self.0.request(id, ShellWindowAction::Snap(target))
+    }
+    pub fn float(&self, id: WindowId) -> Result<u64, ShellServiceError> {
+        self.0.request(id, ShellWindowAction::Float)
     }
     pub fn activate(&self, id: WindowId) -> Result<u64, ShellServiceError> {
         self.0.request(id, ShellWindowAction::Activate)

@@ -1,5 +1,20 @@
 # Telorgon Documentation
 
+See [Compositor decoration policy](DECORATION_POLICY.md) for decoration ownership and independent
+server title bars, borders, rounded clipping, shadows, and resize regions.
+
+See [Visual screen-sharing picker](SCREENCAST_PICKER.md) for preview and consent UI, and its limits.
+
+See [Capture configuration](CAPTURE_API.md) for the public `.capture(Capture::desktop())` API.
+
+See the [screen sharing plan](SCREENCAST_IMPLEMENTATION_PLAN.md),
+[implementation evidence](SCREENCAST_IMPLEMENTATION_STATUS.md), and
+[portal integration inputs](../packaging/portal/README.md), and
+[custom chooser API](SCREENCAST_CUSTOM_CHOOSER.md) for the optional screencast work.
+
+See [Window tiling](WINDOW_TILING.md) for the `WindowTiling` shell widget, snap previews, glass styling,
+and shared-divider resizing.
+
 See [Shell application catalog](APPLICATION_CATALOG.md) for inherited shell context, installed-app
 metadata/search, asynchronous icons, and the test taskbar.
 
@@ -156,3 +171,6 @@ active documentation set. Their completed work is represented by the current-sta
 historical details remain available through version-control history. The former compositor runtime
 and scene-model documents were retired with `telorgon-compositor`; protocol-neutral surface contracts
 now belong to `telorgon-shell`, and external-image execution belongs to the renderer/host boundary.
+
+See [Glass pipeline optimization](GLASS_PIPELINE_OPTIMIZATION.md) for coordinated tile caching,
+cropped captures, reduced blur, capacity reuse and GPU stage measurements.

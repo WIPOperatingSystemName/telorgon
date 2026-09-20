@@ -1,6 +1,9 @@
 //! Protocol-neutral window metadata, chrome roles, actions, and layout-derived hit regions.
 
 mod motion;
+mod decoration;
+pub use decoration::*;
+
 pub use motion::{
     ContentFade, GeometryMotion, Minimize, Spring, WindowMotion, WindowTween, tween_ms,
 };
@@ -11,83 +14,37 @@ use crate::layout::LayoutEngine;
 use crate::render::ImageId;
 use crate::ui::{MountedUi, UiNodeId};
 
-/// Appearance of the whole-window placeholder while waiting for resized client content.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ResizePreview {
-    /// Straight RGBA; alpha reveals the sharp desktop underneath.
-    Color(ColorRgba8),
-    /// Cached, filtered desktop backdrop with an opaque tinted result.
-    Glass(GlassStyle),
+/// Whole-window resize placeholder. Its shape follows the window's outer frame contour.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResizePreviewDesign {
+    pub fill: crate::Fill,
+    /// Border painted inward over the fill, in logical units. Zero widths omit the border.
+    pub border: crate::ui::Border,
 }
 
-impl ResizePreview {
-    /// Flat color, or the glass tint (also the software fallback).
-    pub const fn color(self) -> ColorRgba8 {
-        match self {
-            Self::Color(color) => color,
-            Self::Glass(style) => style.tint,
-        }
-    }
-}
-
-/// Rounded liquid-glass lens over a cached desktop backdrop. Software uses the flat tint.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GlassStyle {
-    /// RGB tint and tint strength in alpha; zero alpha still produces opaque glass.
-    pub tint: ColorRgba8,
-    /// Gaussian blur diameter in logical pixels (sigma = half this value).
-    /// Filtering preserves the full backdrop resolution; the refracted rim uses a sharp source.
-    /// Zero keeps the sharp backdrop. Clamped to 0..=64; non-finite values use 4.
-    pub blur_radius: f32,
-    /// Inward glass band width from the rounded window outline in logical pixels
-    /// (1..=128), limited to the smaller window half-size. Corner bending blends smoothly.
-    pub bevel_width: f32,
-    /// Additional gentle inner fade in logical pixels (0..=128). Zero keeps the edge-only profile.
-    pub blend_softness: f32,
-    /// Refraction strength in logical pixels (0..=64); zero removes lens displacement.
-    pub refraction: f32,
-    /// RGB separation near the rim in logical pixels (0..=4). Zero uses one texture sample.
-    pub dispersion: f32,
-    /// Grazing-angle reflection strength (0..=1).
-    pub fresnel: f32,
-}
-
-impl GlassStyle {
-    /// A mildly blurred, mostly clear lens with a restrained reflective rim.
-    pub const fn liquid() -> Self {
+impl ResizePreviewDesign {
+    pub const fn new(fill: crate::Fill) -> Self {
         Self {
-            tint: ColorRgba8::rgba(23, 27, 37, 32),
-            blur_radius: 4.0,
-            bevel_width: 24.0,
-            blend_softness: 0.0,
-            refraction: 18.0,
-            dispersion: 0.65,
-            fresnel: 0.45,
+            fill,
+            border: crate::ui::Border::all(0.0, ColorRgba8::rgba(0, 0, 0, 0)),
         }
     }
 
-    pub(crate) fn normalized(mut self) -> Self {
-        fn finite(value: f32, default: f32, min: f32, max: f32) -> f32 {
-            if value.is_finite() {
-                value.clamp(min, max)
-            } else {
-                default
-            }
-        }
-        self.blur_radius = finite(self.blur_radius, 4.0, 0.0, 64.0);
-        self.bevel_width = finite(self.bevel_width, 24.0, 1.0, 128.0);
-        self.blend_softness = finite(self.blend_softness, 0.0, 0.0, 128.0);
-        self.refraction = finite(self.refraction, 18.0, 0.0, 64.0);
-        self.dispersion = finite(self.dispersion, 0.65, 0.0, 4.0);
-
-        self.fresnel = finite(self.fresnel, 0.45, 0.0, 1.0);
-        self
+    pub(crate) fn border_is_valid(self) -> bool {
+        [
+            self.border.top,
+            self.border.right,
+            self.border.bottom,
+            self.border.left,
+        ]
+        .iter()
+        .all(|side| side.width.is_finite() && side.width >= 0.0)
     }
 }
 
-impl Default for GlassStyle {
-    fn default() -> Self {
-        Self::liquid()
+impl From<crate::Fill> for ResizePreviewDesign {
+    fn from(fill: crate::Fill) -> Self {
+        Self::new(fill)
     }
 }
 
@@ -107,7 +64,7 @@ pub struct WindowContentStyle {
     /// Finite, nonnegative content-aperture radius in logical pixels, anchored at the window top.
     pub corner_radius: f32,
     /// Whole-window resize-placeholder appearance, including the title bar. `None` inherits the host.
-    pub resize_preview: Option<crate::ResizePreview>,
+    pub resize_preview: Option<crate::ResizePreviewDesign>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -201,7 +158,11 @@ impl WindowChromeCapabilities {
 /// Immutable input supplied to one compositor-owned frame composition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowChromeModel {
+    /// Independent outer visuals and resize regions selected by compositor policy.
+    pub frame_parts: WindowFrameParts,
     pub window_id: u64,
+    /// Managed shell identity used to resolve application artwork through the catalog.
+    pub desktop_window_id: Option<crate::shell::WindowId>,
     pub title: String,
     /// Whether the compositor owns the title bar and its controls. Outer styling remains available.
     pub title_bar_visible: bool,
@@ -217,7 +178,9 @@ pub struct WindowChromeModel {
 impl WindowChromeModel {
     pub fn new(window_id: u64, title: impl Into<String>) -> Self {
         Self {
+            frame_parts: WindowFrameParts::default(),
             window_id,
+            desktop_window_id: None,
             title: title.into(),
             title_bar_visible: true,
             app_icon: None,

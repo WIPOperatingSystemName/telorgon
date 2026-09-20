@@ -4,6 +4,10 @@
 //! host mutation, rendering resources, event loops, tasks, and threads remain outside it.
 
 pub mod chrome;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub mod capture;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub use capture::{CapturePicker, CaptureUi, CaptureUiSnapshot};
 pub mod diagnostics;
 pub mod launcher;
 pub mod notification;

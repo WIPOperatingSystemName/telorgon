@@ -146,6 +146,18 @@ impl AllocatedBuffer {
         if len as u64 > self.size {
             return Err(internal("mapped Vulkan buffer read exceeds allocation"));
         }
+        let mut bytes = vec![0; len];
+        self.read_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Copies completed device writes into caller-owned storage without allocating pixel data.
+    /// The caller must prove GPU completion before calling this method.
+    pub(crate) fn read_into(&self, bytes: &mut [u8]) -> RenderResult<()> {
+        let len = bytes.len();
+        if len as u64 > self.size {
+            return Err(internal("mapped Vulkan buffer read exceeds allocation"));
+        }
         let allocation = self
             .allocation
             .as_ref()
@@ -167,11 +179,10 @@ impl AllocatedBuffer {
         let pointer = allocation
             .mapped_ptr()
             .ok_or_else(|| internal("Vulkan readback buffer is not host mapped"))?;
-        let mut bytes = vec![0; len];
         unsafe {
             std::ptr::copy_nonoverlapping(pointer.as_ptr().cast(), bytes.as_mut_ptr(), len);
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 

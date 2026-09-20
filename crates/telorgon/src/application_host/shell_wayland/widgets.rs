@@ -1,4 +1,7 @@
 //! Shell surface lifetime and sampled geometry over the existing retained runtimes.
+mod output_previews;
+#[cfg(all(test, feature = "shell-screencast-linux"))]
+mod capture_tests;
 use super::motion::geometry::{GeometryTrack, Sample};
 use super::scene::ShellLayerContent;
 use super::*;
@@ -9,6 +12,8 @@ use crate::compose::{
 
 pub(super) struct WidgetLayer {
     pub id: u32,
+    pub tile_preview: Option<(WaylandSurfaceId, RectI)>,
+    pub tile_preview_owner: Option<WaylandSurfaceId>,
     pub parent: Option<u32>,
     parent_bounds: Option<RectI>,
     had_anchor: bool,
@@ -26,9 +31,15 @@ pub(super) struct WidgetLayer {
     presented: bool,
     geometry_dirty: bool,
     previous_previews: Vec<crate::compose::ShellWindowPreview>,
+    previous_output_previews: Vec<crate::compose::ShellOutputPreview>,
     pub parent_visible: bool,
     pub focused: bool,
     pub captured: bool,
+    pointer_hovered: bool,
+    retiring: bool,
+    visibility: super::motion::Track,
+    pub opacity: f32,
+    visibility_pending: bool,
 }
 impl WidgetLayer {
     pub fn new(
@@ -53,6 +64,8 @@ impl WidgetLayer {
         };
         let mut result = Self {
             id,
+            tile_preview: None,
+            tile_preview_owner: None,
             parent: None,
             parent_bounds: None,
             had_anchor: false,
@@ -70,9 +83,15 @@ impl WidgetLayer {
             presented: false,
             geometry_dirty: true,
             previous_previews: Vec::new(),
+            previous_output_previews: Vec::new(),
             parent_visible: true,
             focused: false,
             captured: false,
+            pointer_hovered: false,
+            retiring: false,
+            visibility: super::motion::Track::fixed(0.0),
+            opacity: 0.0,
+            visibility_pending: false,
         };
         result.prepare(output, shell_work_area_for_spec(output), 0)?;
         Ok(result)
@@ -80,23 +99,50 @@ impl WidgetLayer {
     pub fn prepare(&mut self, output: SizeI, work: crate::core::RectF, now: u64) -> AppResult<()> {
         // Flush component/signal updates before observing the surface declaration.
         let extent = self.layer.runtime.extent();
-        self.layer.prepare(
-            SizeI {
-                width: extent.width.max(1.0) as i32,
-                height: extent.height.max(1.0) as i32,
-            },
-            now,
-            false,
-        )?;
-        let mut next = self
-            .binding
-            .0
-            .borrow()
-            .as_ref()
-            .copied()
-            .ok_or_else(|| AppError::new("shell widget has no mounted surface"))?;
+        if !self.retiring {
+            self.layer.prepare(
+                SizeI {
+                    width: extent.width.max(1.0) as i32,
+                    height: extent.height.max(1.0) as i32,
+                },
+                now,
+                false,
+            )?;
+        }
+        let mut next = if self.retiring {
+            self.spec
+        } else {
+            self.binding
+                .0
+                .borrow()
+                .as_ref()
+                .copied()
+                .ok_or_else(|| AppError::new("shell widget has no mounted surface"))?
+        };
+        if let Some(tiling) = next.tiling {
+            next.visible = self.tile_preview.is_some() && !self.retiring;
+            let rect = self
+                .tile_preview
+                .map(|(_, r)| r)
+                .unwrap_or(self.layout_bounds);
+            next.placement = crate::WidgetPlacement::positioned(PointF {
+                x: rect.x as f32,
+                y: rect.y as f32,
+            })
+            .width(rect.width.max(1) as f32)
+            .height(rect.height.max(1) as f32);
+            next.movement = tiling.preview.motion.relocate;
+            next.visibility_motion = Some(crate::Minimize {
+                tween: if next.visible {
+                    tiling.preview.motion.appear
+                } else {
+                    tiling.preview.motion.disappear
+                },
+            });
+        }
         next.validate().map_err(AppError::new)?;
-        next.visible &= self.parent_visible
+        next.visible &= !self.retiring
+            && self.parent_visible
             && next
                 .output
                 .is_none_or(|id| id == crate::shell::OutputId::MIN);
@@ -171,7 +217,25 @@ impl WidgetLayer {
         } else {
             next.movement
         };
-        if !self.initialized {
+        let opacity_target = if next.visible { 1.0 } else { 0.0 };
+        if !self.initialized
+            || next.visible != self.spec.visible
+            || next.visibility_motion != self.spec.visibility_motion
+            || reduced
+        {
+            let tween = if reduced {
+                crate::tween_ms(0, crate::Easing::Linear)
+            } else {
+                next.visibility_motion
+                    .map_or(crate::tween_ms(0, crate::Easing::Linear), |motion| {
+                        motion.tween
+                    })
+            };
+            self.visibility.retarget(opacity_target, tween, now);
+        }
+        if !self.initialized
+            || next.tiling.is_some() && next.visible && !self.spec.visible && self.opacity <= 0.0
+        {
             let from = if next.visible {
                 outside(layout_target, output, next.enter_from)
             } else {
@@ -201,25 +265,40 @@ impl WidgetLayer {
         self.target = target;
         self.initialized = true;
         let before = self.sampled;
+        let previous_opacity = self.opacity;
+        self.opacity = self.visibility.sample(now);
+        self.visibility_pending = self.visibility.active(now);
         self.sampled = self.track.sample(now).rect();
-        self.geometry_dirty |= before != self.sampled || next.visible != self.presented;
+        if next.visibility_motion.is_some() && next.tiling.is_none() {
+            self.sampled = super::motion::minimize_rect(self.sampled, self.opacity);
+        }
+        self.geometry_dirty |= before != self.sampled
+            || next.visible != self.presented
+            || previous_opacity != self.opacity;
         self.track.finish(now);
-        self.presented = next.visible || next.exit_to.is_some() && self.track.pending();
-        self.layer.prepare(
-            SizeI {
-                width: layout_target.width,
-                height: layout_target.height,
-            },
-            now,
-            false,
-        )?;
+        self.presented = next.visible
+            || next.exit_to.is_some() && self.track.pending()
+            || self.visibility_pending;
+        if !self.retiring {
+            self.layer.prepare(
+                SizeI {
+                    width: layout_target.width,
+                    height: layout_target.height,
+                },
+                now,
+                false,
+            )?;
+        }
         let previews = self.binding.2.borrow().clone();
         self.geometry_dirty |= self.previous_previews != previews;
         self.previous_previews = previews;
+        let outputs = self.binding.3.borrow().clone();
+        self.geometry_dirty |= self.previous_output_previews != outputs;
+        self.previous_output_previews = outputs;
         Ok(())
     }
     pub fn animating(&self) -> bool {
-        self.track.pending()
+        self.track.pending() || self.visibility_pending
     }
     pub fn dirty(&self) -> bool {
         self.geometry_dirty || self.layer.has_deltas()
@@ -244,13 +323,57 @@ impl WidgetLayer {
         scene.target = self.sampled;
         scene
     }
+    pub fn tiling_policy(&self) -> Option<crate::WindowTiling> {
+        if self.retiring
+            || !self.parent_visible
+            || self
+                .spec
+                .output
+                .is_some_and(|o| o != crate::shell::OutputId::MIN)
+        {
+            None
+        } else {
+            self.spec.tiling
+        }
+    }
+    pub fn tile_material(&self, locked: bool) -> Option<ShellLayer> {
+        let design = self.spec.tiling?.preview;
+        if locked || !self.presented {
+            return None;
+        }
+        let mut layer = ShellLayer::solid(
+            ShellLayerKey::TilePreview(self.id),
+            ShellSceneKey::TilePreview(self.id),
+            design.fill.color(),
+            self.sampled,
+        );
+        layer.rounded_clips = [
+            Some(
+                crate::render::RoundedClip::new(
+                    crate::RectF {
+                        x: self.sampled.x as f32,
+                        y: self.sampled.y as f32,
+                        width: self.sampled.width as f32,
+                        height: self.sampled.height as f32,
+                    },
+                    crate::ui::CornerRadii::all(design.corner_radius),
+                )
+                .inset(design.border),
+            ),
+            None,
+        ];
+        if let crate::Fill::Glass(style) = design.fill {
+            layer.glass = Some(style.normalized());
+        }
+        Some(layer)
+    }
     pub fn preview_layers(
         &self,
         windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
         sources: &[ShellLayer],
         locked: bool,
     ) -> Vec<ShellLayer> {
-        if locked || !self.input_visible() {
+        if locked || !self.presented {
             return Vec::new();
         }
         let mut layers = Vec::new();
@@ -421,11 +544,12 @@ impl WidgetLayer {
         local.x >= 0.0 && local.y >= 0.0 && local.x < size.width && local.y < size.height
     }
     fn input_visible(&self) -> bool {
-        self.spec.visible
+        !self.retiring
+            && self.spec.visible
             && self.parent_visible
             && self.binding.0.borrow().is_some_and(|s| s.visible)
     }
-    fn contains(&mut self, p: PointF) -> bool {
+    pub(super) fn contains(&mut self, p: PointF) -> bool {
         if !self.spec.visible
             || !self.parent_visible
             || !self.binding.0.borrow().is_some_and(|s| s.visible)
@@ -532,6 +656,15 @@ pub(super) fn widget_pointer_motion(
             if w.captured || w.focused {
                 w.layer.runtime.deactivate_view(now);
             }
+            if w.pointer_hovered {
+                w.layer
+                    .runtime
+                    .shell_input(crate::input::InputEvent::mouse_moved(PointF {
+                        x: -1_000_000.0,
+                        y: -1_000_000.0,
+                    }))?;
+                w.pointer_hovered = false;
+            }
             w.captured = false;
             w.focused = false;
         }
@@ -563,11 +696,13 @@ pub(super) fn widget_pointer_motion(
                 y: -1_000_000.0,
             }
         };
-        if Some(i) == hit {
+        // Notify the previous target once on leave so pending hover work can be cancelled.
+        if Some(i) == hit || w.pointer_hovered {
             w.layer
                 .runtime
                 .shell_input(crate::input::InputEvent::mouse_moved(local))?;
         }
+        w.pointer_hovered = Some(i) == hit;
         w.layer.pointer_motion(local, now);
     }
     Ok(hit.is_some())
@@ -805,8 +940,25 @@ pub(super) fn sync_widget_children(
     wake: &EventNotifier,
     services: &crate::compose::ShellServices,
 ) -> AppResult<()> {
+    let finished: BTreeSet<_> = widgets
+        .iter()
+        .filter(|w| w.retiring && !w.presented)
+        .map(|w| w.id)
+        .collect();
+    for widget in widgets
+        .iter_mut()
+        .rev()
+        .filter(|w| finished.contains(&w.id))
+    {
+        widget.layer.runtime.close_composition()?;
+    }
+    widgets.retain(|w| !finished.contains(&w.id));
     let mut index = 0;
     while index < widgets.len() {
+        if widgets[index].retiring {
+            index += 1;
+            continue;
+        }
         let owner = widgets[index].id;
         let pending = widgets[index].binding.1.borrow_mut().take();
         if let Some(children) = pending {
@@ -846,17 +998,26 @@ pub(super) fn sync_widget_children(
                 }
             }
             // Close deepest children first before dropping their parent runtimes.
+            for widget in widgets.iter_mut().filter(|w| removed.contains(&w.id)) {
+                if !widget.retiring && widget.spec.visibility_motion.is_some() && widget.presented {
+                    widget.dismiss(ShellDismissReason::AnchorRemoved)?;
+                    widget.retiring = true;
+                    widget.focused = false;
+                    widget.captured = false;
+                }
+            }
+            removed.retain(|id| !widgets.iter().any(|w| w.id == *id && w.retiring));
             for w in widgets.iter_mut().rev().filter(|w| removed.contains(&w.id)) {
                 w.layer.runtime.close_composition()?;
             }
             widgets.retain(|w| !removed.contains(&w.id));
             for child in children {
                 let ty = child.root.component_type_id();
-                if let Some(existing) = widgets
-                    .iter_mut()
-                    .find(|w| w.parent == Some(owner) && w.child_key == child.key)
-                {
+                if let Some(existing) = widgets.iter_mut().find(|w| {
+                    w.parent == Some(owner) && w.child_key == child.key && w.component_type == ty
+                }) {
                     if existing.component_type == ty {
+                        existing.retiring = false;
                         existing.layer.runtime.update_composition_root(child.root)?;
                         continue;
                     }
@@ -1172,6 +1333,29 @@ mod tests {
         assert_eq!(dismissals.get(), before + 1);
     }
     #[test]
+    fn shell_hook_receives_pointer_motion_when_pointer_leaves_surface() {
+        let (widget, _, count) = fixture(
+            ShellSurfaceSpec::new()
+                .placement(
+                    WidgetPlacement::positioned(PointF { x: 20.0, y: 20.0 })
+                        .width(200.0)
+                        .height(150.0),
+                )
+                .pointer(ShellPointer::Surface),
+        );
+        let mut widgets = vec![widget];
+        let now = MonotonicInstant::from_nanos(1);
+        assert!(
+            widget_pointer_motion(&mut widgets, PointF { x: 50.0, y: 50.0 }, now, false).unwrap()
+        );
+        assert_eq!(count.get(), 1);
+        assert!(
+            !widget_pointer_motion(&mut widgets, PointF { x: 700.0, y: 500.0 }, now, false)
+                .unwrap()
+        );
+        assert_eq!(count.get(), 2);
+    }
+    #[test]
     fn scroll_routes_only_to_hit_shell_and_never_while_locked() {
         let (widget, _, count) = fixture(
             ShellSurfaceSpec::new()
@@ -1284,6 +1468,233 @@ mod tests {
         assert_eq!(widget.sampled.y, 552);
         assert!(!widget.animating());
     }
+    #[test]
+    fn tile_widget_scene_survives_owner_close_and_fast_reentry() {
+        use super::super::scene::{ShellComposition, ShellSceneKey};
+        use crate::renderer_vulkan::VulkanScene;
+        let (root, surface) = crate::compose::shell_widget::erase(crate::WindowTiling::snap());
+        let registered = crate::application_host::declaration::RegisteredShellWidget {
+            content: CompositionDriver::from_erased_for_target(
+                root,
+                crate::compose::RuntimeTarget::ShellWidget,
+            ),
+            surface,
+        };
+        let widget = WidgetLayer::new(
+            7,
+            registered,
+            output(),
+            AssetBundle::default(),
+            crate::platform::ScaleFactor::new(1.0).unwrap(),
+            &EventNotifier::new("tile retention test").unwrap(),
+            crate::compose::shell_services::ShellServiceHost::new()
+                .services
+                .clone(),
+        )
+        .unwrap();
+        let mut widgets = vec![widget];
+        let mut composition = ShellComposition::new(output());
+        let mut retained = BTreeMap::<ShellSceneKey, VulkanScene>::new();
+        let key = ShellSceneKey::Widget(widgets[0].id);
+        for (step, raw) in [None, Some(91), None, Some(92), None, Some(93)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut windows = BTreeMap::new();
+            if let Some(raw) = raw {
+                let owner = WaylandSurfaceId::from_raw(raw).unwrap();
+                widgets[0].tile_preview_owner = Some(owner);
+                widgets[0].tile_preview = Some((
+                    owner,
+                    RectI {
+                        x: 400,
+                        y: 0,
+                        width: 400 - step as i32 * 10,
+                        height: 600,
+                    },
+                ));
+                windows.insert(
+                    owner,
+                    super::super::client::maximize_preview_tests::test_window(
+                        SizeI {
+                            width: 300,
+                            height: 200,
+                        },
+                        PointI { x: 400, y: 10 },
+                    ),
+                );
+            } else {
+                widgets[0].tile_preview = None;
+            }
+            let order: Vec<_> = windows.keys().copied().collect();
+            let layers = super::super::layers::prepare_desktop_layers(
+                false,
+                output(),
+                step as u64 * 200_000_000,
+                false,
+                &mut BTreeMap::new(),
+                &mut windows,
+                &order,
+                &mut widgets,
+                &mut [],
+                &mut None,
+                None,
+                PointF::default(),
+                None,
+                PointF::default(),
+                &LinuxShellConfig::default(),
+            )
+            .unwrap();
+            let frame = composition
+                .synchronize_with_force(output(), layers, true)
+                .unwrap();
+            for update in frame.updates.iter().filter(|u| u.key == key) {
+                let scene = retained.entry(key).or_default();
+                for delta in &update.deltas {
+                    scene.apply_delta_checked(delta).unwrap();
+                }
+            }
+            retained.retain(|key, _| frame.live_scenes.contains(key));
+            assert!(
+                retained.contains_key(&key),
+                "mounted widget scene retired at step {step}"
+            );
+            if raw.is_none() {
+                assert!(!frame.placements.iter().any(|p| p.scene == key));
+            }
+        }
+        let unmounted = composition
+            .synchronize_with_force(output(), Vec::new(), true)
+            .unwrap();
+        retained.retain(|key, _| unmounted.live_scenes.contains(key));
+        assert!(
+            !retained.contains_key(&key),
+            "unmount still releases the scene"
+        );
+    }
+
+    #[test]
+    fn tile_preview_retargets_fades_and_never_takes_input() {
+        use crate::compose::ShellWidget;
+        let spec = crate::WindowTiling::snap().surface();
+        let (mut widget, _, _) = fixture(spec);
+        let owner = WaylandSurfaceId::from_raw(91).unwrap();
+        let first = RectI {
+            x: 0,
+            y: 40,
+            width: 400,
+            height: 560,
+        };
+        widget.tile_preview = Some((owner, first));
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 10_000_000)
+            .unwrap();
+        assert_eq!(widget.sampled, first);
+        assert_eq!(widget.opacity, 0.0);
+        assert_eq!(widget.spec.pointer, crate::ShellPointer::PassThrough);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 70_000_000)
+            .unwrap();
+        assert!(widget.opacity > 0.0 && widget.opacity < 1.0);
+        let second = RectI {
+            x: 400,
+            y: 40,
+            width: 400,
+            height: 280,
+        };
+        widget.tile_preview = Some((owner, second));
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 70_000_000)
+            .unwrap();
+        assert_eq!(widget.sampled, first);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 300_000_000)
+            .unwrap();
+        assert_eq!(widget.sampled, second);
+        assert_eq!(widget.opacity, 1.0);
+        widget.tile_preview = None;
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 300_000_000)
+            .unwrap();
+        assert!(!widget.input_visible());
+        assert!(widget.scene(false).visible);
+        assert!(widget.tile_material(true).is_none());
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 400_000_000)
+            .unwrap();
+        assert!(!widget.scene(false).visible);
+        assert!(!widget.animating());
+    }
+
+    #[test]
+    fn visibility_fades_shrinks_reverses_and_releases_input() {
+        let spec = ShellSurfaceSpec::new()
+            .placement(WidgetPlacement::center().width(200.0).height(100.0))
+            .pointer(ShellPointer::Surface)
+            .visibility_motion(crate::Minimize::shrink_and_fade(130));
+        let (mut widget, writer, _) = fixture(spec);
+        assert_eq!(widget.opacity, 0.0);
+        assert_eq!(widget.sampled.width, 184);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 65_000_000)
+            .unwrap();
+        assert!(widget.opacity > 0.0 && widget.opacity < 1.0);
+        let halfway = widget.opacity;
+        writer.publish_if_changed(spec.visible(false));
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 65_000_000)
+            .unwrap();
+        assert_eq!(widget.opacity, halfway);
+        assert!(!widget.input_visible());
+        assert!(widget.scene(false).visible);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 100_000_000)
+            .unwrap();
+        let exiting = widget.opacity;
+        assert!(exiting < halfway);
+        writer.publish_if_changed(spec);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 100_000_000)
+            .unwrap();
+        assert_eq!(widget.opacity, exiting);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 230_000_000)
+            .unwrap();
+        assert_eq!(widget.opacity, 1.0);
+        assert_eq!(widget.sampled.width, 200);
+        assert!(!widget.animating());
+        writer.publish_if_changed(spec.visible(false));
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 231_000_000)
+            .unwrap();
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 361_000_000)
+            .unwrap();
+        assert!(!widget.scene(false).visible);
+        assert_eq!(widget.opacity, 0.0);
+    }
+
+    #[test]
+    fn visibility_motion_snaps_with_reduced_motion() {
+        let spec = ShellSurfaceSpec::new().visibility_motion(crate::Minimize::shrink_and_fade(130));
+        let (mut widget, writer, _) = fixture(spec);
+        widget
+            .layer
+            .runtime
+            .set_motion_preference(crate::theme::MotionPreference::Reduced);
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 1)
+            .unwrap();
+        assert_eq!(widget.opacity, 1.0);
+        assert!(!widget.animating());
+        writer.publish_if_changed(spec.visible(false));
+        widget
+            .prepare(output(), shell_work_area_for_spec(output()), 2)
+            .unwrap();
+        assert_eq!(widget.opacity, 0.0);
+        assert!(!widget.scene(false).visible);
+    }
+
     #[test]
     fn exiting_retains_pixels_but_releases_reservation_and_input() {
         let spec = ShellSurfaceSpec::new()
@@ -1433,10 +1844,12 @@ mod child_tests {
     use std::{cell::Cell, rc::Rc};
     struct Parent {
         items: Signal<Vec<u32>>,
+        motion: bool,
         mounted: Rc<Cell<u32>>,
         unmounted: Rc<Cell<u32>>,
     }
     struct Child {
+        motion: bool,
         mounted: Rc<Cell<u32>>,
         unmounted: Rc<Cell<u32>>,
     }
@@ -1483,6 +1896,7 @@ mod child_tests {
                     ShellChild::new(
                         id.to_string(),
                         Child {
+                            motion: self.motion,
                             mounted: self.mounted.clone(),
                             unmounted: self.unmounted.clone(),
                         },
@@ -1493,22 +1907,34 @@ mod child_tests {
     }
     impl ShellWidget for Child {
         fn surface(&self) -> ShellSurfaceSpec {
-            ShellSurfaceSpec::new()
+            let mut spec = ShellSurfaceSpec::new()
                 .placement(
                     WidgetPlacement::attached(ShellEdge::Bottom)
                         .width(100.0)
                         .height(40.0),
                 )
-                .layer(ShellSurfaceLayer::Overlay)
+                .layer(ShellSurfaceLayer::Overlay);
+            if self.motion {
+                spec = spec.visibility_motion(crate::Minimize::shrink_and_fade(130));
+            }
+            spec
         }
     }
     #[test]
     fn keyed_children_reorder_without_remount_and_unmount_on_removal() {
+        child_lifecycle(false);
+    }
+    #[test]
+    fn fading_children_retire_after_exit_and_can_reopen_without_remount() {
+        child_lifecycle(true);
+    }
+    fn child_lifecycle(motion: bool) {
         let (items, writer) = Signal::new(vec![1, 2]);
         let mounted = Rc::new(Cell::new(0));
         let unmounted = Rc::new(Cell::new(0));
         let (root, surface) = crate::compose::shell_widget::erase(Parent {
             items,
+            motion,
             mounted: mounted.clone(),
             unmounted: unmounted.clone(),
         });
@@ -1553,7 +1979,7 @@ mod child_tests {
             &mut widgets,
             output,
             shell_work_area_for_spec(output),
-            1,
+            1_000_000,
             crate::theme::MotionPreference::Full,
         )
         .unwrap();
@@ -1577,7 +2003,7 @@ mod child_tests {
             &mut widgets,
             output,
             shell_work_area_for_spec(output),
-            2,
+            2_000_000,
             crate::theme::MotionPreference::Full,
         )
         .unwrap();
@@ -1591,6 +2017,87 @@ mod child_tests {
             &host.services,
         )
         .unwrap();
+        if motion {
+            assert_eq!(unmounted.get(), 0);
+            assert_eq!(widgets.len(), 3);
+            prepare_widget_surfaces(
+                &mut widgets,
+                output,
+                shell_work_area_for_spec(output),
+                3_000_000,
+                crate::theme::MotionPreference::Full,
+            )
+            .unwrap();
+            let retiring = widgets.iter().find(|w| w.id == first).unwrap();
+            assert!(retiring.retiring);
+            assert!(!retiring.input_visible());
+            writer.publish_if_changed(vec![1, 2]);
+            prepare_widget_surfaces(
+                &mut widgets,
+                output,
+                shell_work_area_for_spec(output),
+                4_000_000,
+                crate::theme::MotionPreference::Full,
+            )
+            .unwrap();
+            sync_widget_children(
+                &mut widgets,
+                &mut next,
+                output,
+                AssetBundle::default(),
+                scale,
+                &wake,
+                &host.services,
+            )
+            .unwrap();
+            assert!(!widgets.iter().find(|w| w.id == first).unwrap().retiring);
+            assert_eq!(mounted.get(), 2);
+            writer.publish_if_changed(vec![2]);
+            prepare_widget_surfaces(
+                &mut widgets,
+                output,
+                shell_work_area_for_spec(output),
+                5_000_000,
+                crate::theme::MotionPreference::Full,
+            )
+            .unwrap();
+            sync_widget_children(
+                &mut widgets,
+                &mut next,
+                output,
+                AssetBundle::default(),
+                scale,
+                &wake,
+                &host.services,
+            )
+            .unwrap();
+            prepare_widget_surfaces(
+                &mut widgets,
+                output,
+                shell_work_area_for_spec(output),
+                6_000_000,
+                crate::theme::MotionPreference::Full,
+            )
+            .unwrap();
+            prepare_widget_surfaces(
+                &mut widgets,
+                output,
+                shell_work_area_for_spec(output),
+                200_000_000,
+                crate::theme::MotionPreference::Full,
+            )
+            .unwrap();
+            sync_widget_children(
+                &mut widgets,
+                &mut next,
+                output,
+                AssetBundle::default(),
+                scale,
+                &wake,
+                &host.services,
+            )
+            .unwrap();
+        }
         assert_eq!(unmounted.get(), 1);
         assert_eq!(widgets.len(), 2);
         let child = &widgets[1];

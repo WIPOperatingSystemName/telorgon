@@ -126,6 +126,11 @@ impl XdgSurfaceState {
         Ok(())
     }
 
+    /// Most recent queued or acknowledged state, for decoration-only configures.
+    pub(crate) fn latest_configure(&self) -> Option<XdgConfigure> {
+        self.pending.back().copied().or(self.last_acked)
+    }
+
     pub fn last_acked(&self) -> Option<XdgConfigure> {
         self.last_acked
     }

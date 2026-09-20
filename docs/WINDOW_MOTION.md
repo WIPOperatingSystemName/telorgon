@@ -228,8 +228,8 @@ returns to native-size sampling. The API leaves room to improve this rendering s
 
 A minimize exit uses centered scaling to 92% plus group opacity. Its semantic/input eligibility ends
 immediately, while its visual finishes at its retained stack position. Restoration can reverse from
-current opacity. Completed exits release snapshots. Unmap, leaving the output, fullscreen, or session
-lock removes the old animation state. Dock destinations are not implemented.
+current opacity. Completed exits release snapshots. Leaving the output, fullscreen, or session
+lock removes the old animation state. Unmapping uses the close fade described below. Dock destinations are not implemented.
 
 Hit testing inverse-maps displayed window geometry, and client input is suppressed during geometry,
 visibility, and content handoffs. New source frames may be rendered into a capture before they
@@ -261,7 +261,7 @@ exclude later-created windows (including Xwayland clients) before their transiti
 CPU regression covers a later surface maximizing alongside a large idle window. This is a
 presentation admission estimate, not a hard bound on all in-flight GPU memory. Resource allocation,
 retirement, and synchronization primitives are unchanged.
-Animation-target allocation failure disables motion for the session and restores ordinary output
+Animation-target allocation or effect-budget failure abandons the current transition and restores ordinary output
 placements and input mapping; device/render errors retain existing host error handling.
 
 Window captures add rendering/storage work for enabled windows. Intermediate target allocation can
@@ -336,3 +336,68 @@ output may slide between left- and right-aligned positions so either side remain
 The policy also applies when dragging a maximized window to restore it. It does not constrain
 resize operations or client-requested positions. The current host uses its single active output;
 this does not introduce multi-monitor transfer policy. Vertical dragging retains its existing rules.
+
+## Tiling integration
+
+The neutral motion state tracks the tile target alongside the maximized flag. Changes in either
+select the existing placement transition: maximize settings for a tiled/maximized destination,
+restore settings for floating. Snap/float operations request the same one-frame placeholder
+handoff as maximize, retaining native/X11 readiness gates. Tile-target changes participate in
+motion admission priority; pointer-driven divider changes keep their target and remain direct.
+The shared handoff covers entry fade, live glass, early-ready holding, restore contour, and
+pointer-anchored drag restoration. No shader, GPU ownership, or protocol readiness rules changed.
+
+Headless regressions exercise per-direction timing, tile switching, maximized-to-tile entry,
+spring overshoot, early-ready content, pointer-following restore with tween/spring, direct divider
+resize, reduced motion, and host placeholder requests. Live hardware/pointer qualification remains
+user-run.
+
+Shared-divider resizing uses each window's `resize_content` entry/ready fades. Frame measurement
+updates interactive configure sizes without ending the grab or publishing a terminal resize.
+The existing readiness gate controls the return fade after release. Headless coverage checks
+distinct resize/maximize fade settings and custom-frame measurement during a tiled grab. This
+reuses the documented resize lifecycle; no GPU mechanism changes. The adjacent reference library
+remains unavailable; the existing reference audit above applies.
+
+## Closing windows
+
+Use `WindowMotion::smooth().close(Minimize::shrink_and_fade(180))` to override the close
+effect. Closing defaults to the configured minimize effect, including its duration and easing.
+Both `smooth()` and `fluid()` therefore default to the same 180 ms centered shrink to 92% and fade;
+`none()` and a zero-duration close remove the image immediately. A close-only style is
+`WindowMotion::none().close(Minimize::shrink_and_fade(200))`. Resize/maximize content
+fade settings remain independent.
+
+The fade starts on actual surface withdrawal/unmap, including client-initiated closure,
+not on the close request (which a client may refuse). Protocol state, focus and input disappear
+immediately. The renderer retains only its last composed snapshot, sampled geometry, clipping,
+and any separate motion shadow. Interrupted content fades retain their last displayed mixture;
+geometry shrinks using the same centered transform as minimize. No new client buffers or presentation feedback are needed.
+Like other snapshot effects, retained glass continues to resolve against the live backdrop.
+
+Exits remain below surviving layers that were above the window. Completion requests a final
+clearing frame and releases the snapshot. Remapping the surface, session lock, reduced motion,
+or renderer fallback cancels the exit. Already hidden minimized windows have no exit image.
+At most 16 simultaneous exits are retained, within the existing aggregate motion pixel budget;
+failed admission removes the image immediately. This uses existing renderer snapshot ownership,
+not a delayed client lifetime or a new GPU synchronization mechanism. The reference audit above
+remains applicable; the adjacent reference library is still unavailable.
+
+Headless tests cover fade pixels/timing, matching minimize geometry, independent API overrides, cleanup,
+interrupted content fades, overlay stacking, remapping, lock cancellation, reduced motion,
+renderer fallback and hidden/disabled exits. Live Wayland/Xwayland and Vulkan appearance remain
+user-qualified.
+
+### Empty retained scene capture fix
+
+A user-run log reported `motion capture scene missing`. A headless reproducer confirms that
+a retained placement with no initial delta previously had no backend scene, despite being eligible
+for a window/widget capture. Composition now publishes a transparent scene at the declared extent
+once, preserving the producer's first real delta with an epoch offset. Removal and recreation
+repeat that initialization. Capture errors now include the capture ID, scene key and layer key.
+The log lacked those keys, so the user's exact triggering scene remains unconfirmed.
+
+Tests cover the former missing-scene error, empty capture, reuse without redundant updates, the
+first real drawing delta, and recreation. This changes retained-scene publication only; existing
+GPU allocation, synchronization and retirement mechanisms are unchanged. The adjacent reference
+library remains unavailable; the existing reference audit applies. Live Vulkan rerun is pending.
