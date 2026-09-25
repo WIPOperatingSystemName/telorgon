@@ -162,7 +162,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let runtime_directory = launch_environment.runtime_directory().map_err(app_error)?;
     let pointer_theme = pointer_config.load_theme(assets).map_err(app_error)?;
     let mut pointer_media = AssetMediaCache::new(assets).map_err(app_error)?;
-    let layer_assets = LayerAssets::new(assets)?;
+    let mut layer_assets = LayerAssets::new(assets)?;
+    layer_assets.typography = config.typography.clone();
     #[cfg(feature = "shell-screencast-linux")]
     let mut compositor = compositor;
     #[cfg(feature = "shell-screencast-linux")]

@@ -76,6 +76,67 @@ pub(crate) struct Journal {
     _lock: File,
 }
 
+fn recovery_directory(config: &SessionConfig, env: &Environment) -> Result<PathBuf> {
+    if let Some(path) = &config.recovery_directory {
+        return Ok(path.clone());
+    }
+    let absolute = |key| env.get(key).map(PathBuf::from).filter(|p| p.is_absolute());
+    #[cfg(target_os = "windows")]
+    let root = absolute("LOCALAPPDATA");
+    #[cfg(target_os = "macos")]
+    let root = absolute("HOME").map(|p| p.join("Library/Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = absolute("XDG_STATE_HOME")
+        .or_else(|| absolute("HOME").map(|p| p.join(".local/state")));
+    let root = root.ok_or_else(|| Error::Invalid(
+        "recovery requires an absolute platform state directory (LOCALAPPDATA on Windows, HOME on macOS, XDG_STATE_HOME or HOME on Unix) or an explicit recovery_directory".into()
+    ))?;
+    Ok(root.join(&config.identity).join("recovery"))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn recovery_path_uses_platform_root_and_exact_override() {
+        let root = std::env::temp_dir();
+        let mut env = Environment(BTreeMap::new());
+        let mut config = SessionConfig::new("org.example.settings");
+        assert!(recovery_directory(&config, &env).is_err());
+        #[cfg(target_os = "windows")]
+        let (key, suffix) = ("LOCALAPPDATA", "");
+        #[cfg(target_os = "macos")]
+        let (key, suffix) = ("HOME", "Library/Application Support");
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let (key, suffix) = ("XDG_STATE_HOME", "");
+        env.0.insert(key.into(), root.clone().into_os_string());
+        assert_eq!(
+            recovery_directory(&config, &env).unwrap(),
+            root.join(suffix).join("org.example.settings/recovery")
+        );
+        env.0.insert(key.into(), "relative/path".into());
+        assert!(recovery_directory(&config, &env).is_err());
+        config.recovery_directory = Some(root.join("custom"));
+        assert_eq!(recovery_directory(&config, &env).unwrap(), root.join("custom"));
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    fn relative_xdg_state_falls_back_to_absolute_home() {
+        let root = std::env::temp_dir();
+        let env = Environment(BTreeMap::from([
+            ("XDG_STATE_HOME".into(), "relative".into()),
+            ("HOME".into(), root.clone().into_os_string()),
+        ]));
+        assert_eq!(
+            recovery_directory(&SessionConfig::new("org.example.settings"), &env).unwrap(),
+            root.join(".local/state/org.example.settings/recovery")
+        );
+    }
+}
+
 impl Journal {
     pub fn open(
         config: &SessionConfig,
@@ -84,15 +145,7 @@ impl Journal {
         if !config.recovery {
             return Ok(None);
         }
-        let directory = match &config.recovery_directory {
-            Some(path) => path.clone(),
-            None => {
-                let root = env.get("XDG_STATE_HOME").map(PathBuf::from).filter(|p| p.is_absolute())
-                    .or_else(|| env.get("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-                    .ok_or_else(|| Error::Invalid("recovery requires HOME, XDG_STATE_HOME or an explicit recovery_directory".into()))?;
-                root.join("telorgon").join(&config.identity)
-            }
-        };
+        let directory = recovery_directory(config, env)?;
         if !directory.is_absolute() {
             return Err(Error::Invalid("recovery_directory must be absolute".into()));
         }
@@ -114,18 +167,10 @@ impl Journal {
             .read(true)
             .write(true)
             .open(directory.join("session.lock"))?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = std::io::Error::last_os_error();
-                return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
-                    Error::RecoveryInUse
-                } else {
-                    error.into()
-                });
-            }
-        }
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => Error::RecoveryInUse,
+            std::fs::TryLockError::Error(error) => error.into(),
+        })?;
         let journal = Self {
             directory,
             _lock: lock,
@@ -174,6 +219,7 @@ impl Journal {
             .open(&temporary)?;
         file.write_all(data.as_bytes())?;
         file.sync_all()?;
+        drop(file);
         std::fs::rename(temporary, self.path())?;
         #[cfg(unix)]
         File::open(&self.directory)?.sync_all()?;

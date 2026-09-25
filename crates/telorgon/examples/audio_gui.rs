@@ -366,7 +366,7 @@ mod linux {
                 }
                 drop(playback);
             })?;
-        let result = Application::gui("Sound playback")
+        let result = Application::gui("org.telorgon.examples.sound-playback", "Sound playback")
             .renderer(Renderer::Software)
             .window(
                 Window::new("Sound playback")

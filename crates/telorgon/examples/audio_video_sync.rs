@@ -290,7 +290,7 @@ mod linux {
                 audio.stop();
                 producer.stop();
             })?;
-        let result = Application::gui("Audio/video sync")
+        let result = Application::gui("org.telorgon.examples.audio-video-sync", "Audio/video sync")
             .renderer(Renderer::Software)
             .window(
                 Window::new("Audio/video sync")

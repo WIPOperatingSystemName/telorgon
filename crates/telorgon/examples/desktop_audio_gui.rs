@@ -11,7 +11,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     let mut connection = Connection::connect(ConnectionConfig::default(), Remote::Default)?;
     let mut audio = DesktopAudio::start(connection.handle())?;
-    let result = Application::gui("Desktop audio")
+    let result = Application::gui("org.telorgon.examples.desktop-audio", "Desktop audio")
         .renderer(Renderer::Software)
         .window(
             Window::new("Desktop audio")

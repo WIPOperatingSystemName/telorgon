@@ -20,7 +20,7 @@ mod linux {
     }
     pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut mixer = AudioMixer::start()?;
-        let result = Application::gui("Sound mixer")
+        let result = Application::gui("org.telorgon.examples.sound-mixer", "Sound mixer")
             .renderer(Renderer::Software)
             .window(
                 Window::new("Sound mixer")

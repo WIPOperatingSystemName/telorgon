@@ -141,7 +141,7 @@ fn counter_rerenders_dynamic_text_without_remounting_the_button() {
 
 #[test]
 fn sealed_application_declaration_owns_initial_content() {
-    let application = Application::gui("Counter").renderer(Renderer::Auto).window(
+    let application = Application::gui("org.telorgon.examples.counter", "Counter").renderer(Renderer::Auto).window(
         Window::new("Counter")
             .size(480, 320)
             .content(Counter::new("Example")),

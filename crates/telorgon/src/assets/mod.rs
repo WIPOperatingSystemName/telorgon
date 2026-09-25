@@ -7,6 +7,9 @@ use crate::ui::ImageId;
 
 mod cursor_theme;
 mod media;
+pub mod builtin;
+pub mod fonts;
+pub use builtin::AssetResolver;
 pub use cursor_theme::{
     ClientCursorMode, CursorGraphic, CursorTheme, CursorThemeError, PointerConfiguration,
     PointerFrame, PointerHotspot, PointerRequest, PointerResolution, PointerTheme,
@@ -146,7 +149,8 @@ macro_rules! typed_asset {
             }
 
             pub fn resolve(self, bundle: AssetBundle) -> Result<&'static AssetEntry, AssetError> {
-                let entry = bundle.get(self.0).ok_or(AssetError::NotFound(self.0))?;
+                let entry = AssetResolver::new(bundle).map_err(AssetError::Catalog)?
+                    .get(self.0).ok_or(AssetError::NotFound(self.0))?;
                 if entry.kind != AssetKind::$kind {
                     return Err(AssetError::KindMismatch {
                         key: self.0,
@@ -412,6 +416,7 @@ pub const fn asset_image_id(key: AssetKey) -> ImageId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetError {
+    Catalog(AssetCatalogError),
     NotFound(AssetKey),
     KindMismatch {
         key: AssetKey,
@@ -423,6 +428,7 @@ pub enum AssetError {
 impl fmt::Display for AssetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Catalog(error) => error.fmt(formatter),
             Self::NotFound(key) => write!(formatter, "asset `{key}` was not registered"),
             Self::KindMismatch {
                 key,
@@ -440,6 +446,7 @@ impl std::error::Error for AssetError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetCatalogError {
+    ReservedKey(AssetKey),
     EmptyKey,
     InvalidKey(AssetKey),
     DuplicateKey(AssetKey),

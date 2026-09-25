@@ -207,6 +207,7 @@ impl AppRuntimeCore<CompositionDriver> {
         driver: CompositionDriver,
         extent: SizeI,
     ) -> AppResult<Self> {
+        let typography = driver.typography.clone();
         let images = driver.image_bindings.clone();
         let view = ViewRuntime::new(driver)?;
         let mut runtime = Self::from_view(
@@ -216,6 +217,7 @@ impl AppRuntimeCore<CompositionDriver> {
             ThemeDomain::Application,
         )?;
         runtime.image_bindings = Some(images);
+        runtime.set_typography(typography);
         Ok(runtime)
     }
 
@@ -341,8 +343,17 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         }
     }
 
+    /// Changes generic font selection and invalidates both measured geometry and rendered text.
+    pub fn set_typography(&mut self, typography: crate::Typography) {
+        self.text.set_typography(typography);
+        self.layout = LayoutEngine::default();
+        self.compiler = SceneCompiler::default();
+        self.view.scheduler_mut().request();
+    }
+
     /// Register embedded font faces before layout. Hosts call this for catalog fonts automatically.
     pub fn register_fonts(&mut self, assets: crate::AssetBundle) -> AppResult<()> {
+        crate::AssetResolver::new(assets).map_err(|e| AppError::new(e.to_string()))?;
         for entry in assets
             .iter()
             .filter(|entry| entry.kind == crate::AssetKind::Font)
@@ -350,6 +361,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             self.text
                 .load_embedded_font(entry.bytes)
                 .map_err(|error| AppError::new(format!("font {}: {error}", entry.key)))?;
+            self.layout = LayoutEngine::default();
             self.compiler = SceneCompiler::default();
             self.view.scheduler_mut().request();
         }

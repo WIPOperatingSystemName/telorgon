@@ -54,6 +54,11 @@ impl RetainedTextSystem {
         })
     }
 
+    pub fn set_typography(&mut self, typography: super::Typography) {
+        self.engine.set_typography(typography);
+        self.clear();
+    }
+
     pub fn raster_scale(&self) -> crate::platform::contracts::ScaleFactor {
         self.engine.raster_scale()
     }

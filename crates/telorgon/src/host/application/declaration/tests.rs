@@ -244,7 +244,7 @@ fn desktop_without_widgets_validates_and_has_no_reserved_widget_space() {
 
 #[test]
 fn both_application_modes_own_renderer_selection() {
-    let gui = Application::gui("Counter")
+    let gui = Application::gui("org.telorgon.examples.counter", "Counter")
         .renderer(Renderer::Software)
         .window(Window::new("Counter").content(Root));
     assert_eq!(gui.renderer, Renderer::Software);
@@ -257,9 +257,27 @@ fn both_application_modes_own_renderer_selection() {
 }
 
 #[test]
+fn gui_identity_is_independent_of_display_name_and_session_options() {
+    use crate::services::session::GuiSessionConfig;
+    for name in ["Settings", "Renamed Settings"] {
+        let app = Application::gui("org.example.settings", name)
+            .session(GuiSessionConfig { recovery: false, ..Default::default() })
+            .window(Window::new("Independent title").content(Root))
+            .session(GuiSessionConfig::default());
+        let config = app.session.clone().into_session(app.identity.clone());
+        assert_eq!(config.identity, "org.example.settings");
+        assert!(app.into_parts().is_ok());
+    }
+    let invalid = Application::gui("../invalid", "Settings")
+        .session(GuiSessionConfig { recovery: false, ..Default::default() })
+        .window(Window::new("Settings").content(Root));
+    assert!(invalid.into_parts().is_err());
+}
+
+#[test]
 fn complete_declarations_have_content_without_optional_storage() {
     let application =
-        Application::gui("Counter").window(Window::new("Counter").size(480, 320).content(Root));
+        Application::gui("org.telorgon.examples.counter", "Counter").window(Window::new("Counter").size(480, 320).content(Root));
     let debug = format!("{application:?}");
     assert!(debug.contains("has_content: true"));
     assert!(debug.contains("renderer: Auto"));

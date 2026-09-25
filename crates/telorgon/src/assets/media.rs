@@ -66,13 +66,15 @@ struct CacheKey {
 /// Bounded decoder and raster cache shared by GUI, shell, cursor, and native icon adapters.
 pub struct AssetMediaCache {
     bundle: AssetBundle,
+    resolver: super::AssetResolver,
     decoded: BTreeMap<CacheKey, Arc<DecodedAssetImage>>,
 }
 
 impl AssetMediaCache {
     pub fn new(bundle: AssetBundle) -> Result<Self, AssetMediaError> {
         Ok(Self {
-            bundle: bundle.validate().map_err(AssetMediaError::Catalog)?,
+            bundle,
+            resolver: super::AssetResolver::new(bundle).map_err(AssetMediaError::Catalog)?,
             decoded: BTreeMap::new(),
         })
     }
@@ -125,7 +127,7 @@ impl AssetMediaCache {
 
     /// Decodes the intrinsic representation for every GUI-renderable catalog entry.
     pub fn preload_render_resources(&mut self) -> Result<Vec<ImageResource>, AssetMediaError> {
-        let entries = self.bundle.iter().copied().collect::<Vec<_>>();
+        let entries = self.resolver.iter().copied().collect::<Vec<_>>();
         let mut resources = Vec::new();
         for entry in entries {
             if !matches!(entry.kind, AssetKind::Icon | AssetKind::Image) {
@@ -152,7 +154,7 @@ impl AssetMediaCache {
         if let Some(image) = self.decoded.get(&cache_key) {
             return Ok(Arc::clone(image));
         }
-        let entry = self.bundle.get(key).ok_or(AssetError::NotFound(key))?;
+        let entry = self.resolver.get(key).ok_or(AssetError::NotFound(key))?;
         if entry.kind != expected {
             return Err(AssetError::KindMismatch {
                 key,

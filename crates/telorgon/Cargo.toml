@@ -11,7 +11,13 @@ description = "Retained, component-based UI framework with software and Vulkan r
 tray-linux = []
 # Ordinary applications compile both managed desktop backends. Runtime entrypoint declarations
 # choose between them; downstream applications do not select a renderer with Cargo features.
-default = ["application-software", "application-vulkan-windows"]
+default = ["application-software", "application-vulkan-windows", "bundled-fonts"]
+bundled-fonts = ["font-inter", "font-instrument-sans", "font-source-serif-4", "font-jetbrains-mono", "font-atkinson-hyperlegible-next"]
+font-inter = []
+font-instrument-sans = []
+font-source-serif-4 = []
+font-jetbrains-mono = []
+font-atkinson-hyperlegible-next = []
 
 # Internal switch shared by managed and embedded profiling without forcing the managed web service
 # into embedded builds.

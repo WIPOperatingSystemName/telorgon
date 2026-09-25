@@ -12,7 +12,7 @@ impl Default for PortalPickerApplication {
 impl PortalPickerApplication {
     pub fn new() -> Self {
         Self {
-            gui: Application::gui("Screen sharing"),
+            gui: Application::gui("org.telorgon.portal-picker", "Screen sharing"),
         }
     }
     pub fn assets(mut self, assets: AssetBundle) -> Self {

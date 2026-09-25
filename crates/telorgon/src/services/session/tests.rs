@@ -700,3 +700,16 @@ fn desktop_settings_reject_injection_before_creating_runtime_files() {
     assert!(super::desktop_settings::prepare(env, &config).is_err());
     assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
 }
+
+    #[test]
+    fn recovery_journal_excludes_second_owner_and_can_be_reopened() {
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        let env = Environment(BTreeMap::new());
+        let (journal, _) = recovery::Journal::open(&config, &env).unwrap().unwrap();
+        assert!(matches!(recovery::Journal::open(&config, &env), Err(Error::RecoveryInUse)));
+        journal.write(Vec::new()).unwrap();
+        journal.write(Vec::new()).unwrap();
+        drop(journal);
+        assert!(recovery::Journal::open(&config, &env).unwrap().is_some());
+    }

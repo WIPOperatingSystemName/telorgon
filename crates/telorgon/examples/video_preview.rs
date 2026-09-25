@@ -169,7 +169,7 @@ mod linux {
                 ..Default::default()
             },
         )?;
-        let result = Application::gui("Telorgon video preview")
+        let result = Application::gui("org.telorgon.examples.video-preview", "Telorgon video preview")
             .renderer(Renderer::Software)
             .window(
                 Window::new("Video preview")

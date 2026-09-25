@@ -7,18 +7,7 @@ use crate::ui::text::atlas::{AtlasPageUpdate, GLYPH_FILTER_GUTTER_PX, GlyphAtlas
 use crate::ui::text::glyph::{AtlasGlyph, glyph_image_alpha};
 use crate::ui::text::{ResolvedTextStyle, TextError, TextResult};
 
-// Discover installed fonts once. Database clones share immutable font sources while each
-// engine keeps its shaping caches, raster scale and glyph atlas independent.
-fn system_font_seed() -> &'static (String, cosmic_text::fontdb::Database) {
-    static SEED: std::sync::OnceLock<(String, cosmic_text::fontdb::Database)> =
-        std::sync::OnceLock::new();
-    SEED.get_or_init(|| {
-        let fonts = FontSystem::new();
-        (fonts.locale().to_owned(), fonts.db().clone())
-    })
-}
-
-fn embedded_faces(
+pub(super) fn embedded_faces(
     bytes: &'static [u8],
 ) -> TextResult<std::sync::Arc<Vec<cosmic_text::fontdb::FaceInfo>>> {
     use std::sync::{Arc, Mutex, OnceLock};
@@ -80,6 +69,8 @@ pub struct PreparedText {
 
 pub struct TextEngine {
     font_system: FontSystem,
+    typography: super::Typography,
+    embedded_fonts: std::collections::HashSet<(usize, usize)>,
     swash_cache: SwashCache,
     atlas: GlyphAtlas,
     raster_scale: crate::platform::contracts::ScaleFactor,
@@ -91,13 +82,34 @@ impl TextEngine {
     }
 
     pub fn with_atlas_size(width_px: i32, height_px: i32) -> TextResult<Self> {
-        let (locale, database) = system_font_seed();
+        Self::from_database(super::font_database::seed(true)?, width_px, height_px)
+    }
+
+    /// Uses bundled fonts only, allowing deterministic rendering without OS font discovery.
+    pub fn without_system_fonts() -> TextResult<Self> {
+        Self::from_database(super::font_database::seed(false)?, DEFAULT_ATLAS_SIZE, DEFAULT_ATLAS_SIZE)
+    }
+
+    fn from_database(
+        seed: &(String, cosmic_text::fontdb::Database), width: i32, height: i32,
+    ) -> TextResult<Self> {
         Ok(Self {
-            font_system: FontSystem::new_with_locale_and_db(locale.clone(), database.clone()),
+            font_system: FontSystem::new_with_locale_and_db(seed.0.clone(), seed.1.clone()),
+            typography: Default::default(),
+            embedded_fonts: crate::assets::builtin::bundle().iter()
+                .filter(|e| e.kind == crate::AssetKind::Font)
+                .map(|e| (e.bytes.as_ptr() as usize, e.bytes.len())).collect(),
             swash_cache: SwashCache::new(),
-            atlas: GlyphAtlas::new(width_px, height_px)?,
+            atlas: GlyphAtlas::new(width, height)?,
             raster_scale: Default::default(),
         })
+    }
+
+    pub fn set_typography(&mut self, typography: super::Typography) {
+        if self.typography != typography {
+            self.typography = typography;
+            self.atlas.clear();
+        }
     }
 
     pub fn raster_scale(&self) -> crate::platform::contracts::ScaleFactor {
@@ -112,11 +124,14 @@ impl TextEngine {
     }
 
     pub(crate) fn load_embedded_font(&mut self, bytes: &'static [u8]) -> TextResult<()> {
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        if self.embedded_fonts.contains(&key) { return Ok(()); }
         let faces = embedded_faces(bytes)?;
         let db = self.font_system.db_mut();
         for face in faces.iter() {
             db.push_face_info(face.clone());
         }
+        self.embedded_fonts.insert(key);
         self.atlas.clear();
         Ok(())
     }
@@ -181,7 +196,7 @@ impl TextEngine {
                 .max_height_px
                 .filter(|height| height.is_finite() && *height > 0.0),
         );
-        let family = match request.style.font_family.as_str() {
+        let family = match self.typography.family(&request.style.font_family) {
             "serif" => Family::Serif,
             "sans-serif" | "sans_serif" => Family::SansSerif,
             "monospace" => Family::Monospace,

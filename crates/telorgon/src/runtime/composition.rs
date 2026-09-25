@@ -193,6 +193,7 @@ impl MountedElement {
 
 /// Runtime driver for one persistent composition root.
 pub struct CompositionDriver {
+    pub(crate) typography: crate::Typography,
     pending_root: Option<Box<dyn ErasedComponent>>,
     arena: CompositionArena,
     root_component: Option<ComponentInstanceId>,
@@ -246,6 +247,7 @@ impl CompositionDriver {
         target: RuntimeTarget,
     ) -> Self {
         Self {
+            typography: Default::default(),
             pending_root: Some(component),
             arena: CompositionArena::new(),
             root_component: None,

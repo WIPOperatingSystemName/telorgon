@@ -1,0 +1,102 @@
+source = "https://github.com/google/fonts"
+commit = "23e54b51ddffbc7713c583748e3bd86f62b1fa4a"
+
+[[files]]
+path = "fonts/instrument-sans/InstrumentSans-Italic[wdth,wght].ttf"
+sha256 = "a74203cc5066a3b2f8de1a7b0887ef897773c2319dc86c911f8e85350cde0d07"
+
+[[files]]
+path = "fonts/instrument-sans/InstrumentSans[wdth,wght].ttf"
+sha256 = "b24f1812584816958afcf22e22d08e44318c5e51651e25d2438efdde389b33b1"
+
+[[files]]
+path = "fonts/instrument-sans/METADATA.pb"
+sha256 = "111191daf841919d5d09b88ca7a17fb691c4b835c61ca81c958f334c40c11535"
+
+[[files]]
+path = "fonts/instrument-sans/OFL.txt"
+sha256 = "9e27a72ed30eb49a08678f6a5d6ed98ec7ba5368f541637ee0683ec9134ef966"
+
+[[files]]
+path = "fonts/instrument-sans/upstream_info.md"
+sha256 = "a511bf7efaa84dca9499ee155cb10715e0f1116d0930c5e803fdaaa632d44830"
+
+[[files]]
+path = "fonts/source-serif-4/METADATA.pb"
+sha256 = "f7b88902c1d2f41839a3f7bf6723d1e64044c7c183b82871ce770a95f24b84e3"
+
+[[files]]
+path = "fonts/source-serif-4/OFL.txt"
+sha256 = "5f94c3fd3a23131a417ab5a0c8452de57e70c3cfb9f604d88241f7065ebf9fd9"
+
+[[files]]
+path = "fonts/source-serif-4/SourceSerif4-Italic[opsz,wght].ttf"
+sha256 = "15fbc7e4679489a501998c3669272637a6646388ef7e4bd77eebb5bf967a1f42"
+
+[[files]]
+path = "fonts/source-serif-4/SourceSerif4[opsz,wght].ttf"
+sha256 = "97b2d4da6e3cb494b5a1e66ae176914d852ccabef49e0c02c0df25f3e39aca0b"
+
+[[files]]
+path = "fonts/source-serif-4/upstream_info.md"
+sha256 = "af79fd601c4a7bf5ecf26085226243f6b4ba7108092a83e315899a39b6814622"
+
+[[files]]
+path = "fonts/inter/Inter-Italic[opsz,wght].ttf"
+sha256 = "acd98e64795781b2058f07b18475e0ecee2a0fe2b42a49e2f9e37d0d6bf66ce6"
+
+[[files]]
+path = "fonts/inter/Inter[opsz,wght].ttf"
+sha256 = "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031"
+
+[[files]]
+path = "fonts/inter/METADATA.pb"
+sha256 = "79e4721ef4f72251c6080a40dfd9efb6728b4df1fc690f0c70eb4b1b5303a5b0"
+
+[[files]]
+path = "fonts/inter/OFL.txt"
+sha256 = "5b9321a4298cfeb6b34354164a1c3afc3db114569984c502b9b35d988fd58c57"
+
+[[files]]
+path = "fonts/inter/upstream_info.md"
+sha256 = "2b8024ee190a7033708ab7d65523496c392e93cdcfd8c3a236627ae003848532"
+
+[[files]]
+path = "fonts/jetbrains-mono/JetBrainsMono-Italic[wght].ttf"
+sha256 = "85ae2a5cd3f56baf1ce1c21a851322c58e3d8fbe8e8ad4a4d090a820dd7fe558"
+
+[[files]]
+path = "fonts/jetbrains-mono/JetBrainsMono[wght].ttf"
+sha256 = "48715a42ec242c21e9f02692891e147d022299a52e48d5e413e1a942193ffeda"
+
+[[files]]
+path = "fonts/jetbrains-mono/METADATA.pb"
+sha256 = "220f22dd4d2a3d9c77183fbbcb250779267725d90d9be673b403dc6bcfada0af"
+
+[[files]]
+path = "fonts/jetbrains-mono/OFL.txt"
+sha256 = "b2fe5e8987594e9ffd1d2ca52a2f5d73eb8335243893c5d6254b5ad69269591d"
+
+[[files]]
+path = "fonts/jetbrains-mono/upstream_info.md"
+sha256 = "a7ff1b72bd77464cd4a8e94c7c71efd527ff77cac41fbba1bbf32578573c8fd9"
+
+[[files]]
+path = "fonts/atkinson-hyperlegible-next/AtkinsonHyperlegibleNext-Italic[wght].ttf"
+sha256 = "ce9cffed32742ad2d9238c561a93220385e5934cdc02b8eb4097a50efa957dc6"
+
+[[files]]
+path = "fonts/atkinson-hyperlegible-next/AtkinsonHyperlegibleNext[wght].ttf"
+sha256 = "5a455d1cfa099b601ab70751bb9673e8fe1854dc4500c80e1a220d0d75e31745"
+
+[[files]]
+path = "fonts/atkinson-hyperlegible-next/METADATA.pb"
+sha256 = "9d0050e8a74b976099f69ba23a25063b60deeb91eae89388bb20dffb5b4a5669"
+
+[[files]]
+path = "fonts/atkinson-hyperlegible-next/OFL.txt"
+sha256 = "aca6a428580965d2297d1b718042dd427c2a9443ece3b0d02d758e161e0c4030"
+
+[[files]]
+path = "fonts/atkinson-hyperlegible-next/upstream_info.md"
+sha256 = "e58f61c25d9d7c89d029f337bdfca9fc1a9b1397cf4a9cc77d04aec66bd0d699"

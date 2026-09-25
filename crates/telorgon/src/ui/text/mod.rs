@@ -12,8 +12,11 @@ mod range;
 mod retained;
 mod session;
 mod shaping;
+mod font_database;
 mod snapshot;
 mod style;
+mod typography;
+pub use typography::Typography;
 
 pub use atlas::{AtlasPageUpdate, GlyphAtlas, GlyphAtlasView};
 pub use buffer::{TextBuffer, TextBufferError, TextChunk, TextChunks};

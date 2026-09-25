@@ -70,6 +70,7 @@ impl KeyboardConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinuxShellConfig {
+    pub typography: crate::Typography,
     /// Fallback for templates without an explicit motion style.
     pub window_motion: crate::WindowMotion,
     /// Applies centrally to all desktop window motion.
@@ -115,6 +116,7 @@ pub struct LinuxShellConfig {
 impl Default for LinuxShellConfig {
     fn default() -> Self {
         Self {
+            typography: Default::default(),
             window_motion: crate::WindowMotion::none(),
             motion_preference: crate::theme::MotionPreference::Full,
             #[cfg(feature = "shell-xwayland")]
@@ -191,14 +193,17 @@ pub struct Application {
 }
 
 impl Application {
-    /// Begins one ordinary managed GUI application declaration.
-    pub fn gui(name: impl Into<String>) -> GuiApplication {
+    /// Begins a GUI declaration with a stable storage identity and a separate display name.
+    /// Identity is validated at startup and must remain stable across app renames and updates.
+    pub fn gui(identity: impl Into<String>, name: impl Into<String>) -> GuiApplication {
         GuiApplication {
+            typography: Default::default(),
+            identity: identity.into(),
             name: name.into(),
             renderer: Renderer::Auto,
             assets: AssetBundle::EMPTY,
             pointer: PointerConfiguration::default(),
-            session: None,
+            session: crate::services::session::GuiSessionConfig::default(),
         }
     }
 
@@ -224,17 +229,23 @@ impl fmt::Debug for Application {
 
 /// Incomplete GUI application declaration that still requires its initial window.
 pub struct GuiApplication {
+    typography: crate::Typography,
+    identity: String,
     name: String,
     renderer: Renderer,
     assets: AssetBundle,
     pointer: PointerConfiguration,
-    session: Option<crate::services::session::SessionConfig>,
+    session: crate::services::session::GuiSessionConfig,
 }
 
 impl GuiApplication {
-    /// Override the launch context's stable identity, recovery, and terminal configuration.
-    pub fn session(mut self, config: crate::services::session::SessionConfig) -> Self {
-        self.session = Some(config);
+    pub fn typography(mut self, typography: crate::Typography) -> Self {
+        self.typography = typography;
+        self
+    }
+    /// Configure launch services without changing the application identity.
+    pub fn session(mut self, config: crate::services::session::GuiSessionConfig) -> Self {
+        self.session = config;
         self
     }
     /// Selects the renderer policy for this application.
@@ -262,6 +273,8 @@ impl GuiApplication {
     /// Installs the single initial window supported by the current managed runtime.
     pub fn window(self, window: ReadyWindow) -> ReadyGuiApplication {
         ReadyGuiApplication {
+            typography: self.typography,
+            identity: self.identity,
             name: self.name,
             renderer: self.renderer,
             assets: self.assets,
@@ -286,17 +299,23 @@ impl fmt::Debug for GuiApplication {
 
 /// Complete GUI application declaration.
 pub struct ReadyGuiApplication {
+    typography: crate::Typography,
+    identity: String,
     name: String,
     renderer: Renderer,
     assets: AssetBundle,
     pointer: PointerConfiguration,
     window: ReadyWindow,
-    session: Option<crate::services::session::SessionConfig>,
+    session: crate::services::session::GuiSessionConfig,
 }
 
 impl ReadyGuiApplication {
-    pub fn session(mut self, config: crate::services::session::SessionConfig) -> Self {
-        self.session = Some(config);
+    pub fn typography(mut self, typography: crate::Typography) -> Self {
+        self.typography = typography;
+        self
+    }
+    pub fn session(mut self, config: crate::services::session::GuiSessionConfig) -> Self {
+        self.session = config;
         self
     }
     /// Replaces the renderer policy without changing the declared window.
@@ -328,20 +347,11 @@ impl ReadyGuiApplication {
         ))]
         {
             validate_application_name(&self.name)?;
-            let config = self.session.clone().unwrap_or_else(|| {
-                // Stable across compiler versions and processes; display names need not be valid IDs.
-                let hash = self.name.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-                });
-                crate::services::session::SessionConfig::new(format!("gui-{hash:016x}"))
-            });
+            crate::services::session::validate_identity(&self.identity)
+                .map_err(|e| AppError::new(e.to_string()))?;
+            let config = self.session.clone().into_session(self.identity.clone());
             let env =
                 crate::services::session::Environment::gui().map_err(|e| AppError::new(e.to_string()))?;
-            if config.publish_user_service_environment {
-                return Err(AppError::new(
-                    "GUI applications cannot publish the shared desktop environment; configure publication on the DE entry point",
-                ));
-            }
             let session = crate::services::session::SessionOwner::start_gui(env, config)
                 .map_err(|e| AppError::new(e.to_string()))?;
             let result = crate::host::application::native::run_gui(self);
@@ -375,13 +385,15 @@ impl ReadyGuiApplication {
         PointerConfiguration,
     )> {
         validate_application_name(&self.name)?;
-        self.assets
-            .validate()
+        crate::services::session::validate_identity(&self.identity)
+            .map_err(|e| AppError::new(e.to_string()))?;
+        crate::AssetResolver::new(self.assets)
             .map_err(|error| AppError::new(error.to_string()))?;
         self.pointer
             .load_theme(self.assets)
             .map_err(|error| AppError::new(error.to_string()))?;
-        let (driver, options) = self.window.into_parts()?;
+        let (mut driver, options) = self.window.into_parts()?;
+        driver.typography = self.typography;
         Ok((driver, options, self.renderer, self.assets, self.pointer))
     }
 }
@@ -933,6 +945,10 @@ pub struct ShellEnvironment {
 }
 
 impl ShellEnvironment {
+    pub fn typography(mut self, typography: crate::Typography) -> Self {
+        self.linux.typography = typography;
+        self
+    }
     /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
     pub fn capture(mut self, capture: super::Capture) -> Self {
         self.capture = capture;
@@ -1016,6 +1032,10 @@ pub struct ShellEnvironmentWithCompositor {
 }
 
 impl ShellEnvironmentWithCompositor {
+    pub fn typography(mut self, typography: crate::Typography) -> Self {
+        self.linux.typography = typography;
+        self
+    }
     /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
     pub fn capture(mut self, capture: super::Capture) -> Self {
         self.capture = capture;
@@ -1109,6 +1129,10 @@ pub struct ReadyShellEnvironment {
 }
 
 impl ReadyShellEnvironment {
+    pub fn typography(mut self, typography: crate::Typography) -> Self {
+        self.linux.typography = typography;
+        self
+    }
     /// Configures capture interfaces. Defaults to disabled, even when compiled with capture support.
     pub fn capture(mut self, capture: super::Capture) -> Self {
         self.capture = capture;
@@ -1196,8 +1220,7 @@ impl ReadyShellEnvironment {
             })?.validate()?;
         }
         validate_application_name(&self.name)?;
-        self.assets
-            .validate()
+        crate::AssetResolver::new(self.assets)
             .map_err(|error| AppError::new(error.to_string()))?;
         self.app_icon
             .validate()

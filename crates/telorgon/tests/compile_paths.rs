@@ -1930,7 +1930,7 @@ fn current_public_paths_compile() {
         let _managed_runtime: Option<telorgon::ManagedComponentRuntime<ComponentFixture>> = None;
         let _app_scheduler_bridge: telorgon::application_host::FrameScheduler =
             telorgon::FrameScheduler::default();
-        let _gui_entry = telorgon::Application::gui("Compile path")
+        let _gui_entry = telorgon::Application::gui("org.telorgon.tests.compile-path", "Compile path")
             .renderer(telorgon::Renderer::Auto)
             .window(
                 telorgon::Window::new("Compile path")

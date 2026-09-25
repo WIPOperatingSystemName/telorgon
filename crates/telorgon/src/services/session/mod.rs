@@ -34,6 +34,9 @@ mod desktop;
 mod desktop_settings;
 mod environment;
 mod recovery;
+mod gui_config;
+pub use gui_config::GuiSessionConfig;
+pub(crate) use gui_config::validate_identity;
 mod registry;
 pub use registry::{
     ApplicationHandle, ApplicationRef, ApplicationRegistry, ApplicationSpec, SessionApplications,
@@ -71,7 +74,7 @@ pub struct SessionConfig {
     /// Persist recoverable launches. No environment variables or arbitrary application memory are
     /// persisted. Files/URLs supplied as launch arguments may be stored in the private journal.
     pub recovery: bool,
-    /// Override the recovery directory. By default uses XDG_STATE_HOME/telorgon/<identity>.
+    /// Override the recovery directory. By default uses the platform state directory followed by <identity>/recovery.
     pub recovery_directory: Option<PathBuf>,
     /// Time allowed for normal child exit. There is no automatic SIGKILL escalation.
     pub shutdown_timeout: Duration,
@@ -99,15 +102,8 @@ impl SessionConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.identity.is_empty()
-            || self.identity.len() > 128
-            || !self
-                .identity
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            || self.identity == "."
-            || self.identity == ".."
-            || self.shutdown_timeout.is_zero()
+        validate_identity(&self.identity)?;
+        if self.shutdown_timeout.is_zero()
             || self.shutdown_timeout > Duration::from_secs(300)
         {
             return Err(Error::Invalid(

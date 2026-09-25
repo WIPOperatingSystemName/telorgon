@@ -3,7 +3,7 @@
 //! Subsystem ownership remains visible through focused modules while applications can import the
 //! ordinary authoring surface with `use telorgon::app::*`.
 
-pub use crate::services::session::{ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
+pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
 
 pub use crate::host::application::request_exit;
 pub use crate::host::application::{
@@ -23,9 +23,10 @@ pub mod portal {
 #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
 pub use portal::*;
 
+pub use crate::ui::text::Typography;
 pub use crate::assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
-    AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,
+    AssetResolver, AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,
     AssetMediaError, AssetRasterSize, ClientCursorMode, CursorAsset, CursorGraphic, CursorTheme,
     CursorThemeAsset, CursorThemeError, DecodedAssetImage, FontAsset, Icon, IconAsset, ImageAsset,
     ImageSource, PointerConfiguration, PointerFrame, PointerHotspot, PointerRequest,
@@ -71,7 +72,7 @@ mod common {
         WindowTween, tween_ms,
     };
     pub use crate::{
-        Alignment, AppIconProfile, AssetBundle, AssetCatalog, AssetKey, Background, Border,
+        Typography, Alignment, AppIconProfile, AssetBundle, AssetCatalog, AssetKey, Background, Border,
         BorderSide, BoxDecoration, BoxDecorationError, BoxSizing, BoxStyle, ColorRgba8, Component,
         ComponentFields, ComponentInstanceId, CornerRadii, CrossAxisAlignment, Dimension,
         EdgeInsets, Element, EventContext, EventHandler, Flow, FontAsset, Icon, IconAsset,
@@ -118,7 +119,7 @@ pub mod app {
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
     pub use crate::portal::*;
     pub use crate::services::session;
-    pub use crate::services::session::{ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
+    pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
     pub use crate::{DecorationNegotiation, DecorationPolicy};
 }
