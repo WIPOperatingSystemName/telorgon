@@ -60,7 +60,7 @@ impl CursorCommitTracker {
     }
 
     pub(super) fn mark_submitted(&mut self, snapshot: CursorSnapshot) -> AppResult<()> {
-        if self.in_flight.is_some() || snapshot.serial != self.desired.serial {
+        if self.in_flight.is_some() || snapshot != self.desired {
             return Err(AppError::new(
                 "atomic cursor submission did not match the desired cursor generation",
             ));
@@ -112,6 +112,12 @@ pub(super) struct PendingKmsCommit {
     pub(super) cursor_event_us: Option<u64>,
 }
 
+impl super::presentation::Commit for PendingKmsCommit {
+    fn primary_slot(&self) -> Option<usize> {
+        self.primary_slot
+    }
+}
+
 pub(super) struct HardwareCursor<'gbm, 'kms, 'fd> {
     // Framebuffers must be removed before the GBM buffers that back them are destroyed.
     framebuffers: Vec<KmsFramebuffer<'kms>>,
@@ -121,7 +127,8 @@ pub(super) struct HardwareCursor<'gbm, 'kms, 'fd> {
     properties: KmsObjectProperties,
     has_hotspot_properties: bool,
     state: CursorCommitTracker,
-    image_signature: Option<u64>,
+    image_signature: Option<(u64, u32)>,
+    upload_pixels: Vec<u8>,
 }
 
 impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
@@ -167,6 +174,7 @@ impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
             has_hotspot_properties,
             state: CursorCommitTracker::default(),
             image_signature: None,
+            upload_pixels: vec![0; extent.width as usize * extent.height as usize * 4],
         })
     }
 
@@ -175,8 +183,21 @@ impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
         cursor: &RenderedCursor,
         scale: crate::platform::contracts::ScaleFactor,
     ) -> AppResult<()> {
+        // Cache the logical source before allocating or resampling physical pixels. Scale,
+        // hotspot, alpha convention, and image geometry all participate in this key.
+        let signature = (cursor_image_signature(cursor), scale.get().to_bits());
+        if self.image_signature == Some(signature) {
+            let buffer = self.state.desired.buffer.ok_or_else(|| {
+                AppError::new("atomic cursor image signature has no staged buffer")
+            })?;
+            self.state.show(buffer, self.state.desired.hotspot);
+            return Ok(());
+        }
         let physical = cursor.for_hardware(scale, self.extent)?;
-        self.set_image(&physical)
+        self.set_image(&physical)?;
+        // Publish only after a successful upload so failures cannot poison the cache.
+        self.image_signature = Some(signature);
+        Ok(())
     }
 
     fn set_image(&mut self, cursor: &RenderedCursor) -> AppResult<()> {
@@ -198,20 +219,13 @@ impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
                 "cursor image pixels do not match its declared extent",
             ));
         }
-        let signature = cursor_image_signature(cursor);
-        if self.image_signature == Some(signature) {
-            let buffer = self.state.desired.buffer.ok_or_else(|| {
-                AppError::new("atomic cursor image signature has no staged buffer")
-            })?;
-            self.state.show(buffer, cursor.hotspot);
-            return Ok(());
-        }
-        let mut pixels = vec![0_u8; self.extent.width as usize * self.extent.height as usize * 4];
+        self.upload_pixels.fill(0);
         let source_stride = cursor.size.width.max(0) as usize * 4;
         let target_stride = self.extent.width as usize * 4;
         for row in 0..cursor.size.height.max(0) as usize {
             let source = &cursor.rgba[row * source_stride..(row + 1) * source_stride];
-            let target = &mut pixels[row * target_stride..row * target_stride + source_stride];
+            let target =
+                &mut self.upload_pixels[row * target_stride..row * target_stride + source_stride];
             target.copy_from_slice(source);
             if !cursor.premultiplied {
                 for pixel in target.chunks_exact_mut(4) {
@@ -229,10 +243,9 @@ impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
         self.buffers[next]
             .map_write()
             .map_err(app_error)?
-            .write_rgba8(&pixels)
+            .write_rgba8(&self.upload_pixels)
             .map_err(app_error)?;
         self.state.show(next, cursor.hotspot);
-        self.image_signature = Some(signature);
         Ok(())
     }
 
@@ -318,5 +331,48 @@ impl<'gbm, 'kms, 'fd> HardwareCursor<'gbm, 'kms, 'fd> {
 
     pub(super) fn ready_to_retire(&self) -> bool {
         self.state.ready_to_retire()
+    }
+}
+
+#[cfg(test)]
+mod cursor_state_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_cursor_state_does_not_schedule_another_commit() {
+        let mut state = CursorCommitTracker::default();
+        state.move_to(PointI { x: 12, y: 24 });
+        state.show(0, PointI { x: 1, y: 2 });
+        let snapshot = state.desired_submission().unwrap();
+        state.mark_submitted(snapshot).unwrap();
+        state.mark_completed(snapshot).unwrap();
+        state.move_to(snapshot.position);
+        state.show(0, snapshot.hotspot);
+        assert!(state.desired_submission().is_none());
+
+        state.hide();
+        let hidden = state.desired_submission().unwrap();
+        state.mark_submitted(hidden).unwrap();
+        state.mark_completed(hidden).unwrap();
+        state.move_to(PointI { x: 30, y: 40 });
+        assert!(state.desired_submission().is_none());
+        state.show(0, snapshot.hotspot);
+        assert_eq!(
+            state.desired_submission().unwrap().position,
+            PointI { x: 30, y: 40 }
+        );
+    }
+
+    #[test]
+    fn cursor_submission_rejects_mismatched_state_with_matching_serial() {
+        let mut state = CursorCommitTracker::default();
+        state.show(0, PointI::default());
+        let mut snapshot = state.desired_submission().unwrap();
+        snapshot.buffer = Some(1);
+        assert!(state.mark_submitted(snapshot).is_err());
+        assert!(state.in_flight.is_none());
+        state
+            .mark_submitted(state.desired_submission().unwrap())
+            .unwrap();
     }
 }

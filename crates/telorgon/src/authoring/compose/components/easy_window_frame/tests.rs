@@ -84,6 +84,30 @@ fn shell_catalog_icon_is_centered_and_focus_changes_shadow_color() {
     }
 }
 
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+#[test]
+fn server_content_slot_is_square_with_or_without_titlebar() {
+    use crate::foundation::{MonotonicInstant, SizeI};
+    use crate::host::application::AppRuntimeCore;
+    use crate::runtime::CompositionDriver;
+    use crate::shell::window_chrome::WindowChromeSnapshot;
+
+    for title_bar_visible in [true, false] {
+        let mut model = WindowChromeModel::new(42, "Browser");
+        model.title_bar_visible = title_bar_visible;
+        let driver = CompositionDriver::new(easy_window_frame(DESIGN).compose(model));
+        let mut runtime = AppRuntimeCore::from_composition_driver(
+            driver, SizeI { width: 640, height: 480 },
+        ).unwrap();
+        runtime.prepare_frame(MonotonicInstant::from_nanos(0), true).unwrap();
+        let snapshot = WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
+        let content = runtime.ui().box_styles.get(snapshot.content.node).unwrap();
+        let frame = runtime.ui().box_styles.get(snapshot.frame.node).unwrap();
+        assert_eq!(content.decoration.corner_radii, crate::ui::CornerRadii::default());
+        assert_eq!(frame.decoration.corner_radii, crate::ui::CornerRadii::all(STATE.frame_radius));
+    }
+}
+
 const fn icon(path: &'static str) -> IconAsset {
     IconAsset::new(AssetKey::new(path))
 }
@@ -355,74 +379,7 @@ fn fractional_content_background_does_not_leak_into_frame_strips() {
 
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 #[test]
-fn decoration_parts_independently_control_geometry_style_and_resize_hits() {
-    use crate::host::application::AppRuntimeCore;
-    use crate::foundation::{MonotonicInstant, SizeI};
-    use crate::shell::window_chrome::{WindowAction, WindowChromeRole, WindowChromeSnapshot};
-    for bits in 0..16 {
-        let parts = crate::WindowFrameParts {
-            border: bits & 1 != 0,
-            rounded_clip: bits & 2 != 0,
-            shadow: bits & 4 != 0,
-            resize_regions: bits & 8 != 0,
-        };
-        for state in [WindowChromeState::Normal, WindowChromeState::Maximized] {
-            let mut model = WindowChromeModel::new(42, "Firefox")
-                .title_bar_visible(false)
-                .state(state);
-            model.frame_parts = parts;
-            let mut design = DESIGN;
-            design.normal.shadow = Some(Shadow {
-                offset: crate::PointF::default(),
-                blur: 8.0,
-                spread: 0.0,
-                color: ColorRgba8::rgba(0, 0, 0, 100),
-            });
-            let mut runtime = AppRuntimeCore::from_composed_with_extent(
-                easy_window_frame(design).compose(model),
-                SizeI {
-                    width: 640,
-                    height: 480,
-                },
-            )
-            .unwrap();
-            runtime
-                .prepare_frame(MonotonicInstant::from_nanos(0), true)
-                .unwrap();
-            let snapshot =
-                WindowChromeSnapshot::derive(runtime.ui(), runtime.layout()).unwrap();
-            let normal = state == WindowChromeState::Normal;
-            let inset = if parts.border && normal { 1.0 } else { 0.0 };
-            assert_eq!(snapshot.content.bounds.x, inset);
-            assert_eq!(snapshot.content.bounds.y, inset);
-            assert_eq!(snapshot.content.bounds.width, 640.0 - 2.0 * inset);
-            let style = runtime.ui().box_styles.get(snapshot.frame.node).unwrap();
-            assert_eq!(
-                style.decoration.corner_radii,
-                crate::ui::CornerRadii::all(if parts.rounded_clip && normal {
-                    12.0
-                } else {
-                    0.0
-                })
-            );
-            assert_eq!(
-                style.decoration.shadows.as_slice().is_empty(),
-                !(parts.shadow && normal)
-            );
-            assert_eq!(
-                snapshot.regions.iter().any(|region| matches!(
-                    region.role,
-                    WindowChromeRole::Action(WindowAction::BeginResize(_))
-                )),
-                parts.resize_regions && normal
-            );
-        }
-    }
-}
-
-#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
-#[test]
-fn client_header_keeps_outer_style_and_resize_regions_without_title_controls() {
+fn server_template_can_hide_title_controls_without_changing_outer_style() {
     use crate::host::application::AppRuntimeCore;
     use crate::foundation::{MonotonicInstant, SizeI};
     use crate::shell::window_chrome::{WindowAction, WindowChromeRole, WindowChromeSnapshot};
@@ -765,3 +722,25 @@ fn square_flush_controls_preserve_the_rounded_window_border() {
         }
     }
 }
+
+#[test]
+fn server_content_backing_is_independent_of_titlebar_visibility() {
+    for alpha in [255, 128, 0] {
+        let design = WindowChromeDesign {
+            content_background: ColorRgba8::rgba(15, 18, 26, alpha),
+            ..DESIGN
+        };
+        let template = easy_window_frame(design);
+        for title_bar_visible in [false, true] {
+            let model = WindowChromeModel::new(7, "Client decorations")
+                .title_bar_visible(title_bar_visible);
+            let style = template.content_style(&model).unwrap();
+            assert_eq!(style.background, design.content_background,
+                "header ownership must not punch holes in the window backing");
+            assert_eq!(style.resize_preview, design.resize_preview);
+        }
+    }
+}
+
+#[cfg(all(feature = "application-software", target_os = "linux"))]
+mod hover_border;

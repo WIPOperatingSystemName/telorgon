@@ -146,7 +146,7 @@ struct VulkanImageResource {
     color_encoding: ImageColorEncoding,
     alpha_mode: ImageAlphaMode,
     pixel_format: ImagePixelFormat,
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
     pending: Vec<ImageUploadChunk>,
     texture: RetainedTexture,
 }
@@ -156,6 +156,10 @@ struct ExternalSceneImage {
 }
 
 pub struct VulkanScene {
+    pub(crate) frame_border: Option<BoxInstance>,
+    pub(crate) coverage_normalization: Option<crate::graphics::render::RoundedClip>,
+    #[cfg(target_os = "linux")]
+    pub(super) isolated_frame: Option<Box<super::frame_border::IsolatedFrame>>,
     pub(crate) id: u64,
     pub(crate) device_id: u64,
     pub(crate) epoch: u64,
@@ -211,9 +215,25 @@ impl Default for VulkanScene {
 }
 
 impl VulkanScene {
+    pub(super) fn mark_frame_background(&mut self, root: crate::graphics::scene::NodeId) {
+        // Bit 2 exempts the enclosing background from the descendant paint inset.
+        for (index, (instance, gpu)) in self.boxes.iter().zip(&mut self.gpu_boxes).enumerate() {
+            let flags = (gpu.border_l_spatial_clip_flags[3] & !4)
+                | if instance.node == root { 4 } else { 0 };
+            if gpu.border_l_spatial_clip_flags[3] != flags {
+                gpu.border_l_spatial_clip_flags[3] = flags;
+                self.box_dirty.add(index..index + 1);
+            }
+        }
+    }
+
     pub(crate) fn new(device_id: u64) -> Self {
         Self {
             id: NEXT_SCENE_ID.fetch_add(1, Ordering::Relaxed),
+            frame_border: None,
+            coverage_normalization: None,
+            #[cfg(target_os = "linux")]
+            isolated_frame: None,
             device_id,
             epoch: 0,
             extent: SizeF::default(),
@@ -401,74 +421,8 @@ impl VulkanScene {
                     depth: 1,
                 },
                 row_bytes: page.width as usize,
-                bytes: page.pixels_a8.to_vec(),
+                bytes: Arc::clone(&page.pixels_a8),
             });
-        }
-    }
-
-    fn apply_image_resources(&mut self, updates: &[ImageResourceDelta]) {
-        for update in updates {
-            match update {
-                ImageResourceDelta::Remove(id) => {
-                    self.image_resources.remove(id);
-                }
-                ImageResourceDelta::Write(update) => {
-                    let resource = self.image_resources.entry(update.image).or_insert_with(|| {
-                        VulkanImageResource {
-                            extent: update.extent,
-                            color_encoding: update.color_encoding,
-                            alpha_mode: update.alpha_mode,
-                            pixel_format: update.pixel_format,
-                            pixels: vec![
-                                0;
-                                update.extent.width as usize
-                                    * update.extent.height as usize
-                                    * 4
-                            ],
-                            pending: Vec::new(),
-                            texture: RetainedTexture::default(),
-                        }
-                    });
-                    if resource.extent != update.extent
-                        || resource.color_encoding != update.color_encoding
-                        || resource.pixel_format != update.pixel_format
-                    {
-                        resource.extent = update.extent;
-                        resource.color_encoding = update.color_encoding;
-                        resource.pixel_format = update.pixel_format;
-                        resource.pixels.resize(
-                            update.extent.width as usize * update.extent.height as usize * 4,
-                            0,
-                        );
-                        resource.texture.image = None;
-                        resource.pending.clear();
-                    }
-                    resource.alpha_mode = update.alpha_mode;
-                    let destination_stride = update.extent.width as usize * 4;
-                    let copy_bytes = update.rect.width as usize * 4;
-                    for row in 0..update.rect.height as usize {
-                        let source = row * update.row_bytes;
-                        let target = (update.rect.y as usize + row) * destination_stride
-                            + update.rect.x as usize * 4;
-                        resource.pixels[target..target + copy_bytes]
-                            .copy_from_slice(&update.pixels[source..source + copy_bytes]);
-                    }
-                    resource.pending.push(ImageUploadChunk {
-                        offset: vk::Offset3D {
-                            x: update.rect.x,
-                            y: update.rect.y,
-                            z: 0,
-                        },
-                        extent: vk::Extent3D {
-                            width: update.rect.width as u32,
-                            height: update.rect.height as u32,
-                            depth: 1,
-                        },
-                        row_bytes: update.row_bytes,
-                        bytes: update.pixels.to_vec(),
-                    });
-                }
-            }
         }
     }
 
@@ -557,7 +511,7 @@ impl VulkanScene {
                 color_encoding: VulkanMaterializationTarget::COLOR_ENCODING,
                 alpha_mode,
                 pixel_format: ImagePixelFormat::Rgba8,
-                pixels: Vec::new(),
+                pixels: Arc::from([]),
                 pending: Vec::new(),
                 texture: RetainedTexture {
                     image: Some(retained),
@@ -993,7 +947,7 @@ impl VulkanScene {
                         depth: 1,
                     },
                     row_bytes: self.atlas_extent.width as usize,
-                    bytes: self.atlas_pixels.clone(),
+                    bytes: self.atlas_pixels.clone().into(),
                 }]
             } else {
                 std::mem::take(&mut self.atlas_pending)
@@ -1559,3 +1513,5 @@ pub(crate) fn validate_texture_count(order: &[DrawItem]) -> Result<(), &'static 
 
 #[cfg(test)]
 mod tests;
+
+mod image_updates;

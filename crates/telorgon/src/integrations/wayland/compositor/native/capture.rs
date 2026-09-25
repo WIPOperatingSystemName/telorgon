@@ -3,6 +3,21 @@
 use super::*;
 
 impl NativeState {
+    pub(super) fn retire_capture_output(
+        &mut self,
+        output: u32,
+    ) -> Result<(), NativeCompositorError> {
+        for frame in self
+            .capture
+            .frames
+            .values_mut()
+            .filter(|frame| frame.output == output)
+        {
+            frame.cancellation.cancel();
+            frame.delivery.invalidate(2);
+        }
+        self.refresh_capture_sources()
+    }
     fn capture_output_size(&self, output: u32) -> Option<crate::foundation::SizeI> {
         if self.secure_session_locked || self.active_session_lock.is_some() {
             return None;
@@ -502,6 +517,11 @@ impl NativeCaptureState {
 }
 
 impl NativeCompositor<'_> {
+    pub(crate) fn direct_capture_waiting(&self) -> bool {
+        self.state.capture.frames.values().any(|frame|
+            frame.pending.is_some() && frame.destination.is_some() && frame.size.is_some())
+    }
+
     pub(crate) fn direct_capture_needs_cursor(&self) -> bool {
         self.state
             .capture

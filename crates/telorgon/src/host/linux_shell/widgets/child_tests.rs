@@ -113,7 +113,7 @@ fn child_lifecycle(motion: bool) {
             0,
             registered,
             output,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             scale,
             &wake,
             host.services.clone(),
@@ -125,12 +125,23 @@ fn child_lifecycle(motion: bool) {
         &mut widgets,
         &mut next,
         output,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         scale,
         &wake,
         &host.services,
     )
     .unwrap();
+    // An attached trigger can toggle its popup without outside dismissal racing it.
+    {
+        let child = widgets.iter_mut().find(|w| w.child_key == "1").unwrap();
+        child.parent_bounds = Some(RectI { x: 300, y: 260, width: 200, height: 80 });
+        child.sampled = RectI { x: 300, y: 340, width: 100, height: 40 };
+        let anchor_press = PointF { x: 350.0, y: 280.0 };
+        assert!(child.outside_press(anchor_press));
+        child.spec.outside_press_excludes_anchor = true;
+        assert!(!child.outside_press(anchor_press));
+        assert!(child.outside_press(PointF { x: 250.0, y: 280.0 }));
+    }
     assert_eq!(mounted.get(), 2);
     let first = widgets.iter().find(|w| w.child_key == "1").unwrap().id;
     writer.publish_if_changed(vec![2, 1]);
@@ -146,7 +157,7 @@ fn child_lifecycle(motion: bool) {
         &mut widgets,
         &mut next,
         output,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         scale,
         &wake,
         &host.services,
@@ -170,7 +181,7 @@ fn child_lifecycle(motion: bool) {
         &mut widgets,
         &mut next,
         output,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         scale,
         &wake,
         &host.services,
@@ -203,7 +214,7 @@ fn child_lifecycle(motion: bool) {
             &mut widgets,
             &mut next,
             output,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             scale,
             &wake,
             &host.services,
@@ -224,7 +235,7 @@ fn child_lifecycle(motion: bool) {
             &mut widgets,
             &mut next,
             output,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             scale,
             &wake,
             &host.services,
@@ -250,7 +261,7 @@ fn child_lifecycle(motion: bool) {
             &mut widgets,
             &mut next,
             output,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             scale,
             &wake,
             &host.services,

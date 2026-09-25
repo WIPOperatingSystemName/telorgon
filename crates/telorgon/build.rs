@@ -6,6 +6,10 @@ mod wayland;
 #[path = "src/integrations/x11/payload_format.rs"]
 mod payload_format;
 
+#[cfg(feature = "shell-xwayland-embedded")]
+#[path = "build/xwayland.rs"]
+mod xwayland;
+
 fn main() {
     #[cfg(feature = "shell-xwayland-embedded")]
     embed_xwayland();
@@ -24,9 +28,7 @@ fn main() {
 fn embed_xwayland() {
     println!("cargo:rerun-if-env-changed=TELORGON_XWAYLAND_PAYLOAD");
     println!("cargo:rerun-if-changed=src/integrations/x11/payload_format.rs");
-    let path = std::env::var_os("TELORGON_XWAYLAND_PAYLOAD")
-        .expect("shell-xwayland-embedded requires TELORGON_XWAYLAND_PAYLOAD; see packaging/linux/xwayland/README.md");
-    let path = std::path::PathBuf::from(path);
+    let path = xwayland::payload_path();
     assert!(
         path.is_absolute(),
         "TELORGON_XWAYLAND_PAYLOAD must be absolute"

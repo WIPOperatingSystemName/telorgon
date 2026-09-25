@@ -33,6 +33,9 @@ fn rgba_drm_pairs_are_explicit_and_alpha_sensitive() {
         height: 32,
     }];
     validate_metadata(valid_metadata(), &damage).unwrap();
+    let mut straight = valid_metadata();
+    straight.alpha_mode = ImageAlphaMode::Straight;
+    validate_metadata(straight, &damage).unwrap();
     let mut wrong_alpha = valid_metadata();
     wrong_alpha.alpha_mode = ImageAlphaMode::Opaque;
     assert_eq!(
@@ -145,4 +148,18 @@ fn scanout_layout_discards_only_before_the_first_submission() {
         linux::scanout_initial_layout(true),
         vk::ImageLayout::GENERAL
     );
+}
+
+#[test]
+fn non_linear_modifier_layouts_defer_pixel_footprints_to_the_driver() {
+    let mut metadata = valid_metadata();
+    metadata.damage_count = 0;
+    metadata.row_pitch = 64;
+    metadata.size = 256;
+    metadata.allocation_size = 256;
+    assert!(validate_metadata(metadata, &[]).is_err());
+    metadata.drm_modifier = 1;
+    validate_metadata(metadata, &[]).unwrap();
+    metadata.offset = 1;
+    assert!(validate_metadata(metadata, &[]).is_err());
 }

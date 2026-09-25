@@ -319,7 +319,7 @@ fn validate_element(
             validate_callback(toggle.on_change.as_ref(), component)?;
         }
         ElementKind::Slider(slider) => {
-            if slider.label.trim().is_empty() {
+            if slider.accessible_label.as_deref().unwrap_or(&slider.label).trim().is_empty() {
                 return Err(ViewError::MissingButtonLabel);
             }
             if !slider.value.is_finite() {

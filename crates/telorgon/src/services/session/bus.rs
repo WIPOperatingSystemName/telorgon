@@ -80,7 +80,7 @@ pub(crate) struct ServiceEnvironment {
     published: HashMap<String, String>,
 }
 impl ServiceEnvironment {
-    pub fn publish(env: &Environment) -> Result<Self> {
+    pub fn publish(env: &Environment, desktop_settings: bool) -> Result<Self> {
         let connection = connect(env)?;
         let manager = Proxy::new(
             &connection,
@@ -96,6 +96,12 @@ impl ServiceEnvironment {
         );
         let published = KEYS
             .iter()
+            .copied()
+            .chain(
+                ["XDG_CONFIG_DIRS", "DCONF_PROFILE"]
+                    .into_iter()
+                    .filter(|_| desktop_settings),
+            )
             .map(|key| {
                 (
                     key.to_string(),

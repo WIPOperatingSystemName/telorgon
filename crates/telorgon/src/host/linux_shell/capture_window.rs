@@ -12,13 +12,22 @@ pub(super) struct WindowCapture {
     pub layout: CaptureLayout,
     /// Physical desktop origin for translating an embedded cursor into the capture target.
     pub origin: PointI,
+    desktop_cursor: bool,
     pub placements: Vec<ShellPlacement>,
     content_versions: Vec<(u32, u64)>,
 }
 
 impl WindowCapture {
-    pub fn into_surface_revisions(self) -> Vec<(u32, u64)> {
-        self.content_versions
+    pub fn surface_revisions(&self) -> &[(u32, u64)] {
+        &self.content_versions
+    }
+    pub fn into_scene(self) -> super::capture_scene::CaptureScene {
+        super::capture_scene::CaptureScene {
+            layout: self.layout,
+            desktop_cursor_origin: self.desktop_cursor.then_some(self.origin),
+            placements: self.placements,
+            sampled: self.content_versions,
+        }
     }
 }
 
@@ -113,6 +122,7 @@ pub(super) fn prepare(
         },
         placements,
         content_versions,
+        desktop_cursor: window.virtual_output.is_none(),
     })
 }
 

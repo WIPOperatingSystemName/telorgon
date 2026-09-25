@@ -71,13 +71,49 @@ struct SceneCommit {
 }
 
 impl VulkanDevice {
-    /// Records ordered retained scenes into one Vulkan render pass within an owned frame.
+    /// Records ordered retained scenes, resolving changed isolated frames before composition.
     ///
     /// Scene resources remain independent (including glyph atlases), while placements share the
     /// output attachment and command stream. An owned frame may record multiple composite passes
     /// for distinct targets before submission. This is the direct compositor path used by the
     /// Linux desktop host; it never invokes or consumes the software renderer.
     pub fn render_composite<'frame>(
+        &self,
+        scenes: &mut [VulkanCompositeScene<'_>],
+        placements: &[VulkanCompositePlacement],
+        frame: &mut VulkanFrameContext<'frame>,
+        target: &VulkanTarget<'frame>,
+        request: &RenderRequest,
+    ) -> RenderResult<RenderStats> {
+        let mut stats = RenderStats::default();
+        for (index, source) in scenes.iter_mut().enumerate() {
+            stats.epoch = stats.epoch.max(source.scene.epoch);
+            let extent = placements.iter().filter(|p| p.scene_index == index)
+                .map(|p| crate::foundation::SizeI {
+                    width: p.target.width, height: p.target.height,
+                })
+                .max_by_key(|s| i64::from(s.width) * i64::from(s.height));
+            if let Some(extent) = extent {
+                super::frame_border::accumulate(
+                    &mut stats, self.prepare_frame_border(source.scene, extent, frame)?,
+                );
+            }
+        }
+        let mut resolved = scenes.iter_mut().map(|source| VulkanCompositeScene {
+            scene: if source.scene.frame_border.is_some() && source.scene.isolated_frame.is_some() {
+                &mut source.scene.isolated_frame.as_mut().unwrap().output
+            } else {
+                &mut *source.scene
+            },
+        }).collect::<Vec<_>>();
+        super::frame_border::accumulate(
+            &mut stats,
+            self.render_composite_direct(&mut resolved, placements, frame, target, request)?,
+        );
+        Ok(stats)
+    }
+
+    pub(super) fn render_composite_direct<'frame>(
         &self,
         scenes: &mut [VulkanCompositeScene<'_>],
         placements: &[VulkanCompositePlacement],
@@ -200,8 +236,6 @@ impl VulkanDevice {
         // Composite passes use freshly allocated descriptor sets. Keeping one absolute staging
         // cursor likewise lets an owned command buffer populate several independent targets
         // before its final desktop pass without later CPU writes changing earlier commands.
-        let staging_start = frame.core.staging_bytes_used;
-        let mut staging_bytes = Vec::new();
         let mut prepared = Vec::with_capacity(placements.len());
         let texture_counts = placements
             .iter()
@@ -216,16 +250,30 @@ impl VulkanDevice {
             let mapping = ViewMapping::new(scene.extent, placement.target);
             let mut view = gpu_view(scene, target, mapping);
             set_placement_clips(&mut view, placement.rounded_clips);
+            if let Some(clip) = scene.coverage_normalization {
+                let sx = placement.target.width as f32 / scene.extent.width;
+                let sy = placement.target.height as f32 / scene.extent.height;
+                view.placement_clip_rects[1] = [
+                    placement.target.x as f32 + clip.rect.x * sx,
+                    placement.target.y as f32 + clip.rect.y * sy,
+                    clip.rect.width * sx, clip.rect.height * sy,
+                ];
+                view.placement_clip_radii[1] = [clip.radii.top_left, clip.radii.top_right,
+                    clip.radii.bottom_right, clip.radii.bottom_left].map(|r| r * sx.min(sy));
+                view.epoch_flags[3] |= 8;
+                if scene.frame_border.as_ref().is_some_and(crate::graphics::render::frame_border::has_border) {
+                    view.epoch_flags[3] |= 16;
+                }
+            }
             let plan = plans[placement.scene_index]
                 .take()
                 .unwrap_or_else(SceneUploadPlan::default);
-            let staged = StagedUploads::append_at(
+            let staged = StagedUploads::append_mapped(
                 &view,
                 plan,
-                frame.core.staging.size(),
-                &mut staging_bytes,
+                &frame.core.staging,
+                &mut frame.core.staging_bytes_used,
                 self.inner.uniform_buffer_offset_alignment as usize,
-                staging_start,
             )?;
             let descriptor_writes = write_descriptors(
                 &self.inner.raw,
@@ -254,11 +302,6 @@ impl VulkanDevice {
                 "updated Vulkan desktop scene has no visible placement",
             ));
         }
-        frame
-            .core
-            .staging
-            .write_at(staging_start as u64, &staging_bytes)?;
-        frame.core.staging_bytes_used = staging_start + staging_bytes.len();
 
         let mut buffer_copies = 0_u32;
         let mut upload_barriers = 0_u32;

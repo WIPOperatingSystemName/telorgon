@@ -474,7 +474,7 @@ fn restored_tile_can_snap_on_the_same_pointer_event() {
     apply_window_interaction(&mut w, &mut grab, &mut q, pointer, output, &c).unwrap();
     assert!(w[&id(1)].tile.is_none());
     t.preview(&mut [], &w, Some(grab), pointer, output, &c, false);
-    t.commit(&mut w, &mut q, grab, &c);
+    t.commit(&mut w, &mut q, grab, &c).unwrap();
     assert_eq!(w[&id(1)].tile.unwrap().target, TileTarget::TopLeft);
 }
 
@@ -589,4 +589,116 @@ fn maximize_from_tile_preserves_original_floating_restore() {
             height: 400
         }
     );
+}
+
+#[test]
+fn preview_hitboxes_resist_jitter_and_release_for_both_decoration_modes() {
+    for server_decorated in [false, true] {
+        let (mut tiling, mut windows, _, config) = setup();
+        windows.get_mut(&id(1)).unwrap().server_decorated = server_decorated;
+        let interaction = WindowInteraction::begin_move(&windows, id(1), PointF { x: 300.0, y: 300.0 });
+        let output = SizeI { width: 1200, height: 800 };
+        for (x, y, expected) in [
+            (15.0, 300.0, Some(TileTarget::Left)),
+            (17.0, 300.0, Some(TileTarget::Left)),
+            (15.0, 300.0, Some(TileTarget::Left)),
+            (23.0, 300.0, Some(TileTarget::Left)),
+            (25.0, 300.0, None),
+            (17.0, 300.0, None), // entry still respects the configured threshold
+            (15.0, 49.0, Some(TileTarget::Left)),
+            (15.0, 47.0, Some(TileTarget::Left)),
+            (15.0, 39.0, Some(TileTarget::TopLeft)),
+            (15.0, 49.0, Some(TileTarget::TopLeft)),
+            (15.0, 57.0, Some(TileTarget::Left)),
+            (1185.0, 300.0, Some(TileTarget::Right)),
+            (1183.0, 300.0, Some(TileTarget::Right)),
+            (1175.0, 300.0, None),
+            (1190.0, 790.0, Some(TileTarget::BottomRight)),
+            (1146.0, 750.0, Some(TileTarget::BottomRight)),
+            (1140.0, 740.0, None),
+        ] {
+            tiling.preview(&mut [], &windows, interaction, PointF { x, y }, output, &config, false);
+            assert_eq!(tiling.candidate.map(|(_, t)| t), expected.map(SnapTarget::Tile),
+                "pointer={x},{y}, server_decorated={server_decorated}");
+        }
+        tiling.preview(&mut [], &windows, interaction, PointF { x: 1.0, y: 1.0 }, output, &config, false);
+        assert!(tiling.candidate.is_some());
+        tiling.preview(&mut [], &windows, None, PointF { x: 1.0, y: 1.0 }, output, &config, false);
+        assert!(tiling.candidate.is_none(), "ending the grab clears retention");
+    }
+}
+
+#[test]
+fn top_edge_previews_work_area_and_maximizes_with_restore_for_both_decoration_modes() {
+    for server_decorated in [false, true] {
+        let (mut tiling, mut windows, mut scheduler, config) = setup();
+        windows.get_mut(&id(1)).unwrap().server_decorated = server_decorated;
+        let original = (windows[&id(1)].position, windows[&id(1)].requested_size);
+        let interaction =
+            WindowInteraction::begin_move(&windows, id(1), PointF { x: 300.0, y: 300.0 }).unwrap();
+        let output = SizeI {
+            width: 1200,
+            height: 800,
+        };
+        for (x, y, expected) in [
+            (600.0, 15.0, Some(SnapTarget::Maximize)),
+            (600.0, 18.0, Some(SnapTarget::Maximize)),
+            (600.0, 25.0, None),
+            (600.0, 17.0, None),
+            (600.0, 0.0, Some(SnapTarget::Maximize)),
+            (1.0, 1.0, Some(SnapTarget::Tile(TileTarget::TopLeft))),
+            (600.0, 1.0, Some(SnapTarget::Maximize)),
+            (1199.0, 1.0, Some(SnapTarget::Tile(TileTarget::TopRight))),
+            (600.0, 1.0, Some(SnapTarget::Maximize)),
+        ] {
+            tiling.preview(
+                &mut [],
+                &windows,
+                Some(interaction),
+                PointF { x, y },
+                output,
+                &config,
+                false,
+            );
+            assert_eq!(tiling.candidate.map(|(_, target)| target), expected);
+        }
+        assert_eq!(
+            preview_rect(
+                tiling.area,
+                tiling.splits,
+                SnapTarget::Maximize,
+                crate::Insets::all(8.0)
+            ),
+            RectI {
+                x: 8,
+                y: 48,
+                width: 1184,
+                height: 744
+            }
+        );
+        tiling
+            .commit(&mut windows, &mut scheduler, interaction, &config)
+            .unwrap();
+        finish_window_interaction(&mut windows, &mut scheduler, interaction);
+        let window = &windows[&id(1)];
+        assert!(window.maximized);
+        assert!(!window.fullscreen);
+        assert!(window.tile.is_none());
+        assert_eq!(window.position, PointI { x: 0, y: 40 });
+        assert_eq!(window.restore_geometry, Some(original));
+        assert!(!windows[&id(2)].maximized);
+        set_window_maximized(
+            &mut windows,
+            &mut scheduler,
+            id(1),
+            false,
+            tiling.area,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            (windows[&id(1)].position, windows[&id(1)].requested_size),
+            original
+        );
+    }
 }

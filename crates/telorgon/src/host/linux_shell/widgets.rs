@@ -1,7 +1,13 @@
 //! Shell surface lifetime and sampled geometry over the existing retained runtimes.
 mod output_previews;
-#[cfg(all(test, feature = "shell-screencast-linux"))]
-mod capture_tests;
+mod pointer_button;
+mod pointer_motion;
+pub(super) use pointer_motion::{queue_widget_pointer_motion, flush_widget_pointer_motion};
+#[cfg(test)]
+use pointer_motion::widget_pointer_motion;
+pub(super) use pointer_button::widget_pointer_button;
+#[cfg(feature = "shell-screencast-linux")]
+mod virtual_previews;
 use super::motion::geometry::{GeometryTrack, Sample};
 use super::scene::ShellLayerContent;
 use super::*;
@@ -34,8 +40,9 @@ pub(super) struct WidgetLayer {
     previous_output_previews: Vec<crate::authoring::compose::ShellOutputPreview>,
     pub parent_visible: bool,
     pub focused: bool,
-    pub captured: bool,
+    pub captured: BTreeSet<u32>,
     pointer_hovered: bool,
+    pending_motion: Option<PointF>,
     retiring: bool,
     visibility: super::motion::Track,
     pub opacity: f32,
@@ -46,7 +53,7 @@ impl WidgetLayer {
         id: u32,
         widget: crate::host::application::declaration::RegisteredShellWidget,
         output: SizeI,
-        assets: AssetBundle,
+        assets: &LayerAssets,
         scale: crate::platform::contracts::ScaleFactor,
         wake: &EventNotifier,
         services: crate::authoring::compose::ShellServices,
@@ -86,8 +93,9 @@ impl WidgetLayer {
             previous_output_previews: Vec::new(),
             parent_visible: true,
             focused: false,
-            captured: false,
+            captured: BTreeSet::new(),
             pointer_hovered: false,
+            pending_motion: None,
             retiring: false,
             visibility: super::motion::Track::fixed(0.0),
             opacity: 0.0,
@@ -97,6 +105,7 @@ impl WidgetLayer {
         Ok(result)
     }
     pub fn prepare(&mut self, output: SizeI, work: crate::foundation::RectF, now: u64) -> AppResult<()> {
+        let probe = stall_probe::begin();
         // Flush component/signal updates before observing the surface declaration.
         let extent = self.layer.runtime.extent();
         if !self.retiring {
@@ -259,7 +268,7 @@ impl WidgetLayer {
         }
         if !next.visible {
             self.focused = false;
-            self.captured = false;
+            self.captured.clear();
         }
         self.spec = next;
         self.target = target;
@@ -295,7 +304,12 @@ impl WidgetLayer {
         let outputs = self.binding.3.borrow().clone();
         self.geometry_dirty |= self.previous_output_previews != outputs;
         self.previous_output_previews = outputs;
+        stall_probe::finish("widget_prepare", probe, || self.probe_context());
         Ok(())
+    }
+    fn probe_context(&self) -> String {
+        format!("widget={} key={:?} layer={:?} visible={} hovered={} captured={}",
+            self.id, self.child_key, self.spec.layer, self.spec.visible, self.pointer_hovered, !self.captured.is_empty())
     }
     pub fn animating(&self) -> bool {
         self.track.pending() || self.visibility_pending
@@ -538,6 +552,18 @@ impl WidgetLayer {
             y: (p.y - self.sampled.y as f32) * size.height / self.sampled.height.max(1) as f32,
         }
     }
+    fn outside_press(&self, p: PointF) -> bool {
+        if self.inside_bounds(p) { return false; }
+        if self.spec.outside_press_excludes_anchor {
+            if let (ShellAttachment::Parent { rect, .. }, Some(parent)) = (self.spec.placement.attachment, self.parent_bounds) {
+                let anchor = rect.unwrap_or(crate::foundation::RectF { x: 0.0, y: 0.0, width: parent.width as f32, height: parent.height as f32 });
+                let x = p.x - parent.x as f32;
+                let y = p.y - parent.y as f32;
+                if x >= anchor.x && x < anchor.x + anchor.width && y >= anchor.y && y < anchor.y + anchor.height { return false; }
+            }
+        }
+        true
+    }
     fn inside_bounds(&self, p: PointF) -> bool {
         let local = self.local(p);
         let size = self.layer.runtime.extent();
@@ -645,68 +671,30 @@ fn ordered(widgets: &[WidgetLayer]) -> Vec<usize> {
     order.reverse();
     order
 }
-pub(super) fn widget_pointer_motion(
-    widgets: &mut [WidgetLayer],
-    p: PointF,
-    now: MonotonicInstant,
-    locked: bool,
-) -> AppResult<bool> {
-    if locked {
-        for w in widgets {
-            if w.captured || w.focused {
-                w.layer.runtime.deactivate_view(now);
-            }
-            if w.pointer_hovered {
-                w.layer
-                    .runtime
-                    .shell_input(crate::input::InputEvent::mouse_moved(PointF {
-                        x: -1_000_000.0,
-                        y: -1_000_000.0,
-                    }))?;
-                w.pointer_hovered = false;
-            }
-            w.captured = false;
-            w.focused = false;
-        }
-        return Ok(false);
-    }
-    let hit = widgets
-        .iter()
-        .position(|w| w.captured && w.input_visible())
-        .or_else(|| {
-            ordered(widgets)
-                .into_iter()
-                .find(|i| widgets[*i].contains(p))
-        });
-    for w in widgets.iter_mut() {
-        if w.input_visible()
-            && w.spec.dismiss_on_pointer_leave
-            && !w.captured
-            && !w.hover_contains(p)
-        {
-            w.dismiss(ShellDismissReason::PointerLeft)?;
-        }
-    }
-    for (i, w) in widgets.iter_mut().enumerate() {
-        let local = if Some(i) == hit {
-            w.local(p)
-        } else {
-            PointF {
-                x: -1_000_000.0,
-                y: -1_000_000.0,
-            }
-        };
-        // Notify the previous target once on leave so pending hover work can be cancelled.
-        if Some(i) == hit || w.pointer_hovered {
-            w.layer
-                .runtime
-                .shell_input(crate::input::InputEvent::mouse_moved(local))?;
-        }
-        w.pointer_hovered = Some(i) == hit;
-        w.layer.pointer_motion(local, now);
-    }
-    Ok(hit.is_some())
+pub(super) fn widget_probe_context(widgets: &[WidgetLayer]) -> String {
+    let active = widgets.iter().find(|w| !w.captured.is_empty())
+        .or_else(|| widgets.iter().find(|w| w.pointer_hovered));
+    let visible: Vec<_> = widgets.iter().filter(|w| w.input_visible())
+        .map(|w| (w.id, w.child_key.as_str())).collect();
+    format!("active=[{}] visible={visible:?}",
+        active.map_or_else(|| "client-or-desktop".into(), WidgetLayer::probe_context))
 }
+
+// Discrete wheel axes are measured in notches, not logical pixels. Keep
+// continuous axes unchanged so touchpad precision is preserved.
+pub(super) fn widget_scroll_distance(
+    horizontal: f64,
+    vertical: f64,
+    discrete_x: i32,
+    discrete_y: i32,
+) -> PointF {
+    const PIXELS_PER_NOTCH: f32 = 48.0;
+    let axis = |continuous: f64, notches: i32| {
+        if notches == 0 { continuous as f32 } else { notches as f32 * PIXELS_PER_NOTCH }
+    };
+    PointF { x: axis(horizontal, discrete_x), y: axis(vertical, discrete_y) }
+}
+
 pub(super) fn widget_pointer_scroll(
     widgets: &mut [WidgetLayer],
     p: PointF,
@@ -724,81 +712,19 @@ pub(super) fn widget_pointer_scroll(
         return Ok(false);
     };
     let w = &mut widgets[i];
+    let probe = stall_probe::begin();
     w.layer.pointer_motion(w.local(p), now);
-    let event = crate::input::InputEvent::mouse_scroll(delta);
+    // Linux axes describe viewport travel (positive down/right); UI scroll
+    // deltas describe content movement (positive up/left).
+    let event = crate::input::InputEvent::mouse_scroll(PointF {
+        x: -delta.x,
+        y: -delta.y,
+    });
     w.layer.runtime.shell_input(event.clone())?;
     w.layer.runtime.queue_input(event);
     w.layer.runtime.flush_input(now);
+    stall_probe::finish("widget_scroll", probe, || w.probe_context());
     Ok(true)
-}
-pub(super) fn widget_pointer_button(
-    widgets: &mut [WidgetLayer],
-    p: PointF,
-    pressed: bool,
-    now: MonotonicInstant,
-    locked: bool,
-) -> AppResult<bool> {
-    if locked {
-        return Ok(false);
-    }
-    let order = ordered(widgets);
-    let captured = widgets.iter().position(|w| w.captured && w.input_visible());
-    if !pressed && captured.is_none() {
-        return Ok(false);
-    }
-    let hit = captured.or_else(|| order.iter().copied().find(|i| widgets[*i].contains(p)));
-    let mut dismissed = false;
-    if pressed {
-        for i in order {
-            if Some(i) == hit {
-                break;
-            }
-            let w = &mut widgets[i];
-            if w.spec.visible && w.spec.dismiss_on_outside_press && !w.inside_bounds(p) {
-                w.dismiss(ShellDismissReason::OutsidePress)?;
-                dismissed = true;
-            }
-        }
-    }
-    if let Some(i) = hit {
-        if pressed && widgets[i].spec.dismiss_on_outside_press && !widgets[i].inside_bounds(p) {
-            widgets[i].dismiss(ShellDismissReason::OutsidePress)?;
-            return Ok(true);
-        }
-        if pressed {
-            let mut ancestors = BTreeSet::new();
-            let mut parent = widgets[i].parent;
-            while let Some(id) = parent {
-                ancestors.insert(id);
-                parent = widgets.iter().find(|w| w.id == id).and_then(|w| w.parent);
-            }
-            for (n, w) in widgets.iter_mut().enumerate() {
-                let next = (n == i && w.spec.focus != ShellFocus::None)
-                    || (ancestors.contains(&w.id) && w.focused);
-                if w.focused && !next {
-                    w.layer.runtime.deactivate_view(now);
-                }
-                w.focused = next;
-            }
-        }
-        let w = &mut widgets[i];
-        w.layer.pointer_motion(w.local(p), now);
-        w.layer
-            .runtime
-            .shell_input(crate::input::InputEvent::mouse_button(
-                crate::input::PointerButton::PRIMARY,
-                if pressed {
-                    crate::input::ButtonState::Pressed
-                } else {
-                    crate::input::ButtonState::Released
-                },
-            ))?;
-        w.layer.pointer_button(pressed, now);
-        w.captured = pressed;
-        Ok(true)
-    } else {
-        Ok(dismissed)
-    }
 }
 pub(super) fn widget_key(
     widgets: &mut [WidgetLayer],
@@ -848,11 +774,11 @@ pub(super) fn sync_widget_focus(
 ) -> AppResult<()> {
     if locked {
         for w in widgets {
-            if w.focused || w.captured {
+            if w.focused || !w.captured.is_empty() {
                 w.layer.runtime.deactivate_view(now);
             }
             w.focused = false;
-            w.captured = false;
+            w.captured.clear();
         }
         *saved = None;
         *active = false;
@@ -935,7 +861,7 @@ pub(super) fn sync_widget_children(
     widgets: &mut Vec<WidgetLayer>,
     next_id: &mut u32,
     output: SizeI,
-    assets: AssetBundle,
+    assets: &LayerAssets,
     scale: crate::platform::contracts::ScaleFactor,
     wake: &EventNotifier,
     services: &crate::authoring::compose::ShellServices,
@@ -1003,7 +929,7 @@ pub(super) fn sync_widget_children(
                     widget.dismiss(ShellDismissReason::AnchorRemoved)?;
                     widget.retiring = true;
                     widget.focused = false;
-                    widget.captured = false;
+                    widget.captured.clear();
                 }
             }
             removed.retain(|id| !widgets.iter().any(|w| w.id == *id && w.retiring));
@@ -1036,6 +962,7 @@ pub(super) fn sync_widget_children(
                     ),
                     surface: child.binding,
                 };
+                let probe = stall_probe::begin();
                 let mut widget = WidgetLayer::new(
                     id,
                     registered,
@@ -1048,6 +975,7 @@ pub(super) fn sync_widget_children(
                 widget.parent = Some(owner);
                 widget.child_key = child.key;
                 widget.component_type = ty;
+                stall_probe::finish("widget_create", probe, || widget.probe_context());
                 widgets.push(widget);
             }
         }

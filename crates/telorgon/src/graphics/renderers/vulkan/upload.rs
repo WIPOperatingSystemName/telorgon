@@ -106,7 +106,7 @@ pub(crate) struct ImageUploadChunk {
     pub(crate) offset: vk::Offset3D,
     pub(crate) extent: vk::Extent3D,
     pub(crate) row_bytes: usize,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: Arc<[u8]>,
 }
 
 impl SceneUploadPlan {
@@ -225,17 +225,52 @@ impl StagedUploads {
         view_alignment: usize,
         base: usize,
     ) -> RenderResult<Self> {
-        align_vec_at(bytes, view_alignment.max(align_of::<GpuView>()), base);
-        let view_offset = (base + bytes.len()) as u64;
-        bytes.extend_from_slice(bytemuck::bytes_of(view));
+        let mut writer = UploadWriter {
+            cursor: base + bytes.len(),
+            capacity: staging_capacity,
+            write: |offset: u64, data: &[u8]| {
+                bytes.resize(offset as usize - base, 0);
+                bytes.extend_from_slice(data);
+                Ok(())
+            },
+        };
+        Self::append_to(view, plan, view_alignment, &mut writer)
+    }
+
+    /// Write uploads straight into the owned frame's mapped staging slot. Each pass appends
+    /// beyond earlier commands' ranges; no temporary window-sized byte vector is needed.
+    pub(crate) fn append_mapped(
+        view: &GpuView,
+        plan: SceneUploadPlan,
+        staging: &AllocatedBuffer,
+        cursor: &mut usize,
+        view_alignment: usize,
+    ) -> RenderResult<Self> {
+        let mut writer = UploadWriter {
+            cursor: *cursor,
+            capacity: staging.size(),
+            write: |offset, data: &[u8]| staging.write_at(offset, data),
+        };
+        let staged = Self::append_to(view, plan, view_alignment, &mut writer)?;
+        *cursor = writer.cursor;
+        Ok(staged)
+    }
+
+    fn append_to(
+        view: &GpuView,
+        plan: SceneUploadPlan,
+        view_alignment: usize,
+        writer: &mut UploadWriter<impl FnMut(u64, &[u8]) -> RenderResult<()>>,
+    ) -> RenderResult<Self> {
+        let view_offset = writer.append(
+            bytemuck::bytes_of(view), view_alignment.max(align_of::<GpuView>()),
+        )?;
         let mut destinations = Vec::with_capacity(plan.groups.len());
         for group in plan.groups {
             let mut regions = Vec::with_capacity(group.chunks.len());
             for chunk in group.chunks {
-                align_vec_at(bytes, COPY_ALIGNMENT, base);
-                let source_offset = (base + bytes.len()) as u64;
                 let size = chunk.bytes.len() as u64;
-                bytes.extend_from_slice(&chunk.bytes);
+                let source_offset = writer.append(&chunk.bytes, COPY_ALIGNMENT)?;
                 regions.push(
                     vk::BufferCopy2::default()
                         .src_offset(source_offset)
@@ -253,9 +288,7 @@ impl StagedUploads {
         for group in plan.image_groups {
             let mut regions = Vec::with_capacity(group.chunks.len());
             for chunk in group.chunks {
-                align_vec_at(bytes, COPY_ALIGNMENT, base);
-                let source_offset = (base + bytes.len()) as u64;
-                bytes.extend_from_slice(&chunk.bytes);
+                let source_offset = writer.append(&chunk.bytes, COPY_ALIGNMENT)?;
                 regions.push(
                     vk::BufferImageCopy2::default()
                         .buffer_offset(source_offset)
@@ -277,15 +310,6 @@ impl StagedUploads {
                 preserve_from: group.preserve_from,
                 regions,
             });
-        }
-        if (base + bytes.len()) as u64 > staging_capacity {
-            return Err(RenderError::new(
-                RenderErrorKind::OutOfMemory,
-                format!(
-                    "Vulkan frame staging requires {} bytes but its reusable slot provides {staging_capacity}",
-                    base + bytes.len()
-                ),
-            ));
         }
         Ok(Self {
             bytes: Vec::new(),
@@ -326,18 +350,38 @@ pub(crate) fn geometric_capacity(current: u64, required: u64) -> u64 {
     capacity
 }
 
-fn align_vec(bytes: &mut Vec<u8>, alignment: usize) {
-    let remainder = bytes.len() % alignment;
-    if remainder != 0 {
-        bytes.resize(bytes.len() + alignment - remainder, 0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graphics::render::RenderErrorKind;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn direct_upload_writer_preserves_previous_passes_and_checks_capacity_before_writing() {
+        let mut memory = vec![0xab; 2048];
+        let mut writer = UploadWriter {
+            cursor: 259,
+            capacity: memory.len() as u64,
+            write: |offset: u64, data: &[u8]| {
+                memory[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+                Ok(())
+            },
+        };
+        let view = GpuView::zeroed();
+        let first = StagedUploads::append_to(&view, SceneUploadPlan::default(), 256, &mut writer).unwrap();
+        assert_eq!(first.view_offset, 512);
+        let payload_offset = writer.append(&[7; 19], 4).unwrap() as usize;
+        let second = StagedUploads::append_to(&view, SceneUploadPlan::default(), 256, &mut writer).unwrap();
+        assert_eq!(second.view_offset % 256, 0);
+        assert!(second.view_offset as usize >= payload_offset + 19);
+        let cursor = writer.cursor;
+        assert!(writer.append(&[0; 2048], 4).is_err());
+        assert_eq!(writer.cursor, cursor);
+        drop(writer);
+        assert!(memory[..512].iter().all(|byte| *byte == 0xab));
+        assert_eq!(&memory[payload_offset..payload_offset + 19], &[7; 19]);
+        assert!(memory[cursor..].iter().all(|byte| *byte == 0xab));
+    }
 
     #[test]
     fn suffix_staging_uses_absolute_offsets_without_initializing_prefix() {
@@ -413,13 +457,24 @@ mod tests {
     }
 }
 
-fn align_vec_at(bytes: &mut Vec<u8>, alignment: usize, base: usize) {
-    if base == 0 {
-        align_vec(bytes, alignment);
-        return;
-    }
-    let remainder = (base + bytes.len()) % alignment;
-    if remainder != 0 {
-        bytes.resize(bytes.len() + alignment - remainder, 0);
+
+struct UploadWriter<F> {
+    cursor: usize,
+    capacity: u64,
+    write: F,
+}
+
+impl<F: FnMut(u64, &[u8]) -> RenderResult<()>> UploadWriter<F> {
+    fn append(&mut self, bytes: &[u8], alignment: usize) -> RenderResult<u64> {
+        let padding = (alignment - self.cursor % alignment) % alignment;
+        let offset = self.cursor.checked_add(padding);
+        let end = offset.and_then(|offset| offset.checked_add(bytes.len()))
+            .filter(|end| *end as u64 <= self.capacity)
+            .ok_or_else(|| RenderError::new(RenderErrorKind::OutOfMemory,
+                "Vulkan frame upload exceeds its reusable staging slot"))?;
+        let offset = offset.expect("checked above");
+        (self.write)(offset as u64, bytes)?;
+        self.cursor = end;
+        Ok(offset as u64)
     }
 }

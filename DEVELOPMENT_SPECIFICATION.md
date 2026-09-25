@@ -35,6 +35,7 @@ telorgon/
         lib.rs
         api/
         foundation/
+        data/
         authoring/
         runtime/
         ui/
@@ -533,6 +534,110 @@ installers belong in `dist/`, not among authored packaging inputs.
 
 These are target ownership rules. Relocate existing files only when a migration is in scope, and
 update their consumers as part of that migration.
+
+## 25. Registered data, live settings, and persistence
+
+The `data` subsystem owns typed registered storage, transactional replacement, change
+notifications, serialization, file persistence, and opt-in autosave. Its public entry point is
+`telorgon::data`; it does not depend on a renderer, window, native device, or application host.
+
+```text
+src/data/
+  mod.rs             Curated subsystem exports
+  value.rs           DataValue, entry specifications, validators, erased value adapters
+  variable.rs        Typed shared handles
+  registry.rs        Registration, snapshot transactions, optional global access
+  subscription.rs    Bounded/coalescing change mailboxes
+  persistence.rs     Resource export/restoration contracts
+  format.rs          Versioned TOML snapshots and transactional restore
+  file.rs            Serialized file writes and safe replacement
+  autosave.rs        Debounce worker, status, flushing, and shutdown
+  error.rs           Actionable failure categories
+```
+
+### Ownership and value contracts
+
+- `Registry` retains entries identified by stable application-defined string keys. `Variable<T>`
+  handles share storage and remain valid across reloads and after the registry owner is dropped.
+  The owner, not the variable handles, controls the autosave worker lifetime.
+- `DataValue` requires `Serialize + DeserializeOwned + Clone + Send + Sync + 'static`.
+  Values must support a faithful TOML round trip. Unsupported representations are errors, not
+  silently converted strings. Encoding, decoding, cloning, and validation must be side-effect-free.
+- Basic colors and geometry remain owned by `foundation`. Theme, motion, media, and graphics
+  configuration retain their respective owners. Persistence support alone does not move them into
+  `data`, introduce new crates, or justify a broad repository migration.
+- Duplicate keys, missing lookups, incorrect types, invalid values, and conflicting transactions
+  produce explicit errors. Defaults are validated at registration and retained for reset operations.
+- Intrinsic invariants must be enforced during deserialization. Registration validators add
+  application-specific restrictions. Validation and user closures run without registry locks.
+
+### Live replacement and concurrency
+
+- Values are immutable shared snapshots replaced under one registry lock. Reads release that lock
+  before cloning or inspecting values. Multi-value reads use one snapshot.
+- Transactions stage and validate replacements before a single commit. Concurrent registry changes
+  produce `Conflict`; arbitrary user closures are not retried automatically. Single-variable updates
+  similarly detect conflicting replacement rather than overwriting a concurrent update.
+- Subscribers receive coalescing mailboxes with the latest revision and union of changed keys.
+  Internal mailbox publication preserves commit order; it invokes no application callbacks.
+  Consumers read current snapshots and perform UI invalidation or subsystem reconfiguration themselves.
+- The optional `Settings` global is installed once per process. Independent registries remain
+  supported. Access before installation is fallible; no hidden initialization or cross-process
+  sharing occurs. Real-time code receives prepared updates through its subsystem instead of locking
+  the registry.
+
+### Persistence and autosave
+
+- Manual saving is the default. Serialization captures a consistent snapshot and writes without
+  holding the registry state lock. A registry serializes its file operations so an older snapshot
+  cannot overwrite a newer completed write. Sharing a destination across independent registries or
+  processes requires coordination outside this subsystem.
+- TOML documents contain a registry identity, schema version, and keyed values. Identity/version
+  mismatch is an error. Loading decodes and validates all matching entries before committing;
+  failure leaves all values unchanged. Missing keys retain current values. Unknown keys survive
+  saving and may be consumed by later registration.
+- Explicit restore establishes a clean baseline and does not schedule autosave. It discards pending
+  edits for keys present in the document; callers choose when to reload. Existing handles observe
+  restored values. File watching and schema migration are extension points, not implicit behavior.
+- File saving uses an exclusively created temporary file beside the destination, flushes its
+  contents, and renames it over the destination. Unix also syncs the parent directory. Failures are
+  returned; unsupported replacement never falls back to deleting the existing file first. Power-loss
+  guarantees still depend on the platform and filesystem.
+- Optional runtime autosave uses one sleeping worker per registry, a quiet-period debounce, and a
+  maximum delay under continuous changes. The maximum bounds scheduling, not completion of slow or
+  failing I/O. Failures remain observable and retry with backoff. Dirty revisions arriving during a
+  write remain pending. Exporting another destination does not acknowledge the autosave file.
+- `flush` synchronously saves to the configured autosave destination. Quiesce producers, then call
+  `shutdown` to stop the worker and save its final snapshot. Dropping the owner stops and joins its
+  worker without an implicit final save. Global registries require explicit shutdown because static
+  storage is not dropped at process exit. Abrupt exit can lose changes not yet persisted.
+
+### Resource preferences and application
+
+`SaveState` exports persistent data from a runtime object; `RestoreState<S>` is implemented by a
+service capable of recreating a resource. Loading a registry never invokes restoration or opens a
+device. Async services may expose their own asynchronous restoration operations.
+
+Saved preferences contain persistent selectors and fallback policy, never raw pointers or
+connection-scoped handles. Desired configuration remains separate from observed hardware state.
+Fallback does not overwrite the preference automatically. A successful storage transaction does not
+promise successful or atomic hardware reconfiguration.
+
+The initial audio adapter persists configured PipeWire sink/source names and resolves them against
+current discovery. These names identify configured endpoints, not universally stable physical
+hardware across machine reconfiguration. Ambiguous names and invalid directions are rejected.
+Restoration creates an ordinary buffered stream; actual readiness and negotiated format remain
+observable on that stream. It does not automatically replace an existing stream or authorize access
+beyond the supplied connection.
+
+### Adoption scope
+
+The initial implementation includes the registry, live updates, manual persistence, global access,
+and runtime autosave; basic color/geometry, scroll, and motion value integration; and a buffered
+audio preference adapter. It does not claim every existing configuration is serializable. Additional
+keyboard, renderer, GPU, MIDI, camera, and display preferences should adopt these contracts through
+focused subsystem changes. Settings editors, automatic hardware switching, file watching, and schema
+migrations remain later work.
 
 ## Governing standard
 

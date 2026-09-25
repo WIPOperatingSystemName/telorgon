@@ -20,7 +20,7 @@ pub use plane_formats::plane_formats;
 #[cfg(target_os = "linux")]
 pub use gbm::{GbmBuffer, GbmDevice, GbmPlane, GbmWriteMapping};
 #[cfg(target_os = "linux")]
-pub use kms::{AtomicRequest, KmsDevice, KmsError, KmsErrorKind, KmsFramebuffer, PropertyBlob};
+pub use kms::{AtomicRequest, KmsDevice, KmsPageFlip, KmsError, KmsErrorKind, KmsFramebuffer, PropertyBlob};
 pub use model::{
     AtomicProperty, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR,
     DRM_FORMAT_XRGB8888, DRM_PLANE_TYPE_CURSOR, DRM_PLANE_TYPE_PRIMARY, FrameSlot, FrameSlotError,

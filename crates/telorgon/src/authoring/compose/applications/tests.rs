@@ -132,3 +132,26 @@ fn asynchronous_catalog_and_icon_publication() {
     }
     drop(worker);
 }
+
+#[test]
+fn missing_preferred_icon_does_not_mask_available_fallback_artwork() {
+    let f = Fixture::new();
+    f.file("applications/broken.desktop",
+        "[Desktop Entry]\nType=Application\nName=Broken\nExec=broken\nIcon=missing\n");
+    f.file("applications/discord.desktop",
+        "[Desktop Entry]\nType=Application\nName=Discord\nExec=discord\nIcon=discord\n");
+    f.file("pixmaps/discord.svg", r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="blue"/></svg>"#);
+    let (catalog, _worker) = start(ApplicationCatalog::system()
+        .data_directories(vec![f.0.clone()]), 32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let request = IconRequest::new().logical_size(24);
+    let icon = loop {
+        let result = catalog.try_resolve_icon(&ApplicationId::new("broken.desktop"), request)
+            .or_else(|| catalog.try_resolve_icon(&ApplicationId::new("discord.desktop"), request));
+        if let Some(icon) = result { break icon; }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(Some(icon), catalog.try_resolve_named_icon("discord", request));
+    assert!(catalog.try_resolve_icon(&ApplicationId::new("broken.desktop"), request).is_none());
+}

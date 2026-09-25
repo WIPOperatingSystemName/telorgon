@@ -12,11 +12,22 @@ pub(crate) struct AllocatedImage {
     view: vk::ImageView,
     allocation: Option<Allocation>,
     device_local_reserved_bytes: u64,
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    capture_reservation: Option<crate::media::video::MemoryReservation>,
     pub(crate) format: vk::Format,
     pub(crate) extent: vk::Extent2D,
 }
 
 impl AllocatedImage {
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    pub(crate) fn retain_capture_charge(&mut self, charge: crate::media::video::MemoryReservation) {
+        assert!(
+            self.capture_reservation.is_none(),
+            "capture allocation already charged"
+        );
+        self.capture_reservation = Some(charge);
+    }
+
     pub(crate) fn new_color_target(
         device: std::sync::Arc<DeviceInner>,
         extent: vk::Extent2D,
@@ -41,7 +52,17 @@ impl AllocatedImage {
         name: &str,
         phase: &mut dyn FnMut(&'static str),
     ) -> RenderResult<Self> {
-        Self::new_with_usage_traced(
+        Self::new_color_target_traced_accounted(device, extent, format, name, phase, |_| Ok(()))
+    }
+    pub(crate) fn new_color_target_traced_accounted(
+        device: std::sync::Arc<DeviceInner>,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        name: &str,
+        phase: &mut dyn FnMut(&'static str),
+        admit: impl FnOnce(u64) -> RenderResult<()>,
+    ) -> RenderResult<Self> {
+        Self::new_with_usage_traced_accounted(
             device,
             extent,
             format,
@@ -50,6 +71,7 @@ impl AllocatedImage {
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             name,
             phase,
+            admit,
         )
     }
 
@@ -88,6 +110,25 @@ impl AllocatedImage {
         name: &str,
         phase: &mut dyn FnMut(&'static str),
     ) -> RenderResult<Self> {
+        Self::new_with_usage_traced_accounted(
+            device,
+            extent,
+            format,
+            usage,
+            name,
+            phase,
+            |_| Ok(()),
+        )
+    }
+    fn new_with_usage_traced_accounted(
+        device: std::sync::Arc<DeviceInner>,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        name: &str,
+        phase: &mut dyn FnMut(&'static str),
+        admit: impl FnOnce(u64) -> RenderResult<()>,
+    ) -> RenderResult<Self> {
         phase("dmabuf_alloc_image");
         let raw = unsafe {
             device.raw.create_image(
@@ -112,6 +153,10 @@ impl AllocatedImage {
         .map_err(|result| vk_error(format!("failed to create {name} image"), result))?;
         phase("dmabuf_alloc_requirements");
         let requirements = unsafe { device.raw.get_image_memory_requirements(raw) };
+        if let Err(error) = admit(requirements.size) {
+            unsafe { device.raw.destroy_image(raw, None) };
+            return Err(error);
+        }
         let reservation = match device.reserve_device_local(requirements.size) {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -191,6 +236,8 @@ impl AllocatedImage {
             view,
             allocation: Some(allocation),
             device_local_reserved_bytes,
+            #[cfg(all(target_os = "linux", feature = "video-linux"))]
+            capture_reservation: None,
             format,
             extent,
         })

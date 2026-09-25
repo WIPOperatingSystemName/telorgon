@@ -1,3 +1,4 @@
+use crate::host::linux_shell::motion::{SnapshotInput, position_images};
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::foundation::{ColorRgba8, RectI};
@@ -56,6 +57,9 @@ impl SoftwareShellRenderer {
             }
         }
         self.scenes.retain(|key, _| frame.live_scenes.contains(key));
+        for (key, scene) in &mut self.scenes {
+            scene.set_frame_border(frame.frame_borders.get(key).cloned());
+        }
         self.render_motion(&frame.motion)?;
         let previous_target_version = *self
             .target_versions
@@ -156,7 +160,7 @@ impl SoftwareShellRenderer {
         }
         for output in &motion.outputs {
             let scene =
-                self.sample_motion_scene(output.extent, &[(output.source, output.opacity)], false)?;
+                self.sample_motion_scene(output.extent, &[(output.source, output.opacity).into()], false)?;
             self.scenes.insert(ShellSceneKey::Motion(output.id), scene);
         }
         self.motion_snapshots
@@ -166,7 +170,7 @@ impl SoftwareShellRenderer {
     fn sample_motion_scene(
         &self,
         extent: crate::foundation::SizeI,
-        inputs: &[(u64, f32)],
+        inputs: &[SnapshotInput],
         additive: bool,
     ) -> AppResult<SoftwareScene> {
         use crate::graphics::render::{
@@ -175,10 +179,12 @@ impl SoftwareShellRenderer {
         let images = inputs
             .iter()
             .enumerate()
-            .map(|(i, (_, weight))| (ImageId(i as u32 + 1), *weight))
+            .map(|(i, input)| (ImageId(i as u32 + 1), input.weight))
             .collect::<Vec<_>>();
         let mut source = super::super::motion::image_scene(extent, &images, additive);
-        for ((snapshot, _), (image, _)) in inputs.iter().zip(images) {
+        position_images(&mut source, inputs);
+        for (input, (image, _)) in inputs.iter().zip(images) {
+            let snapshot = &input.id;
             let pixels = self
                 .motion_snapshots
                 .get(snapshot)

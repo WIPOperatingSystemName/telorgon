@@ -115,9 +115,13 @@ impl CompositionDriver {
                     children,
                 },
                 ElementKind::Container(candidate),
-            ) => {
+            ) if (ui.kinds.get(*node) == Some(&crate::ui::NodeKind::Scroll)) == candidate.scrollable => {
                 ui.set_box_style(*node, candidate.style);
-                ui.set_layout_style(*node, candidate.layout);
+                let mut next_layout = candidate.layout;
+                if candidate.scrollable {
+                    next_layout.scroll_offset = ui.layouts.get(*node).map_or(crate::PointF::default(), |l| l.scroll_offset);
+                }
+                ui.set_layout_style(*node, next_layout);
                 ui.set_hover_within(*node, candidate.hover_within);
                 if let Some(style) = candidate.inline_style.as_ref() {
                     ui.set_style_id(*node, style.id);
@@ -207,12 +211,21 @@ impl CompositionDriver {
                 );
                 ui.set_box_style(*icon_node, button_icon_style(&candidate));
                 ui.set_dynamic_text(*label_node, &candidate.label);
-                let mut label_style = candidate.label_style;
-                if let Some(family) = candidate.font_family {
-                    label_style.family = ui.intern(family);
+                // Slot styling is resolved independently of authored button props. Preview or
+                // label-content updates must not overwrite an unchanged themed font/layout.
+                if props.label_style != candidate.label_style
+                    || props.font_family != candidate.font_family
+                {
+                    let mut label_style = candidate.label_style;
+                    if let Some(family) = candidate.font_family {
+                        label_style.family = ui.intern(family);
+                    }
+                    ui.set_text_style(*label_node, label_style);
                 }
-                ui.set_text_style(*label_node, label_style);
-                ui.set_box_style(*label_node, button_label_box_style(&candidate));
+                let label_box_style = button_label_box_style(&candidate);
+                if button_label_box_style(props) != label_box_style {
+                    ui.set_box_style(*label_node, label_box_style);
+                }
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_busy(*node, candidate.busy);
                 ui.set_style_id(*node, candidate.style_id);
@@ -286,10 +299,11 @@ impl CompositionDriver {
                 },
                 ElementKind::Toggle(candidate),
             ) => {
-                let styles = switch_styles(
+                let mut styles = switch_styles(
                     candidate.value == SemanticCheckState::Checked,
                     candidate.enabled,
                 );
+                if let Some(width) = candidate.width { styles.container.width = crate::ui::SizeRule::Logical(width); }
                 ui.set_box_style(*node, styles.container);
                 ui.set_box_style(*track, styles.track);
                 ui.set_box_style(*thumb, styles.thumb);
@@ -319,6 +333,8 @@ impl CompositionDriver {
             }
             (
                 MountedKind::Slider {
+                    before_thumb,
+                    after_thumb,
                     node,
                     track,
                     fill,
@@ -328,16 +344,18 @@ impl CompositionDriver {
                 },
                 ElementKind::Slider(candidate),
             ) => {
-                let styles = slider_styles(candidate.value, candidate.enabled);
+                let styles = slider_styles(candidate.value, candidate.enabled, candidate.width.into());
                 ui.set_box_style(*node, styles.container);
                 ui.set_box_style(*track, styles.track);
                 ui.set_box_style(*fill, styles.fill);
                 ui.set_box_style(*thumb, styles.thumb);
+                ui.set_box_style(*before_thumb, styles.before_thumb);
+                ui.set_box_style(*after_thumb, styles.after_thumb);
                 ui.set_dynamic_text(*label, &candidate.label);
                 ui.set_text_style(*label, control_label_style(candidate.enabled));
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_control_value(*node, candidate.value);
-                let name = ui.intern(&candidate.label);
+                let name = ui.intern(candidate.accessible_label.as_deref().unwrap_or(&candidate.label));
                 let value_text = ui.intern(format!("{:.0}%", candidate.value * 100.0));
                 let _ = ui.set_semantics(*node, slider_semantics(name, value_text, &candidate));
                 match &candidate.on_change {

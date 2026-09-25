@@ -67,7 +67,11 @@ pub(super) fn apply(
     area: RectI,
 ) {
     for (surface, window) in windows {
-        if window.backend.is_none() || window.maximized || window.fullscreen {
+        if window.backend.is_none()
+            || window.maximized
+            || window.fullscreen
+            || window.virtual_output.is_some()
+        {
             continue;
         }
         let outer = if window_has_frame(window) {

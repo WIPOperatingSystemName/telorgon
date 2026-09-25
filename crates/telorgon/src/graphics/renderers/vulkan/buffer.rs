@@ -12,15 +12,36 @@ pub(crate) struct AllocatedBuffer {
     allocation: Option<Allocation>,
     size: vk::DeviceSize,
     device_local_reserved_bytes: u64,
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    capture_reservation: Option<crate::media::video::MemoryReservation>,
 }
 
 impl AllocatedBuffer {
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    pub(crate) fn retain_capture_charge(&mut self, charge: crate::media::video::MemoryReservation) {
+        assert!(
+            self.capture_reservation.is_none(),
+            "capture allocation already charged"
+        );
+        self.capture_reservation = Some(charge);
+    }
+
     pub(crate) fn new(
         device: std::sync::Arc<DeviceInner>,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
         name: &str,
+    ) -> RenderResult<Self> {
+        Self::new_accounted(device, size, usage, location, name, |_| Ok(()))
+    }
+    pub(crate) fn new_accounted(
+        device: std::sync::Arc<DeviceInner>,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        location: MemoryLocation,
+        name: &str,
+        admit: impl FnOnce(u64) -> RenderResult<()>,
     ) -> RenderResult<Self> {
         let size = size.max(4);
         let raw = unsafe {
@@ -34,6 +55,10 @@ impl AllocatedBuffer {
         }
         .map_err(|result| vk_error(format!("failed to create {name} buffer"), result))?;
         let requirements = unsafe { device.raw.get_buffer_memory_requirements(raw) };
+        if let Err(error) = admit(requirements.size) {
+            unsafe { device.raw.destroy_buffer(raw, None) };
+            return Err(error);
+        }
         let reservation = if matches!(location, MemoryLocation::GpuOnly) {
             match device.reserve_device_local(requirements.size) {
                 Ok(reservation) => Some(reservation),
@@ -89,6 +114,8 @@ impl AllocatedBuffer {
             allocation: Some(allocation),
             size,
             device_local_reserved_bytes,
+            #[cfg(all(target_os = "linux", feature = "video-linux"))]
+            capture_reservation: None,
         })
     }
 

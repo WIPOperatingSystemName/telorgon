@@ -45,6 +45,14 @@ impl AutoPresentation {
 }
 
 impl NativePresentation for AutoPresentation {
+    fn uses_logical_coordinates(&self) -> bool {
+        match self.active {
+            ActiveRenderer::Vulkan => self.vulkan.as_ref().unwrap().uses_logical_coordinates(),
+            ActiveRenderer::Software => true,
+            ActiveRenderer::Pending => false,
+        }
+    }
+
     fn attach(&mut self, window: Arc<Window>) -> Result<(), String> {
         let vulkan_error = match self.vulkan.as_mut() {
             Some(vulkan) => match vulkan.attach(Arc::clone(&window)) {

@@ -58,16 +58,22 @@ impl CompositionDriver {
             ElementKind::Container(ContainerElement {
                 inline_style,
                 hover_within,
+                scrollable,
                 style,
                 layout,
                 children,
             }) => {
                 let mut mounted_children = Vec::with_capacity(children.len());
-                let node = writer.container(style, layout, |writer| {
+                let content = |writer: &mut MountWriter<'_, ()>| {
                     for child in children {
                         mounted_children.push(self.mount_element(writer, child, owner));
                     }
-                });
+                };
+                let node = if scrollable {
+                    writer.scroll(style, layout, content).node
+                } else {
+                    writer.container(style, layout, content)
+                };
                 let children = mounted_children
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
@@ -358,14 +364,15 @@ impl CompositionDriver {
                 })
             }
             ToggleKind::Switch => {
-                let styles =
+                let mut styles =
                     switch_styles(props.value == SemanticCheckState::Checked, props.enabled);
+                if let Some(width) = props.width { styles.container.width = crate::ui::SizeRule::Logical(width); }
                 let mut track = None;
                 let mut thumb = None;
                 let mut label = None;
                 let control = writer.toggle_node(styles.container, |writer| {
                     writer.container(
-                        BoxStyle::default(),
+                        BoxStyle { width: crate::ui::SizeRule::Fill(1.0), ..Default::default() },
                         LayoutStyle {
                             flow: Flow::Horizontal,
                             gap: 8.0,
@@ -396,7 +403,7 @@ impl CompositionDriver {
                                     .dynamic_text(
                                         props.label.clone(),
                                         control_label_style(props.enabled),
-                                        BoxStyle::default(),
+                                        BoxStyle {width: crate::ui::SizeRule::Fill(1.0), ..Default::default()},
                                         LayoutStyle::default(),
                                     )
                                     .node,
@@ -463,17 +470,24 @@ impl CompositionDriver {
         props: SliderElement,
         owner: ComponentInstanceId,
     ) -> Result<MountedElement, ViewError> {
-        let styles = slider_styles(props.value, props.enabled);
+        let styles = slider_styles(props.value, props.enabled, props.width.into());
         let mut track = None;
         let mut fill = None;
         let mut thumb = None;
+        let mut before_thumb = None;
+        let mut after_thumb = None;
         let mut label = None;
         let control = writer.slider_node(styles.container, |writer| {
             writer.container(
-                BoxStyle::default(),
+                BoxStyle {
+                    width: SizeRule::Fill(1.0),
+                    height: SizeRule::Logical(22.0),
+                    ..BoxStyle::default()
+                },
                 LayoutStyle {
                     flow: Flow::Horizontal,
-                    gap: 8.0,
+                    cross_axis_alignment: crate::ui::CrossAxisAlignment::Center,
+                    gap: if props.label.is_empty() { 0.0 } else { 8.0 },
                     ..LayoutStyle::default()
                 },
                 |writer| {
@@ -505,14 +519,22 @@ impl CompositionDriver {
                                             )
                                             .node,
                                     );
-                                    thumb = Some(
-                                        writer
-                                            .container_handle(
-                                                styles.thumb,
-                                                LayoutStyle::default(),
-                                                |_| {},
-                                            )
-                                            .node,
+                                    // Weighted spacers position the thumb within the remaining
+                                    // track space without reading or computing the track width.
+                                    writer.container(
+                                        BoxStyle {
+                                            width: SizeRule::Fill(1.0),
+                                            height: SizeRule::Logical(18.0),
+                                            max_size: SizeRule2D { width: SizeRule::Fill(1.0), height: SizeRule::Logical(18.0) },
+                                            transform: Transform2D { translation: PointF { x: 0.0, y: -6.0 }, ..Transform2D::default() },
+                                            ..BoxStyle::default()
+                                        },
+                                        LayoutStyle { flow: Flow::Horizontal, ..LayoutStyle::default() },
+                                        |writer| {
+                                            before_thumb = Some(writer.container_handle(styles.before_thumb, LayoutStyle::default(), |_| {}).node);
+                                            thumb = Some(writer.container_handle(styles.thumb, LayoutStyle::default(), |_| {}).node);
+                                            after_thumb = Some(writer.container_handle(styles.after_thumb, LayoutStyle::default(), |_| {}).node);
+                                        },
                                     );
                                 },
                             )
@@ -554,7 +576,7 @@ impl CompositionDriver {
             track,
             ValueAxis::Horizontal { inverted: false },
         );
-        let name = writer.intern(&props.label);
+        let name = writer.intern(props.accessible_label.as_deref().unwrap_or(&props.label));
         let value_text = writer.intern(format!("{:.0}%", props.value * 100.0));
         writer
             .semantic_node(control.node, slider_semantics(name, value_text, &props))
@@ -566,6 +588,8 @@ impl CompositionDriver {
         Ok(MountedElement {
             key: None,
             kind: MountedKind::Slider {
+                before_thumb: before_thumb.expect("slider leading space mounted"),
+                after_thumb: after_thumb.expect("slider trailing space mounted"),
                 node: control.node,
                 track,
                 fill: fill.expect("slider fill was bound"),

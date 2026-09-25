@@ -1,5 +1,8 @@
 use super::renderer::DmaBufRetirement;
 use super::*;
+mod stacking;
+pub(super) use stacking::surface_tree_visible;
+pub(super) mod state_publication;
 
 pub(super) struct ClientWindow {
     pub(super) tile: Option<super::tiling::TilePlacement>,
@@ -22,7 +25,8 @@ pub(super) struct ClientWindow {
     pub(super) parent: Option<WaylandSurfaceId>,
     pub(super) offset: PointI,
     pub(super) server_decorated: bool,
-    pub(super) decoration_policy: crate::DecorationPolicy,
+    /// Shell-owned border around a client header using tiled client styling.
+    pub(super) frame_client_decorations: bool,
     pub(super) position: PointI,
     pub(super) window_geometry: RectI,
     pub(super) requested_size: SizeI,
@@ -33,6 +37,7 @@ pub(super) struct ClientWindow {
     pub(super) maximized: bool,
     pub(super) fullscreen: bool,
     pub(super) minimized: bool,
+    pub(super) virtual_output: Option<crate::shell::OutputId>,
     pub(super) chrome_outer: Option<SizeI>,
     pub(super) chrome_content_offset: Option<PointI>,
     pub(super) chrome: Option<WindowChromeSnapshot>,
@@ -84,6 +89,7 @@ impl PendingClientImageUpdate {
 pub(super) enum PreparedClientImage {
     Unchanged {
         extent: SizeI,
+        raster_extent: SizeI,
         pixel_format: ImagePixelFormat,
         alpha_mode: ImageAlphaMode,
     },
@@ -118,8 +124,32 @@ pub(super) fn observe_surface_configure_acknowledgement(
     }
 }
 
+fn publication_requested_size(previous: Option<&ClientWindow>, committed: SizeI) -> SizeI {
+    let retained = previous.filter(|window| {
+        // Free-standing clients may change their own geometry (for example when CSD
+        // margins change). Retain a host target only while host sizing still owns it.
+        matches!(
+            window.role,
+            SurfaceRole::XdgToplevel | SurfaceRole::Xwayland
+        ) && (window.maximized
+            || window.fullscreen
+            || window.tile.is_some()
+            || window.native_configure.resize_anchor.is_some()
+            || window.native_configure.resize_final.is_some()
+            || window.requested_size
+                != SizeI {
+                    width: window.window_geometry.width,
+                    height: window.window_geometry.height,
+                })
+    });
+    retained_requested_size(retained.map(|window| window.requested_size), committed)
+}
+
 impl PreparedClientImage {
-    pub(super) fn full_scaled(image: crate::graphics::render::ImageResource, logical_extent: SizeI) -> Self {
+    pub(super) fn full_scaled(
+        image: crate::graphics::render::ImageResource,
+        logical_extent: SizeI,
+    ) -> Self {
         let retained_pixels = image.pixels.to_vec();
         Self::Full {
             logical_extent,
@@ -140,7 +170,9 @@ impl PreparedClientImage {
     fn raster_extent(&self) -> SizeI {
         match self {
             Self::Full { image, .. } => image.extent,
-            Self::External { raster_extent, .. } => *raster_extent,
+            Self::Unchanged { raster_extent, .. } | Self::External { raster_extent, .. } => {
+                *raster_extent
+            }
             _ => self.extent(),
         }
     }
@@ -165,6 +197,9 @@ impl PreparedClientImage {
 }
 
 impl ClientWindow {
+    pub(super) fn hidden_on_primary(&self) -> bool {
+        self.minimized || self.virtual_output.is_some()
+    }
     /// Hidden final-size content still needs frame callbacks to produce its replacement.
     /// These callbacks are pacing hints, not claims that the hidden image was displayed.
     pub(super) fn waiting_for_resize_content(&self) -> bool {
@@ -212,7 +247,9 @@ impl SurfacePresentation {
     fn apply_image(&mut self, revision: u64, image: PreparedClientImage) {
         self.revision = self.revision.max(revision);
         match image {
-            PreparedClientImage::Unchanged { .. } => {}
+            PreparedClientImage::Unchanged { extent, .. } => {
+                self.size = extent;
+            }
             PreparedClientImage::Full {
                 image,
                 retained_pixels,
@@ -358,6 +395,8 @@ pub(super) fn apply_surface_publication(
     );
     let image_pixel_format = prepared_image.pixel_format();
     let image_alpha_mode = prepared_image.alpha_mode();
+    crate::integrations::wayland::compositor::diagnostics::event(surface.get(), "prepared", format_args!(
+        "role={role:?} revision={} kind={kind} extent={raw_extent:?} raster={raster_extent:?} alpha={image_alpha_mode:?} format={image_pixel_format:?}", snapshot.revision));
     let window_geometry = if role == SurfaceRole::XdgToplevel {
         snapshot
             .window_geometry
@@ -429,10 +468,7 @@ pub(super) fn apply_surface_publication(
     };
     let is_new = !windows.contains_key(&surface);
     let previous_window = windows.get(&surface);
-    let mut requested_size = retained_requested_size(
-        previous_window.map(|window| window.requested_size),
-        committed_window_extent,
-    );
+    let mut requested_size = publication_requested_size(previous_window, committed_window_extent);
     let mut reconciled_position = position;
     let mut resize_anchor =
         previous_window.and_then(|window| window.native_configure.resize_anchor);
@@ -484,10 +520,13 @@ pub(super) fn apply_surface_publication(
     );
     let server_decorated = if role == SurfaceRole::XdgToplevel {
         wayland.decoration_mode(surface)
-            != Some(crate::integrations::wayland::compositor::DecorationMode::ClientSide)
+            == Some(crate::integrations::wayland::compositor::DecorationMode::ServerSide)
     } else {
         previous_window.is_some_and(|window| window.server_decorated)
     };
+    crate::integrations::wayland::compositor::diagnostics::event(surface.get(), "geometry", format_args!(
+        "role={role:?} parent={parent:?} offset={offset:?} position={reconciled_position:?} logical={raw_extent:?} raster={raster_extent:?} coordinate_density={surface_scale} buffer_scale={} transform={:?} viewport={:?} window_geometry={window_geometry:?} requested={requested_size:?} server_decorated={server_decorated} maximized={maximized} fullscreen={fullscreen}",
+        snapshot.buffer_scale, snapshot.buffer_transform, wayland.viewport(surface)));
     let pointer_geometry_changed = !matches!(role, SurfaceRole::Cursor | SurfaceRole::DragIcon)
         && previous_window.is_none_or(|window| {
             window.role != role
@@ -567,7 +606,7 @@ pub(super) fn apply_surface_publication(
                 parent,
                 offset,
                 server_decorated,
-                decoration_policy: wayland.decoration_policy(),
+                frame_client_decorations: false,
                 position: reconciled_position,
                 window_geometry,
                 requested_size,
@@ -575,6 +614,7 @@ pub(super) fn apply_surface_publication(
                 maximized,
                 fullscreen,
                 minimized,
+                virtual_output: None,
                 chrome_outer,
                 chrome_content_offset,
                 chrome,
@@ -604,7 +644,7 @@ pub(super) fn apply_surface_publication(
         );
     }
     if is_new && !matches!(role, SurfaceRole::Cursor | SurfaceRole::DragIcon) {
-        stacking_order.push(surface);
+        stacking::insert_new_surface(windows, stacking_order, surface);
     }
     *pointer_scene_dirty |= pointer_geometry_changed;
     if is_new && role == SurfaceRole::XdgToplevel && !session_locked {
@@ -636,7 +676,10 @@ pub(super) fn finish_shm_copy(
     work_area: RectI,
     session_locked: bool,
     pointer_scene_dirty: &mut bool,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     pending_surfaces: &mut BTreeMap<WaylandSurfaceId, usize>,
     completion: ShmCopyCompletion,
 ) -> AppResult<bool> {
@@ -645,7 +688,7 @@ pub(super) fn finish_shm_copy(
         pending_buffers,
         pending_surfaces,
         completion.snapshot.surface,
-        completion.snapshot.revision,
+        completion.snapshot.attachment_revision,
         completion.buffer,
         true,
     )?;
@@ -655,13 +698,18 @@ pub(super) fn finish_shm_copy(
         .surface(completion.snapshot.surface)
         .map(|surface| surface.snapshot().clone());
     let completion_is_current = current.as_ref().is_some_and(|snapshot| {
-        snapshot.revision == completion.snapshot.revision
+        snapshot.attachment_revision == completion.snapshot.attachment_revision
             && snapshot.attachment == completion.snapshot.attachment
     });
     let apply =
         completion_is_current && !pending_surfaces.contains_key(&completion.snapshot.surface);
     if apply {
-        let image = completion.result.map_err(AppError::new)?;
+        let mut image = completion.result.map_err(AppError::new)?;
+        if let PreparedClientImage::Full { logical_extent, .. } = &mut image {
+            *logical_extent = wayland
+                .surface_logical_size(completion.snapshot.surface)
+                .map_err(app_error)?;
+        }
         apply_surface_publication(
             display,
             wayland,
@@ -673,7 +721,7 @@ pub(super) fn finish_shm_copy(
             work_area,
             session_locked,
             pointer_scene_dirty,
-            &completion.snapshot,
+            current.as_ref().expect("current completion has a surface"),
             image,
         )?;
     }
@@ -682,7 +730,10 @@ pub(super) fn finish_shm_copy(
 
 pub(super) fn discard_shm_copy(
     wayland: &mut NativeCompositor<'_>,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     pending_surfaces: &mut BTreeMap<WaylandSurfaceId, usize>,
     request: ShmCopyRequest,
 ) -> AppResult<()> {
@@ -691,7 +742,7 @@ pub(super) fn discard_shm_copy(
         pending_buffers,
         pending_surfaces,
         request.snapshot.surface,
-        request.snapshot.revision,
+        request.snapshot.attachment_revision,
         request.buffer(),
         true,
     )
@@ -699,7 +750,10 @@ pub(super) fn discard_shm_copy(
 
 pub(super) fn discard_replaced_shm_copy(
     wayland: &mut NativeCompositor<'_>,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     pending_surfaces: &mut BTreeMap<WaylandSurfaceId, usize>,
     request: ShmCopyRequest,
     replacement_buffer: crate::integrations::wayland::compositor::WaylandBufferId,
@@ -712,7 +766,7 @@ pub(super) fn discard_replaced_shm_copy(
         pending_buffers,
         pending_surfaces,
         request.snapshot.surface,
-        request.snapshot.revision,
+        request.snapshot.attachment_revision,
         request.buffer(),
         release_buffer,
     )
@@ -720,7 +774,10 @@ pub(super) fn discard_replaced_shm_copy(
 
 fn retire_pending_shm_use(
     wayland: &mut NativeCompositor<'_>,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     pending_surfaces: &mut BTreeMap<WaylandSurfaceId, usize>,
     surface: WaylandSurfaceId,
     revision: u64,
@@ -767,7 +824,10 @@ pub(super) fn finish_dma_buf_release(
 
 pub(super) fn retire_unsubmitted_dma_buf(
     wayland: &mut NativeCompositor<'_>,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     retirement: DmaBufRetirement,
 ) -> AppResult<()> {
     finish_dma_buf_release(wayland, retirement, None)?;
@@ -776,7 +836,10 @@ pub(super) fn retire_unsubmitted_dma_buf(
 
 pub(super) fn retire_submitted_dma_buf(
     wayland: &mut NativeCompositor<'_>,
-    pending_buffers: &mut BTreeMap<crate::integrations::wayland::compositor::WaylandBufferId, usize>,
+    pending_buffers: &mut BTreeMap<
+        crate::integrations::wayland::compositor::WaylandBufferId,
+        usize,
+    >,
     retirement: DmaBufRetirement,
 ) -> AppResult<()> {
     let pending = pending_buffers
@@ -796,3 +859,6 @@ pub(super) fn retire_submitted_dma_buf(
 
 #[cfg(test)]
 pub(super) mod maximize_preview_tests;
+
+#[cfg(test)]
+mod buffer_lifetime_tests;

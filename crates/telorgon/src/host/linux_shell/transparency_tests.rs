@@ -52,6 +52,9 @@ impl Raster {
             }
         }
         self.scenes.retain(|key, _| frame.live_scenes.contains(key));
+        for (key, scene) in &mut self.scenes {
+            scene.set_frame_border(frame.frame_borders.get(key).cloned());
+        }
         let layers = frame
             .placements
             .iter()
@@ -1104,3 +1107,9 @@ fn resize_preview_border_inherits_contour_and_scales_once() {
         3.0
     );
 }
+
+#[path = "transparency_tests/client_clip.rs"]
+mod client_clip;
+
+#[path = "transparency_tests/corner_coverage.rs"]
+mod corner_coverage;

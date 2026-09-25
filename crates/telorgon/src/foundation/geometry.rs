@@ -1,16 +1,16 @@
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointI {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SizeI {
     pub width: i32,
     pub height: i32,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RectI {
     pub x: i32,
     pub y: i32,
@@ -31,19 +31,19 @@ impl RectI {
         point.x >= self.x && point.y >= self.y && point.x < self.right() && point.y < self.bottom()
     }
 }
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq)]
 pub struct PointF {
     pub x: f32,
     pub y: f32,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq)]
 pub struct SizeF {
     pub width: f32,
     pub height: f32,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq)]
 pub struct RectF {
     pub x: f32,
     pub y: f32,
@@ -123,7 +123,7 @@ impl RectF {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, Default, PartialEq)]
 pub struct EdgeInsets {
     pub top: f32,
     pub right: f32,
@@ -153,7 +153,7 @@ impl EdgeInsets {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, PartialEq)]
 pub struct Transform2D {
     pub translation: PointF,
     pub scale: PointF,
@@ -163,7 +163,7 @@ pub struct Transform2D {
     pub origin: PointF,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug, PartialEq)]
 pub struct Affine2D {
     pub m11: f32,
     pub m12: f32,

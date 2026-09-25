@@ -183,10 +183,8 @@ impl Default for XdgToplevelState {
             parent: None,
             minimum_size: None,
             maximum_size: None,
-            // Telorgon is a desktop shell as well as a protocol server.  A client that does not
-            // negotiate xdg-decoration therefore receives Telorgon's composed frame by default;
-            // an explicit client-side decoration request still overrides this value.
-            decoration: DecorationMode::ServerSide,
+            // Server decorations require explicit negotiation with the client.
+            decoration: DecorationMode::ClientSide,
         }
     }
 }
@@ -425,10 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn telorgon_owns_the_default_toplevel_decoration() {
+    fn unnegotiated_toplevels_are_client_decorated() {
         assert_eq!(
             XdgToplevelState::default().decoration,
-            DecorationMode::ServerSide
+            DecorationMode::ClientSide
         );
     }
 }

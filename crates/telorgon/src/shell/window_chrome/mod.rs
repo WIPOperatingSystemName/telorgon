@@ -14,12 +14,15 @@ use crate::ui::layout::LayoutEngine;
 use crate::graphics::render::ImageId;
 use crate::ui::{MountedUi, UiNodeId};
 
-/// Whole-window resize placeholder. Its shape follows the window's outer frame contour.
+/// Whole-window resize placeholder, independent of who decorates the live client.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ResizePreviewDesign {
     pub fill: crate::Fill,
     /// Border painted inward over the fill, in logical units. Zero widths omit the border.
     pub border: crate::ui::Border,
+    /// Floating preview radius when no server frame supplies a contour, in logical pixels.
+    /// Maximized, tiled, and fullscreen previews remain square.
+    pub corner_radius: f32,
 }
 
 impl ResizePreviewDesign {
@@ -27,6 +30,7 @@ impl ResizePreviewDesign {
         Self {
             fill,
             border: crate::ui::Border::all(0.0, ColorRgba8::rgba(0, 0, 0, 0)),
+            corner_radius: 0.0,
         }
     }
 
@@ -53,10 +57,10 @@ impl From<crate::Fill> for ResizePreviewDesign {
 /// The host cuts the frame decoration out of the content slot, then paints this backing once
 /// beneath the client. During resize it replaces both with the preview, so preview transparency
 /// reveals lower desktop layers, never the stale client or this backing. Input regions are
-/// unaffected. The corner radius clips the backing, preview, and client surface tree in addition
-/// to the composed frame's inner border contour. Both start at the window's inner top edge,
-/// not the content/title-bar seam. The chrome fill remains outside this aperture; popups retain
-/// independent bounds.
+/// unaffected. The corner radius shapes the shell-owned backing in addition to the composed
+/// frame's inner border contour. Both start at the window's inner top edge, not the
+/// content/title-bar seam. Application pixels retain their own alpha and corner shape;
+/// the host constrains them only to the rectangular content slot. Popups retain independent bounds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowContentStyle {
     /// Straight RGBA color beneath the client; alpha zero removes the content backing.
@@ -158,13 +162,11 @@ impl WindowChromeCapabilities {
 /// Immutable input supplied to one compositor-owned frame composition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowChromeModel {
-    /// Independent outer visuals and resize regions selected by compositor policy.
-    pub frame_parts: WindowFrameParts,
     pub window_id: u64,
     /// Managed shell identity used to resolve application artwork through the catalog.
     pub desktop_window_id: Option<crate::shell::WindowId>,
     pub title: String,
-    /// Whether the compositor owns the title bar and its controls. Outer styling remains available.
+    /// Whether this server frame template shows its title bar and controls.
     pub title_bar_visible: bool,
     pub app_icon: Option<Icon>,
     pub app_icon_name: Option<String>,
@@ -178,7 +180,6 @@ pub struct WindowChromeModel {
 impl WindowChromeModel {
     pub fn new(window_id: u64, title: impl Into<String>) -> Self {
         Self {
-            frame_parts: WindowFrameParts::default(),
             window_id,
             desktop_window_id: None,
             title: title.into(),

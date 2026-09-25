@@ -28,6 +28,14 @@ impl NativeState {
         if matches!(kind, ResourceKind::ForeignToplevelList) {
             self.bind_foreign_toplevel_list(resource)?;
         }
+        if matches!(kind, ResourceKind::KdeDecorationManager) {
+            self.post_event(
+                resource,
+                "org_kde_kwin_server_decoration_manager",
+                "default_mode",
+                &mut [ffi::wl_argument { u: 2 }],
+            )?;
+        }
         if interface == "wl_shm" {
             for format in [0_u32, 1_u32] {
                 self.post_event(
@@ -219,6 +227,9 @@ impl NativeState {
             ResourceKind::DataDeviceManager => {
                 self.dispatch_data_device_manager(resource, context, request)
             }
+            ResourceKind::PrimaryManager | ResourceKind::PrimaryDevice(_) => self.dispatch_primary(resource, context, request),
+            ResourceKind::PrimarySource(source) => self.dispatch_data_source(source, request),
+            ResourceKind::PrimaryOffer(offer) => self.dispatch_data_offer(resource, context, offer, request),
             ResourceKind::DataDevice(seat) => self.dispatch_data_device(context, seat, request),
             ResourceKind::DataSource(source) => self.dispatch_data_source(source, request),
             ResourceKind::DataOffer(offer) => {
@@ -229,11 +240,17 @@ impl NativeState {
             ResourceKind::LinuxBufferParams(object) => {
                 self.dispatch_linux_buffer_params(resource, context, object, request)
             }
+            ResourceKind::KdeDecorationManager => {
+                self.dispatch_kde_decoration_manager(resource, context, request)
+            }
+            ResourceKind::KdeDecoration(surface) => {
+                self.dispatch_kde_decoration(resource, context, surface, request)
+            }
             ResourceKind::DecorationManager => {
                 self.dispatch_decoration_manager(resource, context, request)
             }
             ResourceKind::ToplevelDecoration(surface) => {
-                self.dispatch_toplevel_decoration(resource, surface, request)
+                self.dispatch_toplevel_decoration(resource, context, surface, request)
             }
             ResourceKind::CursorShapeManager => {
                 self.dispatch_cursor_shape_manager(resource, context, request)

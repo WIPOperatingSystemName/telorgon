@@ -791,9 +791,13 @@ impl<'a, A> MountWriter<'a, A> {
                 core.state_bits = interaction.flags.bits();
             }
         }
-        let state_root = parent
-            .and_then(|parent| self.ui.nearest_control(parent))
-            .unwrap_or(node);
+        // Nested controls own their state. Inheriting a scroll viewport's state here
+        // leaves a second foundation binding competing with the control's inline style.
+        let state_root = if interaction.behavior != ControlBehavior::None {
+            node
+        } else {
+            parent.and_then(|parent| self.ui.nearest_control(parent)).unwrap_or(node)
+        };
         let component = match kind {
             NodeKind::Box => "box",
             NodeKind::Text => "text",

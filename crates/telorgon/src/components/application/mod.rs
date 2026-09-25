@@ -1,6 +1,10 @@
 //! Accessible application component values and components.
 
 pub mod action;
+#[cfg(all(target_os = "linux", feature = "audio-linux"))]
+mod audio_level_meter;
+#[cfg(all(target_os = "linux", feature = "audio-linux"))]
+pub use audio_level_meter::AudioLevelMeter;
 pub mod change;
 pub mod choice;
 pub mod collection;

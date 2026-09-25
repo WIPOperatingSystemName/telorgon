@@ -20,6 +20,7 @@ use std::sync::Arc;
 fn dense_glyph_samples_the_entire_atlas_region() {
     let mut pixels = [0_u8; 2 * 4];
     let mut raster = RasterTarget {
+        coverage_normalization: None,
         pixels: &mut pixels,
         width: 2,
         height: 1,
@@ -70,6 +71,7 @@ fn dense_glyph_samples_the_entire_atlas_region() {
 fn fractional_glyph_bounds_do_not_sample_outside_the_quad() {
     let mut pixels = [0_u8; 3 * 4];
     let mut raster = RasterTarget {
+        coverage_normalization: None,
         pixels: &mut pixels,
         width: 3,
         height: 1,
@@ -130,6 +132,7 @@ fn fractional_glyph_bounds_do_not_sample_outside_the_quad() {
 fn image_tint_recolors_the_source_alpha_mask() {
     let mut pixels = [0_u8; 4];
     let mut raster = RasterTarget {
+        coverage_normalization: None,
         pixels: &mut pixels,
         width: 1,
         height: 1,
@@ -425,6 +428,7 @@ fn rounded_clip_preserves_fractional_pixel_coverage_at_all_corners() {
             let mut pixels = vec![0; 80 * 80 * 4];
             draw_box(
                 &mut RasterTarget {
+                    coverage_normalization: None,
                     pixels: &mut pixels,
                     width: 80,
                     height: 80,
@@ -487,6 +491,7 @@ fn adjacent_square_controls_cover_every_corner_pixel() {
             let height = 24 * scale + 2;
             let mut pixels = vec![0; width * height * 4];
             let mut raster = RasterTarget {
+                coverage_normalization: None,
                 pixels: &mut pixels,
                 width,
                 height,
@@ -558,6 +563,7 @@ fn border_and_fill_share_coverage_without_an_alpha_seam() {
             let mut pixels = vec![0; 32 * 32 * 4];
             draw_box(
                 &mut RasterTarget {
+                    coverage_normalization: None,
                     pixels: &mut pixels,
                     width: 32,
                     height: 32,

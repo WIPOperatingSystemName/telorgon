@@ -16,5 +16,6 @@ pub struct ToggleElement {
     pub label: String,
     pub value: SemanticCheckState,
     pub enabled: bool,
+    pub width: Option<f32>,
     pub on_change: Option<ComponentCallback>,
 }

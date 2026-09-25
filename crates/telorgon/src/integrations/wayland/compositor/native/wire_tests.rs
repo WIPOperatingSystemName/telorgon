@@ -1,13 +1,13 @@
 use super::*;
 use std::{io::Write, os::unix::net::UnixStream, time::Duration};
 
-fn send(peer: &mut UnixStream, object: u32, opcode: u16, payload: &[u8]) {
+pub(super) fn send(peer: &mut UnixStream, object: u32, opcode: u16, payload: &[u8]) {
     let mut bytes = object.to_ne_bytes().to_vec();
     bytes.extend_from_slice(&((((payload.len() + 8) as u32) << 16) | opcode as u32).to_ne_bytes());
     bytes.extend_from_slice(payload);
     peer.write_all(&bytes).unwrap();
 }
-fn words(values: &[u32]) -> Vec<u8> {
+pub(super) fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_ne_bytes()).collect()
 }
 
@@ -369,7 +369,7 @@ fn destroyed_buffer_retains_pending_and_synchronized_cached_storage() {
     native.state.collect_destroyed_buffers();
     assert!(native.core().buffer(buffer).is_none());
 }
-fn registry(display: &Display, peer: &mut UnixStream) -> BTreeMap<String, u32> {
+pub(super) fn registry(display: &Display, peer: &mut UnixStream) -> BTreeMap<String, u32> {
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     send(peer, 1, 1, &words(&[2]));
     send(peer, 1, 0, &words(&[3]));
@@ -395,10 +395,10 @@ fn registry(display: &Display, peer: &mut UnixStream) -> BTreeMap<String, u32> {
         }
     }
 }
-fn bind(peer: &mut UnixStream, globals: &BTreeMap<String, u32>, interface: &str, id: u32) {
+pub(super) fn bind(peer: &mut UnixStream, globals: &BTreeMap<String, u32>, interface: &str, id: u32) {
     bind_version(peer, globals, interface, id, 1);
 }
-fn bind_version(
+pub(super) fn bind_version(
     peer: &mut UnixStream,
     globals: &BTreeMap<String, u32>,
     interface: &str,

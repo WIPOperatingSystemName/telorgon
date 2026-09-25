@@ -17,7 +17,7 @@ use crate::host::application::{
 };
 
 /// Renderer policy selected by an application declaration.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Renderer {
     /// Uses the entrypoint's platform default renderer policy.
     #[default]
@@ -147,6 +147,9 @@ impl Default for LinuxShellConfig {
 
 impl LinuxShellConfig {
     fn validate(&self) -> AppResult<()> {
+        if !self.resize_preview.corner_radius.is_finite() || self.resize_preview.corner_radius < 0.0 {
+            return Err(AppError::new("resize preview radius must be finite and nonnegative"));
+        }
         if !self.resize_preview.border_is_valid() {
             return Err(AppError::new(
                 "resize preview border widths must be finite and nonnegative",
@@ -321,7 +324,7 @@ impl ReadyGuiApplication {
     pub fn run(self) -> AppResult<()> {
         #[cfg(any(
             feature = "application-software",
-            all(feature = "application-vulkan-windows", target_os = "windows")
+            any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
         ))]
         {
             validate_application_name(&self.name)?;
@@ -352,7 +355,7 @@ impl ReadyGuiApplication {
 
         #[cfg(not(any(
             feature = "application-software",
-            all(feature = "application-vulkan-windows", target_os = "windows")
+            any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
         )))]
         {
             let _ = self.into_parts()?;
@@ -428,6 +431,14 @@ impl Window {
     /// Selects whether the native platform draws its standard non-client frame.
     pub fn decorations(mut self, decorations: WindowDecorationMode) -> Self {
         self.options.decorations = decorations;
+        self
+    }
+
+    /// Uses identical minimum and maximum extents and disables interactive resizing.
+    pub fn fixed_size(mut self, width: i32, height: i32) -> Self {
+        self.options.size = SizeI { width, height };
+        self.options.min_size = Some(self.options.size);
+        self.options.fixed_size = true;
         self
     }
 
@@ -704,9 +715,6 @@ pub(crate) type ShellKeyHandler = Box<dyn FnMut(ShellKeyEvent) -> ShellKeyAction
 /// Incomplete compositor declaration.
 pub struct MissingCursorTheme;
 
-#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-pub(crate) type CaptureChooserFactory = Box<dyn FnOnce(crate::CaptureUi) -> RegisteredShellWidget>;
-
 /// Compositor declaration; cursor_theme is required before desktop admission.
 ///
 /// ```compile_fail
@@ -722,7 +730,7 @@ pub(crate) type CaptureChooserFactory = Box<dyn FnOnce(crate::CaptureUi) -> Regi
 pub struct Compositor<C = MissingCursorTheme> {
     cursor_theme: C,
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-    capture_chooser: Option<CaptureChooserFactory>,
+    screen_cast_portal: Option<super::ScreenCastPortal>,
     client_cursor_mode: ClientCursorMode,
     decoration_policy: crate::DecorationPolicy,
     window_frame: Option<WindowFrameFactory>,
@@ -742,7 +750,7 @@ impl Compositor {
         Self {
             cursor_theme: MissingCursorTheme,
             #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-            capture_chooser: None,
+            screen_cast_portal: None,
             client_cursor_mode: ClientCursorMode::Allow,
             decoration_policy: crate::DecorationPolicy::DEFAULT,
             window_frame: None,
@@ -754,25 +762,20 @@ impl Compositor {
 }
 
 impl<C> Compositor<C> {
-    /// Replace the default capture chooser with a shell widget. The host retains consent
-    /// authority and the standard sharing indicator/stop controls. The factory runs once on
-    /// the compositor owner thread after the screencast backend is ready to be assembled.
+    /// Installs a shell-defined screen-cast portal design. Enable delivery with `Capture::desktop()`.
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-    pub fn capture_chooser<W: crate::authoring::compose::ShellWidget>(
-        mut self,
-        factory: impl FnOnce(crate::CaptureUi) -> W + 'static,
-    ) -> Self {
-        self.capture_chooser = Some(Box::new(move |ui| RegisteredShellWidget::new(factory(ui))));
+    pub fn screen_cast_portal(mut self, portal: super::ScreenCastPortal) -> Self {
+        self.screen_cast_portal = Some(portal);
         self
     }
 
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-    pub(crate) fn take_capture_chooser(&mut self) -> Option<CaptureChooserFactory> {
-        self.capture_chooser.take()
+    pub(crate) fn take_screen_cast_portal(&mut self) -> Option<super::ScreenCastPortal> {
+        self.screen_cast_portal.take()
     }
 
-    /// Selects startup decoration ownership and independent frame parts.
-    /// Custom templates receive resolved policy through `WindowChromeModel`.
+    /// Selects Wayland decoration negotiation. Only windows with committed server
+    /// decorations receive the frame template; X11 windows follow their decoration hints.
     pub fn decoration_policy(mut self, policy: crate::DecorationPolicy) -> Self {
         self.decoration_policy = policy;
         self
@@ -1186,6 +1189,12 @@ impl ReadyShellEnvironment {
             self.linux.session.publish_user_service_environment,
             self.shell_widgets.len(),
         )?;
+        #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+        if self.capture.configured_portal().is_some() {
+            self.compositor.screen_cast_portal.as_ref().ok_or_else(|| {
+                AppError::new("portal capture requires Compositor::screen_cast_portal")
+            })?.validate()?;
+        }
         validate_application_name(&self.name)?;
         self.assets
             .validate()
@@ -1252,7 +1261,7 @@ impl<C> Compositor<C> {
             shell_actions: self.shell_actions,
             keyboard_shortcut_handler: self.keyboard_shortcut_handler,
             #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
-            capture_chooser: self.capture_chooser,
+            screen_cast_portal: self.screen_cast_portal,
         }
     }
 

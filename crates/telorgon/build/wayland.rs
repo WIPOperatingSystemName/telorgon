@@ -30,6 +30,10 @@ pub fn source_paths() -> Vec<(&'static profile::ProtocolSpec, PathBuf)> {
         .map(|profile| {
             let path = if profile.name == "wayland" {
                 core.clone()
+            } else if profile.name == "server-decoration" {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../")
+                    .join(profile.source)
             } else {
                 extensions.join(profile.source)
             };

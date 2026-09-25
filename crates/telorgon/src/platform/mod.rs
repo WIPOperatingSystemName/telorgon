@@ -4,7 +4,8 @@ pub mod conformance;
 pub mod linux;
 #[cfg(any(
     feature = "application-software",
-    feature = "application-vulkan-windows"
+    feature = "application-vulkan-windows",
+    feature = "application-vulkan-linux"
 ))]
 pub mod winit;
 pub mod contracts;

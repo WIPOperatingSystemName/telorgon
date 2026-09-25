@@ -10,6 +10,8 @@ use crate::integrations::wayland::compositor::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompositorAction {
     PublishSurface(WaylandSurfaceId),
+    /// Apply committed state and callbacks using content already owned by the host.
+    UpdateSurface(WaylandSurfaceId),
     WithdrawSurface(WaylandSurfaceId),
     ImportBuffer(WaylandBufferId),
     ReleaseBuffer(WaylandBufferId),
@@ -64,6 +66,7 @@ pub struct CompositorCore {
     actions: Vec<CompositorAction>,
     // Buffer ownership is not coalesced with the latest image publication.
     queued_publications: BTreeMap<WaylandSurfaceId, QueuedPublication>,
+    dispatched_attachments: BTreeMap<WaylandSurfaceId, u64>,
     superseded_publications: Vec<(WaylandSurfaceId, u64, WaylandBufferId)>,
 }
 
@@ -88,6 +91,7 @@ impl CompositorCore {
             xdg_surfaces: BTreeMap::new(),
             actions: Vec::new(),
             queued_publications: BTreeMap::new(),
+            dispatched_attachments: BTreeMap::new(),
             superseded_publications: Vec::new(),
         })
     }
@@ -212,7 +216,11 @@ impl CompositorCore {
                     let snapshot = state.snapshot();
                     snapshot
                         .attachment
-                        .map(|attachment| (snapshot.revision, attachment.buffer))
+                        .filter(|_| {
+                            self.dispatched_attachments.get(&surface)
+                                != Some(&snapshot.attachment_revision)
+                        })
+                        .map(|attachment| (snapshot.attachment_revision, attachment.buffer))
                 })
             } else {
                 None
@@ -253,6 +261,17 @@ impl CompositorCore {
 
     pub fn drain_actions(&mut self) -> impl Iterator<Item = CompositorAction> + '_ {
         let publications = std::mem::take(&mut self.queued_publications);
+        for (&surface, publication) in &publications {
+            if let Some((revision, _)) = publication.buffer_use {
+                self.dispatched_attachments.insert(surface, revision);
+            }
+            if matches!(
+                self.actions[publication.action_index],
+                CompositorAction::WithdrawSurface(_)
+            ) {
+                self.dispatched_attachments.remove(&surface);
+            }
+        }
         self.actions
             .drain(..)
             .enumerate()
@@ -266,6 +285,13 @@ impl CompositorCore {
                     {
                         return None;
                     }
+                }
+                if let CompositorAction::PublishSurface(surface) = action
+                    && publications
+                        .get(&surface)
+                        .is_some_and(|pending| pending.buffer_use.is_none())
+                {
+                    return Some(CompositorAction::UpdateSurface(surface));
                 }
                 Some(action)
             })
@@ -500,5 +526,96 @@ mod publication_tests {
                 .contains(&WaylandBufferId::from_raw(10).unwrap())
         );
         assert!(core.world.surface(surface).unwrap().snapshot().revision > revision);
+    }
+}
+
+#[cfg(test)]
+mod buffer_lifetime_tests {
+    use super::*;
+    use crate::integrations::wayland::compositor::BufferAttachment;
+
+    #[test]
+    fn state_commits_preserve_a_pending_use_and_never_reacquire_a_dispatched_use() {
+        let mut core = CompositorCore::default();
+        let client = ClientId::from_raw(1).unwrap();
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        let buffer = WaylandBufferId::from_raw(10).unwrap();
+        core.connect_client(client).unwrap();
+        core.world.create_surface(client, surface).unwrap();
+        let state = core.world.surface_mut(surface).unwrap();
+        state.attach(Some(BufferAttachment {
+            buffer,
+            offset: Default::default(),
+        }));
+        let attached = state.commit().unwrap().revision;
+        core.queue_action(CompositorAction::PublishSurface(surface));
+        // Callback/state commits arriving in the same batch must not retire the attachment.
+        core.world.surface_mut(surface).unwrap().commit().unwrap();
+        core.queue_action(CompositorAction::PublishSurface(surface));
+        assert!(core.take_superseded_publications().is_empty());
+        assert_eq!(core.pending_publication_buffers(), BTreeSet::from([buffer]));
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::PublishSurface(surface)]
+        );
+        assert_eq!(
+            core.world
+                .surface(surface)
+                .unwrap()
+                .snapshot()
+                .attachment_revision,
+            attached
+        );
+        // Reproduce Firefox's frame-only commit after the host copied and released its buffer.
+        for _ in 0..3 {
+            core.world.surface_mut(surface).unwrap().commit().unwrap();
+            core.queue_action(CompositorAction::PublishSurface(surface));
+            assert!(core.pending_publication_buffers().is_empty());
+            assert!(core.take_superseded_publications().is_empty());
+            assert_eq!(
+                core.drain_actions().collect::<Vec<_>>(),
+                vec![CompositorAction::UpdateSurface(surface)]
+            );
+        }
+        // An explicit reattachment of the same object is a new use, unlike a state-only commit.
+        let state = core.world.surface_mut(surface).unwrap();
+        state.attach(Some(BufferAttachment {
+            buffer,
+            offset: Default::default(),
+        }));
+        state.commit().unwrap();
+        core.queue_action(CompositorAction::PublishSurface(surface));
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::PublishSurface(surface)]
+        );
+    }
+
+    #[test]
+    fn state_only_commit_superseded_by_a_new_attachment_does_not_release_old_storage() {
+        let mut core = CompositorCore::default();
+        let client = ClientId::from_raw(1).unwrap();
+        let surface = WaylandSurfaceId::from_raw(1).unwrap();
+        core.connect_client(client).unwrap();
+        core.world.create_surface(client, surface).unwrap();
+        for buffer_id in [10, 11] {
+            let state = core.world.surface_mut(surface).unwrap();
+            state.attach(Some(BufferAttachment {
+                buffer: WaylandBufferId::from_raw(buffer_id).unwrap(),
+                offset: Default::default(),
+            }));
+            state.commit().unwrap();
+            core.queue_action(CompositorAction::PublishSurface(surface));
+            assert!(core.take_superseded_publications().is_empty());
+            core.drain_actions().for_each(drop);
+            core.world.surface_mut(surface).unwrap().commit().unwrap();
+            core.queue_action(CompositorAction::PublishSurface(surface));
+        }
+        core.destroy_surface(client, surface).unwrap();
+        assert!(core.take_superseded_publications().is_empty());
+        assert_eq!(
+            core.drain_actions().collect::<Vec<_>>(),
+            vec![CompositorAction::WithdrawSurface(surface)]
+        );
     }
 }

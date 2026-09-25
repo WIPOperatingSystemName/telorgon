@@ -7,11 +7,12 @@ pub struct CaptureSources(u32);
 impl CaptureSources {
     pub const MONITORS: Self = Self(1);
     pub const WINDOWS: Self = Self(2);
+    pub const VIRTUAL_OUTPUTS: Self = Self(4);
     pub const fn empty() -> Self {
         Self(0)
     }
     pub const fn all() -> Self {
-        Self(3)
+        Self(7)
     }
     pub const fn bits(self) -> u32 {
         self.0
@@ -53,7 +54,7 @@ impl Default for Capture {
     }
 }
 impl Capture {
-    /// All interfaces disabled; monitors and windows available when one is enabled.
+    /// All interfaces disabled; physical displays, windows and virtual displays available when enabled.
     pub const fn new() -> Self {
         Self {
             sources: CaptureSources::all(),
@@ -62,7 +63,7 @@ impl Capture {
             internal: None,
         }
     }
-    /// Portal sharing of monitors/windows with the default (or compositor-supplied) chooser.
+    /// Portal sharing with a chooser supplied through `Compositor::screen_cast_portal`.
     pub const fn desktop() -> Self {
         Self::new().portal(PortalCapture::new())
     }
@@ -136,7 +137,7 @@ impl Capture {
         }
         if widgets > 254 {
             return Err(AppError::new(
-                "portal capture needs two free shell widget slots for consent and sharing controls",
+                "portal capture needs two free shell widget slots for the portal picker and sharing controls",
             ));
         }
         if self
@@ -157,6 +158,9 @@ impl Capture {
             && self.sources.contains(match source {
                 crate::shell::capture::CaptureSource::Output(_) => CaptureSources::MONITORS,
                 crate::shell::capture::CaptureSource::Window(_) => CaptureSources::WINDOWS,
+                crate::shell::capture::CaptureSource::VirtualOutput(_) => {
+                    CaptureSources::VIRTUAL_OUTPUTS
+                }
             })
     }
 }
@@ -259,7 +263,7 @@ mod tests {
         assert!(desktop.configured_internal().is_none());
         assert_eq!(
             desktop.configured_sources(),
-            CaptureSources::MONITORS | CaptureSources::WINDOWS
+            CaptureSources::MONITORS | CaptureSources::WINDOWS | CaptureSources::VIRTUAL_OUTPUTS
         );
         assert!(
             Capture::new()

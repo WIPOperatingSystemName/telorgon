@@ -137,6 +137,35 @@ impl SessionHandle {
             .unwrap_or_else(|e| e.into_inner())
             .phase
     }
+    pub fn applications(&self) -> super::SessionApplications {
+        super::SessionApplications::new(self.clone())
+    }
+
+    // Request-scoped helpers are reaped by their owner, not the restart supervisor.
+    pub(crate) fn spawn_helper(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::Child> {
+        let state = self.worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.phase != SessionPhase::Ready {
+            return Err(Error::Closing);
+        }
+        let env = state.launch_environment(&self.worker.env);
+        let overrides: Vec<_> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(ToOwned::to_owned)))
+            .collect();
+        command.env_clear().envs(&env.0);
+        for (key, value) in overrides {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        Ok(command.spawn()?)
+    }
+
     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let mut command = Command::new(program);
         command.session = Some(self.clone());
@@ -605,6 +634,9 @@ pub(crate) struct SessionOwner {
     thread: Option<JoinHandle<()>>,
     #[cfg(target_os = "linux")]
     services: Option<super::bus::ServiceEnvironment>,
+    // Drop generated configuration after the shared service environment is restored.
+    #[cfg(target_os = "linux")]
+    _desktop_settings: Option<super::desktop_settings::PreparedSettings>,
 }
 
 impl SessionOwner {
@@ -630,6 +662,13 @@ impl SessionOwner {
         if registry.is_some() {
             return Err(Error::AlreadyRunning);
         }
+        if config.desktop_settings.is_some() && (gui || !cfg!(target_os = "linux")) {
+            return Err(Error::Unsupported(
+                "desktop settings require a managed Linux desktop session".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let (env, desktop_settings) = super::desktop_settings::prepare(env, &config)?;
         let mut errors = Vec::new();
         let (journal, pending) = match Journal::open(&config, &env) {
             Ok(Some((j, p))) => (Some(j), p),
@@ -680,12 +719,15 @@ impl SessionOwner {
             thread: Some(thread),
             #[cfg(target_os = "linux")]
             services: None,
+            #[cfg(target_os = "linux")]
+            _desktop_settings: desktop_settings,
         })
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn publish_services(&mut self) -> Result<()> {
         self.services = Some(super::bus::ServiceEnvironment::publish(
             &self.handle.worker.env,
+            self.handle.worker.config.desktop_settings.is_some(),
         )?);
         Ok(())
     }

@@ -11,6 +11,7 @@ use crate::authoring::compose::{Alignment, Dimension, Element, ElementKind, Inse
 pub struct ContainerElement {
     pub inline_style: Option<std::sync::Arc<crate::theme::CompiledComponentStyle>>,
     pub hover_within: bool,
+    pub scrollable: bool,
     pub style: BoxStyle,
     pub layout: LayoutStyle,
     pub children: Vec<Element>,
@@ -36,6 +37,21 @@ impl Container {
     /// Works independently of whether an inline style is installed.
     pub fn hover_within(mut self, enabled: bool) -> Self {
         self.element.hover_within = enabled;
+        self
+    }
+
+    /// Clips overflowing content and accepts wheel/trackpad scrolling inside this viewport.
+    pub fn scrollable(mut self) -> Self {
+        self.element.scrollable = true;
+        self.element.style.overflow = crate::ui::Overflow::Scroll;
+        self
+    }
+
+    /// Wraps equal-size cells into as many columns as the available width permits.
+    pub fn grid(mut self, cell_width: u16, cell_height: u16) -> Self {
+        self.element.layout.flow = Flow::Grid { cell_width: cell_width.max(1), cell_height: cell_height.max(1) };
+        self.element.style.height = SizeRule::Shrink;
+        self.element.style.max_size.height = SizeRule::Logical(f32::MAX);
         self
     }
 
@@ -211,6 +227,7 @@ fn container(flow: Flow) -> Container {
         element: ContainerElement {
             inline_style: None,
             hover_within: false,
+            scrollable: false,
             style: BoxStyle {
                 width: SizeRule::Fill(1.0),
                 height: SizeRule::Fill(1.0),

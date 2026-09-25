@@ -242,17 +242,9 @@ fn easy_frame_publishes_controls_and_all_resize_directions() {
         .decoration;
     assert_eq!(root.corner_radii, CornerRadii::all(NORMAL.frame_radius));
     assert_eq!(
-        slot.corner_radii.top_left, 0.0,
-        "title-bar seam is not a window corner"
-    );
-    assert_eq!(slot.corner_radii.top_right, 0.0);
-    assert_eq!(
-        slot.corner_radii.bottom_left,
-        NORMAL.frame_radius - TEST_CHROME.active.frame_border.top.width
-    );
-    assert_eq!(
-        slot.corner_radii.bottom_right,
-        NORMAL.frame_radius - TEST_CHROME.active.frame_border.top.width
+        slot.corner_radii,
+        CornerRadii::all(0.0),
+        "the outer frame owns the window shape; its content slot stays square"
     );
 
     assert!(
@@ -1024,23 +1016,10 @@ fn asymmetric_palette_borders_drive_insets_corners_and_resize_hits() {
                 .get(snapshot.content.node)
                 .unwrap()
                 .decoration;
-            let r = design.normal.frame_radius;
             assert_eq!(
                 slot.corner_radii,
-                CornerRadii {
-                    top_left: if title_bar_visible {
-                        0.0
-                    } else {
-                        (r - 8.0).max(0.0)
-                    },
-                    top_right: if title_bar_visible {
-                        0.0
-                    } else {
-                        (r - 5.0).max(0.0)
-                    },
-                    bottom_right: (r - 5.0).max(0.0),
-                    bottom_left: (r - 8.0).max(0.0),
-                }
+                CornerRadii::all(0.0),
+                "asymmetric borders do not introduce content corner radii"
             );
             for (edge, x, y, outside_x, outside_y) in [
                 (WindowResizeEdge::Top, 320.0, -5.25, 320.0, -5.75),

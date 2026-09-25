@@ -22,6 +22,7 @@ impl NativeState {
             .retain(|(_, output)| *output != context.object);
         if let ResourceKind::Surface(surface) = context.kind {
             self.mapped_outputs.remove(&surface);
+            self.surface_outputs.remove(&surface);
             self.entered_outputs
                 .retain(|(candidate, _)| *candidate != surface);
         }
@@ -69,7 +70,9 @@ impl NativeState {
                     .retain(|(candidate, _), _| *candidate != surface);
                 self.initial_configures.remove(&surface);
                 self.xdg_resources.remove(&surface);
+                self.decorations.remove(&surface);
                 self.toplevels.remove(&surface);
+                self.requested_toplevel_states.remove(&surface);
                 self.committed_decorations.remove(&surface);
                 self.pending_toplevel_icons.remove(&surface);
                 self.committed_toplevel_icons.remove(&surface);
@@ -124,7 +127,7 @@ impl NativeState {
             ResourceKind::LinuxBufferParams(object) => {
                 self.dmabuf_params.remove(&object);
             }
-            ResourceKind::DataSource(source) => {
+            ResourceKind::DataSource(source) | ResourceKind::PrimarySource(source) => {
                 self.finished_drag_sources.remove(&source);
                 if self.core.data_devices.remove_source(source) {
                     let focused = self
@@ -140,7 +143,7 @@ impl NativeState {
                     }
                 }
             }
-            ResourceKind::DataOffer(offer) => {
+            ResourceKind::DataOffer(offer) | ResourceKind::PrimaryOffer(offer) => {
                 self.core.data_devices.remove_offer(offer);
             }
             ResourceKind::Subsurface(surface) => {
@@ -149,8 +152,15 @@ impl NativeState {
             ResourceKind::XdgSurface(surface) => {
                 self.xdg_resources.remove(&surface);
             }
+            ResourceKind::ToplevelDecoration(surface) | ResourceKind::KdeDecoration(surface) => {
+                self.remove_decoration(surface, context.object);
+            }
             ResourceKind::XdgToplevel(surface) => {
+                if let Some(object) = self.decorations.get(&surface).and_then(|state| state.xdg) {
+                    self.remove_decoration(surface, object);
+                }
                 self.toplevels.remove(&surface);
+                self.requested_toplevel_states.remove(&surface);
                 self.committed_decorations.remove(&surface);
                 self.pending_toplevel_icons.remove(&surface);
                 self.committed_toplevel_icons.remove(&surface);

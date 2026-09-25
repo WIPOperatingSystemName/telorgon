@@ -77,11 +77,7 @@ pub(super) fn window_content_offset(window: &ClientWindow, config: &LinuxShellCo
         window.chrome_content_offset.unwrap_or(PointI {
             x: window_border_width(window, config),
             y: window_border_width(window, config)
-                + if window_is_decorated(window) {
-                    config.titlebar_height
-                } else {
-                    0
-                },
+                + if window_has_titlebar(window) { config.titlebar_height } else { 0 },
         })
     }
 }
@@ -112,7 +108,7 @@ pub(super) fn legacy_window_outer(window: &ClientWindow, config: &LinuxShellConf
         width: window.requested_size.width + window_border_width(window, config) * 2,
         height: window.requested_size.height
             + window_border_width(window, config) * 2
-            + if window_is_decorated(window) {
+            + if window_has_titlebar(window) {
                 config.titlebar_height
             } else {
                 0
@@ -133,39 +129,68 @@ pub(super) fn wayland_resize_edge(edge: WindowResizeEdge) -> ResizeEdge {
     }
 }
 
+/// Client headers can retain ownership while the shell supplies only the outer frame.
 pub(super) fn window_has_frame(window: &ClientWindow) -> bool {
-    if window.fullscreen || window.backend.is_none() {
-        return false;
-    }
-    let parts = window
-        .decoration_policy
-        .frame_parts(window.server_decorated);
-    window_is_decorated(window)
-        || parts.border
-        || parts.rounded_clip
-        || parts.shadow
-        || parts.resize_regions
+    (window.server_decorated || window.frame_client_decorations)
+        && !window.fullscreen && window.backend.is_some()
 }
 
-pub(super) fn window_is_decorated(window: &ClientWindow) -> bool {
-    !window.fullscreen
-        && window.backend.is_some()
-        && window
-            .decoration_policy
-            .title_bar_visible(window.server_decorated)
+pub(super) fn window_has_titlebar(window: &ClientWindow) -> bool {
+    window.server_decorated && window_has_frame(window)
 }
 
 pub(super) fn window_border_width(window: &ClientWindow, config: &LinuxShellConfig) -> i32 {
-    if window_has_frame(window)
-        && window
-            .decoration_policy
-            .frame_parts(window.server_decorated)
-            .border
-    {
+    if window_has_frame(window) {
         config.window_border
     } else {
         0
     }
+}
+
+pub(super) fn surface_tree_position(
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+    surface: WaylandSurfaceId,
+    config: &LinuxShellConfig,
+) -> PointI {
+    let Some(window) = windows.get(&surface) else {
+        return PointI::default();
+    };
+    let mut chain = Vec::new();
+    let mut current = window;
+    while let Some(parent) = current.parent.and_then(|id| windows.get(&id)) {
+        if chain.len() >= windows.len() {
+            return window.position;
+        }
+        chain.push((current, parent));
+        current = parent;
+    }
+    let mut position = current.position;
+    for (child, parent) in chain.into_iter().rev() {
+        let origin = if child.role == SurfaceRole::Subsurface {
+            // wl_subsurface positions are relative to the parent's surface origin,
+            // not its window geometry or compositor frame. This also handles nesting.
+            let placement = surface_placement(parent, position, config);
+            PointI {
+                x: placement.target.x,
+                y: placement.target.y,
+            }
+        } else {
+            let offset = if parent.role == SurfaceRole::Xwayland {
+                window_content_offset(parent, config)
+            } else {
+                PointI::default()
+            };
+            PointI {
+                x: position.x.saturating_add(offset.x),
+                y: position.y.saturating_add(offset.y),
+            }
+        };
+        position = PointI {
+            x: origin.x.saturating_add(child.offset.x),
+            y: origin.y.saturating_add(child.offset.y),
+        };
+    }
+    position
 }
 
 pub(super) fn surface_local_position(
@@ -177,7 +202,12 @@ pub(super) fn surface_local_position(
     let Some(window) = windows.get(&surface) else {
         return position;
     };
-    surface_placement(window, window.position, config).surface_local(
+    surface_placement(
+        window,
+        surface_tree_position(windows, surface, config),
+        config,
+    )
+    .surface_local(
         window
             .motion_input
             .map_or(position, |input| input.map(position)),
@@ -190,12 +220,17 @@ pub(super) fn surface_placement(
     config: &LinuxShellConfig,
 ) -> SurfacePlacement {
     if window.role == SurfaceRole::XdgToplevel {
-        return SurfacePlacement::toplevel(
+        let mut placement = SurfacePlacement::toplevel(
             window.presentation.size,
             window.window_geometry,
             window_content_rect(window, position, config),
             window.native_configure.resize_anchor,
         );
+        if !window_has_frame(window) && !window.fullscreen {
+            // CSD geometry excludes client shadows, but the complete surface still renders.
+            placement.clip = None;
+        }
+        return placement;
     }
     let offset = window_content_offset(window, config);
     let origin = PointI {
@@ -224,7 +259,11 @@ pub(super) fn constrain_pointer(
     let Some(window) = windows.get(&constraint.surface) else {
         return current;
     };
-    let placement = surface_placement(window, window.position, config);
+    let placement = surface_placement(
+        window,
+        surface_tree_position(windows, constraint.surface, config),
+        config,
+    );
     let local = placement.surface_local(proposed);
     let Some(visible) = placement.visible_rect() else {
         return current;
@@ -527,8 +566,10 @@ pub(super) fn surface_raster_scale(
     output_scale: crate::platform::contracts::ScaleFactor,
     coordinate_density: i32,
 ) -> crate::platform::contracts::ScaleFactor {
-    crate::platform::contracts::ScaleFactor::new(output_scale.get() / coordinate_density.max(1) as f32)
-        .expect("validated output scale and positive coordinate density")
+    crate::platform::contracts::ScaleFactor::new(
+        output_scale.get() / coordinate_density.max(1) as f32,
+    )
+    .expect("validated output scale and positive coordinate density")
 }
 
 #[cfg(test)]
@@ -543,6 +584,115 @@ mod raster_scale_tests {
             let output = crate::platform::contracts::ScaleFactor::new(output).unwrap();
             assert_eq!(surface_raster_scale(output, density).get(), expected);
             assert_eq!(surface_raster_scale(output, 1), output);
+        }
+    }
+}
+
+#[cfg(test)]
+mod surface_tree_tests {
+    use super::super::client::maximize_preview_tests::test_window;
+    use super::*;
+
+    #[test]
+    fn decoration_ownership_preserves_client_shadows_and_clips_server_content() {
+        let config = LinuxShellConfig::default();
+        let mut window = test_window(
+            SizeI { width: 440, height: 340 },
+            PointI { x: 100, y: 80 },
+        );
+        window.window_geometry = RectI { x: 20, y: 20, width: 400, height: 300 };
+        window.requested_size = SizeI { width: 400, height: 300 };
+        for server_decorated in [false, true, false] {
+            window.server_decorated = server_decorated;
+            let placement = surface_placement(&window, window.position, &config);
+            let content = window_content_rect(&window, window.position, &config);
+            assert_eq!(placement.target.x, content.x - 20);
+            assert_eq!(placement.target.y, content.y - 20);
+            assert_eq!(placement.clip, server_decorated.then_some(content));
+            assert_eq!(placement.surface_local(PointF {
+                x: content.x as f32, y: content.y as f32,
+            }), PointF { x: 20.0, y: 20.0 });
+        }
+        window.frame_client_decorations = true;
+        let content = window_content_rect(&window, window.position, &config);
+        assert!(!window_has_titlebar(&window));
+        assert_eq!(window_content_offset(&window, &config), PointI {
+            x: config.window_border, y: config.window_border,
+        });
+        assert_eq!(surface_placement(&window, window.position, &config).clip, Some(content));
+        window.fullscreen = true;
+        assert!(!window_has_frame(&window));
+        assert!(surface_placement(&window, window.position, &config).clip.is_some());
+    }
+
+    #[test]
+    fn subsurfaces_share_parent_surface_origin_for_painting_and_input() {
+        let config = LinuxShellConfig::default();
+        let root = WaylandSurfaceId::from_raw(30).unwrap();
+        let child = WaylandSurfaceId::from_raw(20).unwrap();
+        let nested = WaylandSurfaceId::from_raw(10).unwrap();
+        let world = test_input_world(&[root, child, nested]);
+        for decorated in [false, true] {
+            let mut parent = test_window(
+                SizeI {
+                    width: 400,
+                    height: 300,
+                },
+                PointI { x: 100, y: 80 },
+            );
+            parent.server_decorated = decorated;
+            parent.window_geometry.x = 26;
+            parent.window_geometry.y = 26;
+            parent.chrome_content_offset = Some(PointI { x: 7, y: 37 });
+            let mut content = test_window(
+                SizeI {
+                    width: 200,
+                    height: 150,
+                },
+                PointI { x: 999, y: 999 },
+            );
+            content.role = SurfaceRole::Subsurface;
+            content.backend = None;
+            content.parent = Some(root);
+            content.offset = PointI { x: 26, y: 26 };
+            let mut descendant = test_window(
+                SizeI {
+                    width: 50,
+                    height: 40,
+                },
+                PointI { x: 999, y: 999 },
+            );
+            descendant.role = SurfaceRole::Subsurface;
+            descendant.backend = None;
+            descendant.parent = Some(child);
+            descendant.offset = PointI { x: 11, y: 13 };
+            let mut windows =
+                BTreeMap::from([(root, parent), (child, content), (nested, descendant)]);
+            for moved in [0, 100] {
+                windows.get_mut(&root).unwrap().position.x = 100 + moved;
+                let expected = PointI {
+                    x: 100 + moved + if decorated { 7 } else { 0 },
+                    y: 80 + if decorated { 37 } else { 0 },
+                };
+                assert_eq!(surface_tree_position(&windows, child, &config), expected);
+                let expected = PointI {
+                    x: expected.x + 11,
+                    y: expected.y + 13,
+                };
+                assert_eq!(surface_tree_position(&windows, nested, &config), expected);
+                let pointer = PointF {
+                    x: expected.x as f32 + 5.0,
+                    y: expected.y as f32 + 6.0,
+                };
+                assert_eq!(
+                    surface_local_position(&windows, nested, pointer, &config),
+                    PointF { x: 5.0, y: 6.0 }
+                );
+                assert_eq!(
+                    hit_test_surface(&world, &windows, &[root, child, nested], pointer, &config, false),
+                    Some(nested)
+                );
+            }
         }
     }
 }

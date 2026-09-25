@@ -94,7 +94,7 @@ fn descendant_taskbar_tracks_existing_open_closed_and_delayed_icons_and_dispatch
             surface: binding,
         },
         output,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
         &EventNotifier::new("taskbar-test").unwrap(),
         host.services.clone(),
@@ -111,8 +111,8 @@ fn descendant_taskbar_tracks_existing_open_closed_and_delayed_icons_and_dispatch
     admit(&mut layers[0], &mut retained);
     assert_eq!(seen.borrow().len(), 1);
     let now = MonotonicInstant::from_nanos(1);
-    widget_pointer_button(&mut layers, PointF { x: 20.0, y: 20.0 }, true, now, false).unwrap();
-    widget_pointer_button(&mut layers, PointF { x: 20.0, y: 20.0 }, false, now, false).unwrap();
+    widget_pointer_button(&mut layers, PointF { x: 20.0, y: 20.0 }, 0x110, true, now, false).unwrap();
+    widget_pointer_button(&mut layers, PointF { x: 20.0, y: 20.0 }, 0x110, false, now, false).unwrap();
     layers[0]
         .prepare(output, shell_work_area_for_spec(output), 2)
         .unwrap();

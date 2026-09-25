@@ -176,6 +176,26 @@ pub const EXT_IMAGE_COPY_CAPTURE_INTERFACES: &[InterfaceSpec] = &[
 
 pub const DESKTOP_PROTOCOLS: &[ProtocolSpec] = &[
     ProtocolSpec {
+        name: "server-decoration",
+        stage: ProtocolStage::Unstable,
+        source: "third_party/protocols/plasma-wayland-protocols/server-decoration.xml",
+        interfaces: &[
+            InterfaceSpec::new("org_kde_kwin_server_decoration_manager", 1, 1),
+            InterfaceSpec::new("org_kde_kwin_server_decoration", 1, 1),
+        ],
+    },
+    ProtocolSpec {
+        name: "wp_primary_selection_unstable_v1",
+        stage: ProtocolStage::Unstable,
+        source: "unstable/primary-selection/primary-selection-unstable-v1.xml",
+        interfaces: &[
+            InterfaceSpec::new("zwp_primary_selection_device_manager_v1", 1, 1),
+            InterfaceSpec::new("zwp_primary_selection_device_v1", 1, 1),
+            InterfaceSpec::new("zwp_primary_selection_source_v1", 1, 1),
+            InterfaceSpec::new("zwp_primary_selection_offer_v1", 1, 1),
+        ],
+    },
+    ProtocolSpec {
         name: "xwayland-shell-v1",
         stage: ProtocolStage::Staging,
         source: "staging/xwayland-shell/xwayland-shell-v1.xml",

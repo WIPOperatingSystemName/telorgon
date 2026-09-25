@@ -69,7 +69,7 @@ fn icon_published_during_view_is_in_the_same_delta_as_its_draw() {
             surface: binding,
         },
         output,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
         &EventNotifier::new("late-icon-test").unwrap(),
         host.services.clone(),

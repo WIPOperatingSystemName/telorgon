@@ -35,7 +35,6 @@ fn failed_preparation_or_deadline_keeps_unrelated_wayland_client_alive() {
             descendants: BTreeSet::new(),
             desktop: Default::default(),
             policy_repaint: false,
-            decoration_policy: crate::DecorationPolicy::DEFAULT,
             closing: BTreeMap::new(),
             pending_focus: None,
             pending_raise: None,

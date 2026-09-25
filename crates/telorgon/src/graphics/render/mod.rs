@@ -3,6 +3,7 @@
 mod backend;
 mod compiler;
 mod error;
+pub(crate) mod frame_border;
 mod gaussian_blur;
 mod readback;
 mod request;

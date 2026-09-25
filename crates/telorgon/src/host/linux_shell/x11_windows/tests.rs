@@ -55,7 +55,7 @@ fn app_header_move_requires_a_live_press_owned_by_that_surface() {
 }
 
 #[test]
-fn client_header_receives_input_while_outer_border_keeps_resize_hits() {
+fn client_decorated_window_has_no_shell_resize_hits() {
     let config = LinuxShellConfig::default();
     let surface = WaylandSurfaceId::from_raw(1).unwrap();
     let mut window = test_window(
@@ -65,12 +65,6 @@ fn client_header_receives_input_while_outer_border_keeps_resize_hits() {
         },
         PointI { x: 100, y: 100 },
     );
-    window.decoration_policy.outer_frame = crate::OuterFramePolicy {
-        border: crate::FramePartPolicy::Always,
-        rounded_clip: crate::FramePartPolicy::Always,
-        shadow: crate::FramePartPolicy::Always,
-    };
-    window.decoration_policy.interaction.resize_regions = crate::ResizeRegionPolicy::Enabled;
     window.role = SurfaceRole::Xwayland;
     window.backend = Some(WindowBackend::X11(id()));
     apply_decorations(&mut window, false, &config);
@@ -81,7 +75,7 @@ fn client_header_receives_input_while_outer_border_keeps_resize_hits() {
     };
     let windows = BTreeMap::from([(surface, window)]);
     assert_eq!(
-        hit_test_decoration(
+        hit_test_decoration(&super::super::input::test_input_world(&windows.keys().copied().collect::<Vec<_>>()),
             &windows,
             &[surface],
             PointF {
@@ -93,95 +87,39 @@ fn client_header_receives_input_while_outer_border_keeps_resize_hits() {
         ),
         None
     );
-    assert!(matches!(
-        hit_test_decoration(&windows, &[surface], border, &config, &[]),
-        Some((_, DecorationHit::Resize(ResizeEdge::Left)))
-    ));
+    assert_eq!(hit_test_decoration(&super::super::input::test_input_world(&windows.keys().copied().collect::<Vec<_>>()), &windows, &[surface], border, &config, &[]), None);
 }
 
 #[test]
-fn decoration_premap_extents_match_default_override_and_mixed_policy() {
+fn decoration_premap_extents_follow_x11_hints() {
     let config = LinuxShellConfig::default();
-    for negotiation in [
-        crate::DecorationNegotiation::ClientPreference,
-        crate::DecorationNegotiation::PreferServer,
-    ] {
-        for border in [
-            crate::FramePartPolicy::Automatic,
-            crate::FramePartPolicy::Always,
-            crate::FramePartPolicy::Never,
-        ] {
-            for decorated in [false, true] {
-                let mut window = test_window(
-                    SizeI {
-                        width: 640,
-                        height: 480,
-                    },
-                    PointI::default(),
-                );
-                window.role = SurfaceRole::Xwayland;
-                window.backend = Some(WindowBackend::X11(id()));
-                window.surface_scale = 3;
-                window.server_decorated = decorated;
-                window.decoration_policy.negotiation = negotiation;
-                window.decoration_policy.outer_frame.border = border;
-                assert_eq!(
-                    estimated_frame_extents(
-                        window.decoration_policy,
-                        decorated,
-                        false,
-                        3,
-                        &config
-                    ),
-                    frame_extents(&window, &config)
-                );
-                assert_eq!(
-                    estimated_frame_extents(
-                        window.decoration_policy,
-                        decorated,
-                        true,
-                        3,
-                        &config
-                    ),
-                    [0; 4]
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn decoration_default_removes_csd_extents_and_server_override_preserves_geometry() {
-    for negotiation in [
-        crate::DecorationNegotiation::ClientPreference,
-        crate::DecorationNegotiation::PreferServer,
-    ] {
-        let config = LinuxShellConfig::default();
-        let mut window = test_window(
-            SizeI {
-                width: 640,
-                height: 480,
-            },
-            PointI { x: 100, y: 100 },
-        );
+    for decorated in [false, true] {
+        let mut window = test_window(SizeI { width: 640, height: 480 }, PointI::default());
         window.role = SurfaceRole::Xwayland;
         window.backend = Some(WindowBackend::X11(id()));
-        window.decoration_policy.negotiation = negotiation;
-        let content = frame_geometry(&window, &config);
-        let extents = frame_extents(&window, &config);
-        apply_decorations(&mut window, false, &config);
-        assert_eq!(frame_geometry(&window, &config), content);
-        if negotiation == crate::DecorationNegotiation::ClientPreference {
-            assert_eq!(frame_extents(&window, &config), [0; 4]);
-            assert!(!window_has_frame(&window));
-        } else {
-            assert_eq!(frame_extents(&window, &config), extents);
-            assert!(window_is_decorated(&window));
-        }
-        apply_decorations(&mut window, true, &config);
-        assert_eq!(frame_geometry(&window, &config), content);
-        assert_eq!(frame_extents(&window, &config), extents);
+        window.surface_scale = 3;
+        window.server_decorated = decorated;
+        assert_eq!(estimated_frame_extents(decorated, false, 3, &config),
+            frame_extents(&window, &config));
+        assert_eq!(estimated_frame_extents(decorated, true, 3, &config), [0; 4]);
     }
+}
+
+#[test]
+fn decoration_ownership_changes_preserve_geometry_and_remove_all_csd_extents() {
+    let config = LinuxShellConfig::default();
+    let mut window = test_window(SizeI { width: 640, height: 480 }, PointI { x: 100, y: 100 });
+    window.role = SurfaceRole::Xwayland;
+    window.backend = Some(WindowBackend::X11(id()));
+    let content = frame_geometry(&window, &config);
+    let extents = frame_extents(&window, &config);
+    apply_decorations(&mut window, false, &config);
+    assert_eq!(frame_geometry(&window, &config), content);
+    assert_eq!(frame_extents(&window, &config), [0; 4]);
+    assert!(!window_has_frame(&window));
+    apply_decorations(&mut window, true, &config);
+    assert_eq!(frame_geometry(&window, &config), content);
+    assert_eq!(frame_extents(&window, &config), extents);
 }
 
 #[test]
@@ -196,13 +134,6 @@ fn decoration_changes_preserve_client_geometry_management_and_scaled_extents() {
             },
             PointI { x: 100, y: 100 },
         );
-        window.decoration_policy.outer_frame = crate::OuterFramePolicy {
-            border: crate::FramePartPolicy::Always,
-            rounded_clip: crate::FramePartPolicy::Always,
-            shadow: crate::FramePartPolicy::Always,
-        };
-        window.decoration_policy.interaction.resize_regions =
-            crate::ResizeRegionPolicy::Enabled;
         window.role = SurfaceRole::Xwayland;
         window.surface_scale = density;
         let mut adapter = X11Windows::default();
@@ -218,7 +149,7 @@ fn decoration_changes_preserve_client_geometry_management_and_scaled_extents() {
         assert_eq!(frame_geometry(&window, &config), content);
         assert_eq!(
             frame_extents(&window, &config),
-            [(config.window_border * density) as u32; 4]
+            [0; 4]
         );
         assert_eq!(window.backend, Some(WindowBackend::X11(id())));
         assert!(!window.minimized);
@@ -563,7 +494,7 @@ fn shared_titlebar_drag_and_coordinates_work_for_both_backends() {
         };
         let mut windows = BTreeMap::from([(surface, image)]);
         assert!(matches!(
-            hit_test_decoration(&windows, &[surface], pointer, &config, &[]),
+            hit_test_decoration(&super::super::input::test_input_world(&windows.keys().copied().collect::<Vec<_>>()), &windows, &[surface], pointer, &config, &[]),
             Some((_, DecorationHit::Titlebar))
         ));
         let mut drag = WindowInteraction::begin_move(&windows, surface, pointer).unwrap();
@@ -768,7 +699,7 @@ fn unmanaged_popups_remain_unframed() {
         &LinuxShellConfig::default(),
     );
     assert_eq!(image.backend, None);
-    assert!(!window_is_decorated(&image));
+    assert!(!window_has_frame(&image));
     assert_eq!(image.position, PointI { x: 40, y: 50 });
     let native = WaylandSurfaceId::from_raw(21).unwrap();
     let popup = WaylandSurfaceId::from_raw(20).unwrap();
@@ -787,7 +718,7 @@ fn unmanaged_popups_remain_unframed() {
     ]);
     let point = PointF { x: 100.0, y: 60.0 };
     assert!(
-        hit_test_decoration(
+        hit_test_decoration(&super::super::input::test_input_world(&windows.keys().copied().collect::<Vec<_>>()),
             &windows,
             &[native, popup],
             point,
@@ -798,7 +729,7 @@ fn unmanaged_popups_remain_unframed() {
     );
     windows.remove(&popup);
     assert!(matches!(
-        hit_test_decoration(
+        hit_test_decoration(&super::super::input::test_input_world(&windows.keys().copied().collect::<Vec<_>>()),
             &windows,
             &[native],
             point,

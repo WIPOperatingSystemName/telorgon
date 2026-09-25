@@ -8,6 +8,7 @@ readme.workspace = true
 description = "Retained, component-based UI framework with software and Vulkan rendering"
 
 [features]
+tray-linux = []
 # Ordinary applications compile both managed desktop backends. Runtime entrypoint declarations
 # choose between them; downstream applications do not select a renderer with Cargo features.
 default = ["application-software", "application-vulkan-windows"]
@@ -20,6 +21,10 @@ application-software = [
     "dep:softbuffer",
     "dep:winit",
     "dep:windows-sys",
+]
+application-vulkan-linux = [
+    "dep:ash", "dep:ash-window", "dep:bytemuck", "dep:gpu-allocator",
+    "dep:raw-window-handle", "dep:sha2", "dep:winit",
 ]
 application-vulkan-windows = [
     "dep:ash",
@@ -39,11 +44,18 @@ shell-wayland-linux = [
     "dep:gpu-allocator",
     "dep:sha2",
 ]
-shell-screencast-linux = ["shell-wayland-linux", "dep:pipewire", "dep:async-channel", "dep:async-io"]
+pipewire-linux = ["dep:pipewire"]
+audio-linux = ["pipewire-linux", "dep:rtrb"]
+midi-linux = ["pipewire-linux", "dep:rtrb"]
+video-linux = ["pipewire-linux"]
+portal-client-linux = ["pipewire-linux", "dep:async-channel", "dep:async-io"]
+desktop-audio-linux = ["pipewire-linux", "dep:serde_json"]
+shell-screencast-linux = ["shell-wayland-linux", "video-linux", "dep:async-channel", "dep:async-io", "dep:serde_json"]
 # Compatibility components; does not start a server or change native defaults.
 shell-xwayland = [
     "shell-wayland-linux",
     "dep:x11rb-protocol",
+    "dep:x11rb",
     "dep:flate2",
     "dep:serde_json",
 ]
@@ -66,6 +78,7 @@ profiler = [
 
 [dependencies]
 x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "composite", "randr", "shape", "xfixes", "sync", "render"], optional = true }
+x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes"], optional = true }
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"], optional = true }
 async-process.workspace = true
 blocking.workspace = true
@@ -103,7 +116,7 @@ windows-sys = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 async-channel = { version = "2.5", optional = true }
 async-io = { version = "2.6", optional = true }
-pipewire = { version = "=0.10.1", features = ["v0_3_34"], optional = true }
+pipewire = { version = "=0.10.1", features = ["v0_3_65"], optional = true }
 zbus.workspace = true
 signal-hook-registry.workspace = true
 
@@ -121,3 +134,67 @@ roxmltree = { version = "0.21.1", optional = true }
 [[test]]
 name = "wayland_protocol_generation"
 required-features = ["shell-wayland-linux"]
+
+[[example]]
+name = "desktop_audio"
+required-features = ["desktop-audio-linux"]
+
+[[example]]
+name = "audio_playback"
+required-features = ["audio-linux"]
+
+[[example]]
+name = "midi"
+required-features = ["midi-linux"]
+
+[[example]]
+name = "midi_forward"
+required-features = ["midi-linux"]
+
+[[example]]
+name = "video_source"
+required-features = ["video-linux"]
+
+[[example]]
+name = "video_preview"
+required-features = ["video-linux", "portal-client-linux", "application-software"]
+
+[[example]]
+name = "video_gpu_capture"
+required-features = ["video-linux", "embedded-vulkan"]
+
+[[example]]
+name = "video_gpu_source"
+required-features = ["video-linux", "embedded-vulkan"]
+
+[[example]]
+name = "audio_record"
+required-features = ["audio-linux"]
+
+[[example]]
+name = "audio_processing"
+required-features = ["audio-linux"]
+
+[[example]]
+name = "audio_routing"
+required-features = ["audio-linux"]
+
+[[example]]
+name = "audio_gui"
+required-features = ["audio-linux", "application-software"]
+
+[[example]]
+name = "desktop_audio_gui"
+required-features = ["desktop-audio-linux", "application-software"]
+
+[[example]]
+name = "audio_video_sync"
+required-features = ["audio-linux", "video-linux", "application-software"]
+
+[[example]]
+name = "audio_mixer_gui"
+required-features = ["desktop-audio-linux", "application-software"]
+
+[[example]]
+name = "tray_publisher"
+required-features = ["tray-linux"]

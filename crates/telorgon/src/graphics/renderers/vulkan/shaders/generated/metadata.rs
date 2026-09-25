@@ -3,40 +3,40 @@
 pub(crate) const BUNDLE_INTERFACE_MAJOR: u32 = 4;
 pub(crate) const BUNDLE_INTERFACE_MINOR: u32 = 4;
 pub(crate) const BUNDLE_HASH: &str =
-    "c051397be87210fa8a07dfa6062c73c066a5cd9908cf3864a999f34b7f874222";
+    "055ad64f52d10a9195342a43ddf6cbb23daf0a3e4985aba23b4dde0f85e20380";
 pub(crate) const BOX_VERTEX_HASH: &str =
-    "74a5ca1a74dade29acd48781047899fd7ae626e32c39ccd49862134b011ecbfe";
+    "6092cb70b7ee8d0deaa7c52841c6535ebc99180dbfda8c39fcb0ed063e0b94b3";
 pub(crate) const BOX_VERTEX: &[u8] = include_bytes!("spirv/box.vert.spv");
 pub(crate) const BOX_FRAGMENT_HASH: &str =
-    "87bcfb6a83f52c588060de8c155e96298e98ee5f33b7608c8273a76f4aee1813";
+    "366770086ca2a5a8f3e299e1691bec636c11777dd7ce221036af4d266bdb1ec1";
 pub(crate) const BOX_FRAGMENT: &[u8] = include_bytes!("spirv/box.frag.spv");
 pub(crate) const GLYPH_VERTEX_HASH: &str =
     "deaec55e693a5a735813197cee82c05b283f84587b7131d57def08919ec4331a";
 pub(crate) const GLYPH_VERTEX: &[u8] = include_bytes!("spirv/glyph.vert.spv");
 pub(crate) const GLYPH_FRAGMENT_HASH: &str =
-    "7670b58770c921f6c8188004314a88743e8259292f7e73e2652bc716fb9d00bb";
+    "c44656b4201a292f2d06236932df702709b7436ea8aeeac02073cb4eb3bf0542";
 pub(crate) const GLYPH_FRAGMENT: &[u8] = include_bytes!("spirv/glyph.frag.spv");
 pub(crate) const IMAGE_VERTEX_HASH: &str =
     "0e78d740032e2754466bc6750bdca100dde5fbd0411e2a98b6bea5e9852babb3";
 pub(crate) const IMAGE_VERTEX: &[u8] = include_bytes!("spirv/image.vert.spv");
 pub(crate) const IMAGE_FRAGMENT_HASH: &str =
-    "c517924d1dd1d086e8f041d9966e683d78258f0018668ee524a40f05c46586b8";
+    "3d9cccdb9dcd75d9d30389d351a6d93dcc867364431430765e7662a4322c48ac";
 pub(crate) const IMAGE_FRAGMENT: &[u8] = include_bytes!("spirv/image.frag.spv");
 pub(crate) const MATERIAL_VERTEX_HASH: &str =
     "783af7da04c758dc2db03d1187818f7a77548101504d07d1f29a8314a806fe3c";
 pub(crate) const MATERIAL_VERTEX: &[u8] = include_bytes!("spirv/material.vert.spv");
 pub(crate) const MATERIAL_FRAGMENT_HASH: &str =
-    "9081901c6da5270cfd18ab0f8a873f299a7c66a3b0c169980cde18c1013c454e";
+    "86d2890917fa1971302044def4d38ce59372b25b396981bb763e93cdd03be848";
 pub(crate) const MATERIAL_FRAGMENT: &[u8] = include_bytes!("spirv/material.frag.spv");
 pub(crate) const LIQUID_VERTEX_HASH: &str =
     "723a6f6c78547285b259a27b70662cd099ca1de03aef8c386ddab111cc0a7834";
 pub(crate) const LIQUID_VERTEX: &[u8] = include_bytes!("spirv/liquid.vert.spv");
 pub(crate) const LIQUID_FRAGMENT_HASH: &str =
-    "54df50039ea4a6f8337db15cd147dd3d17b1cd458baf75f3571913bbcb4dce6a";
+    "b41b357e67565213d86f952227651abc60248ba6f4f615198ebe2783116e8344";
 pub(crate) const LIQUID_FRAGMENT: &[u8] = include_bytes!("spirv/liquid.frag.spv");
 pub(crate) const BLUR_VERTEX_HASH: &str =
     "783af7da04c758dc2db03d1187818f7a77548101504d07d1f29a8314a806fe3c";
 pub(crate) const BLUR_VERTEX: &[u8] = include_bytes!("spirv/blur.vert.spv");
 pub(crate) const BLUR_FRAGMENT_HASH: &str =
-    "61e9d7a37fd6bc569f9a929db4b792f1567a62383a02e4c14fc24a2da796f755";
+    "2ba4fbca98b56d33d958ed3465efae6c5da2fc42756019d32fa32f8d28ac4179";
 pub(crate) const BLUR_FRAGMENT: &[u8] = include_bytes!("spirv/blur.frag.spv");

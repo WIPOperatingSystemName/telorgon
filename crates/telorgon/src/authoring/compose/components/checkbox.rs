@@ -67,6 +67,7 @@ pub fn checkbox(label: impl Into<String>, checked: bool) -> Checkbox {
                 SemanticCheckState::Unchecked
             },
             enabled: true,
+            width: None,
             on_change: None,
         },
     }

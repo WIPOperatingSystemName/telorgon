@@ -720,6 +720,7 @@ impl VulkanDevice {
             staging_bytes_used: 0,
             buffers: Vec::new(),
             images: Vec::new(),
+            resources: Vec::new(),
             external_images: Vec::new(),
             rendered: false,
             #[cfg(feature = "instrumentation")]

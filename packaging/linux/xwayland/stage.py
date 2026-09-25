@@ -55,6 +55,22 @@ def stage(work, destination, packaging):
                           input_sha256=sha(packaging / "runtime-policy.toml"),
                           license="GPL-3.0-or-later; see licenses/Telorgon-GPL-3.0.txt"))
     (destination / "licenses" / "sources.lock.toml").write_bytes((third_party / "sources.lock.toml").read_bytes())
+    dependency_lock = work / 'dependencies.lock.toml'
+    if dependency_lock.exists():
+        dependencies = tomllib.loads(dependency_lock.read_text())['source']
+        shutil.copyfile(dependency_lock, destination / 'licenses/dependencies.lock.toml')
+        for source in dependencies:
+            directory = work / 'sources' / source['source_root']
+            notices = [directory / name for name in (
+                'COPYING', 'COPYING.md', 'LICENSE', 'LICENSE.txt', 'LICENSE.TXT',
+                'COPYING.LIB', 'Copyright', 'README', 'docs/FTL.TXT', 'docs/GPLv2.TXT')]
+            for notice in notices:
+                if notice.is_file():
+                    shutil.copyfile(notice, destination / 'licenses' /
+                                    (source['name'] + '-' + notice.name))
+            inventory.append(dict(name=source['name'], version=source['version'],
+                                  input_sha256=source['sha256'],
+                                  license='See licenses and dependencies.lock.toml'))
     pending = []
     for name, source in [("Xwayland", work / "build/xwayland/hw/xwayland/Xwayland"),
                          ("xkbcomp", work / "build/xkbcomp/xkbcomp")]:
@@ -74,7 +90,10 @@ def stage(work, destination, packaging):
                 continue
             if soname not in policy["private"]:
                 raise ValueError(f"undeclared runtime library: {soname}")
-            source = next((p / soname for p in [work / "private/lib", Path("/usr/lib/x86_64-linux-gnu")]
+            search = [work / "private/lib"]
+            if not dependency_lock.exists():
+                search.append(Path("/usr/lib/x86_64-linux-gnu"))
+            source = next((p / soname for p in search
                            if (p / soname).is_file()), None)
             if source is None:
                 raise ValueError(f"missing private runtime library: {soname}")

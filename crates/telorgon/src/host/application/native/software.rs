@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::foundation::SizeI;
 use crate::graphics::presentation::softbuffer::SoftbufferPresenter;
 use crate::graphics::render::{RenderBackend, RenderRequest, RenderTargetInfo, TargetLoad, TargetStore};
 use crate::graphics::renderers::software::{SoftwareRenderer, SoftwareScene, SoftwareSurface, SoftwareTarget};
@@ -62,11 +61,7 @@ impl SoftwarePresentation {
             crate::runtime::instrumentation::instant!("presentation.idle");
             return Ok(false);
         }
-        let logical_extent = frame.metrics.logical_extent;
-        let extent = SizeI {
-            width: logical_extent.width.ceil().max(1.0) as i32,
-            height: logical_extent.height.ceil().max(1.0) as i32,
-        };
+        let extent = frame.metrics.physical_extent;
         let target = SoftwareTarget::new(RenderTargetInfo::full(extent));
         let clear = self.scene.background();
         let force_render = frame.force_present || !self.presented;
@@ -75,7 +70,7 @@ impl SoftwarePresentation {
             let _span = crate::runtime::instrumentation::span!("software.raster");
             let mut frame = self.framebuffer.begin_frame();
             self.renderer
-                .render(
+                .render_logical(
                     &mut self.scene,
                     &mut frame,
                     &target,
@@ -119,6 +114,10 @@ impl SoftwarePresentation {
 }
 
 impl NativePresentation for SoftwarePresentation {
+    fn uses_logical_coordinates(&self) -> bool {
+        true
+    }
+
     fn attach(&mut self, window: Arc<Window>) -> Result<(), String> {
         SoftwarePresentation::attach(self, window)
     }

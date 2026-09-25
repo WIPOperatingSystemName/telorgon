@@ -27,16 +27,27 @@ void include_shadow(in vec4 shadow, inout vec4 extent) {
 void main(){
     instance_slot=draw_indices.values[gl_InstanceIndex];
     GpuBoxInstance item=boxes.values[instance_slot];
+    GpuSpatial spatial=spatials.values[item.border_l_spatial_clip_flags.y];
     float outline_extent=max(0.0,item.outline.x+item.outline.y);
     vec4 extent=vec4(outline_extent);
     uint shadow_count=item.outline_shadow_colors.w;
     if(shadow_count>0u)include_shadow(item.shadow_0,extent);
     if(shadow_count>1u)include_shadow(item.shadow_1,extent);
+    if((view_data.epoch_flags.w&8u)!=0u){
+        // Include pixel centers just outside fractional control bounds. The fragment
+        // shader resolves their coverage against the isolated frame's inner contour.
+        mat2 local_to_view=mat2(spatial.local_to_view_0.xy,spatial.local_to_view_1.xy);
+        if(abs(determinant(local_to_view))>1e-8){
+            mat2 view_to_local=transpose(inverse(local_to_view));
+            vec2 half_pixel=.5*view_data.view_size_scale.xy/view_data.render_size_inverse.xy;
+            vec2 reach=abs(view_to_local[0])*half_pixel.x+abs(view_to_local[1])*half_pixel.y;
+            extent=max(extent,vec4(reach,reach));
+        }
+    }
     vec2 low=-extent.xy;
     vec2 high=item.rect.zw+extent.zw;
     local_position=mix(low,high,QUAD[gl_VertexIndex]);
     vec2 local=item.rect.xy+local_position;
-    GpuSpatial spatial=spatials.values[item.border_l_spatial_clip_flags.y];
     view_position=vec2(dot(spatial.local_to_view_0.xyz,vec3(local,1)),dot(spatial.local_to_view_1.xyz,vec3(local,1)));
     vec4 p=vec4(view_position,0,1);
     gl_Position=vec4(dot(view_data.clip_from_view_0,p),dot(view_data.clip_from_view_1,p),dot(view_data.clip_from_view_2,p),dot(view_data.clip_from_view_3,p));

@@ -7,7 +7,7 @@ use std::time::Instant;
 pub(crate) enum HostEvent {
     ExitRequested,
     RuntimeWake,
-    #[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+    #[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
     PresentationWake,
     ResizeSignalChanged {
         signal: resize::ResizeSignalSnapshot,
@@ -17,33 +17,30 @@ pub(crate) enum HostEvent {
 
 #[cfg(all(
     feature = "application-software",
-    feature = "application-vulkan-windows",
-    target_os = "windows"
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
 ))]
 mod auto;
 #[cfg(feature = "application-software")]
 mod software;
-#[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+#[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
 mod vulkan;
-#[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+#[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
 mod vulkan_pipeline;
-#[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+#[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
 mod vulkan_worker;
 
 #[cfg(all(
     feature = "application-software",
-    feature = "application-vulkan-windows",
-    target_os = "windows"
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
 ))]
 pub use auto::run_gui_auto as run_gui;
 #[cfg(all(
-    feature = "application-vulkan-windows",
-    target_os = "windows",
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")),
     not(feature = "application-software")
 ))]
 pub use vulkan::run_gui_vulkan as run_gui;
 #[cfg(all(
-    not(all(feature = "application-vulkan-windows", target_os = "windows")),
+    not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))),
     feature = "application-software"
 ))]
 pub use winit_host::run_gui_software as run_gui;

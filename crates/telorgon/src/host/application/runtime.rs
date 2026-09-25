@@ -190,14 +190,18 @@ impl AppRuntimeCore<CompositionDriver> {
         theme: ThemeRuntime,
         domain: ThemeDomain,
     ) -> AppResult<Self> {
-        let view = ViewRuntime::from_composed(component)?;
-        Self::from_view(view, extent, theme, domain)
+        let driver = CompositionDriver::new(component);
+        let images = driver.image_bindings.clone();
+        let view = ViewRuntime::new(driver)?;
+        let mut runtime = Self::from_view(view, extent, theme, domain)?;
+        runtime.image_bindings = Some(images);
+        Ok(runtime)
     }
 
     #[cfg(any(
         feature = "application-software",
         feature = "shell-wayland-linux",
-        all(feature = "application-vulkan-windows", target_os = "windows")
+        any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
     ))]
     pub(crate) fn from_composition_driver(
         driver: CompositionDriver,
@@ -541,13 +545,16 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                         );
                     }
                 }
-                PlatformInput::Input(event @ InputEvent::Scroll { pointer, .. }) => {
+                PlatformInput::Input(event @ InputEvent::Scroll { pointer, delta, .. }) => {
                     let position = self
                         .interaction
                         .pointer_position(pointer)
                         .unwrap_or_default();
                     let hit = self.layout.hit_test(self.view.ui_mut(), position);
                     if let Some(target) = hit {
+                        if super::scroll::wheel(self.view.ui_mut(), &self.layout, target, delta) {
+                            self.view.scheduler_mut().request();
+                        }
                         self.view.dispatch_ui(
                             target,
                             UiEventKind::Input(event),

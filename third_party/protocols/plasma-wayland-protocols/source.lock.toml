@@ -1,0 +1,6 @@
+# Unmodified upstream XML from the wayland-protocols-plasma 0.3.12 source distribution.
+[source]
+url = "https://crates.io/api/v1/crates/wayland-protocols-plasma/0.3.12/download"
+path = "plasma-wayland-protocols/src/protocols/server-decoration.xml"
+sha256 = "c5f857734bb190dc9adfb65fb05550a6245f12af1a2be5eefd05be199805a68c"
+license = "LGPL-2.1-or-later"

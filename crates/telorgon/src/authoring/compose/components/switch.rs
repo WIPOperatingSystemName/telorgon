@@ -12,6 +12,11 @@ pub struct Switch {
 }
 
 impl Switch {
+    pub fn width(mut self, width: f32) -> Self {
+        self.element.width = width.is_finite().then_some(width.max(0.0));
+        self
+    }
+
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self
@@ -62,6 +67,7 @@ pub fn switch(label: impl Into<String>, value: bool) -> Switch {
                 SemanticCheckState::Unchecked
             },
             enabled: true,
+            width: None,
             on_change: None,
         },
     }

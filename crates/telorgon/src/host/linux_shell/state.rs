@@ -3,11 +3,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::integrations::wayland::compositor::{ResizeEdge, WaylandSurfaceId, XdgConfigure};
 use crate::foundation::{PointF, PointI, RectI, SizeI};
 
-/// A pending page flip may overlap one render, but don't build a queue behind GPU/ready work.
-pub(super) fn primary_render_budget(gpu_pending: usize, ready_pending: usize) -> bool {
-    gpu_pending == 0 && ready_pending == 0
-}
-
 /// Native xdg configure transaction state. Shell geometry and retained surface
 /// imagery are deliberately outside this record. X11 geometry commands have no
 /// xdg acknowledgement or terminal-configure transaction to store here.
@@ -295,17 +290,6 @@ fn intersection(left: RectI, right: RectI) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn primary_backpressure_resumes_after_gpu_and_ready_retirement() {
-        // A flip may be pending during each of these transitions. It doesn't consume the render
-        // budget itself; a completed frame waiting behind it does.
-        assert!(primary_render_budget(0, 0));
-        assert!(!primary_render_budget(1, 0)); // queued GPU work
-        assert!(!primary_render_budget(0, 1)); // completion observed, waiting for KMS
-        assert!(primary_render_budget(0, 0)); // moved to the pending flip
-        assert!(!primary_render_budget(2, 1)); // tolerate a pre-existing queue during transition
-    }
 
     #[test]
     fn native_content_does_not_stretch_or_expose_shadow_margins() {

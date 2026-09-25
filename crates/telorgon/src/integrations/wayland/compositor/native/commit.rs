@@ -39,6 +39,22 @@ impl NativeState {
         &mut self,
         surface: WaylandSurfaceId,
     ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if let Some(observer) = &self.timing_observer {
+            let state = self.core.world.surface(surface);
+            observer(TimingEvent::CommitRequested {
+                surface: surface.get(),
+                current_revision: state.map_or(0, |s| s.snapshot().revision),
+                attaches_buffer: state.is_some_and(|s| s.pending().attachment.flatten().is_some()),
+                callbacks: self.callbacks.get(&surface).map_or(0, Vec::len),
+            });
+        }
+        if let Some(state) = self.core.world.surface(surface) {
+            super::super::diagnostics::event(surface.get(), "commit", format_args!(
+                "role={:?} parent={:?} revision={} attachment={:?} scale={:?} damage={} buffer_damage={}",
+                state.snapshot().role, self.core.subsurfaces.parent(surface), state.snapshot().revision,
+                state.pending().attachment, state.pending().buffer_scale,
+                state.pending().damage.len(), state.pending().buffer_damage.len()));
+        }
         let pending_buffer = self
             .surface_mut(surface)?
             .pending()
@@ -87,6 +103,7 @@ impl NativeState {
                 .map_err(error)?
                 .is_none()
             {
+                super::super::diagnostics::event(surface.get(), "cached", format_args!("waiting for synchronized parent commit"));
                 return Ok(DispatchOutcome::default());
             }
         }
@@ -96,10 +113,7 @@ impl NativeState {
             .xdg_surface_mut(surface)
             .map(|xdg_surface| xdg_surface.commit_state())
         {
-            if let Some(configure) = acknowledged_configure {
-                self.committed_decorations
-                    .insert(surface, configure.decoration);
-            }
+            self.commit_decoration_mode(surface, acknowledged_configure);
             self.surface_mut(surface)?
                 .apply_xdg_commit_state(acknowledged_configure, window_geometry);
         }
@@ -149,6 +163,7 @@ impl NativeState {
             self.send_initial_configure(surface)?;
         }
         for (child, commit) in self.core.subsurfaces.release_children(surface) {
+            super::super::diagnostics::event(child.get(), "released", format_args!("ancestor={surface:?}"));
             self.surface_mut(child)?.stage(commit).map_err(error)?;
             let child_outcome = self.surface_mut(child)?.commit().map_err(error)?;
             self.commit_viewport_state(child)?;
@@ -315,42 +330,17 @@ impl NativeState {
                 "presented surface revision is newer than committed state",
             ));
         }
-        let callback_commits =
-            take_surface_commits_through(&mut self.committed_callbacks, surface, through_revision);
+        let mut identities = self.queue_frame_callbacks(surface, through_revision, time_milliseconds, presented)?;
         let (presented_feedbacks, discarded_feedbacks) = take_surface_feedbacks_through(
             &mut self.committed_presentation_feedbacks,
             surface,
             through_revision,
             presented,
         );
-        let callback_count = callback_commits
-            .iter()
-            .map(|(_, callbacks)| callbacks.len())
-            .sum::<usize>();
+        let callback_count = identities.len();
         let feedback_count = presented_feedbacks.len() + discarded_feedbacks.len();
-        let mut identities = Vec::with_capacity(callback_count + feedback_count);
-        for object in callback_commits
-            .into_iter()
-            .flat_map(|(_, callbacks)| callbacks)
-        {
-            let Some(identity) = self.resources.get(&object).copied() else {
-                continue;
-            };
-            let Some(resource) =
-                (unsafe { ResourceRef::from_raw(identity as *mut ffi::wl_resource) })
-            else {
-                continue;
-            };
-            self.post_event(
-                resource,
-                "wl_callback",
-                "done",
-                &mut [ffi::wl_argument {
-                    u: time_milliseconds,
-                }],
-            )?;
-            identities.push(identity);
-        }
+        super::super::diagnostics::event(surface.get(), "frame", format_args!(
+            "revision={through_revision} presented={presented} callbacks={callback_count} feedbacks={feedback_count}"));
         for object in discarded_feedbacks {
             let Some(identity) = self.resources.get(&object).copied() else {
                 continue;

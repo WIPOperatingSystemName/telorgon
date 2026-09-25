@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn client_geometry_changes_resize_free_frames_but_preserve_host_targets() {
+    let old = SizeI {
+        width: 852,
+        height: 652,
+    };
+    let content = SizeI {
+        width: 800,
+        height: 600,
+    };
+    let mut window = test_window(old, PointI::default());
+    assert_eq!(publication_requested_size(Some(&window), content), content);
+    window.requested_size = SizeI {
+        width: 900,
+        height: 700,
+    };
+    assert_eq!(
+        publication_requested_size(Some(&window), content),
+        window.requested_size
+    );
+    window.requested_size = old;
+    window.maximized = true;
+    assert_eq!(publication_requested_size(Some(&window), content), old);
+    window.maximized = false;
+    window.native_configure.resize_final = Some(FinalResizeConfigure::pending(old));
+    assert_eq!(publication_requested_size(Some(&window), content), old);
+    window.native_configure.resize_final = None;
+    window.role = SurfaceRole::Subsurface;
+    window.requested_size = SizeI {
+        width: 1,
+        height: 1,
+    };
+    assert_eq!(publication_requested_size(Some(&window), content), content);
+}
+
+#[test]
 fn activation_raises_a_window_family_without_reordering_other_windows() {
     let ids: Vec<_> = (1..=4)
         .map(|id| WaylandSurfaceId::from_raw(id).unwrap())
@@ -82,7 +117,7 @@ pub(in crate::host::linux_shell) fn test_window(
         parent: None,
         offset: PointI::default(),
         server_decorated: true,
-        decoration_policy: crate::DecorationPolicy::DEFAULT,
+        frame_client_decorations: false,
         position,
         window_geometry: RectI {
             x: 0,
@@ -98,6 +133,7 @@ pub(in crate::host::linux_shell) fn test_window(
         maximized: false,
         fullscreen: false,
         minimized: false,
+        virtual_output: None,
         chrome_outer: None,
         chrome_content_offset: None,
         chrome: None,

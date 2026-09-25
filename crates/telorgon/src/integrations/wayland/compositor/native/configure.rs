@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "configure_tests.rs"]
+mod tests;
+
 impl NativeState {
     pub(super) fn send_initial_configure(
         &mut self,
@@ -11,6 +15,12 @@ impl NativeState {
                 "libwayland returned a zero configure serial",
             ));
         }
+        let decoration = self.pending_decoration_mode(surface);
+        let states = if self.toplevels.contains_key(&surface) {
+            decoration_states(self.decoration_policy, decoration, Default::default())
+        } else {
+            Default::default()
+        };
         self.core
             .xdg_surface_mut(surface)
             .ok_or_else(|| NativeCompositorError::new("unknown xdg_surface"))?
@@ -18,11 +28,8 @@ impl NativeState {
                 serial,
                 size: None,
                 bounds: None,
-                states: crate::integrations::wayland::compositor::ToplevelState::default(),
-                decoration: self.toplevels.get(&surface).map_or(
-                    crate::integrations::wayland::compositor::DecorationMode::ServerSide,
-                    |toplevel| toplevel.decoration,
-                ),
+                states,
+                decoration,
             })
             .map_err(error)?;
         if self.toplevels.contains_key(&surface)
@@ -37,10 +44,24 @@ impl NativeState {
             && let Some(identity) = self.resources.get(&toplevel_object).copied()
             && let Some(resource) = unsafe { ResourceRef::from_raw(identity as *mut ffi::wl_resource) }
         {
+            if resource.version() >= 5 {
+                // Clients use this mandatory initial event to expose their window controls.
+                // The host handles maximize, fullscreen, and minimize, but no window menu.
+                let mut capabilities = [2_u32, 3, 4];
+                let mut array = ffi::wl_array {
+                    size: std::mem::size_of_val(&capabilities),
+                    alloc: std::mem::size_of_val(&capabilities),
+                    data: capabilities.as_mut_ptr().cast(),
+                };
+                self.post_event(resource, "xdg_toplevel", "wm_capabilities", &mut [
+                    ffi::wl_argument { a: &mut array },
+                ])?;
+            }
+            let mut state_values = wire_states(states, resource.version());
             let mut states = ffi::wl_array {
-                size: 0,
-                alloc: 0,
-                data: std::ptr::null_mut(),
+                size: state_values.len() * std::mem::size_of::<u32>(),
+                alloc: state_values.len() * std::mem::size_of::<u32>(),
+                data: state_values.as_mut_ptr().cast(),
             };
             self.post_event(
                 resource,
@@ -73,6 +94,11 @@ impl NativeState {
             &mut [ffi::wl_argument { u: serial }],
         )?;
         self.initial_configures.insert(surface);
+        super::super::diagnostics::event(
+            surface.get(),
+            "configure",
+            format_args!("initial serial={serial} size=client-choice decoration={decoration:?}"),
+        );
         Ok(())
     }
 
@@ -110,11 +136,9 @@ impl NativeState {
                 "libwayland returned a zero configure serial",
             ));
         }
-        let decoration = self
-            .toplevels
-            .get(&surface)
-            .expect("checked above")
-            .decoration;
+        let decoration = self.pending_decoration_mode(surface);
+        self.requested_toplevel_states.insert(surface, states);
+        let states = decoration_states(self.decoration_policy, decoration, states);
         self.core
             .xdg_surface_mut(surface)
             .ok_or_else(|| NativeCompositorError::new("unknown xdg_surface"))?
@@ -126,36 +150,7 @@ impl NativeState {
                 decoration,
             })
             .map_err(error)?;
-        let mut state_values = Vec::<u32>::with_capacity(9);
-        if states.maximized {
-            state_values.push(1);
-        }
-        if states.fullscreen {
-            state_values.push(2);
-        }
-        if states.resizing {
-            state_values.push(3);
-        }
-        if states.activated {
-            state_values.push(4);
-        }
-        if toplevel_version >= 2 {
-            if states.tiled_left {
-                state_values.push(5);
-            }
-            if states.tiled_right {
-                state_values.push(6);
-            }
-            if states.tiled_top {
-                state_values.push(7);
-            }
-            if states.tiled_bottom {
-                state_values.push(8);
-            }
-        }
-        if toplevel_version >= 6 && states.suspended {
-            state_values.push(9);
-        }
+        let mut state_values = wire_states(states, toplevel_version);
         let mut state_array = ffi::wl_array {
             size: state_values.len() * std::mem::size_of::<u32>(),
             alloc: state_values.len() * std::mem::size_of::<u32>(),
@@ -182,6 +177,13 @@ impl NativeState {
             "configure",
             &mut [ffi::wl_argument { u: serial }],
         )?;
+        super::super::diagnostics::event(
+            surface.get(),
+            "configure",
+            format_args!(
+                "serial={serial} size={size:?} states={states:?} decoration={decoration:?}"
+            ),
+        );
         Ok(serial)
     }
 
@@ -221,4 +223,59 @@ impl NativeState {
         }
         Ok(())
     }
+}
+
+fn decoration_states(
+    policy: crate::DecorationPolicy,
+    decoration: crate::integrations::wayland::compositor::DecorationMode,
+    mut states: crate::integrations::wayland::compositor::ToplevelState,
+) -> crate::integrations::wayland::compositor::ToplevelState {
+    // This is only a client styling hint. Host tile membership and geometry stay unchanged.
+    if policy.tiled_client_decorations
+        && decoration == crate::integrations::wayland::compositor::DecorationMode::ClientSide
+        && !states.fullscreen
+    {
+        states.tiled_left = true;
+        states.tiled_right = true;
+        states.tiled_top = true;
+        states.tiled_bottom = true;
+    }
+    states
+}
+
+fn wire_states(
+    states: crate::integrations::wayland::compositor::ToplevelState,
+    version: u32,
+) -> Vec<u32> {
+    let mut state_values = Vec::<u32>::with_capacity(9);
+    if states.maximized {
+        state_values.push(1);
+    }
+    if states.fullscreen {
+        state_values.push(2);
+    }
+    if states.resizing {
+        state_values.push(3);
+    }
+    if states.activated {
+        state_values.push(4);
+    }
+    if version >= 2 {
+        if states.tiled_left {
+            state_values.push(5);
+        }
+        if states.tiled_right {
+            state_values.push(6);
+        }
+        if states.tiled_top {
+            state_values.push(7);
+        }
+        if states.tiled_bottom {
+            state_values.push(8);
+        }
+    }
+    if version >= 6 && states.suspended {
+        state_values.push(9);
+    }
+    state_values
 }

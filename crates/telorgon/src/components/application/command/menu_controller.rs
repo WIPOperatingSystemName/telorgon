@@ -460,7 +460,7 @@ fn level_state<K: Copy + Eq + Hash>(level: &MenuLevel<K>) -> MenuLevelState<K> {
     }
 }
 
-const fn menu_navigation_policy() -> CompositeNavigationPolicy {
+pub(crate) const fn menu_navigation_policy() -> CompositeNavigationPolicy {
     CompositeNavigationPolicy {
         orientation: CompositeOrientation::Vertical,
         edge_behavior: CompositeEdgeBehavior::Wrap,

@@ -103,6 +103,34 @@ impl fmt::Debug for TextArea {
 }
 
 impl TextArea {
+    pub fn clipboard_command(
+        &self,
+        clipboard: &crate::services::clipboard::Clipboard,
+        action: crate::services::clipboard::ClipboardEditAction,
+    ) -> Result<Option<super::TextClipboardTransfer>, crate::services::clipboard::ClipboardError>
+    {
+        self.field.clipboard_command(clipboard, action)
+    }
+    pub fn invalidate_clipboard_requests(&mut self) {
+        self.field.invalidate_clipboard_requests();
+    }
+    pub fn paste_clipboard(
+        &mut self,
+        target: super::TextClipboardTarget,
+        text: &str,
+        now: crate::runtime::MonotonicInstant,
+    ) -> Result<TextFieldOutput, crate::services::clipboard::ClipboardError> {
+        self.field
+            .apply_clipboard_text(target, text, now, true, super::EditHistoryKind::Paste)
+    }
+    pub fn finish_clipboard_cut(
+        &mut self,
+        target: super::TextClipboardTarget,
+        now: crate::runtime::MonotonicInstant,
+    ) -> Result<TextFieldOutput, crate::services::clipboard::ClipboardError> {
+        self.field
+            .apply_clipboard_text(target, "", now, true, super::EditHistoryKind::Cut)
+    }
     pub fn new(
         controller: TextController,
         label: impl Into<String>,

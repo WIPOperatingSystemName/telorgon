@@ -100,6 +100,7 @@ impl Harness {
                 minimized: false,
                 veiled: false,
                 style: WindowMotion::smooth().resize_content(ContentFade::new(100, 100)),
+                client_decorated: false,
                 corner_radii: Default::default(),
                 shadows: Default::default(),
             },
@@ -185,6 +186,10 @@ impl Harness {
 }
 const RED: ColorRgba8 = ColorRgba8::rgba(255, 0, 0, 255);
 const BLUE: ColorRgba8 = ColorRgba8::rgba(0, 0, 255, 255);
+
+#[path = "preview_tests.rs"]
+mod preview_tests;
+
 #[test]
 fn close_fades_last_image_without_input_and_retires_on_the_final_frame() {
     let mut h = Harness::new();
@@ -978,3 +983,6 @@ fn reduced_motion_cancels_snapshots_and_preserves_placeholder() {
     assert_eq!(h.pixel(), [0, 0, 255, 255]);
     assert!(h.state.veiled);
 }
+
+#[path = "opening_tests.rs"]
+mod opening_tests;

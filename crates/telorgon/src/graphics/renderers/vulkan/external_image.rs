@@ -119,8 +119,8 @@ pub struct HostedExternalImageUse {
     pub final_queue_family: u32,
 }
 
-/// Linear wrapper consumed by `VulkanScene::bind_external_image`; it never owns the native image,
-/// image view, or semaphore handles.
+/// Linear lease consumed by `VulkanScene::bind_external_image`. Borrowed interop handles stay
+/// host-owned; DMA-BUF imports retain their native resources through GPU completion.
 pub struct VulkanExternalImageLease {
     pub(crate) inner: Option<Arc<ExternalImageInner>>,
     _linear: PhantomData<Rc<()>>,
@@ -197,6 +197,8 @@ pub(crate) struct ExternalImageInner {
     pub(crate) damage: Vec<RectI>,
     pub(crate) ownership: ExternalImageOwnership,
     pub(crate) state: AtomicU64,
+    // Optional media allocation/accounting lease; drops after native imported ownership.
+    pub(crate) retained_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 pub(crate) enum ExternalImageOwnership {
@@ -257,6 +259,7 @@ impl VulkanDevice {
                 damage: descriptor.damage,
                 ownership: ExternalImageOwnership::Borrowed,
                 state: AtomicU64::new(UNUSED),
+                retained_owner: None,
             })),
             _linear: PhantomData,
         })
@@ -430,7 +433,7 @@ fn validate_descriptor(
     let encoding_matches_format = match descriptor.color_encoding {
         ImageColorEncoding::Linear => matches!(
             descriptor.format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R16G16B16A16_SFLOAT
         ),
         ImageColorEncoding::Srgb => matches!(
             descriptor.format,
@@ -549,6 +552,7 @@ mod tests {
             damage: Vec::new(),
             ownership: ExternalImageOwnership::Borrowed,
             state: AtomicU64::new(UNUSED),
+                retained_owner: None,
         };
         image.begin_use(11).unwrap();
         assert_eq!(

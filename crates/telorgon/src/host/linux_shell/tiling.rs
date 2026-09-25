@@ -1,4 +1,6 @@
 //! Host-owned snap layout and coordinated divider grabs. No GPU ownership lives here.
+mod preview;
+use preview::SnapTarget;
 use super::*;
 use crate::authoring::compose::{TileTarget, WindowTiling};
 
@@ -34,7 +36,7 @@ pub(super) struct TilingController {
     grab: Option<DividerGrab>,
     reveal: BTreeMap<WaylandSurfaceId, TileTarget>,
     pub policy: Option<WindowTiling>,
-    candidate: Option<(WaylandSurfaceId, TileTarget)>,
+    candidate: Option<(WaylandSurfaceId, SnapTarget)>,
     area: RectI,
 }
 impl Default for TilingController {
@@ -83,29 +85,29 @@ fn tile_rect(area: RectI, splits: [f32; 3], target: TileTarget) -> RectI {
 fn preview_rect(
     area: RectI,
     splits: [f32; 3],
-    target: TileTarget,
+    target: impl Into<SnapTarget>,
     padding: crate::authoring::compose::Insets,
 ) -> RectI {
-    let rect = tile_rect(area, splits, target);
+    let rect = target.into().rect(area, splits);
     let p = padding.0;
     let inset =
         |distance: f32, available: i32| (distance.round() as i32).clamp(0, available.max(0));
-    let left = if target.left() {
+    let left = if rect.x == area.x {
         inset(p.left, rect.width - 1)
     } else {
         0
     };
-    let right = if !target.left() {
+    let right = if rect.right() == area.right() {
         inset(p.right, rect.width - left - 1)
     } else {
         0
     };
-    let top = if target.row() != Some(true) {
+    let top = if rect.y == area.y {
         inset(p.top, rect.height - 1)
     } else {
         0
     };
-    let bottom = if target.row() != Some(false) {
+    let bottom = if rect.bottom() == area.bottom() {
         inset(p.bottom, rect.height - top - 1)
     } else {
         0
@@ -307,6 +309,7 @@ impl TilingController {
         locked: bool,
     ) {
         self.reset_empty_layout(windows);
+        let previous_candidate = self.candidate;
         self.candidate = if !locked {
             self.policy.and_then(|p| {
                 let WindowInteraction::Move {
@@ -321,16 +324,25 @@ impl TilingController {
                     return None;
                 }
                 let w = windows.get(&surface)?;
-                if w.fullscreen || w.minimized {
+                if w.fullscreen || w.hidden_on_primary() {
                     return None;
                 }
-                let target = p.target(pointer, full_rect(output))?;
-                fits(w, tile_rect(self.area, self.splits, target), config)
+                let previous = self.candidate
+                    .filter(|(owner, _)| *owner == surface)
+                    .map(|(_, target)| target);
+                let target = preview::target(p, pointer, full_rect(output), previous)?;
+                fits(w, target.rect(self.area, self.splits), config)
                     .then_some((surface, target))
             })
         } else {
             None
         };
+        if self.candidate != previous_candidate {
+            super::preview_trace::event(format_args!(
+                "tile_candidate from={previous_candidate:?} to={:?} pointer={pointer:?}",
+                self.candidate,
+            ));
+        }
         for widget in widgets.iter_mut().filter(|w| w.spec.tiling.is_some()) {
             let padding = widget.spec.tiling.unwrap().preview.padding;
             widget.tile_preview = self.candidate.map(|(surface, target)| {
@@ -364,7 +376,7 @@ impl TilingController {
         }
         let rect = tile_rect(self.area, self.splits, target);
         if !windows.get(&surface).is_some_and(|w| {
-            w.backend.is_some() && !w.fullscreen && !w.minimized && fits(w, rect, config)
+            w.backend.is_some() && !w.fullscreen && !w.hidden_on_primary() && fits(w, rect, config)
         }) {
             return false;
         }
@@ -423,14 +435,22 @@ impl TilingController {
         scheduler: &mut ConfigureScheduler,
         interaction: WindowInteraction,
         config: &LinuxShellConfig,
-    ) {
+    ) -> AppResult<()> {
         if let WindowInteraction::Move { surface, .. } = interaction {
             if let Some((owner, target)) = self.candidate.take() {
                 if owner == surface {
-                    self.snap(windows, scheduler, surface, target, config);
+                    match target {
+                        SnapTarget::Tile(target) => {
+                            self.snap(windows, scheduler, surface, target, config);
+                        }
+                        SnapTarget::Maximize => set_window_maximized(
+                            windows, scheduler, surface, true, self.area, config,
+                        )?,
+                    }
                 }
             }
         }
+        Ok(())
     }
     pub fn hover(
         &self,
@@ -449,7 +469,7 @@ impl TilingController {
             .rev()
             .filter_map(|id| windows.get(id))
             .find(|w| {
-                if w.minimized || w.backend.is_none() {
+                if w.hidden_on_primary() || w.backend.is_none() {
                     return false;
                 }
                 let o = w
@@ -505,7 +525,7 @@ impl TilingController {
         });
         for (id, w) in windows
             .iter_mut()
-            .filter(|(_, w)| w.tile.is_some_and(|t| affects(divider, t.target)) && !w.minimized)
+            .filter(|(_, w)| w.tile.is_some_and(|t| affects(divider, t.target)) && !w.hidden_on_primary())
         {
             if w.backend == Some(WindowBackend::Wayland) {
                 w.native_configure.resize_anchor = Some(ResizeAnchor::new(
@@ -618,7 +638,7 @@ impl TilingController {
     pub fn release_ready_group(&mut self, windows: &mut BTreeMap<WaylandSurfaceId, ClientWindow>) {
         self.reveal.retain(|id, target| {
             windows.get(id).is_some_and(|w| {
-                !w.minimized && !w.fullscreen && w.tile.is_some_and(|t| t.target == *target)
+                !w.hidden_on_primary() && !w.fullscreen && w.tile.is_some_and(|t| t.target == *target)
             })
         });
         let waiting = self
@@ -646,7 +666,7 @@ impl TilingController {
             .filter(|(_, w)| w.tile.is_some_and(|t| affects(grab.divider, t.target)))
         {
             terminal(w, *id, scheduler);
-            if !w.minimized {
+            if !w.hidden_on_primary() {
                 self.reveal.insert(*id, w.tile.unwrap().target);
                 w.tile_resize_hold = true;
             }

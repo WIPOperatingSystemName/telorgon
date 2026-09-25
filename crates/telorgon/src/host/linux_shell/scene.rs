@@ -12,7 +12,8 @@ use crate::graphics::scene::NodeId;
 /// Both contours start at the window's inner top edge, not the app/title-bar seam.
 /// The rectangular content scissor cuts off the title bar without introducing another pair of
 /// top corners. Easy frames use only the border contour; custom templates can request a second
-/// contour for an aperture inside wider frame margins.
+/// contour for an aperture inside wider frame margins. These contours shape shell-owned
+/// chrome, backing, and framed client surfaces; the content scissor supplies their rectangular bounds.
 pub(super) fn frame_content_clips(
     border: &BoxInstance,
     position: PointI,
@@ -135,6 +136,7 @@ pub(super) enum ShellLayerContent {
     Retained {
         scene: ShellSceneKey,
         deltas: Vec<RenderSceneDelta>,
+        border: Option<BoxInstance>,
     },
     Image {
         scene: ShellSceneKey,
@@ -281,6 +283,8 @@ impl ShellLayer {
             instance,
         };
         // Keep transparent clients and resize previews free of their own exterior shadow.
+        // Shadow rasterization excludes fully interior pixels; partial edge pixels retain
+        // the shadow because the foreground frame supplies their antialiasing coverage.
         layer.rounded_clips = [Some(outline.inverse()), None];
         Some(layer)
     }
@@ -288,6 +292,12 @@ impl ShellLayer {
     /// Frame scenes are rectangular allocations; their paint must stay inside the chrome
     /// contour even when the scene contains a rectangular backing or a clipped shadow.
     pub(super) fn with_frame_outline(mut self, border: &BoxInstance, position: PointI) -> Self {
+        if let ShellLayerContent::Retained { scene: ShellSceneKey::Frame(_), border: group, .. } = &mut self.content {
+            *group = Some(border.clone());
+            // The isolated frame applies its contour once, after composing its children.
+            self.rounded_clips = [None; 2];
+            return self;
+        }
         self.rounded_clips = [
             Some(RoundedClip::new(
                 RectF {
@@ -511,7 +521,7 @@ impl ShellLayer {
         Self {
             glass: None,
             key,
-            content: ShellLayerContent::Retained { scene, deltas },
+            content: ShellLayerContent::Retained { scene, deltas, border: None },
             source_extent: extent,
             target: RectI {
                 x: position.x,
@@ -576,6 +586,7 @@ pub(super) struct ShellPlacement {
 #[derive(Clone, Debug)]
 #[cfg_attr(all(test, not(target_os = "linux")), allow(dead_code))]
 pub(super) struct ShellFrame {
+    pub frame_borders: BTreeMap<ShellSceneKey, BoxInstance>,
     pub glass_changed: BTreeSet<ShellSceneKey>,
     pub glass: BTreeMap<ShellSceneKey, crate::GlassStyle>,
     pub preview_borders: BTreeMap<ShellSceneKey, crate::ui::Border>,
@@ -959,6 +970,7 @@ impl ShellComposition {
         self.extent = extent;
         let mut glass = BTreeMap::new();
         let mut preview_borders = BTreeMap::new();
+        let mut frame_borders = BTreeMap::new();
         let mut live_scenes = BTreeSet::new();
         let mut updates = BTreeMap::<ShellSceneKey, Vec<RenderSceneDelta>>::new();
         let mut placements = Vec::new();
@@ -1069,7 +1081,13 @@ impl ShellComposition {
                     }
                     scene
                 }
-                ShellLayerContent::Retained { scene, mut deltas } => {
+                ShellLayerContent::Retained { scene, mut deltas, border } => {
+                    if let Some(border) = border {
+                        for delta in &mut deltas {
+                            crate::graphics::render::frame_border::prepare_interior(delta, &border);
+                        }
+                        frame_borders.insert(scene, border);
+                    }
                     // An empty retained scene is still a valid capture source. Publish its
                     // identity once even if the producer has no initial draw delta; otherwise
                     // renderers never create it and a later motion capture references a hole.
@@ -1290,6 +1308,7 @@ impl ShellComposition {
             })
             .collect();
         Some(ShellFrame {
+            frame_borders,
             glass_changed,
             glass,
             preview_borders,

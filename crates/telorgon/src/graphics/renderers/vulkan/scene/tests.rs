@@ -200,7 +200,7 @@ fn full_image_upload_detection_rejects_regional_chunks() {
             depth: 1,
         },
         row_bytes: 32,
-        bytes: vec![0; 128],
+        bytes: vec![0; 128].into(),
     };
     assert!(image_upload_is_full(&[full], extent, 4));
 
@@ -212,7 +212,7 @@ fn full_image_upload_detection_rejects_regional_chunks() {
             depth: 1,
         },
         row_bytes: 12,
-        bytes: vec![0; 24],
+        bytes: vec![0; 24].into(),
     };
     assert!(!image_upload_is_full(&[region], extent, 4));
 }

@@ -33,6 +33,7 @@ impl NativeState {
             self.post_event(lock_resource, "ext_session_lock_v1", "finished", &mut [])?;
         } else {
             self.active_session_lock = Some(object);
+            self.clipboard_turn(true);
             self.refresh_capture_sources()?;
             self.core
                 .queue_action(CompositorAction::SessionLockRequested(object));
@@ -207,6 +208,9 @@ impl NativeState {
             .get(&surface)
             .ok_or_else(|| NativeCompositorError::new("unknown session-lock surface"))?
             .output;
+        if self.retired_outputs.contains(&output) {
+            return Ok(());
+        }
         let size = self.output_logical_size(output)?;
         let serial = unsafe { ffi::wl_display_next_serial(self.display.as_ptr()) };
         if serial == 0 {

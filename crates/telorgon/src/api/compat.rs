@@ -13,6 +13,7 @@ pub use crate::graphics::bridges::vulkan_dxgi as bridge_vulkan_dxgi;
 pub use crate::graphics::bridges::wayland as compositor_render;
 #[cfg(any(
     feature = "application-vulkan-windows",
+    feature = "application-vulkan-linux",
     feature = "shell-wayland-linux",
     feature = "embedded-vulkan"
 ))]
@@ -25,13 +26,14 @@ pub use crate::graphics::presentation::dxgi as presenter_dxgi;
 pub use crate::graphics::presentation::kms as presenter_vulkan_kms;
 #[cfg(feature = "application-software")]
 pub use crate::graphics::presentation::softbuffer as presenter_softbuffer;
-#[cfg(feature = "application-vulkan-windows")]
+#[cfg(any(feature = "application-vulkan-windows", feature = "application-vulkan-linux"))]
 pub use crate::graphics::presentation::wsi as presenter_vulkan_wsi;
 pub use crate::graphics::render;
 #[cfg(any(feature = "application-software", feature = "shell-wayland-linux"))]
 pub use crate::graphics::renderers::software as renderer_software;
 #[cfg(any(
     feature = "application-vulkan-windows",
+    feature = "application-vulkan-linux",
     feature = "shell-wayland-linux",
     feature = "embedded-vulkan"
 ))]
@@ -51,7 +53,8 @@ pub use crate::platform::conformance as platform_conformance;
 pub use crate::platform::linux as platform_linux;
 #[cfg(any(
     feature = "application-software",
-    feature = "application-vulkan-windows"
+    feature = "application-vulkan-windows",
+    feature = "application-vulkan-linux"
 ))]
 pub use crate::platform::winit as platform_winit;
 #[cfg(feature = "instrumentation")]

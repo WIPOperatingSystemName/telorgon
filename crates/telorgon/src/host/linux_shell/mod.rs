@@ -53,9 +53,21 @@ mod capture_direct;
 mod capture_streams;
 #[cfg(feature = "shell-screencast-linux")]
 mod capture_portal;
+#[cfg(feature = "shell-screencast-linux")]
+mod portal_picker_window;
+#[cfg(feature = "shell-screencast-linux")]
+mod portal_picker_delivery;
+#[cfg(feature = "shell-screencast-linux")]
+mod portal_previews;
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_restore;
 mod capture_cursor;
 #[cfg(feature = "shell-screencast-linux")]
 mod capture_window;
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_scene;
+#[cfg(feature = "shell-screencast-linux")]
+mod virtual_outputs;
 mod window_backend;
 use window_backend::WindowBackend;
 mod window_identity;
@@ -66,12 +78,17 @@ mod cursor_plane;
 mod dma_buf_readiness;
 mod event_source;
 mod frame_stats;
+mod stall_probe;
+mod transition_probe;
+mod frame_pacer;
+mod presentation;
 mod geometry;
 mod input;
 mod widgets;
 use widgets::*;
 mod interaction;
 mod latency_trace;
+mod preview_trace;
 mod layers;
 mod motion;
 mod pointer_visual;
@@ -140,14 +157,16 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         pointer_config,
         app_icon_profile,
     ) = application.into_parts()?;
+    let _stall_probes = stall_probe::Session::from_env();
     let launch_environment = crate::services::session::Environment::inherited();
     let runtime_directory = launch_environment.runtime_directory().map_err(app_error)?;
     let pointer_theme = pointer_config.load_theme(assets).map_err(app_error)?;
     let mut pointer_media = AssetMediaCache::new(assets).map_err(app_error)?;
+    let layer_assets = LayerAssets::new(assets)?;
     #[cfg(feature = "shell-screencast-linux")]
     let mut compositor = compositor;
     #[cfg(feature = "shell-screencast-linux")]
-    let capture_chooser = compositor.take_capture_chooser();
+    let screen_cast_portal = compositor.take_screen_cast_portal();
     let decoration_policy = compositor.configured_decoration_policy();
     let (window_frame, mut pointer, mut icons, shell_actions, mut keyboard_shortcut_handler) =
         compositor.into_runtime_parts();
@@ -175,6 +194,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         .resolve(physical_extent, connector.physical_millimeters)?;
     let selected_output = output_state(connector, mode_index, output_scale)?;
     let extent = selected_output.logical_size();
+    #[cfg(feature = "shell-screencast-linux")]
+    let capture_output_restore_key = capture_config.configured_portal()
+        .and_then(|_| capture_restore::output_key(&kms, connector, &drm_path));
     #[cfg(feature = "shell-screencast-linux")]
     let capture_output_label = format!("{} ({} × {})", selected_output.description.name, physical_extent.width, physical_extent.height);
     eprintln!(
@@ -238,6 +260,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
     let mut capture_cursor_visual = None;
     let mut window_motion = motion::WindowMotionController::default();
+    let mut transition_probes = transition_probe::Probe::new(refresh_period);
     let mut frame_surface_revisions = vec![Vec::<(u32, u64)>::new(); frame_slots.len()];
     let cursor_plane = topology.planes.iter().find(|candidate| {
         candidate.possible_crtcs_mask & (1_u32.checked_shl(crtc_index as u32).unwrap_or(0)) != 0
@@ -368,7 +391,6 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             runtime_directory.clone(),
             launch_environment.clone(),
             runtime_wake.clone(),
-            decoration_policy,
         ) {
             Ok(host) => compatibility = Some(host),
             Err(error) => {
@@ -487,7 +509,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
 
     let mut frame_layers = BTreeMap::<WaylandSurfaceId, WindowFrameLayer>::new();
     let mut pointer = pointer
-        .map(|driver| Layer::new(driver, config.pointer_extent, assets, output_scale))
+        .map(|driver| Layer::new(driver, config.pointer_extent, &layer_assets, output_scale))
         .transpose()?;
     let mut icon_layers = icons
         .into_iter()
@@ -500,7 +522,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         width: 24,
                         height: 24,
                     },
-                    assets,
+                    &layer_assets,
                     output_scale,
                 )?,
             ))
@@ -558,6 +580,27 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             ),
         }
     }
+    let mut services = services;
+    let clipboard = wayland.install_clipboard({
+        let wake = runtime_wake.clone();
+        Arc::new(move || wake.notify())
+    });
+    let contracts = std::rc::Rc::new(crate::services::clipboard::ClipboardContracts::new(
+        clipboard.clone(),
+    ));
+    let mut platform_services = crate::platform::contracts::ServiceRegistry::new();
+    let _ = platform_services
+        .register::<crate::platform::contracts::ClipboardServiceKey>(contracts.clone());
+    let _ = platform_services
+        .register::<crate::platform::contracts::DataTransferServiceKey>(contracts.clone());
+    services.insert(platform_services);
+    services.insert(contracts);
+    services.insert(clipboard.clone());
+    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+    let mut clipboard_bridge = None::<(
+        (std::ffi::OsString, std::ffi::OsString),
+        crate::services::clipboard::x11::Bridge,
+    )>;
     let widget_services = crate::authoring::compose::shell_services::ShellServiceHost::with_registry_and_scale(
         services,
         (32.0 * output_scale.get()).ceil() as u32,
@@ -574,7 +617,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 id as u32,
                 widget,
                 extent,
-                assets,
+                &layer_assets,
                 output_scale,
                 &runtime_wake,
                 widget_services.services.clone(),
@@ -613,13 +656,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         let wake = runtime_wake.clone();
         let (portal, controls) = capture_portal::CapturePortal::new(
             Arc::new(move || wake.notify()),
-            capture_chooser,
+            screen_cast_portal,
+            &runtime_directory.join(&socket),
             capture_config.configured_sources().bits(),
             portal_config.activates_frontend(config.session.publish_user_service_environment),
             capture_output_label,
+            capture_output_restore_key,
         )?;
         for widget in controls {
-            widgets.push(WidgetLayer::new(next_widget_id, widget, extent, assets, output_scale,
+            widgets.push(WidgetLayer::new(next_widget_id, widget, extent, &layer_assets, output_scale,
                 &runtime_wake, widget_services.services.clone())?);
             next_widget_id += 1;
         }
@@ -645,12 +690,17 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut next_window_offset = 0_i32;
     let mut next_frame_id = 1_u64;
     let mut frame_stats = frame_stats::FrameStats::from_env(mode.refresh_millihertz());
+    let mut presentation = presentation::Scheduler::<PendingKmsCommit>::new(refresh_period);
+    eprintln!("telorgon-presentation: clock={} fixed_frame_targets=true submission_margin_ms={:.3}",
+        if kms.page_flip_timestamps_monotonic() { "drm-monotonic" } else { "dispatch-fallback" },
+        (refresh_period / 2).min(Duration::from_millis(3)).as_secs_f64() * 1000.0);
     let mut owner_stats_start = None::<Instant>;
     let mut latency_trace = latency_trace::LatencyTrace::from_env().map_err(app_error)?;
-    let mut ready_scanout = VecDeque::<usize>::new();
-    let mut pending_kms_commit = None::<PendingKmsCommit>;
+    let mut presentation_trace = preview_trace::PresentationTrace::default();
+    wayland.set_timing_observer(latency_trace.protocol_observer());
     let mut current_scanout = None::<usize>;
     let mut first_modeset = true;
+    let mut virtual_routing_dirty = false;
     let mut repaint = true;
     #[cfg(feature = "profiler")]
     let mut pending_primary_pointer_event_us = None::<u64>;
@@ -672,6 +722,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut close_requested = std::collections::BTreeSet::new();
 
     loop {
+        wayland.dispatch_clipboard(session_locked);
         latency_trace.phase("schedule");
         if let (Some(stats), Some(started)) = (&mut frame_stats, owner_stats_start.take()) {
             stats.owner_turn(started.elapsed());
@@ -738,252 +789,6 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         let schedule_now = MonotonicInstant::from_nanos(
             start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
         );
-        let active_window = wayland
-            .core()
-            .seats
-            .get(&1)
-            .and_then(|s| s.keyboard_focus)
-            .map(|f| f.surface)
-            .and_then(|surface| window_backend::focus_owner(&windows, surface))
-            .filter(|surface| windows.get(surface).is_some_and(|w| !w.minimized));
-        widget_services.publish(
-            windows
-                .iter()
-                .filter_map(|(surface, w)| {
-                    w.backend?;
-                    let id = w.desktop_id?;
-                    Some(crate::authoring::compose::ShellWindow {
-                        preview_size: (w.presentation.size.width > 0
-                            && w.presentation.size.height > 0)
-                            .then_some(SizeF {
-                                width: w.presentation.size.width as f32,
-                                height: w.presentation.size.height as f32,
-                            }),
-                        id,
-                        application_id: None,
-                        application_identity: wayland
-                            .toplevel_metadata(*surface)
-                            .map(|m| m.application_id.clone())
-                            .filter(|id| !id.is_empty())
-                            .unwrap_or_else(|| w.application_identity.clone()),
-                        icon_name: wayland.toplevel_icon(*surface).and_then(|i| i.name.clone()),
-                        icon: wayland
-                            .toplevel_icon(*surface)
-                            .and_then(|icon| {
-                                icon.images
-                                    .iter()
-                                    .max_by_key(|i| {
-                                        let size = i.image.descriptor.size;
-                                        size.width.min(size.height)
-                                    })
-                                    .and_then(|image| {
-                                        let mut resource = shm_image_resource(
-                                            image.buffer,
-                                            icon.revision.max(1),
-                                            image.image.clone(),
-                                        )
-                                        .ok()?;
-                                        resource.image =
-                                            layers::toplevel_icon_image_id(*surface, icon.revision);
-                                        Some(resource)
-                                    })
-                            })
-                            .or_else(|| w.application_icon.clone()),
-                        title: w.frame_title.clone().unwrap_or_else(|| {
-                            wayland
-                                .toplevel_metadata(*surface)
-                                .map_or_else(String::new, |m| {
-                                    if m.title.is_empty() {
-                                        m.application_id.clone()
-                                    } else {
-                                        m.title.clone()
-                                    }
-                                })
-                        }),
-                        active: active_window == Some(*surface),
-                        minimized: w.minimized,
-                        maximized: w.maximized,
-                    })
-                })
-                .collect(),
-        );
-        for command in widget_services.drain() {
-            use crate::authoring::compose::{ShellRequestOutcome as Outcome, ShellWindowAction as Action};
-            let target = windows
-                .iter()
-                .find(|(_, w)| w.desktop_id == Some(command.window))
-                .map(|(id, _)| *id);
-            let Some(surface) = target else {
-                widget_services.complete(command.id, Outcome::Stale);
-                continue;
-            };
-            if session_locked {
-                widget_services.complete(command.id, Outcome::Denied);
-                continue;
-            }
-            let result = match command.action {
-                Action::Snap(target) => {
-                    if !tiling.snap(
-                        &mut windows,
-                        &mut configure_scheduler,
-                        surface,
-                        target,
-                        &config,
-                    ) {
-                        widget_services.complete(command.id, Outcome::Denied);
-                        continue;
-                    }
-                    Ok(())
-                }
-                Action::Float => {
-                    if let Some(w) = windows.get_mut(&surface) {
-                        tiling::float_window(w, surface, &mut configure_scheduler);
-                    }
-                    Ok(())
-                }
-                Action::Activate => {
-                    if let Some(w) = windows.get_mut(&surface) {
-                        w.minimized = false;
-                    }
-                    for w in &mut widgets {
-                        w.focused = false;
-                    }
-                    widget_focus_active = false;
-                    widget_saved_focus = None;
-                    window_backend::focus(
-                        &display,
-                        &mut wayland,
-                        &windows,
-                        &mut configure_scheduler,
-                        &mut stacking_order,
-                        Some(surface),
-                        #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
-                        compatibility.as_mut(),
-                    )
-                }
-                Action::SetMinimized(value) => {
-                    if let Some(w) = windows.get_mut(&surface) {
-                        w.minimized = value;
-                    }
-                    if value {
-                        stacking_order.retain(|id| *id != surface);
-                    } else if !stacking_order.contains(&surface) {
-                        stacking_order.push(surface);
-                    }
-                    if value {
-                        window_backend::unfocus_minimized(
-                            &display,
-                            &mut wayland,
-                            &windows,
-                            &mut configure_scheduler,
-                            &mut stacking_order,
-                            &mut widget_saved_focus,
-                            surface,
-                            #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
-                            compatibility.as_mut(),
-                        )?;
-                    }
-                    Ok(())
-                }
-                Action::SetMaximized(value) => set_window_maximized(
-                    &mut windows,
-                    &mut configure_scheduler,
-                    surface,
-                    value,
-                    work_area,
-                    &config,
-                ),
-                Action::Close => window_backend::close(
-                    surface,
-                    &windows,
-                    &mut wayland,
-                    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
-                    compatibility.as_mut(),
-                ),
-            };
-            widget_services.complete(
-                command.id,
-                if result.is_ok() {
-                    Outcome::Dispatched
-                } else {
-                    Outcome::Failed
-                },
-            );
-            repaint = true;
-        }
-        sync_widget_children(
-            &mut widgets,
-            &mut next_widget_id,
-            extent,
-            assets,
-            output_scale,
-            &runtime_wake,
-            &widget_services.services,
-        )?;
-        let previous_work_area = work_area;
-        let work = crate::foundation::RectF {
-            x: work_area.x as f32,
-            y: work_area.y as f32,
-            width: work_area.width as f32,
-            height: work_area.height as f32,
-        };
-        prepare_widget_surfaces(
-            &mut widgets,
-            extent,
-            work,
-            schedule_now.as_nanos(),
-            if desktop_renderer.motion_enabled() {
-                config.motion_preference
-            } else {
-                crate::theme::MotionPreference::Reduced
-            },
-        )?;
-        work_area = shell_work_area(extent, &widgets);
-        tiling.sync(
-            &mut widgets,
-            &mut windows,
-            &mut configure_scheduler,
-            work_area,
-            &config,
-            session_locked,
-        )?;
-        tiling.preview(
-            &mut widgets,
-            &windows,
-            window_interaction,
-            pointer_position,
-            extent,
-            &config,
-            session_locked,
-        );
-        if work_area != previous_work_area {
-            let maximized = windows
-                .iter()
-                .filter(|(_, w)| w.maximized && !w.fullscreen)
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
-            for id in maximized {
-                set_window_maximized(
-                    &mut windows,
-                    &mut configure_scheduler,
-                    id,
-                    true,
-                    work_area,
-                    &config,
-                )?;
-            }
-            repaint = true;
-        }
-        sync_widget_focus(
-            &mut widgets,
-            &mut wayland,
-            &display,
-            &windows,
-            session_locked,
-            &mut widget_saved_focus,
-            &mut widget_focus_active,
-            schedule_now,
-        )?;
         let (runtime_immediate, runtime_deadline, runtime_animation) = desktop_runtime_schedule(
             &frame_layers,
             pointer.as_ref(),
@@ -998,37 +803,23 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             && hardware_cursor
                 .as_ref()
                 .is_some_and(HardwareCursor::needs_commit);
-        let primary_render_ready = state::primary_render_budget(
-            frame_slots
-                .iter()
-                .filter(|slot| slot.state == FrameSlotState::GpuSubmitted)
-                .count(),
-            ready_scanout.len(),
-        );
-        let immediate_work = ((repaint || runtime_immediate)
-            && scanout_available
-            && primary_render_ready)
-            || (pending_kms_commit.is_none() && (!ready_scanout.is_empty() || cursor_commit_ready))
-            || runtime_ready.load(Ordering::Acquire)
+        let render_now_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let plan = if seat.state() == SeatState::Enabled {
+            presentation.plan(presentation::Work {
+                primary_damage: repaint || runtime_immediate,
+                primary_animation: runtime_animation || window_motion.active(render_now_ns),
+                cursor_dirty: cursor_commit_ready,
+                scanout_available,
+            }, render_now_ns)
+        } else {
+            presentation::Plan::default()
+        };
+        let io_ready = runtime_ready.load(Ordering::Acquire)
             || seat_ready.load(Ordering::Acquire)
             || input_ready.ready.load(Ordering::Acquire)
             || kms_ready.load(Ordering::Acquire)
-            || vulkan_completion_ready
-                .as_ref()
-                .is_some_and(|ready| ready.load(Ordering::Acquire));
-        let wait = if immediate_work {
-            Some(Duration::ZERO)
-        } else if let Some(deadline) = runtime_deadline {
-            Some(Duration::from_nanos(
-                deadline.as_nanos().saturating_sub(schedule_now.as_nanos()),
-            ))
-        } else if (runtime_animation || window_motion.active(schedule_now.as_nanos()))
-            && pending_kms_commit.is_none()
-        {
-            Some(refresh_period)
-        } else {
-            None
-        };
+            || vulkan_completion_ready.as_ref().is_some_and(|ready| ready.load(Ordering::Acquire));
+        let wait = plan.wait(io_ready, runtime_deadline.map(|deadline| deadline.as_nanos()), render_now_ns);
         let wait = if direct_captures.pending() && seat.state() == SeatState::Enabled {
             Some(wait.unwrap_or(refresh_period).min(refresh_period))
         } else { wait };
@@ -1053,16 +844,172 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         );
         latency_trace.phase("wayland_wait_dispatch");
         #[cfg(feature = "shell-screencast-linux")]
-        let wait = capture_streams.wait(wait);
+        let wait = if presentation.background_allowed(render_now_ns, repaint || runtime_immediate || runtime_animation || window_motion.active(render_now_ns)) {
+            capture_streams.wait(wait)
+        } else { wait };
+        #[cfg(feature = "shell-screencast-linux")]
+        let wait = if presentation.background_allowed(render_now_ns, repaint || runtime_immediate || runtime_animation || window_motion.active(render_now_ns)) {
+            capture_portal.as_ref().map_or(wait, |portal| {
+                portal.previews.wait(wait, start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+            })
+        } else { wait };
+        // Service deadlines may shorten pacing, but known IO must never be delayed.
+        let wait = if io_ready { Some(Duration::ZERO) } else { wait };
         display.dispatch_and_flush(wait).map_err(app_error)?;
-        latency_trace.phase("xwm_dispatch");
+        latency_trace.event("client_events_flushed", [0; 4]);
         owner_stats_start = frame_stats.as_ref().map(|_| Instant::now());
+        latency_trace.phase("kms_completions");
+        if kms_ready.swap(false, Ordering::AcqRel) {
+            kms.dispatch_events().map_err(app_error)?;
+            for flip in kms.take_page_flip_events() {
+                let monotonic_us = crate::platform::linux::monotonic_time_microseconds();
+                let observed_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                let hardware_ns = kms.page_flip_timestamps_monotonic()
+                    .then(|| presentation::flip_time(flip.timestamp_us, monotonic_us, observed_ns)).flatten();
+                let completed = presentation.completed_at(hardware_ns.unwrap_or(observed_ns), observed_ns)
+                    .ok_or_else(|| AppError::new("DRM completed a page flip with no tracked atomic commit"))?;
+                latency_trace.event("kms_flip_clock", [u64::from(flip.sequence), flip.timestamp_us,
+                    observed_ns.saturating_sub(hardware_ns.unwrap_or(observed_ns)), u64::from(hardware_ns.is_some())]);
+                stall_probe::completed();
+                if let Some(completed_slot) = completed.primary_slot {
+                    transition_probes.flip(completed_slot, flip.sequence, hardware_ns);
+                    frame_slots[completed_slot]
+                        .page_flip_completed()
+                        .map_err(app_error)?;
+                    if let Some(previous) = current_scanout.replace(completed_slot) {
+                        frame_slots[previous]
+                            .page_flip_replaced()
+                            .map_err(app_error)?;
+                    }
+                    if let Some(stats) = &mut frame_stats {
+                        stats.presented(&frame_surface_revisions[completed_slot]);
+                    }
+                    latency_trace.event("primary_flip", [completed_slot as u64, 0, 0, 0]);
+                    presentation_completed = true;
+                    presented_surface_revisions
+                        .extend(std::mem::take(&mut frame_surface_revisions[completed_slot]));
+                    #[cfg(feature = "profiler")]
+                    if let Some(event_time_us) = frame_pointer_event_us[completed_slot].take() {
+                        record_pointer_event_latency(
+                            "input.libinput.pointer_motion.pipeline.event_to_primary_scanout_ns",
+                            event_time_us,
+                        );
+                    }
+                }
+                if completed.primary_slot.is_none() {
+                    latency_trace.event("cursor_flip", [0; 4]);
+                }
+                if let Some(cursor_snapshot) = completed.cursor {
+                    hardware_cursor
+                        .as_mut()
+                        .ok_or_else(|| {
+                            AppError::new(
+                                "DRM completed an atomic cursor commit after cursor retirement",
+                            )
+                        })?
+                        .mark_completed(cursor_snapshot)?;
+                    #[cfg(feature = "profiler")]
+                    if let Some(event_time_us) = completed.cursor_event_us {
+                        record_pointer_event_latency(
+                            "input.libinput.pointer_motion.pipeline.event_to_cursor_scanout_ns",
+                            event_time_us,
+                        );
+                    }
+                }
+                #[cfg(feature = "profiler")]
+                {
+                    crate::runtime::instrumentation::record_instant("presentation.kms.page_flip_completed");
+                }
+                if hardware_cursor
+                    .as_ref()
+                    .is_some_and(HardwareCursor::ready_to_retire)
+                {
+                    hardware_cursor = None;
+                    #[cfg(feature = "profiler")]
+                    crate::runtime::instrumentation::record_instant("presentation.cursor.composited_fallback");
+                }
+            }
+        }
+
+        latency_trace.phase("gpu_completions_releases");
+        if vulkan_completion_ready
+            .as_ref()
+            .is_some_and(|ready| ready.swap(false, Ordering::AcqRel))
+        {
+            // Allocation and GPU completion share a wake FD; ordinary GPU completion alone
+            // must not trigger another otherwise unchanged desktop preparation.
+            repaint |= desktop_renderer.poll_allocations(&mut latency_trace)?;
+            for completion in desktop_renderer.drain_completions() {
+                transition_probes.gpu_submission(&completion);
+                if let Some(direct) = completion.direct {
+                    wayland.complete_direct_capture(direct).map_err(app_error)?;
+                }
+                if let Some(capture) = completion.capture {
+                    presentation.background_completed(completion.completed_at.saturating_duration_since(completion.submitted_at));
+                    #[cfg(feature = "shell-screencast-linux")]
+                    if let Some(portal) = &capture_portal { portal.revoke_cancelled(&mut capture_sessions); }
+                    if let Some(receipt) = completion.capture_pending {
+                        // Timeout is not completion. Retain the exact receipt and job while retrying.
+                        desktop_renderer.retry_capture(receipt, capture)?;
+                        continue;
+                    }
+                    #[cfg(feature = "shell-screencast-linux")]
+                    if let Some(portal) = &mut capture_portal {
+                        if portal.previews.owns(capture.ticket.session()) {
+                            portal.previews.complete(&mut capture_sessions, capture, completion.result.is_ok());
+                            continue;
+                        }
+                    }
+                    if direct_captures.owns(capture.ticket.session()) {
+                        direct_captures.complete(&mut capture_sessions, capture, completion.result.is_ok());
+                        continue;
+                    }
+                    #[cfg(feature = "shell-screencast-linux")]
+                    {
+                        let sampled = capture_streams.complete(&mut capture_sessions, capture, completion.result.is_ok());
+                        let time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+                        for (surface, revision) in sampled {
+                            if let Some(surface) = WaylandSurfaceId::from_raw(surface) {
+                                // Capture completion paces an obscured client without claiming KMS presentation.
+                                wayland.surface_occluded_frame_ready(surface, revision, time).map_err(app_error)?;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "shell-screencast-linux"))]
+                    let _ = capture_sessions.finish_frame(capture.ticket, completion.result.is_ok());
+                    continue;
+                }
+                completion.result.map_err(AppError::new)?;
+                for retirement in completion.dma_bufs {
+                    retire_submitted_dma_buf(&mut wayland, &mut pending_dma_bufs, retirement)?;
+                }
+                presentation.frame_ready(completion.slot_index,
+                    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                ).map_err(AppError::new)?;
+                frame_slots[completion.slot_index]
+                    .gpu_completed()
+                    .map_err(app_error)?;
+                presentation_trace.ready(completion.slot_index);
+                transition_probes.gpu_ready(completion.slot_index, completion.completed_at);
+                latency_trace.event("gpu_ready", [completion.slot_index as u64, 0, 0, 0]);
+                #[cfg(feature = "profiler")]
+                crate::runtime::instrumentation::record_instant("vulkan.scanout.completion_ready");
+            }
+        }
+
+
+        latency_trace.phase("xwm_dispatch");
         #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
         if let Some(host) = &mut compatibility {
             host.dispatch(&display);
             if host.startup_complete() {
                 session.set_x11_environment(host.environment());
-            }
+                if let Some(environment) = host.environment() {
+                    if clipboard_bridge.as_ref().is_none_or(|(previous, _)| *previous != environment) {
+                        clipboard_bridge = Some((environment.clone(), crate::services::clipboard::x11::Bridge::start(environment.0, environment.1, clipboard.clone())));
+                    }
+                } else { clipboard_bridge = None; }
+            } else { clipboard_bridge = None; }
             let changed = host.sync_presentation(&mut windows, &mut window_identities, &config)?;
             repaint |= changed;
             pointer_scene_dirty |= changed;
@@ -1128,7 +1075,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             if let Some(surface) = resume_keyboard_focus.take().filter(|surface| {
                 !deferred_keyboard_focus
                     && !session_locked
-                    && windows.get(surface).is_some_and(|window| !window.minimized)
+                    && windows.get(surface).is_some_and(|window| !window.hidden_on_primary())
                     && wayland.core().world.surface(*surface).is_some()
             }) {
                 // Preserve focus chosen by lock/desktop policy while we were inactive.
@@ -1157,7 +1104,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
         latency_trace.phase("input_dispatch_route_flush");
         if seat.state() == SeatState::Enabled && input_ready.ready.swap(false, Ordering::AcqRel) {
-            let mut input_stats = (frame_stats.is_some() || latency_trace.enabled()).then(|| {
+            let mut input_stats = (frame_stats.is_some() || latency_trace.enabled() || stall_probe::enabled()).then(|| {
                 frame_stats::InputBatch::new(crate::platform::linux::monotonic_time_microseconds())
             });
             #[cfg(feature = "profiler")]
@@ -1175,6 +1122,11 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             #[cfg(feature = "profiler")]
             let input_observed_us = crate::platform::linux::monotonic_time_microseconds();
             while let Some(event) = input.next_event() {
+                if !matches!(event.kind, LinuxInputEventKind::PointerMotion { .. } | LinuxInputEventKind::PointerAbsolute { .. }) {
+                    repaint |= flush_widget_pointer_motion(&mut widgets, MonotonicInstant::from_nanos(
+                        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    ))?;
+                }
                 let time_microseconds = event.time_microseconds;
                 if let Some(stats) = &mut input_stats {
                     stats.observe(time_microseconds);
@@ -1244,7 +1196,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     .seats
                                     .get(&1)
                                     .is_none_or(|seat| seat.pressed_buttons().is_empty())
-                                && widget_pointer_motion(
+                                && queue_widget_pointer_motion(
                                     &mut widgets,
                                     pointer_position,
                                     widget_now,
@@ -1261,7 +1213,6 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     .map_err(app_error)?;
                                 pointer_focus = None;
                                 cursor_position_dirty = true;
-                                repaint = true;
                                 continue;
                             }
                             if tiling.dragging() {
@@ -1395,7 +1346,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     .seats
                                     .get(&1)
                                     .is_none_or(|seat| seat.pressed_buttons().is_empty())
-                                && widget_pointer_motion(
+                                && queue_widget_pointer_motion(
                                     &mut widgets,
                                     pointer_position,
                                     widget_now,
@@ -1412,7 +1363,6 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                     .map_err(app_error)?;
                                 pointer_focus = None;
                                 cursor_position_dirty = true;
-                                repaint = true;
                                 continue;
                             }
                             if tiling.dragging() {
@@ -1503,17 +1453,14 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                         );
                         let held = widget_buttons.contains(&button);
-                        let consumed = if button == 0x110 {
-                            widget_pointer_button(
-                                &mut widgets,
-                                pointer_position,
-                                pressed,
-                                widget_now,
-                                session_locked,
-                            )?
-                        } else {
-                            false
-                        };
+                        let consumed = widget_pointer_button(
+                            &mut widgets,
+                            pointer_position,
+                            button,
+                            pressed,
+                            widget_now,
+                            session_locked,
+                        )?;
                         if consumed || held {
                             if pressed {
                                 widget_buttons.insert(button);
@@ -1586,6 +1533,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 .is_some_and(|seat| seat.compositor_owns_button(button));
                             let over = if owns_release && !session_locked {
                                 hit_test_decoration(
+                                    &wayland.core().world,
                                     &windows,
                                     &stacking_order,
                                     pointer_position,
@@ -1670,6 +1618,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 .get(&1)
                                 .is_some_and(|seat| seat.pressed_buttons().is_empty())
                             && let Some((surface, hit)) = hit_test_decoration(
+                                &wayland.core().world,
                                 &windows,
                                 &stacking_order,
                                 pointer_position,
@@ -1779,6 +1728,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 && seat_pointer_focus.is_none()
                                 && !wayland.drag_active(1)
                                 && hit_test_decoration(
+                                    &wayland.core().world,
                                     &windows,
                                     &stacking_order,
                                     pointer_position,
@@ -1845,7 +1795,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 &mut configure_scheduler,
                                 interaction,
                                 &config,
-                            );
+                            )?;
                             finish_window_interaction(
                                 &mut windows,
                                 &mut configure_scheduler,
@@ -2003,10 +1953,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         if widget_pointer_scroll(
                             &mut widgets,
                             pointer_position,
-                            PointF {
-                                x: horizontal as f32,
-                                y: vertical as f32,
-                            },
+                            widget_scroll_distance(horizontal, vertical, discrete_x, discrete_y),
                             schedule_now,
                             session_locked,
                         )? {
@@ -2021,6 +1968,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         if slot >= 0 {
                             let position = normalized_output_position(normalized, extent);
                             if let Some(surface) = hit_test_surface(
+                                &wayland.core().world,
                                 &windows,
                                 &stacking_order,
                                 position,
@@ -2047,6 +1995,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         let position = normalized_output_position(normalized, extent);
                         if wayland.drag_touch_slot(1) == Some(slot) {
                             let target = hit_test_surface(
+                                &wayland.core().world,
                                 &windows,
                                 &stacking_order,
                                 position,
@@ -2100,6 +2049,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     }
                 }
             }
+            repaint |= flush_widget_pointer_motion(&mut widgets, MonotonicInstant::from_nanos(
+                start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            ))?;
             #[cfg(feature = "profiler")]
             let mut cursor_path = PointerCursorPath::Unchanged;
             #[cfg(feature = "profiler")]
@@ -2128,6 +2080,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         .as_mut()
                         .expect("atomic hardware cursor checked")
                         .move_to(output_scale.physical_point(pointer_position));
+                    stall_probe::cursor_moved();
                     #[cfg(feature = "profiler")]
                     {
                         cursor_path = PointerCursorPath::Deferred;
@@ -2145,9 +2098,11 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             // submission. Flushing only at the next event-loop dispatch adds that entire work to
             // application input latency even when the hardware cursor already moved.
             display.flush_clients();
+            latency_trace.event("client_events_flushed", [0; 4]);
             if let Some(batch) = input_stats {
                 let flushed_us = crate::platform::linux::monotonic_time_microseconds();
                 latency_trace.event("input_flush", batch.trace_values(flushed_us));
+                batch.probe(flushed_us, || widget_probe_context(&widgets));
                 if let Some(stats) = &mut frame_stats {
                     stats.input_flushed(batch, flushed_us);
                 }
@@ -2181,6 +2136,257 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 }
             }
         }
+
+        // Reconcile shell UI after input has been delivered for this turn.
+        let schedule_now = MonotonicInstant::from_nanos(
+            start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
+        let active_window = wayland
+            .core()
+            .seats
+            .get(&1)
+            .and_then(|s| s.keyboard_focus)
+            .map(|f| f.surface)
+            .and_then(|surface| window_backend::focus_owner(&windows, surface))
+            .filter(|surface| windows.get(surface).is_some_and(|w| !w.hidden_on_primary()));
+        widget_services.publish(
+            windows
+                .iter()
+                .filter_map(|(surface, w)| {
+                    w.backend?;
+                    let id = w.desktop_id?;
+                    Some(crate::authoring::compose::ShellWindow {
+                        preview_size: (w.presentation.size.width > 0
+                            && w.presentation.size.height > 0)
+                            .then_some(SizeF {
+                                width: w.presentation.size.width as f32,
+                                height: w.presentation.size.height as f32,
+                            }),
+                        id,
+                        application_id: None,
+                        application_identity: wayland
+                            .toplevel_metadata(*surface)
+                            .map(|m| m.application_id.clone())
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| w.application_identity.clone()),
+                        icon_name: wayland.toplevel_icon(*surface).and_then(|i| i.name.clone()),
+                        icon: wayland
+                            .toplevel_icon(*surface)
+                            .and_then(|icon| {
+                                icon.images
+                                    .iter()
+                                    .max_by_key(|i| {
+                                        let size = i.image.descriptor.size;
+                                        size.width.min(size.height)
+                                    })
+                                    .and_then(|image| {
+                                        let mut resource = shm_image_resource(
+                                            image.buffer,
+                                            icon.revision.max(1),
+                                            image.image.clone(),
+                                        )
+                                        .ok()?;
+                                        resource.image =
+                                            layers::toplevel_icon_image_id(*surface, icon.revision);
+                                        Some(resource)
+                                    })
+                            })
+                            .or_else(|| w.application_icon.clone()),
+                        title: w.frame_title.clone().unwrap_or_else(|| {
+                            wayland
+                                .toplevel_metadata(*surface)
+                                .map_or_else(String::new, |m| {
+                                    if m.title.is_empty() {
+                                        m.application_id.clone()
+                                    } else {
+                                        m.title.clone()
+                                    }
+                                })
+                        }),
+                        active: active_window == Some(*surface),
+                        minimized: w.minimized,
+                        maximized: w.maximized,
+                    })
+                })
+                .collect(),
+        );
+        for command in widget_services.drain() {
+            use crate::authoring::compose::{ShellRequestOutcome as Outcome, ShellWindowAction as Action};
+            let target = windows
+                .iter()
+                .find(|(_, w)| w.desktop_id == Some(command.window) && w.virtual_output.is_none())
+                .map(|(id, _)| *id);
+            let Some(surface) = target else {
+                widget_services.complete(command.id, Outcome::Stale);
+                continue;
+            };
+            if session_locked {
+                widget_services.complete(command.id, Outcome::Denied);
+                continue;
+            }
+            let result = match command.action {
+                Action::Snap(target) => {
+                    if !tiling.snap(
+                        &mut windows,
+                        &mut configure_scheduler,
+                        surface,
+                        target,
+                        &config,
+                    ) {
+                        widget_services.complete(command.id, Outcome::Denied);
+                        continue;
+                    }
+                    Ok(())
+                }
+                Action::Float => {
+                    if let Some(w) = windows.get_mut(&surface) {
+                        tiling::float_window(w, surface, &mut configure_scheduler);
+                    }
+                    Ok(())
+                }
+                Action::Activate => {
+                    if let Some(w) = windows.get_mut(&surface) {
+                        w.minimized = false;
+                    }
+                    for w in &mut widgets {
+                        w.focused = false;
+                    }
+                    widget_focus_active = false;
+                    widget_saved_focus = None;
+                    window_backend::focus(
+                        &display,
+                        &mut wayland,
+                        &windows,
+                        &mut configure_scheduler,
+                        &mut stacking_order,
+                        Some(surface),
+                        #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                        compatibility.as_mut(),
+                    )
+                }
+                Action::SetMinimized(value) => {
+                    if let Some(w) = windows.get_mut(&surface) {
+                        w.minimized = value;
+                    }
+                    if value {
+                        stacking_order.retain(|id| *id != surface);
+                    } else if !stacking_order.contains(&surface) {
+                        stacking_order.push(surface);
+                    }
+                    if value {
+                        window_backend::unfocus_minimized(
+                            &display,
+                            &mut wayland,
+                            &windows,
+                            &mut configure_scheduler,
+                            &mut stacking_order,
+                            &mut widget_saved_focus,
+                            surface,
+                            #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                            compatibility.as_mut(),
+                        )?;
+                    }
+                    Ok(())
+                }
+                Action::SetMaximized(value) => set_window_maximized(
+                    &mut windows,
+                    &mut configure_scheduler,
+                    surface,
+                    value,
+                    work_area,
+                    &config,
+                ),
+                Action::Close => window_backend::close(
+                    surface,
+                    &windows,
+                    &mut wayland,
+                    #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                    compatibility.as_mut(),
+                ),
+            };
+            widget_services.complete(
+                command.id,
+                if result.is_ok() {
+                    Outcome::Dispatched
+                } else {
+                    Outcome::Failed
+                },
+            );
+            repaint = true;
+        }
+        sync_widget_children(
+            &mut widgets,
+            &mut next_widget_id,
+            extent,
+            &layer_assets,
+            output_scale,
+            &runtime_wake,
+            &widget_services.services,
+        )?;
+        let previous_work_area = work_area;
+        let work = crate::foundation::RectF {
+            x: work_area.x as f32,
+            y: work_area.y as f32,
+            width: work_area.width as f32,
+            height: work_area.height as f32,
+        };
+        prepare_widget_surfaces(
+            &mut widgets,
+            extent,
+            work,
+            schedule_now.as_nanos(),
+            if desktop_renderer.motion_enabled() {
+                config.motion_preference
+            } else {
+                crate::theme::MotionPreference::Reduced
+            },
+        )?;
+        work_area = shell_work_area(extent, &widgets);
+        tiling.sync(
+            &mut widgets,
+            &mut windows,
+            &mut configure_scheduler,
+            work_area,
+            &config,
+            session_locked,
+        )?;
+        tiling.preview(
+            &mut widgets,
+            &windows,
+            window_interaction,
+            pointer_position,
+            extent,
+            &config,
+            session_locked,
+        );
+        if work_area != previous_work_area {
+            let maximized = windows
+                .iter()
+                .filter(|(_, w)| w.maximized && !w.fullscreen)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in maximized {
+                set_window_maximized(
+                    &mut windows,
+                    &mut configure_scheduler,
+                    id,
+                    true,
+                    work_area,
+                    &config,
+                )?;
+            }
+            repaint = true;
+        }
+        sync_widget_focus(
+            &mut widgets,
+            &mut wayland,
+            &display,
+            &windows,
+            session_locked,
+            &mut widget_saved_focus,
+            &mut widget_focus_active,
+            schedule_now,
+        )?;
 
         window_backend::flush(
             &display,
@@ -2260,122 +2466,6 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         );
         repaint |= runtime_turn_ready;
         other_work_seen |= runtime_turn_ready;
-
-        latency_trace.phase("kms_completions");
-        if kms_ready.swap(false, Ordering::AcqRel) {
-            kms.dispatch_events().map_err(app_error)?;
-            for _ in 0..kms.take_completed_page_flips() {
-                let completed = pending_kms_commit.take().ok_or_else(|| {
-                    AppError::new("DRM completed a page flip with no tracked atomic commit")
-                })?;
-                if let Some(completed_slot) = completed.primary_slot {
-                    frame_slots[completed_slot]
-                        .page_flip_completed()
-                        .map_err(app_error)?;
-                    if let Some(previous) = current_scanout.replace(completed_slot) {
-                        frame_slots[previous]
-                            .page_flip_replaced()
-                            .map_err(app_error)?;
-                    }
-                    if let Some(stats) = &mut frame_stats {
-                        stats.presented(&frame_surface_revisions[completed_slot]);
-                    }
-                    latency_trace.event("primary_flip", [completed_slot as u64, 0, 0, 0]);
-                    presentation_completed = true;
-                    presented_surface_revisions
-                        .extend(std::mem::take(&mut frame_surface_revisions[completed_slot]));
-                    #[cfg(feature = "profiler")]
-                    if let Some(event_time_us) = frame_pointer_event_us[completed_slot].take() {
-                        record_pointer_event_latency(
-                            "input.libinput.pointer_motion.pipeline.event_to_primary_scanout_ns",
-                            event_time_us,
-                        );
-                    }
-                }
-                if let Some(cursor_snapshot) = completed.cursor {
-                    hardware_cursor
-                        .as_mut()
-                        .ok_or_else(|| {
-                            AppError::new(
-                                "DRM completed an atomic cursor commit after cursor retirement",
-                            )
-                        })?
-                        .mark_completed(cursor_snapshot)?;
-                    #[cfg(feature = "profiler")]
-                    if let Some(event_time_us) = completed.cursor_event_us {
-                        record_pointer_event_latency(
-                            "input.libinput.pointer_motion.pipeline.event_to_cursor_scanout_ns",
-                            event_time_us,
-                        );
-                    }
-                }
-                #[cfg(feature = "profiler")]
-                {
-                    crate::runtime::instrumentation::record_instant("presentation.kms.page_flip_completed");
-                }
-                if hardware_cursor
-                    .as_ref()
-                    .is_some_and(HardwareCursor::ready_to_retire)
-                {
-                    hardware_cursor = None;
-                    #[cfg(feature = "profiler")]
-                    crate::runtime::instrumentation::record_instant("presentation.cursor.composited_fallback");
-                }
-            }
-        }
-
-        latency_trace.phase("gpu_completions_releases");
-        if vulkan_completion_ready
-            .as_ref()
-            .is_some_and(|ready| ready.swap(false, Ordering::AcqRel))
-        {
-            // Allocation and GPU completion share a wake FD; ordinary GPU completion alone
-            // must not trigger another otherwise unchanged desktop preparation.
-            repaint |= desktop_renderer.poll_allocations(&mut latency_trace)?;
-            for completion in desktop_renderer.drain_completions() {
-                if let Some(direct) = completion.direct {
-                    wayland.complete_direct_capture(direct).map_err(app_error)?;
-                }
-                if let Some(capture) = completion.capture {
-                    #[cfg(feature = "shell-screencast-linux")]
-                    if let Some(portal) = &capture_portal { portal.revoke_cancelled(&mut capture_sessions); }
-                    if let Some(receipt) = completion.capture_pending {
-                        // Timeout is not completion. Retain the exact receipt and job while retrying.
-                        desktop_renderer.retry_capture(receipt, capture)?;
-                        continue;
-                    }
-                    if direct_captures.owns(capture.ticket.session()) {
-                        direct_captures.complete(&mut capture_sessions, capture, completion.result.is_ok());
-                        continue;
-                    }
-                    #[cfg(feature = "shell-screencast-linux")]
-                    {
-                        let sampled = capture_streams.complete(&mut capture_sessions, capture, completion.result.is_ok());
-                        let time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
-                        for (surface, revision) in sampled {
-                            if let Some(surface) = WaylandSurfaceId::from_raw(surface) {
-                                // Capture completion paces an obscured client without claiming KMS presentation.
-                                wayland.surface_occluded_frame_ready(surface, revision, time).map_err(app_error)?;
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "shell-screencast-linux"))]
-                    let _ = capture_sessions.finish_frame(capture.ticket, completion.result.is_ok());
-                    continue;
-                }
-                completion.result.map_err(AppError::new)?;
-                for retirement in completion.dma_bufs {
-                    retire_submitted_dma_buf(&mut wayland, &mut pending_dma_bufs, retirement)?;
-                }
-                frame_slots[completion.slot_index]
-                    .gpu_completed()
-                    .map_err(app_error)?;
-                ready_scanout.push_back(completion.slot_index);
-                latency_trace.event("gpu_ready", [completion.slot_index as u64, 0, 0, 0]);
-                #[cfg(feature = "profiler")]
-                crate::runtime::instrumentation::record_instant("vulkan.scanout.completion_ready");
-            }
-        }
 
         repaint |= desktop_renderer.take_acquire_wakeup();
         latency_trace.phase("window_requests");
@@ -2533,13 +2623,17 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
         for action in actions {
             match action {
-                CompositorAction::PublishSurface(surface) => {
+                CompositorAction::PublishSurface(surface)
+                | CompositorAction::UpdateSurface(surface) => {
+                    let state_only = matches!(action, CompositorAction::UpdateSurface(_));
                     let snapshot = wayland
                         .core()
                         .world
                         .surface(surface)
                         .map(|surface| surface.snapshot().clone());
                     let Some(snapshot) = snapshot else { continue };
+                    latency_trace.event("surface_publication", [surface.get() as u64,
+                        snapshot.revision, snapshot.attachment_revision, u64::from(state_only)]);
                     let Some(role) = snapshot.role else {
                         continue;
                     };
@@ -2553,6 +2647,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     }
                     // Configure acknowledgement is commit state, not image-worker state. Observe
                     // it before a newer latest-wins SHM publication can replace these pixels.
+                    // Input-region-only commits must retarget a stationary pointer immediately,
+                    // independently of asynchronous image preparation.
+                    pointer_scene_dirty = true;
                     observe_surface_configure_acknowledgement(&mut windows, &snapshot);
                     if !matches!(
                         role,
@@ -2564,6 +2661,25 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             | SurfaceRole::SessionLock
                             | SurfaceRole::Xwayland
                     ) {
+                        continue;
+                    }
+                    if state_only {
+                        if !pending_shm_surfaces.contains_key(&surface) {
+                            client::state_publication::apply_retained_surface_state(
+                                &display,
+                                &mut wayland,
+                                &mut windows,
+                                &mut window_identities,
+                                &mut configure_scheduler,
+                                &mut stacking_order,
+                                &mut next_window_offset,
+                                work_area,
+                                session_locked,
+                                &mut pointer_scene_dirty,
+                                &snapshot,
+                            )?;
+                        }
+                        repaint = true;
                         continue;
                     }
                     let Some(attachment) = snapshot.attachment else {
@@ -2619,14 +2735,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         // linux-dmabuf defaults to implicit synchronization. Preserve an explicit
                         // protocol fence when present; otherwise snapshot the buffer's producer
                         // fences so Vulkan cannot sample a partially rendered client frame.
-                        let acquire = match wayland.take_acquire_fence(surface, snapshot.revision) {
-                            Some(explicit) => explicit,
-                            None => image.export_implicit_read_sync_file().map_err(app_error)?,
-                        };
+                        let acquire =
+                            match wayland.take_acquire_fence(surface, snapshot.attachment_revision) {
+                                Some(explicit) => explicit,
+                                None => image.export_implicit_read_sync_file().map_err(app_error)?,
+                            };
                         let queued = desktop_renderer.queue_dma_buf(
                             DmaBufPublication {
                                 surface,
-                                revision: snapshot.revision,
+                                revision: snapshot.attachment_revision,
                                 buffer: attachment.buffer,
                                 image,
                                 acquire: Some(acquire),
@@ -2764,6 +2881,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             ),
                             None => PreparedClientImage::Unchanged {
                                 extent: descriptor.size,
+                                raster_extent: descriptor.size,
                                 pixel_format: native_pixel_format,
                                 alpha_mode: native_alpha_mode,
                             },
@@ -2839,7 +2957,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         prepared_image,
                     )?;
                     wayland
-                        .finish_explicit_release(surface, snapshot.revision, None)
+                        .finish_explicit_release(surface, snapshot.attachment_revision, None)
                         .map_err(app_error)?;
                     wayland
                         .release_buffer(attachment.buffer)
@@ -3007,16 +3125,40 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 CompositorAction::FullscreenToplevel {
                     surface,
                     fullscreen,
-                    output: _,
+                    output,
                 } => {
+                    #[allow(unused_mut)]
+                    let mut fullscreen_extent = extent;
+                    #[cfg(feature = "shell-screencast-linux")]
+                    if let Some(portal) = &mut capture_portal {
+                        if let Some(window) = windows.get(&surface) {
+                            match portal.virtual_fullscreen(window, fullscreen, output) {
+                                Ok(Some(size)) => fullscreen_extent = size,
+                                Ok(None) => {},
+                                Err(_) => continue,
+                            }
+                        }
+                        if fullscreen {
+                            portal.sync_virtual_geometry(&mut windows, &mut configure_scheduler);
+                        }
+                        portal.sync_virtual_capture(&mut capture_streams);
+                    }
+                    #[cfg(not(feature = "shell-screencast-linux"))]
+                    let _ = output;
                     set_window_fullscreen(
                         &mut windows,
                         &mut configure_scheduler,
                         surface,
                         fullscreen,
-                        extent,
+                        fullscreen_extent,
                         &config,
                     )?;
+                    #[cfg(feature = "shell-screencast-linux")]
+                    if !fullscreen {
+                        if let Some(portal) = &mut capture_portal {
+                            portal.sync_virtual_geometry(&mut windows, &mut configure_scheduler);
+                        }
+                    }
                     pointer_scene_dirty = true;
                     repaint = true;
                 }
@@ -3130,7 +3272,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
 
         latency_trace.phase("window_policy_cursor");
         capture_sessions.set_locked(session_locked || wayland.session_locked());
-        capture_sessions.sync_sources(
+        let mut published_capture_sources: Vec<_> =
             std::iter::once(crate::shell::capture::CaptureSource::Output(crate::shell::OutputId::MIN))
                 .chain(windows.values().filter_map(|window| {
                     // Only managed, currently mapped content is a selectable window.
@@ -3139,8 +3281,12 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         || window.presentation.revision == 0
                     { return None; }
                     window.desktop_id.map(crate::shell::capture::CaptureSource::Window)
-                })).filter(|source| capture_config.allows(*source)),
-        );
+                })).filter(|source| capture_config.allows(*source)).collect();
+        #[cfg(feature = "shell-screencast-linux")]
+        if let Some(portal) = &capture_portal {
+            published_capture_sources.extend(portal.virtual_sources().filter(|source| capture_config.allows(*source)));
+        }
+        capture_sessions.sync_sources(published_capture_sources);
         wayland.sync_foreign_toplevels(windows.values().filter_map(|window| {
             // Minimized windows remain mapped and discoverable. Unmap actions above
             // retire the mapping immediately, even if remapping occurs in this batch.
@@ -3154,7 +3300,31 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         #[cfg(feature = "shell-screencast-linux")]
         if let Some(portal) = &mut capture_portal {
             portal.poll(&mut capture_sessions, &mut capture_streams, desktop_renderer,
-                physical_extent, extent, output_scale, session_locked || wayland.session_locked());
+                physical_extent, extent, output_scale, session_locked || wayland.session_locked(), &mut wayland, &display, &windows);
+        }
+        #[cfg(feature = "shell-screencast-linux")]
+        if let Some(portal) = &mut capture_portal {
+            portal.sync_virtual_capture(&mut capture_streams);
+            let membership_changed = portal.sync_virtual_membership(&mut wayland, &mut windows)?;
+            let geometry_changed = portal.sync_virtual_geometry(&mut windows, &mut configure_scheduler);
+            if membership_changed || geometry_changed {
+                virtual_routing_dirty = true;
+                repaint = true;
+                pointer_scene_dirty = true;
+                window_interaction = None;
+                tiling.finish(&mut windows, &mut configure_scheduler);
+                let routed_focus = wayland.core().seats.get(&1).is_some_and(|seat| {
+                    seat.keyboard_focus.is_some_and(|focus| windows.get(&focus.surface).is_some_and(|window| window.virtual_output.is_some()))
+                    || seat.pointer_grab_focus().or(seat.pointer_focus).is_some_and(|focus| windows.get(&focus.surface).is_some_and(|window| window.virtual_output.is_some()))
+                });
+                if routed_focus {
+                    wayland.suspend_seat_input(1).map_err(app_error)?;
+                    wayland.resume_seat_input(1).map_err(app_error)?;
+                    shortcut_keys.suppress_held();
+                    window_backend::focus(&display, &mut wayland, &windows, &mut configure_scheduler, &mut stacking_order, None,
+                        #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))] compatibility.as_mut())?;
+                }
+            }
         }
         // Resume frame-callback-paced clients after release even when the veil itself no longer
         // changes (so there may be no new KMS frame). Hidden intermediate images are not presented;
@@ -3243,16 +3413,34 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         let pointer_motion_only = repaint && pointer_motion_seen && !other_work_seen;
 
         latency_trace.phase("kms_submit");
+        if let Some(commit) = presentation.pending() {
+            presentation_trace.blocked(commit.primary_slot.is_some());
+            stall_probe::blocked(presentation.has_ready());
+        }
         // One atomic commit per CRTC may be outstanding. Primary frames retain mailbox behavior,
         // while cursor-only motion reuses the current primary plane and commits only cursor state.
         let cursor_commit_ready = !first_modeset
             && hardware_cursor
                 .as_ref()
                 .is_some_and(HardwareCursor::needs_commit);
-        if pending_kms_commit.is_none() && (!ready_scanout.is_empty() || cursor_commit_ready) {
-            while ready_scanout.len() > 1 {
-                let stale = ready_scanout.pop_front().expect("length checked");
+        // Input, publications and widget reconciliation may have changed work since
+        // the wait plan. Always replan before reserving a display refresh.
+        let commit_now = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let (ui_pending, _, ui_animation) = desktop_runtime_schedule(
+            &frame_layers, pointer.as_ref(), &icon_layers, &widgets,
+            MonotonicInstant::from_nanos(commit_now),
+        );
+        presentation.observe_ready_wait(commit_now, cursor_commit_ready);
+        let commit_plan = presentation.plan(presentation::Work {
+            primary_damage: repaint || ui_pending,
+            primary_animation: ui_animation || window_motion.active(commit_now),
+            cursor_dirty: cursor_commit_ready,
+            scanout_available: frame_slots.iter().any(|slot| slot.state == FrameSlotState::Available),
+        }, commit_now);
+        if seat.state() == SeatState::Enabled && commit_plan.submit.is_some() {
+            while let Some(stale) = presentation.take_stale_frame() {
                 frame_slots[stale].discard_ready().map_err(app_error)?;
+                presentation_trace.discard(stale);
                 latency_trace.event("frame_discard", [stale as u64, 0, 0, 0]);
                 #[cfg(feature = "profiler")]
                 {
@@ -3260,7 +3448,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     frame_pointer_event_us[stale] = None;
                 }
             }
-            let primary_slot = ready_scanout.pop_back();
+            if let Some((slot, target, waits)) = presentation.ready_wait_sample(commit_now) {
+                transition_probes.presentation_wait(slot, target, waits);
+                latency_trace.event("ready_wait_causes", [slot as u64, waits[0], waits[1], waits[2]]);
+                for (stage, duration) in ["ready_wait_previous_commit", "ready_wait_pacing", "ready_wait_dispatch"].into_iter().zip(waits) {
+                    stall_probe::observe(stage, Duration::from_nanos(duration),
+                        || format!("slot={slot} target_ns={target} submit_plan_ns={commit_now}"));
+                }
+            }
+            let primary_slot = presentation.take_ready_frame();
             let mut request = if let Some(slot_index) = primary_slot {
                 kms.primary_modeset_request(
                     connector.id,
@@ -3295,6 +3491,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     .is_some_and(HardwareCursor::composited_fallback_requested);
             #[cfg(feature = "profiler")]
             let _kms_commit = crate::runtime::instrumentation::span!("presentation.kms.atomic_commit");
+            let commit_probe = stall_probe::begin();
             let commit_result = if first_modeset {
                 match request.test(true) {
                     Ok(()) => request.commit(true, false),
@@ -3303,13 +3500,20 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             } else {
                 request.commit(false, true)
             };
+            stall_probe::finish("kms_atomic_submit", commit_probe, || format!(
+                "primary={} modeset={} success={}", primary_slot.is_some(), first_modeset, commit_result.is_ok()));
             if commit_result.is_ok()
                 && let Some(slot) = primary_slot
             {
+                presentation_trace.submitted(slot);
+                transition_probes.submitted(slot);
                 latency_trace.event(
                     "kms_submitted",
                     [slot as u64, u64::from(first_modeset), 0, 0],
                 );
+            }
+            if commit_result.is_ok() && primary_slot.is_none() {
+                latency_trace.event("cursor_submitted", [0; 4]);
             }
             match commit_result {
                 Ok(()) if first_modeset => {
@@ -3320,6 +3524,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         .and_then(|_| frame_slots[slot_index].page_flip_completed())
                         .map_err(app_error)?;
                     current_scanout = Some(slot_index);
+                    transition_probes.completed(slot_index);
+                    presentation.modeset_completed(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
                     if let Some(snapshot) = cursor_snapshot {
                         let cursor = hardware_cursor
                             .as_mut()
@@ -3381,12 +3587,13 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     } else {
                         None
                     };
-                    pending_kms_commit = Some(PendingKmsCommit {
+                    stall_probe::submitted(primary_slot.is_some(), cursor_snapshot.is_some());
+                    presentation.submitted(PendingKmsCommit {
                         primary_slot,
                         cursor: cursor_snapshot,
                         #[cfg(feature = "profiler")]
                         cursor_event_us,
-                    });
+                    }).map_err(AppError::new)?;
                     #[cfg(feature = "profiler")]
                     if cursor_snapshot.is_some() {
                         crate::runtime::instrumentation::record_instant(
@@ -3444,11 +3651,21 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             }
             let time = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
             for (surface, revision) in presented_surface_revisions {
+                latency_trace.event("surface_presented", [surface as u64, revision, 0, 0]);
                 resize_trace::event(surface, "presented", format_args!("revision={revision}"));
                 let Some(surface) = WaylandSurfaceId::from_raw(surface) else {
                     continue;
                 };
                 if wayland.core().world.surface(surface).is_some() {
+                    // Pace visible clients on this output tick, not on the later scanout of
+                    // their callback-only revision. Presentation feedback stays frame-owned.
+                    if let Some(window) = windows.get(&surface)
+                        && !window.hidden_on_primary()
+                        && (!session_locked || window.role == SurfaceRole::SessionLock)
+                    {
+                        wayland.surface_frame_ready(surface, window.presentation.revision, time)
+                            .map_err(app_error)?;
+                    }
                     wayland
                         .surface_presented(surface, revision, time)
                         .map_err(app_error)?;
@@ -3482,6 +3699,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         // Frame callbacks, completed buffer releases and configure events unblock client work.
         // Let clients start their next frame while we prepare ours; no nested dispatch or roundtrip.
         display.flush_clients();
+        latency_trace.event("client_events_flushed", [0; 4]);
         let available_scanout = frame_slots
             .iter()
             .position(|slot| slot.state == FrameSlotState::Available);
@@ -3489,31 +3707,57 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             latency_trace.event(
                 "no_scanout_slot",
                 [
-                    ready_scanout.len() as u64,
-                    u64::from(pending_kms_commit.is_some()),
+                    presentation.ready_len() as u64,
+                    u64::from(presentation.pending().is_some()),
                     0,
                     0,
                 ],
             );
         }
-        let primary_render_ready = state::primary_render_budget(
-            frame_slots
-                .iter()
-                .filter(|slot| slot.state == FrameSlotState::GpuSubmitted)
-                .count(),
-            ready_scanout.len(),
-        );
+        let primary_render_ready = presentation.render_budget();
         if repaint && !primary_render_ready {
             latency_trace.event(
                 "primary_render_backpressure",
-                [ready_scanout.len() as u64, 0, 0, 0],
+                [presentation.ready_len() as u64,
+                    u64::from(presentation.primary_pending()),
+                    frame_slots.iter().filter(|slot| slot.state == FrameSlotState::GpuSubmitted).count() as u64, 0],
             );
         }
+        // Capture producers retain their latest demand until admission. Reserve a
+        // bounded opportunity before another animation successor consumes the GPU.
+        let background_waiting = !capture_sessions.has_pending_frame()
+            && (direct_captures.pending() || wayland.direct_capture_waiting());
+        #[cfg(feature = "shell-screencast-linux")]
+        let background_waiting = background_waiting || (!capture_sessions.has_pending_frame()
+            && (capture_streams.wait(None).is_some() || capture_portal.as_ref().is_some_and(|portal|
+                portal.previews.wait(None, start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64).is_some())));
+        presentation.request_background(background_waiting && !session_locked);
         'primary_render: {
-            if !repaint || seat.state() != SeatState::Enabled || !primary_render_ready {
+            if seat.state() != SeatState::Enabled {
                 break 'primary_render;
             }
-            let Some(scanout_index) = available_scanout else { break 'primary_render; };
+            let render_now_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let (ui_pending, _, ui_animation) = desktop_runtime_schedule(
+                &frame_layers, pointer.as_ref(), &icon_layers, &widgets,
+                MonotonicInstant::from_nanos(render_now_ns),
+            );
+            // Use the same animation demand that reserves the refresh against cursor-only
+            // commits. A repaint-only gate can otherwise strand the cursor until hover ends.
+            let render_plan = presentation.plan(presentation::Work {
+                primary_damage: repaint || ui_pending,
+                primary_animation: ui_animation || window_motion.active(render_now_ns),
+                scanout_available: available_scanout.is_some(),
+                ..Default::default()
+            }, render_now_ns);
+            if !render_plan.render {
+                if let Some(deadline) = render_plan.deadline_ns {
+                    latency_trace.event("render_deferred", [deadline.saturating_sub(render_now_ns) / 1000, 0, 0, 0]);
+                }
+                break 'primary_render;
+            }
+            let scanout_index = available_scanout.expect("render plan requires an available slot");
+            presentation.begin_render(scanout_index, render_now_ns);
+            let transition_frame_start = stall_probe::begin();
             latency_trace.phase("render_chrome");
             let frame_stats_start = frame_stats.as_ref().map(|_| Instant::now());
             #[cfg(feature = "profiler")]
@@ -3545,11 +3789,11 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 );
                 crate::runtime::instrumentation::counter!(
                     "presentation.scanout.ready_frames",
-                    ready_scanout.len() as u64
+                    presentation.ready_len() as u64
                 );
                 crate::runtime::instrumentation::counter!(
                     "presentation.scanout.flip_pending",
-                    u8::from(pending_kms_commit.is_some())
+                    u8::from(presentation.pending().is_some())
                 );
             }
             let now = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -3560,7 +3804,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     &mut windows,
                     &wayland,
                     &config,
-                    assets,
+                    &layer_assets,
                     &app_icon_profile,
                     Some(&widget_services.services),
                     &runtime_wake,
@@ -3660,7 +3904,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             }
             latency_trace.phase("render_layers");
             let widget_frame_changed = widgets.iter().any(|w| w.dirty() || w.animating());
-            let layers = prepare_desktop_layers(
+            let mut layers = prepare_desktop_layers(
                 session_locked,
                 extent,
                 now,
@@ -3681,27 +3925,47 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             )?;
             #[cfg(feature = "shell-screencast-linux")]
             if capture_streams.refresh_windows(&capture_sessions, &windows, &layers, output_scale,
-                capture_portal.as_ref().is_some_and(|portal| portal.wants_window_sources())) {
+                capture_portal.as_ref().is_some_and(|portal| portal.wants_window_sources()), |surface|
+                    wayland.toplevel_metadata(surface).map(|m| if m.title.trim().is_empty() { m.application_id.clone() } else { m.title.clone() })) {
                 runtime_wake.notify();
+            }
+            #[cfg(feature = "shell-screencast-linux")]
+            if let Some(portal) = &mut capture_portal {
+                if portal.refresh_virtual_outputs(&windows, &layers, output_scale) {
+                    runtime_wake.notify();
+                }
+                portal.sync_virtual_capture(&mut capture_streams);
+                portal.append_virtual_previews(&mut layers, &widgets, session_locked || wayland.session_locked());
             }
             latency_trace.phase("render_scene_sync");
             capture_cursor_visual = rendered_cursor;
             let Some(frame) = desktop_scene.synchronize_with_force(
                 extent,
                 layers,
-                window_motion.active(now) || widget_frame_changed,
+                render_plan.force_frame || widget_frame_changed || virtual_routing_dirty,
             ) else {
                 repaint = false;
+                presentation.cancel_render();
                 // A capture request still needs its initial/explicit frame from the
                 // retained scene even when the desktop itself has no new damage.
                 break 'primary_render;
             };
+            virtual_routing_dirty = false;
             let mut frame = frame.into_physical(output_scale, physical_extent);
+            // Keep virtual client scenes uploaded, but remove every physical placement and
+            // presentation acknowledgement before animation can capture them as desktop content.
+            let virtual_surfaces: BTreeSet<_> = windows.iter().filter_map(|(surface, window)| window.virtual_output.map(|_| surface.get())).collect();
+            if !virtual_surfaces.is_empty() {
+                frame.placements.retain(|placement| motion::surface_for_key(placement.key).is_none_or(|id| !virtual_surfaces.contains(&id)));
+                frame.surface_revisions.retain(|(surface, _)| !virtual_surfaces.contains(surface));
+                frame.damage = None;
+                for &surface in &virtual_surfaces { window_motion.withdraw_from_primary(surface); }
+            }
             let mut motion_states = BTreeMap::new();
             let mut motion_owners = BTreeMap::new();
             if !session_locked {
                 for (surface, window) in &windows {
-                    if window.backend.is_some() && !window.fullscreen {
+                    if window.backend.is_some() && !window.fullscreen && window.virtual_output.is_none() {
                         let outer = window
                             .chrome_outer
                             .unwrap_or_else(|| geometry::legacy_window_outer(window, &config));
@@ -3730,12 +3994,16 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                                 minimized: window.minimized,
                                 veiled: resize_veil_owner(&windows, *surface).is_some(),
                                 style,
+                                client_decorated: !window_has_frame(window),
                                 shadows: frame_layers.get(surface)
                                     .map(|layer| layer.shadows(output_scale.get()))
                                     .unwrap_or_default(),
                                 corner_radii: frame_layers.get(surface)
                                     .map(|layer| layer.corner_radii(output_scale.get() as f32))
-                                    .unwrap_or_default(),
+                                    .unwrap_or_else(|| {
+                                        let radii = layers::resize_preview_radii(window, config.resize_preview);
+                                        crate::ui::CornerRadii::all(radii.top_left * output_scale.get())
+                                    }),
                             },
                         );
                     }
@@ -3762,11 +4030,13 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             if session_locked {
                 window_motion.cancel_closing();
             }
-            window_motion.apply(
+            transition_probes.observe_states(&motion_states);
+            window_motion.apply_at(
                 &mut frame,
                 motion_states,
                 &motion_owners,
                 now,
+                presentation.animation_sample_time(now),
                 if desktop_renderer.motion_enabled() {
                     config.motion_preference
                 } else {
@@ -3783,6 +4053,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                     .collect();
                 window_motion.apply_widget_visibility(&mut frame, &fades);
             }
+            preview_trace::tile_frames(&frame, &widgets, &windows, now);
             for (surface, window) in &mut windows {
                 consumed_motion_veil |= std::mem::take(&mut window.motion_veil_pending);
                 window.motion_input = motion_owners
@@ -3813,7 +4084,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             latency_trace.phase("render_backend");
             let fallback_revisions = (!frame.motion.hidden_revisions.is_empty())
                 .then(|| frame.surface_revisions.clone());
+            transition_probes.prepared(scanout_index, frame_id, transition_frame_start,
+                |id| window_motion.transition_pending(id));
             let rendered = desktop_renderer.render(scanout_index, frame, &mut latency_trace)?;
+            transition_probes.rendered(scanout_index);
             if desktop_renderer.take_motion_failure() {
                 window_motion.reset_after_fallback();
                 // Fallback presented ordinary surfaces, including ones an animation would hide.
@@ -3826,6 +4100,16 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             }
             latency_trace.phase("render_retire");
             latency_trace.event("render_submitted", [scanout_index as u64, frame_id, 0, 0]);
+            // Include host window state even when an opaque child covers the root image.
+            // Bits: fullscreen=1, maximized=2. Pixel count distinguishes larger client buffers.
+            for (surface, window) in windows.iter().filter(|(_, w)| {
+                w.backend.is_some() && !w.hidden_on_primary()
+            }) {
+                let flags = u64::from(window.fullscreen) | (u64::from(window.maximized) << 1);
+                let image = window.presentation.image_size;
+                latency_trace.event("frame_window", [scanout_index as u64, surface.get() as u64,
+                    flags, (image.width.max(0) as u64) * (image.height.max(0) as u64)]);
+            }
             for &(surface, revision) in &frame_surface_revisions[scanout_index] {
                 latency_trace.event(
                     "frame_surface",
@@ -3875,11 +4159,15 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         )
                         .map_err(app_error)?;
                     desktop_renderer.mark_software_copied(scanout_index);
+                    presentation.frame_ready(scanout_index,
+                        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    ).map_err(AppError::new)?;
                     frame_slots[scanout_index]
                         .gpu_submitted()
                         .and_then(|_| frame_slots[scanout_index].gpu_completed())
                         .map_err(app_error)?;
-                    ready_scanout.push_back(scanout_index);
+                    presentation_trace.ready(scanout_index);
+                    transition_probes.ready(scanout_index);
                 }
             }
             if let (Some(stats), Some(started)) = (&mut frame_stats, frame_stats_start) {
@@ -3912,21 +4200,42 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 desktop_renderer.clear_capture_cursor();
                 capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
             }
+            #[cfg(feature = "shell-screencast-linux")]
+            capture_streams.update_cursor_metadata(
+                &mut capture_sessions, capture_cursor_visual.as_ref(), pointer_position, output_scale,
+            );
             let capture_was_busy = capture_sessions.has_pending_frame();
             let capture_now = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            if direct_capture_turn {
-                direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
-            }
-            #[cfg(feature = "shell-screencast-linux")]
-            capture_streams.schedule(&mut capture_sessions, desktop_renderer, capture_now)?;
-            if !direct_capture_turn {
-                direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
-            }
-            if !capture_was_busy && capture_sessions.has_pending_frame() {
-                direct_capture_turn = !direct_capture_turn;
+            let display_work = repaint || runtime_immediate || runtime_animation || window_motion.active(capture_now);
+            let background_allowed = presentation.background_allowed(capture_now, display_work);
+            latency_trace.event("gpu_background_admission", [u64::from(background_allowed),
+                u64::from(display_work), u64::from(capture_was_busy), 0]);
+            if background_allowed {
+                if direct_capture_turn {
+                    direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
+                }
+                #[cfg(feature = "shell-screencast-linux")]
+                capture_streams.schedule(&mut capture_sessions, desktop_renderer, capture_now)?;
+                #[cfg(feature = "shell-screencast-linux")]
+                if let (Some(portal), Some(layout)) = (&mut capture_portal, capture_portal::capture_layout(physical_extent)) {
+                    portal.previews.schedule(&mut capture_sessions, &capture_streams, desktop_renderer, layout, capture_now)?;
+                }
+                if !direct_capture_turn {
+                    direct_captures.schedule(&mut wayland, &mut capture_sessions, desktop_renderer, capture_now)?;
+                }
+                if !capture_was_busy && capture_sessions.has_pending_frame() {
+                    direct_capture_turn = !direct_capture_turn;
+                }
+                if background_waiting {
+                    // Also consume an unused opportunity (e.g. a stream is not due yet),
+                    // rather than repeatedly holding up display work for it.
+                    presentation.background_submitted(capture_now);
+                }
             }
         }
         if session_locked {
+            #[cfg(feature = "shell-screencast-linux")]
+            capture_streams.clear_cursor_metadata();
             desktop_renderer.clear_capture_cursor();
             capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
             capture_cursor_visual = None;

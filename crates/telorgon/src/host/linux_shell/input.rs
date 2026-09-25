@@ -93,11 +93,12 @@ pub(super) fn update_pointer_focus(
         .map(|focus| focus.surface)
         .filter(|surface| {
             windows.get(surface).is_some_and(|window| {
-                !window.minimized && (window.role == SurfaceRole::SessionLock) == session_locked
+                client::surface_tree_visible(windows, *surface)
+                    && (window.role == SurfaceRole::SessionLock) == session_locked
             })
         });
     let next = grab
-        .or_else(|| hit_test_surface(windows, stacking_order, position, config, session_locked))
+        .or_else(|| hit_test_surface(&wayland.core().world, windows, stacking_order, position, config, session_locked))
         .filter(|surface| wayland.core().world.surface(*surface).is_some());
     let seat_focus = wayland
         .core()
@@ -168,7 +169,7 @@ pub(super) fn route_pointer_motion(
     config: &LinuxShellConfig,
 ) -> AppResult<()> {
     if wayland.drag_active(1) && wayland.drag_touch_slot(1).is_none() {
-        let target = hit_test_surface(windows, stacking_order, position, config, session_locked);
+        let target = hit_test_surface(&wayland.core().world, windows, stacking_order, position, config, session_locked);
         let local = target.map_or(position, |surface| {
             surface_local_position(windows, surface, position, config)
         });
@@ -282,7 +283,7 @@ fn toplevel_ancestor(
     for _ in 0..=windows.len() {
         let window = windows.get(&candidate)?;
         match window.role {
-            SurfaceRole::XdgToplevel if !window.minimized => return Some(candidate),
+            SurfaceRole::XdgToplevel if !window.hidden_on_primary() => return Some(candidate),
             SurfaceRole::XdgPopup | SurfaceRole::Subsurface => {
                 candidate = window.parent?;
             }
@@ -293,6 +294,7 @@ fn toplevel_ancestor(
 }
 
 pub(super) fn hit_test_decoration(
+    world: &crate::integrations::wayland::compositor::WaylandWorld,
     windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
     stacking_order: &[WaylandSurfaceId],
     position: PointF,
@@ -308,14 +310,22 @@ pub(super) fn hit_test_decoration(
             .map_or(position, |input| input.map(position));
         if window.role == SurfaceRole::Xwayland
             && window.backend.is_none()
-            && !window.minimized
+            && !window.hidden_on_primary()
             && surface_placement(window, window.position, config).contains(position)
         {
             // An unmanaged menu above a frame owns its pixels; do not activate
             // the underlying titlebar/control through it.
             return None;
         }
-        if window.backend.is_some() && !window.minimized {
+        if window.role == SurfaceRole::XdgToplevel && !window_has_frame(window)
+            && !window.fullscreen && !window.hidden_on_primary()
+            && surface_placement(window, window.position, config).contains(position)
+            && surface_accepts_input(world, windows, *surface, position, config)
+        {
+            // A foreground client's resize margin wins over a background server frame.
+            return None;
+        }
+        if window.backend.is_some() && !window.hidden_on_primary() {
             let content = window_content_rect(window, window.position, config);
             if position.x >= content.x as f32
                 && position.x < content.right() as f32
@@ -333,7 +343,7 @@ pub(super) fn hit_test_decoration(
                 }
             }
         }
-        if window.backend.is_none() || window.minimized || !window_has_frame(window) {
+        if window.backend.is_none() || window.hidden_on_primary() || !window_has_frame(window) {
             continue;
         }
         let outer = window
@@ -418,14 +428,10 @@ pub(super) fn hit_test_decoration(
         };
         if let Some(edge) = edge
             && !window.maximized
-            && window
-                .decoration_policy
-                .frame_parts(window.server_decorated)
-                .resize_regions
         {
             return Some((*surface, DecorationHit::Resize(edge)));
         }
-        if window_is_decorated(window) && local.y < border + config.titlebar_height {
+        if window_has_titlebar(window) && local.y < border + config.titlebar_height {
             let icon_extent = config.titlebar_height.clamp(1, 24);
             for (index, (name, hit)) in [
                 ("window.close", DecorationHit::Close),
@@ -474,7 +480,7 @@ pub(super) fn set_decoration_pointer_cursor(
     {
         return;
     }
-    let next = decoration_pointer_request(frames, windows, stacking_order, position, config, icons)
+    let next = decoration_pointer_request(&wayland.core().world, frames, windows, stacking_order, position, config, icons)
         .map(pointer_request_cursor_image)
         .or_else(|| {
             client_focus
@@ -493,6 +499,7 @@ pub(super) fn set_decoration_pointer_cursor(
 }
 
 pub(super) fn decoration_pointer_request(
+    world: &crate::integrations::wayland::compositor::WaylandWorld,
     frames: &BTreeMap<WaylandSurfaceId, WindowFrameLayer>,
     windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
     stacking_order: &[WaylandSurfaceId],
@@ -500,7 +507,7 @@ pub(super) fn decoration_pointer_request(
     config: &LinuxShellConfig,
     icons: &[(String, Layer)],
 ) -> Option<PointerRequest> {
-    let (surface, hit) = hit_test_decoration(windows, stacking_order, position, config, icons)?;
+    let (surface, hit) = hit_test_decoration(world, windows, stacking_order, position, config, icons)?;
     // Tiled resize cursors belong to the shared-divider controller, including wider hit regions.
     if windows.get(&surface).is_some_and(|w| w.tile.is_some())
         && matches!(hit, DecorationHit::Resize(_))
@@ -577,7 +584,28 @@ pub(super) fn invoke_shell_action(
     handler.invoke(frame.model.clone());
 }
 
+fn surface_accepts_input(
+    world: &crate::integrations::wayland::compositor::WaylandWorld,
+    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
+    surface: WaylandSurfaceId,
+    position: PointF,
+    config: &LinuxShellConfig,
+) -> bool {
+    let Some(state) = world.surface(surface) else { return false };
+    state.snapshot().input_region.as_ref().is_none_or(|region| {
+        let local = surface_local_position(windows, surface, position, config);
+        region.rectangles().iter().any(|rect| {
+            let x = f64::from(local.x);
+            let y = f64::from(local.y);
+            x >= f64::from(rect.x) && y >= f64::from(rect.y)
+                && x < f64::from(rect.x) + f64::from(rect.width)
+                && y < f64::from(rect.y) + f64::from(rect.height)
+        })
+    })
+}
+
 pub(super) fn hit_test_surface(
+    world: &crate::integrations::wayland::compositor::WaylandWorld,
     windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
     stacking_order: &[WaylandSurfaceId],
     position: PointF,
@@ -588,7 +616,7 @@ pub(super) fn hit_test_surface(
     // exclusive pointer ownership so leaving it sends a fresh enter to that client,
     // even when the client had focus before the pointer crossed the frame.
     if !session_locked
-        && hit_test_decoration(windows, stacking_order, position, config, &[]).is_some()
+        && hit_test_decoration(world, windows, stacking_order, position, config, &[]).is_some()
     {
         return None;
     }
@@ -599,11 +627,25 @@ pub(super) fn hit_test_surface(
         .filter(|(surface, _)| {
             resize_veil_owner(windows, *surface).is_none_or(|owner| owner == *surface)
         })
-        .find(|(_, window)| {
+        // Test committed protocol state before selecting an occluding surface. An empty
+        // input region makes a rendering subsurface transparent to input, not to painting.
+        .filter(|(surface, _)| {
+            surface_accepts_input(world, windows, *surface, position, config)
+        })
+        .find(|(surface, window)| {
             let position = window.motion_input.map_or(position, |input|input.map(position));
-            let target = window_content_rect(window, window.position, config);
+            let origin = surface_tree_position(windows, *surface, config);
+            let target = if window.role == SurfaceRole::XdgToplevel
+                && !window_has_frame(window) && !window.fullscreen
+            {
+                // GTK resize handles live in the surface margins outside xdg geometry.
+                // The committed input region above excludes noninteractive shadow pixels.
+                surface_placement(window, origin, config).target
+            } else {
+                window_content_rect(window, origin, config)
+            };
             window.role != SurfaceRole::Cursor
-                && !window.minimized
+                && client::surface_tree_visible(windows, *surface)
                 && (window.role == SurfaceRole::SessionLock) == session_locked
                 && position.x >= target.x as f32
                 && position.y >= target.y as f32
@@ -615,7 +657,7 @@ pub(super) fn hit_test_surface(
         .filter(|(surface, window)| {
             let position = window.motion_input.map_or(position, |input|input.map(position));
             !window.motion_input.is_some_and(|i|i.block_content) && resize_veil_owner(windows, *surface).is_none()
-                && surface_placement(window, window.position, config).contains(position)
+                && surface_placement(window, surface_tree_position(windows, *surface, config), config).contains(position)
                 // Rounded corner handles overlap the rectangular content slot. Use the same
                 // chrome geometry as cursor/decoration routing so leaving a handle produces a
                 // fresh client enter (and a new opportunity to install its cursor).
@@ -637,14 +679,119 @@ pub(super) fn normalized_output_position(normalized: PointF, extent: SizeI) -> P
 }
 
 #[cfg(test)]
+pub(super) fn test_input_world(surfaces: &[WaylandSurfaceId]) -> crate::integrations::wayland::compositor::WaylandWorld {
+    use crate::integrations::wayland::compositor::{ClientId, WaylandWorld};
+    let mut world = WaylandWorld::default();
+    let client = ClientId::from_raw(1).unwrap();
+    world.add_client(client).unwrap();
+    for surface in surfaces {
+        world.create_surface(client, *surface).unwrap();
+    }
+    world
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_resize_margins_receive_input_but_transparent_shadows_do_not() {
+        use super::super::client::maximize_preview_tests::test_window;
+        use crate::integrations::wayland::compositor::Region;
+        let back = WaylandSurfaceId::from_raw(1).unwrap();
+        let front = WaylandSurfaceId::from_raw(2).unwrap();
+        let stack = [back, front];
+        let config = LinuxShellConfig::default();
+        let mut world = test_input_world(&stack);
+        let mut background = test_window(SizeI { width: 800, height: 600 }, PointI::default());
+        background.server_decorated = false;
+        let mut firefox = test_window(SizeI { width: 440, height: 330 }, PointI { x: 100, y: 100 });
+        firefox.server_decorated = false;
+        firefox.window_geometry = RectI { x: 20, y: 15, width: 400, height: 300 };
+        // Five pixels of active resize margin surround the declared window geometry.
+        world.surface_mut(front).unwrap().set_input_region(Some(Region::from_rectangles(vec![
+            RectI { x: 15, y: 10, width: 410, height: 310 },
+        ]).unwrap()));
+        world.surface_mut(front).unwrap().commit().unwrap();
+        let mut windows = BTreeMap::from([(back, background), (front, firefox)]);
+        for point in [
+            PointF { x: 97.0, y: 200.0 }, PointF { x: 502.0, y: 200.0 },
+            PointF { x: 200.0, y: 97.0 }, PointF { x: 200.0, y: 402.0 },
+            PointF { x: 97.0, y: 97.0 }, PointF { x: 502.0, y: 402.0 },
+        ] {
+            assert_eq!(hit_test_surface(&world, &windows, &stack, point, &config, false), Some(front), "{point:?}");
+        }
+        for point in [PointF { x: 90.0, y: 200.0 }, PointF { x: 200.0, y: 410.0 }] {
+            assert_eq!(hit_test_surface(&world, &windows, &stack, point, &config, false), Some(back));
+        }
+        let background = windows.get_mut(&back).unwrap();
+        background.server_decorated = true;
+        background.position = PointI { x: 50, y: 90 };
+        let margin = PointF { x: 97.0, y: 97.0 };
+        assert_eq!(hit_test_surface(&world, &windows, &stack, margin, &config, false), Some(front));
+        assert_eq!(hit_test_decoration(&world, &windows, &stack, margin, &config, &[]), None);
+        let shadow = PointF { x: 90.0, y: 97.0 };
+        assert!(matches!(hit_test_decoration(&world, &windows, &stack, shadow, &config, &[]), Some((owner, _)) if owner == back));
+    }
+
+    #[test]
+    fn committed_input_regions_route_through_firefox_rendering_subsurface() {
+        use super::super::client::maximize_preview_tests::test_window;
+        use crate::integrations::wayland::compositor::Region;
+        let root = WaylandSurfaceId::from_raw(7).unwrap();
+        let child = WaylandSurfaceId::from_raw(4).unwrap();
+        let stack = [root, child];
+        let config = LinuxShellConfig::default();
+        let mut world = test_input_world(&stack);
+        let size = SizeI { width: 400, height: 300 };
+        let mut parent = test_window(size, PointI { x: 48, y: 48 });
+        parent.server_decorated = false;
+        parent.window_geometry.x = 26;
+        parent.window_geometry.y = 23;
+        let mut content = test_window(size, PointI::default());
+        content.role = SurfaceRole::Subsurface;
+        content.backend = None;
+        content.parent = Some(root);
+        content.offset = PointI { x: 26, y: 23 };
+        let windows = BTreeMap::from([(root, parent), (child, content)]);
+        let pointer = PointF { x: 100.0, y: 100.0 };
+        let hit = |world: &crate::integrations::wayland::compositor::WaylandWorld, point| {
+            hit_test_surface(world, &windows, &stack, point, &config, false)
+        };
+        assert_eq!(hit(&world, pointer), Some(child)); // Default region is infinite.
+        world.surface_mut(child).unwrap().set_input_region(Some(Region::empty()));
+        assert_eq!(hit(&world, pointer), Some(child)); // Pending state is not effective.
+        world.surface_mut(child).unwrap().commit().unwrap();
+        assert_eq!(hit(&world, pointer), Some(root));
+
+        // Regions use surface-local logical coordinates, independent of buffer scale.
+        let state = world.surface_mut(child).unwrap();
+        state.set_buffer_scale(2).unwrap();
+        state.set_input_region(Some(Region::from_rectangles(vec![RectI {
+            x: 50, y: 50, width: 10, height: 10,
+        }]).unwrap()));
+        state.commit().unwrap();
+        assert_eq!(hit(&world, pointer), Some(child)); // Child-local (52, 52).
+        assert_eq!(hit(&world, PointF { x: 97.5, y: 100.0 }), Some(root));
+        assert_eq!(hit(&world, PointF { x: 108.0, y: 100.0 }), Some(root));
+        assert_eq!(hit(&world, PointF { x: 100.0, y: 108.0 }), Some(root));
+
+        world.surface_mut(child).unwrap().set_input_region(None);
+        world.surface_mut(child).unwrap().commit().unwrap();
+        assert_eq!(hit(&world, PointF { x: 108.0, y: 100.0 }), Some(child));
+        for surface in stack {
+            world.surface_mut(surface).unwrap().set_input_region(Some(Region::empty()));
+            world.surface_mut(surface).unwrap().commit().unwrap();
+        }
+        assert_eq!(hit(&world, pointer), None);
+    }
 
     #[test]
     fn foreground_resize_border_revokes_background_pointer_focus() {
         use super::super::client::maximize_preview_tests::test_window;
         let back = WaylandSurfaceId::from_raw(1).unwrap();
         let front = WaylandSurfaceId::from_raw(2).unwrap();
+        let world = test_input_world(&[back, front]);
         let config = LinuxShellConfig::default();
         let mut windows = BTreeMap::from([
             (
@@ -689,15 +836,15 @@ mod tests {
             let border = PointF { x: 200.0, y: 280.0 };
             let behind = PointF { x: 180.0, y: 280.0 };
             assert!(
-                matches!(hit_test_decoration(&windows, &stack, border, &config, &[]),
+                matches!(hit_test_decoration(&world, &windows, &stack, border, &config, &[]),
             Some((id, DecorationHit::Resize(_))) if id == front)
             );
             assert_eq!(
-                hit_test_surface(&windows, &stack, border, &config, false),
+                hit_test_surface(&world, &windows, &stack, border, &config, false),
                 None
             );
             assert_eq!(
-                hit_test_surface(&windows, &stack, behind, &config, false),
+                hit_test_surface(&world, &windows, &stack, behind, &config, false),
                 Some(back)
             );
             assert!(pointer_focus_requires_transition(None, Some(back)));

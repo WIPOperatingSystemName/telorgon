@@ -5,12 +5,16 @@ use crate::theme::MotionPreference;
 use crate::{WindowMotion, WindowTween};
 use std::collections::{BTreeMap, BTreeSet};
 pub(super) mod geometry;
+mod image;
+mod admission;
+mod timing;
+pub(super) use image::{SnapshotInput, image_scene, position_images};
 use geometry::GeometryTrack;
 
 #[derive(Clone, Debug)]
 pub(super) enum SnapshotContent {
     Capture(Vec<ShellPlacement>),
-    Mix(Vec<(u64, f32)>),
+    Mix(Vec<SnapshotInput>),
 }
 #[derive(Clone, Debug)]
 pub(super) struct SnapshotCommand {
@@ -45,6 +49,8 @@ pub(super) struct WindowState {
     pub minimized: bool,
     pub veiled: bool,
     pub style: WindowMotion,
+    pub client_decorated: bool,
+    /// Preview contour; client decorations only receive this mask during a preview handoff.
     pub corner_radii: crate::ui::CornerRadii,
     pub shadows: crate::ui::ShadowList,
 }
@@ -98,12 +104,13 @@ struct WindowVisual {
     state: WindowState,
     placements: Vec<ShellPlacement>,
     captured: Option<u64>,
-    displayed: Option<u64>,
-    outgoing: Option<u64>,
+    displayed: Option<(u64, crate::foundation::RectF)>,
+    outgoing: Option<(u64, crate::foundation::RectF)>,
     bounds: RectI,
     geometry_from: RectI,
     geometry: GeometryTrack,
     visibility: Track,
+    opening: Track,
     content: Track,
     order: usize,
     placement_handoff: bool,
@@ -114,6 +121,9 @@ struct WindowVisual {
     last_output: Option<(SnapshotOutput, ShellPlacement)>,
     last_shadow: Option<(crate::graphics::render::BoxInstance, crate::foundation::PointI)>,
     above: Vec<ShellLayerKey>,
+    last_trace: Option<u64>,
+    last_frame: u64,
+    sample_time: u64,
 }
 struct ClosingWindow {
     above: Vec<ShellLayerKey>,
@@ -121,6 +131,7 @@ struct ClosingWindow {
     output: SnapshotOutput,
     placement: ShellPlacement,
     opacity: Track,
+    started: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VisualInput {
@@ -140,8 +151,10 @@ impl VisualInput {
 pub(super) struct WindowMotionController {
     inputs: BTreeMap<u32, VisualInput>,
     windows: BTreeMap<u32, WindowVisual>,
+    presented: BTreeSet<u32>,
     closing: BTreeMap<u32, ClosingWindow>,
     next_id: u64,
+    widget_opacities: BTreeMap<u32, f32>,
     shadows: Option<super::scene::ShellComposition>,
 }
 fn next_id(next: &mut u64) -> u64 {
@@ -149,9 +162,16 @@ fn next_id(next: &mut u64) -> u64 {
     *next
 }
 impl WindowMotionController {
+    pub(super) fn withdraw_from_primary(&mut self, id: u32) {
+        self.inputs.remove(&id);
+        self.windows.remove(&id);
+        self.closing.remove(&id);
+    }
+
     /// Withdrawal, rather than a close request, is authoritative: clients may refuse to close.
     pub(super) fn close(&mut self, id: u32, now: u64) {
         self.inputs.remove(&id);
+        self.presented.remove(&id);
         let Some(visual) = self.windows.remove(&id) else {
             return;
         };
@@ -172,6 +192,7 @@ impl WindowMotionController {
                 placement,
                 above: visual.above,
                 opacity,
+                started: false,
             },
         );
     }
@@ -194,6 +215,7 @@ impl WindowMotionController {
             visual.geometry_from = visual.state.bounds;
             visual.geometry = GeometryTrack::fixed(visual.state.bounds);
             visual.visibility = Track::fixed(if visual.state.minimized { 0.0 } else { 1.0 });
+            visual.opening = Track::fixed(1.0);
             visual.content = Track::fixed(1.0);
             visual.placement_handoff = false;
             visual.drag_restore = false;
@@ -208,10 +230,9 @@ impl WindowMotionController {
         frame: &mut ShellFrame,
         widgets: &[(u32, f32)],
     ) {
+        self.widget_opacities.retain(|id, _| widgets.iter().any(|(widget, _)| widget == id));
         for &(id, opacity) in widgets {
-            if opacity >= 1.0 {
-                continue;
-            }
+            let previous = self.widget_opacities.insert(id, opacity).unwrap_or(1.0);
             let belongs = |key| {
                 matches!(key,
                 ShellLayerKey::Widget(owner) | ShellLayerKey::TilePreview(owner) | ShellLayerKey::WindowPreview(owner, _, _) | ShellLayerKey::OutputPreview(owner, _, _) if owner == id)
@@ -219,6 +240,14 @@ impl WindowMotionController {
             let Some(index) = frame.placements.iter().position(|p| belongs(p.key)) else {
                 continue;
             };
+            // Composition damage was computed before group opacity was applied. Invalidate
+            // late fades and their final opaque frame, including dependent glass above them.
+            if previous != opacity {
+                frame.damage = None;
+            }
+            if opacity >= 1.0 {
+                continue;
+            }
             let bounds = frame.placements[index].target;
             let local = frame
                 .placements
@@ -262,8 +291,10 @@ fn extent(r: RectI) -> SizeI {
         height: r.height.max(1),
     }
 }
-pub(super) fn minimize_rect(mut target: RectI, opacity: f32) -> RectI {
-    let shrink = 0.92 + 0.08 * opacity;
+pub(super) fn minimize_rect(target: RectI, opacity: f32) -> RectI {
+    scale_rect(target, 0.92 + 0.08 * opacity)
+}
+fn scale_rect(mut target: RectI, shrink: f32) -> RectI {
     let width = (target.width as f32 * shrink).round().max(1.0) as i32;
     let height = (target.height as f32 * shrink).round().max(1.0) as i32;
     target.x += (target.width - width) / 2;
@@ -321,26 +352,41 @@ impl WindowMotionController {
             input
         })
     }
+    pub(super) fn transition_pending(&self, id: u32) -> bool {
+        self.windows.get(&id).is_some_and(|v| {
+            (!v.state.minimized && v.state.veiled) || v.geometry.pending() || v.visibility.from != v.visibility.to
+                || v.content.from != v.content.to || v.opening.from != v.opening.to
+        })
+    }
+
     pub fn active(&self, _now: u64) -> bool {
         !self.closing.is_empty()
             || self.windows.values().any(|v| {
                 v.geometry.pending()
+                    || v.opening.from != v.opening.to
                     || v.visibility.from != v.visibility.to
                     || v.content.from != v.content.to
             })
     }
     /// Frame transforms are rendering-only. Protocol readiness is supplied by the host.
-    pub fn apply(
+    pub fn apply_at(
         &mut self,
         frame: &mut ShellFrame,
         states: BTreeMap<u32, WindowState>,
         owners: &BTreeMap<u32, u32>,
         now: u64,
+        sample_now: u64,
         preference: MotionPreference,
     ) {
         frame.motion.fallback = frame.placements.clone();
         self.inputs.clear();
-        let was_active = self.active(now);
+        let was_active = self.active(sample_now);
+        self.presented.retain(|id| states.contains_key(id));
+        // Keep first presentation separate from transient capture eviction and reduced motion.
+        let first_presentations: BTreeSet<_> = frame.placements.iter()
+            .filter_map(|p| surface_for_key(p.key).and_then(|id| owners.get(&id)).copied())
+            .filter(|id| states.contains_key(id) && self.presented.insert(*id))
+            .collect();
         if preference == MotionPreference::Reduced {
             self.windows.clear();
             self.closing.clear();
@@ -370,7 +416,13 @@ impl WindowMotionController {
         let mut pixels = 0_u64;
         // Closed clients own no input or protocol state. Only immutable renderer snapshots survive.
         self.closing.retain(|id, closing| {
-            if states.contains_key(id) || !closing.opacity.active(now) {
+            // Event processing may stall before the next render. Give the exit effect
+            // its full duration starting with the first frame that can display it.
+            if !closing.started {
+                closing.opacity.start = now;
+                closing.started = true;
+            }
+            if states.contains_key(id) || !closing.opacity.active(sample_now) {
                 return false;
             }
             let area = closing.output.extent.width.max(1) as u64
@@ -385,7 +437,7 @@ impl WindowMotionController {
                 .find_map(|key| frame.placements.iter().position(|p| p.key == *key))
                 .unwrap_or(frame.placements.len());
             let mut output = closing.output.clone();
-            output.opacity = closing.opacity.sample(now);
+            output.opacity = closing.opacity.sample(sample_now);
             // Normalize against the last visible opacity to avoid a jump if closing interrupts minimize.
             let remaining = output.opacity / closing.output.opacity;
             let mut placement = closing.placement;
@@ -430,23 +482,7 @@ impl WindowMotionController {
             outputs.push((order, placement));
             true
         });
-        let mut candidates = states
-            .into_iter()
-            .filter(|(_, s)| s.style.enabled())
-            .map(|(id, state)| {
-                let active = self.windows.get(&id).is_some_and(|v| {
-                    v.state.placement_changed(state)
-                        || v.state.minimized != state.minimized
-                        || v.state.veiled != state.veiled
-                        || v.geometry.pending()
-                        || v.visibility.from != v.visibility.to
-                        || v.content.from != v.content.to
-                });
-                (id, state, active)
-            })
-            .collect::<Vec<_>>();
-        // Admission must follow presentation activity, not native surface-ID allocation order.
-        candidates.sort_by_key(|(id, _, active)| (!*active, *id));
+        let candidates = admission::candidates(states, &self.windows, &first_presentations, &groups);
         for (id, state, active) in candidates {
             let group = groups.remove(&id).unwrap_or_default();
             if group.is_empty() && !state.minimized {
@@ -494,6 +530,16 @@ impl WindowMotionController {
                 geometry_from: state.bounds,
                 geometry: GeometryTrack::fixed(state.bounds),
                 visibility: Track::fixed(if state.minimized { 0.0 } else { 1.0 }),
+                opening: {
+                    let from = if first_presentations.contains(&id) && !state.minimized {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let mut track = Track::fixed(from);
+                    track.retarget(1.0, state.style.open_transition(), now);
+                    track
+                },
                 content: Track::fixed(1.0),
                 order: group.first().map_or(0, |(i, _)| *i),
                 placement_handoff: false,
@@ -504,8 +550,12 @@ impl WindowMotionController {
                 last_output: None,
                 last_shadow: None,
                 above: Vec::new(),
+                last_trace: None,
+                last_frame: now,
+                sample_time: now,
             });
-            let current_sample = visual.geometry.sample(now);
+            let current_sample = visual.geometry.sample(now.max(visual.sample_time));
+            visual.sample_time = sample_now;
             let current_geometry = current_sample.rect();
             if visual.state.arranged() && !state.arranged() && state.move_pointer.is_some() {
                 visual.drag_restore = true;
@@ -540,7 +590,7 @@ impl WindowMotionController {
                         (pointer.x - fraction * current_geometry.width as f32).round() as i32;
                     visual.geometry_from.y = state.bounds.y;
                 }
-                let continuing = visual.geometry.active(now);
+                let continuing = visual.geometry.active(sample_now);
                 let mut from = current_sample;
                 if visual.drag_restore
                     && let Some(pointer) = state.move_pointer
@@ -582,7 +632,7 @@ impl WindowMotionController {
                     );
                 } else {
                     // Direct manipulation follows the pointer. A measured maximize/tile target retargets.
-                    if visual.geometry.active(now) {
+                    if visual.geometry.active(sample_now) {
                         let start = visual.geometry.start.max(now);
                         let end = visual
                             .geometry
@@ -616,7 +666,7 @@ impl WindowMotionController {
             // An early redraw cannot interrupt entry/movement. Keep the captured placeholder
             // until geometry reaches its destination, then start the ready-content fade.
             let hold_placeholder =
-                visual.placement_handoff && visual.geometry.active(now) && !state.veiled;
+                visual.placement_handoff && visual.geometry.active(sample_now) && !state.veiled;
             let mut presented_state = state;
             if hold_placeholder {
                 presented_state.veiled = true;
@@ -675,8 +725,13 @@ impl WindowMotionController {
                     visual.bounds = map_rect(visual.bounds, visual.state.bounds, state.bounds);
                 }
             }
+            let trace_changed = visual.state.placement_changed(state)
+                || visual.state.interactive != state.interactive
+                || content_changed;
             visual.state = presented_state;
-            let opacity = visual.visibility.sample(now);
+            let visibility = visual.visibility.sample(sample_now);
+            let opening = visual.opening.sample(sample_now);
+            let opacity = visibility * opening;
             if state.minimized && opacity <= 0.0 {
                 visual.last_output = None;
                 visual.captured = None;
@@ -685,6 +740,7 @@ impl WindowMotionController {
                 visual.placements.clear();
                 visual.visibility = Track::fixed(0.0);
                 visual.geometry = GeometryTrack::fixed(state.bounds);
+                visual.opening = Track::fixed(1.0);
                 visual.content = Track::fixed(1.0);
                 continue;
             }
@@ -692,8 +748,9 @@ impl WindowMotionController {
                 continue;
             };
             let mut displayed = captured;
-            let t = visual.content.sample(now);
-            if let Some(from) = visual.outgoing
+            let t = visual.content.sample(sample_now);
+            let canvas = image::relative_bounds(visual.bounds, state.bounds);
+            if let Some((from, from_canvas)) = visual.outgoing
                 && t < 1.0
             {
                 let mix = next_id(&mut self.next_id);
@@ -705,17 +762,23 @@ impl WindowMotionController {
                     } else {
                         extent(visual.bounds)
                     },
-                    content: SnapshotContent::Mix(vec![(from, 1.0 - t), (captured, t)]),
+                    content: SnapshotContent::Mix(vec![
+                        SnapshotInput::aligned(from, 1.0 - t, from_canvas, canvas),
+                        (captured, t).into(),
+                    ]),
                 });
                 frame.motion.live.insert(from);
                 displayed = mix;
             } else {
                 visual.outgoing = None;
             }
-            visual.displayed = Some(displayed);
+            visual.displayed = Some((displayed, canvas));
             frame.motion.live.extend([captured, displayed]);
-            let geometry = visual.geometry.sample(now).rect();
-            let target = minimize_rect(map_rect(visual.bounds, state.bounds, geometry), opacity);
+            let geometry = visual.geometry.sample(sample_now).rect();
+            let opening_scale = state.style.open_initial_scale();
+            let scale = (0.92 + 0.08 * visibility)
+                * (opening_scale + (1.0 - opening_scale) * opening);
+            let target = scale_rect(map_rect(visual.bounds, state.bounds, geometry), scale);
             let visual_outer = map_rect(state.bounds, visual.bounds, target);
             let float = |r: RectI| crate::foundation::RectF {
                 x: r.x as f32,
@@ -731,7 +794,7 @@ impl WindowMotionController {
                     block_content: state.veiled
                         || t < 1.0
                         || opacity < 1.0
-                        || visual.geometry.active(now),
+                        || visual.geometry.active(sample_now),
                 },
             );
             if hold_placeholder || t <= 0.0 || opacity <= 0.0 {
@@ -745,8 +808,8 @@ impl WindowMotionController {
             }
             if visual.placement_handoff
                 && !presented_state.veiled
-                && !visual.geometry.active(now)
-                && !visual.content.active(now)
+                && !visual.geometry.active(sample_now)
+                && !visual.content.active(sample_now)
             {
                 // Publish the unclipped resting state in the final fully damaged frame.
                 // Clearing this after emitting the placement leaves the shadow clipped until
@@ -758,7 +821,7 @@ impl WindowMotionController {
                 visual.shared_resize = true;
             }
             if visual.shared_resize {
-                if state.tiled.is_some() && (state.veiled || visual.content.active(now)) {
+                if state.tiled.is_some() && (state.veiled || visual.content.active(sample_now)) {
                     frame.motion.resize_group.insert(id);
                 } else {
                     visual.shared_resize = false;
@@ -768,10 +831,10 @@ impl WindowMotionController {
             let separate_shadow = visual.placement_handoff
                 || state.interactive
                 || state.veiled
-                || visual.content.active(now);
+                || visual.content.active(sample_now);
             visual.last_shadow = None;
             if separate_shadow {
-                let moving = visual.placement_handoff && visual.geometry.active(now);
+                let moving = visual.placement_handoff && visual.geometry.active(sample_now);
                 let rect = crate::foundation::RectF {
                     x: 0.0,
                     y: 0.0,
@@ -823,8 +886,10 @@ impl WindowMotionController {
                     scene: ShellSceneKey::Motion(output),
                     target,
                     clip: None,
-                    rounded_clips: if separate_shadow {
-                        let radii = if visual.placement_handoff && visual.geometry.active(now) {
+                    rounded_clips: if separate_shadow && (!state.client_decorated
+                        || presented_state.veiled || visual.content.active(sample_now)
+                        || visual.placement_handoff) {
+                        let radii = if visual.placement_handoff && visual.geometry.active(sample_now) {
                             visual.motion_radii
                         } else {
                             state.corner_radii
@@ -842,18 +907,35 @@ impl WindowMotionController {
                 frame.motion.outputs.last().unwrap().clone(),
                 outputs.last().unwrap().1,
             ));
+            if super::preview_trace::enabled() {
+                let transitioning = state.veiled || visual.placement_handoff || visual.content.active(sample_now);
+                let finished = !visual.content.active(sample_now) && visual.content.from != visual.content.to;
+                if trace_changed || finished || (transitioning
+                    && visual.last_trace.is_none_or(|last| now.saturating_sub(last) >= 100_000_000))
+                {
+                    super::preview_trace::event(format_args!(
+                        "window={id} now_ns={now} client_decorated={} veiled={} held={} handoff={} interactive={} content={t:.3} frame_gap_us={} bounds={:?} capture_bounds={:?} displayed={visual_outer:?} radii={:?} capture={captured} output={displayed}",
+                        state.client_decorated, state.veiled, hold_placeholder,
+                        visual.placement_handoff, state.interactive,
+                        now.saturating_sub(visual.last_frame) / 1000,
+                        state.bounds, visual.bounds, outputs.last().unwrap().1.rounded_clips,
+                    ));
+                    visual.last_trace = Some(now);
+                }
+                visual.last_frame = now;
+            }
             replaced.extend(group.iter().map(|(i, _)| *i));
-            visual.geometry.finish(now);
-            for track in [&mut visual.visibility, &mut visual.content] {
-                if !track.active(now) {
+            visual.geometry.finish(sample_now);
+            for track in [&mut visual.visibility, &mut visual.opening, &mut visual.content] {
+                if !track.active(sample_now) {
                     *track = Track::fixed(track.to);
                 }
             }
-            if !visual.geometry.active(now) {
+            if !visual.geometry.active(sample_now) {
                 visual.drag_restore = false;
             }
         }
-        if was_active || self.active(now) {
+        if was_active || self.active(sample_now) {
             // Motion changes can uncover any underlying layer, including shadows.
             frame.damage = None;
         }
@@ -906,64 +988,6 @@ fn motion_shadow(
     Some(layer)
 }
 
-/// One sampled image per input. Additive blending sums premultiplied weighted endpoints.
-pub(super) fn image_scene(
-    extent: SizeI,
-    inputs: &[(crate::graphics::render::ImageId, f32)],
-    additive: bool,
-) -> crate::graphics::render::RenderScene {
-    use crate::foundation::{ColorRgba8, RectF, SizeF};
-    use crate::graphics::render::*;
-    use crate::graphics::scene::NodeId;
-    let mut scene = RenderScene::default();
-    scene.extent = SizeF {
-        width: extent.width as f32,
-        height: extent.height as f32,
-    };
-    scene.background = ColorRgba8::rgba(0, 0, 0, 0);
-    scene.damage.full = true;
-    let rect = RectF {
-        x: 0.0,
-        y: 0.0,
-        width: extent.width as f32,
-        height: extent.height as f32,
-    };
-    let mut order = Vec::new();
-    for (index, (image, opacity)) in inputs.iter().enumerate() {
-        let node = NodeId::new(index as u32 + 1, 1);
-        scene.images.upsert(
-            node,
-            ImageInstance {
-                node,
-                image: *image,
-                tint: None,
-                rect,
-                view_bounds: rect,
-                content_version: 1,
-                opacity: *opacity,
-                clip: ClipId(0),
-                spatial: SpatialId(0),
-            },
-        );
-        order.push(DrawItem {
-            kind: PrimitiveKind::Image,
-            index: index as u32,
-            batch: BatchKey {
-                pipeline: PipelineKind::Image,
-                resource: image.0,
-                clip: ClipId(0),
-                blend: if additive {
-                    BlendMode::Add
-                } else {
-                    BlendMode::Alpha
-                },
-                target: 0,
-            },
-        });
-    }
-    scene.set_draw_order(order);
-    scene
-}
 
 #[cfg(test)]
 mod tests;

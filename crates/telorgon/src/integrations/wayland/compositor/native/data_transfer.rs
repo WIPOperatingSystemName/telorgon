@@ -107,36 +107,20 @@ impl NativeState {
     ) -> Result<DispatchOutcome, NativeCompositorError> {
         match request.message().name {
             "set_selection" => {
-                let focus = self
-                    .core
-                    .seats
-                    .get(&seat)
-                    .and_then(|seat| seat.keyboard_focus)
-                    .ok_or_else(|| NativeCompositorError::new("seat has no keyboard focus"))?;
-                if focus.client != context.client {
-                    return Err(NativeCompositorError::new(
-                        "only the keyboard-focused client may set the selection",
-                    ));
-                }
+                let Some(focus) = self.core.seats.get(&seat).and_then(|seat| seat.keyboard_focus) else { return Ok(DispatchOutcome::default()); };
+                if focus.client != context.client { return Ok(DispatchOutcome::default()); }
                 let serial = request.uint(1).map_err(error)?;
-                self.core
-                    .serials
-                    .consume(
-                        context.client,
-                        serial,
-                        &[
-                            crate::integrations::wayland::compositor::SerialKind::PointerButton,
-                            crate::integrations::wayland::compositor::SerialKind::KeyboardKey,
-                        ],
-                        None,
-                    )
-                    .map_err(error)?;
+                if self.core.serials.validate(context.client, serial, &[
+                    crate::integrations::wayland::compositor::SerialKind::PointerButton,
+                    crate::integrations::wayland::compositor::SerialKind::KeyboardKey,
+                ], None).is_err() { return Ok(DispatchOutcome::default()); }
                 let source = request
                     .object(0)
                     .map_err(error)?
                     .map(|resource| self.data_source_from_resource(resource))
                     .transpose()?;
                 let previous = self.core.data_devices.selection();
+                if previous == source { return Ok(DispatchOutcome::default()); }
                 self.core
                     .data_devices
                     .set_selection(context.client, source)
@@ -375,27 +359,32 @@ impl NativeState {
                 }
             }
             "receive" => {
+                if self.active_session_lock.is_some() || self.secure_session_locked {
+                    let _fd = request.take_fd(1).map_err(error)?;
+                    return Ok(DispatchOutcome::default());
+                }
                 let mime =
                     crate::integrations::wayland::compositor::MimeType::new(c_string(request, 0)?)
                         .map_err(error)?;
-                let source = self
-                    .core
-                    .data_devices
-                    .offer(offer)
-                    .and_then(|offer| self.core.data_devices.source(offer.source))
-                    .cloned()
-                    .ok_or_else(|| NativeCompositorError::new("unknown data offer source"))?;
+                let Some(source) = self.core.data_devices.offer(offer)
+                    .and_then(|offer| self.core.data_devices.source(offer.source)).cloned() else {
+                        let _fd = request.take_fd(1).map_err(error)?;
+                        return Ok(DispatchOutcome::default());
+                    };
                 if !source.mime_types.contains(&mime) {
                     return Err(NativeCompositorError::new(
                         "requested MIME type was not offered",
                     ));
                 }
                 let fd = request.take_fd(1).map_err(error)?;
+                if self.send_host_clipboard(source.object, mime.as_str(), fd.try_clone().map_err(error)?)? {
+                    return Ok(DispatchOutcome::default());
+                }
                 let source_resource = self.data_source_resource(source.object)?;
                 let mime = protocol_string(mime.as_str());
                 self.post_event(
                     source_resource,
-                    "wl_data_source",
+                    self.source_interface(source_resource)?,
                     "send",
                     &mut [
                         ffi::wl_argument { s: mime.as_ptr() },
@@ -521,7 +510,7 @@ impl NativeState {
         source: ProtocolObjectId,
     ) -> Result<ResourceRef<'_>, NativeCompositorError> {
         self.resource_for_kind(
-            |kind| matches!(kind, ResourceKind::DataSource(candidate) if candidate == source),
+            |kind| matches!(kind, ResourceKind::DataSource(candidate) | ResourceKind::PrimarySource(candidate) if candidate == source),
         )?
         .ok_or_else(|| NativeCompositorError::new("wl_data_source resource is absent"))
     }
@@ -531,9 +520,9 @@ impl NativeState {
         source: ProtocolObjectId,
     ) -> Result<(), NativeCompositorError> {
         if let Some(resource) = self.resource_for_kind(
-            |kind| matches!(kind, ResourceKind::DataSource(candidate) if candidate == source),
+            |kind| matches!(kind, ResourceKind::DataSource(candidate) | ResourceKind::PrimarySource(candidate) if candidate == source),
         )? {
-            self.post_event(resource, "wl_data_source", "cancelled", &mut [])?;
+            self.post_event(resource, self.source_interface(resource)?, "cancelled", &mut [])?;
         }
         Ok(())
     }
@@ -543,6 +532,7 @@ impl NativeState {
         seat: u32,
         client: ClientId,
     ) -> Result<(), NativeCompositorError> {
+        self.send_primary_to_client(seat, client, false)?;
         let devices = self
             .resources_for_client(
                 client,
@@ -567,6 +557,7 @@ impl NativeState {
         seat: u32,
         client: ClientId,
     ) -> Result<(), NativeCompositorError> {
+        self.send_primary_to_client(seat, client, true)?;
         self.core.data_devices.remove_offers_for_target(client);
         for resource in self.resources_for_client(
             client,
@@ -589,10 +580,16 @@ impl NativeState {
         device: ResourceRef<'_>,
         client: ClientId,
     ) -> Result<(), NativeCompositorError> {
-        let Some(selection) = self.core.data_devices.selection() else {
+        self.send_selection_device_kind(device, client, false)
+    }
+    pub(super) fn send_selection_device_kind(&mut self, device: ResourceRef<'_>, client: ClientId, primary: bool) -> Result<(), NativeCompositorError> {
+        let device_interface = if primary { "zwp_primary_selection_device_v1" } else { "wl_data_device" };
+        let offer_interface = if primary { "zwp_primary_selection_offer_v1" } else { "wl_data_offer" };
+        let selected = if primary { self.core.data_devices.primary_selection() } else { self.core.data_devices.selection() };
+        let Some(selection) = selected else {
             return self.post_event(
                 device,
-                "wl_data_device",
+                device_interface,
                 "selection",
                 &mut [ffi::wl_argument {
                     o: std::ptr::null_mut(),
@@ -609,10 +606,10 @@ impl NativeState {
         let offer_resource = self.create_resource(
             device.client(),
             client,
-            "wl_data_offer",
+            offer_interface,
             device.version(),
             0,
-            ResourceKind::DataOffer(object),
+            if primary { ResourceKind::PrimaryOffer(object) } else { ResourceKind::DataOffer(object) },
             true,
         )?;
         if let Err(cause) = self.core.data_devices.create_offer(
@@ -635,7 +632,7 @@ impl NativeState {
         }
         self.post_event(
             device,
-            "wl_data_device",
+            device_interface,
             "data_offer",
             &mut [ffi::wl_argument {
                 o: offer_resource.identity() as *mut ffi::wl_resource,
@@ -645,14 +642,14 @@ impl NativeState {
             let mime = protocol_string(mime.as_str());
             self.post_event(
                 offer_resource,
-                "wl_data_offer",
+                offer_interface,
                 "offer",
                 &mut [ffi::wl_argument { s: mime.as_ptr() }],
             )?;
         }
         self.post_event(
             device,
-            "wl_data_device",
+            device_interface,
             "selection",
             &mut [ffi::wl_argument {
                 o: offer_resource.identity() as *mut ffi::wl_resource,

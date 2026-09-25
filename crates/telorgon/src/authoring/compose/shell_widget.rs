@@ -383,6 +383,8 @@ pub struct ShellSurfaceSpec {
     pub reservation: ShellReservation,
     pub dismiss_on_escape: bool,
     pub dismiss_on_outside_press: bool,
+    /// Let an attached popup's trigger handle its own toggle without outside dismissal.
+    pub outside_press_excludes_anchor: bool,
     /// Dismiss after leaving this surface and its attachment anchor/connecting gap.
     pub dismiss_on_pointer_leave: bool,
     pub movement: crate::GeometryMotion,
@@ -410,6 +412,7 @@ impl ShellSurfaceSpec {
             reservation: ShellReservation::None,
             dismiss_on_escape: false,
             dismiss_on_outside_press: false,
+            outside_press_excludes_anchor: false,
             dismiss_on_pointer_leave: false,
             movement: crate::GeometryMotion::Tween(crate::tween_ms(0, crate::Easing::Linear)),
             enter_from: None,
@@ -471,6 +474,10 @@ impl ShellSurfaceSpec {
     }
     pub const fn dismiss_on_outside_press(mut self, value: bool) -> Self {
         self.dismiss_on_outside_press = value;
+        self
+    }
+    pub const fn outside_press_excludes_anchor(mut self, value: bool) -> Self {
+        self.outside_press_excludes_anchor = value;
         self
     }
     pub const fn dismiss_on_pointer_leave(mut self, value: bool) -> Self {

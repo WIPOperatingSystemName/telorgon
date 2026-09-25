@@ -21,12 +21,12 @@ mod interaction;
 mod keybindings;
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows")
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
 ))]
 mod native;
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 pub(super) mod profiler;
@@ -105,3 +105,31 @@ pub use crate::authoring::compose::{
 };
 
 pub use crate::authoring::compose::{TilePreviewDesign, TilePreviewMotion, TileTarget, WindowTiling};
+
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+pub mod video;
+
+#[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+pub mod desktop_audio;
+
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+mod screen_cast_portal;
+pub(crate) mod share_audio;
+pub use share_audio::{ShareAudio, AudioScope, PortalAudioDelivery, PortalAudioRequest, PortalAudioSession};
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub use screen_cast_portal::{ScreenCastPortal, PortalPickerWindow};
+
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub(crate) mod portal_wire;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+mod portal_picker_client;
+
+mod scroll;
+
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+mod portal_picker_application;
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub use portal_picker_application::{PortalPickerApplication, ReadyPortalPickerApplication};
+
+#[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+pub mod audio_mixer;

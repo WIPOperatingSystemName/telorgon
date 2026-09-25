@@ -19,6 +19,15 @@ impl NativeState {
                 "decoration target is not an xdg_toplevel",
             ));
         };
+        if self
+            .decorations
+            .get(&surface)
+            .is_some_and(|state| state.xdg.is_some())
+        {
+            resource.post_error(1, "xdg_toplevel already has a decoration object");
+            return Ok(DispatchOutcome::default());
+        }
+        let object = self.peek_next_object()?;
         let decoration = self.create_resource(
             resource.client(),
             context.client,
@@ -32,6 +41,7 @@ impl NativeState {
             .get_mut(&surface)
             .ok_or_else(|| NativeCompositorError::new("unknown xdg_toplevel"))?
             .decoration = crate::integrations::wayland::compositor::DecorationMode::ServerSide;
+        self.decorations.entry(surface).or_default().xdg = Some(object);
         self.post_event(
             decoration,
             "zxdg_toplevel_decoration_v1",
@@ -44,9 +54,19 @@ impl NativeState {
     pub(super) fn dispatch_toplevel_decoration(
         &mut self,
         resource: ResourceRef<'_>,
+        context: &ResourceContext,
         surface: WaylandSurfaceId,
         request: &IncomingRequest<'_>,
     ) -> Result<DispatchOutcome, NativeCompositorError> {
+        if !self
+            .decorations
+            .get(&surface)
+            .is_some_and(|state| state.xdg == Some(context.object))
+        {
+            return Err(NativeCompositorError::new(
+                "decoration toplevel no longer exists",
+            ));
+        }
         let mode = match request.message().name {
             "set_mode" => match request.uint(0).map_err(error)? {
                 1 => crate::integrations::wayland::compositor::DecorationMode::ClientSide,
@@ -87,7 +107,7 @@ impl NativeState {
             self.send_toplevel_configure(
                 surface,
                 latest.and_then(|configure| configure.size),
-                latest.map_or_else(Default::default, |configure| configure.states),
+                self.requested_toplevel_states.get(&surface).copied().unwrap_or_default(),
             )?;
         }
         Ok(DispatchOutcome::default())

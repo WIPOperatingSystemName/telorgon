@@ -19,6 +19,7 @@ fn previews_share_fill_but_keep_independent_borders() {
         resize_preview: Some(ResizePreviewDesign {
             fill: Fill::None,
             border: tile.border,
+            corner_radius: 12.0,
         }),
     };
     assert_eq!(content.resize_preview.unwrap().border, tile.border);

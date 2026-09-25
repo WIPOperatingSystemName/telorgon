@@ -55,6 +55,7 @@ const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 }
 
 pub const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+pub const DRM_FORMAT_ABGR16161616F: u32 = drm_fourcc(b'A', b'B', b'4', b'H');
 pub const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
 pub const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
 pub const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
@@ -161,22 +162,27 @@ fn validate_metadata(metadata: DmaBufMetadata, damage: &[RectI]) -> RenderResult
             "DMA-BUF plane range exceeds its declared allocation size",
         ));
     }
-    let minimum_row_pitch = u64::from(metadata.extent.width)
-        .checked_mul(4)
-        .ok_or_else(|| invalid_target("DMA-BUF row-pitch calculation overflowed"))?;
-    if u64::from(metadata.row_pitch) < minimum_row_pitch {
-        return Err(host_contract(
-            "DMA-BUF RGBA row pitch is smaller than one pixel row",
-        ));
-    }
-    let minimum_size = u64::from(metadata.row_pitch)
-        .checked_mul(u64::from(metadata.extent.height.saturating_sub(1)))
-        .and_then(|bytes| bytes.checked_add(minimum_row_pitch))
-        .ok_or_else(|| invalid_target("DMA-BUF allocation-size calculation overflowed"))?;
-    if minimum_size > metadata.size {
-        return Err(host_contract(
-            "DMA-BUF row layout exceeds its declared plane size",
-        ));
+    // Tiled/compressed modifiers do not obey a linear row footprint. The driver's
+    // explicit-modifier image creation validates those layouts; keep generic allocation
+    // bounds above, and apply pixel-row arithmetic only to DRM_FORMAT_MOD_LINEAR.
+    if metadata.drm_modifier == DRM_FORMAT_MOD_LINEAR {
+        let minimum_row_pitch = u64::from(metadata.extent.width)
+            .checked_mul(if metadata.drm_fourcc == DRM_FORMAT_ABGR16161616F { 8 } else { 4 })
+            .ok_or_else(|| invalid_target("DMA-BUF row-pitch calculation overflowed"))?;
+        if u64::from(metadata.row_pitch) < minimum_row_pitch {
+            return Err(host_contract(
+                "DMA-BUF RGBA row pitch is smaller than one pixel row",
+            ));
+        }
+        let minimum_size = u64::from(metadata.row_pitch)
+            .checked_mul(u64::from(metadata.extent.height.saturating_sub(1)))
+            .and_then(|bytes| bytes.checked_add(minimum_row_pitch))
+            .ok_or_else(|| invalid_target("DMA-BUF allocation-size calculation overflowed"))?;
+        if minimum_size > metadata.size {
+            return Err(host_contract(
+                "DMA-BUF row layout exceeds its declared plane size",
+            ));
+        }
     }
     if metadata.content_version == 0 || metadata.lease_generation == 0 {
         return Err(host_contract(
@@ -224,6 +230,11 @@ fn drm_format_matches(
     encoding: ImageColorEncoding,
     alpha: ImageAlphaMode,
 ) -> bool {
+    if fourcc == DRM_FORMAT_ABGR16161616F {
+        return format == vk::Format::R16G16B16A16_SFLOAT
+            && encoding == ImageColorEncoding::Linear
+            && matches!(alpha, ImageAlphaMode::Premultiplied | ImageAlphaMode::Straight);
+    }
     let rgba = match encoding {
         ImageColorEncoding::Linear => vk::Format::R8G8B8A8_UNORM,
         ImageColorEncoding::Srgb => vk::Format::R8G8B8A8_SRGB,
@@ -234,13 +245,13 @@ fn drm_format_matches(
     };
     matches!(
         (fourcc, format, alpha),
-        (DRM_FORMAT_ABGR8888, value, ImageAlphaMode::Premultiplied) if value == rgba
+        (DRM_FORMAT_ABGR8888, value, ImageAlphaMode::Premultiplied | ImageAlphaMode::Straight) if value == rgba
     ) || matches!(
         (fourcc, format, alpha),
         (DRM_FORMAT_XBGR8888, value, ImageAlphaMode::Opaque) if value == rgba
     ) || matches!(
         (fourcc, format, alpha),
-        (DRM_FORMAT_ARGB8888, value, ImageAlphaMode::Premultiplied) if value == bgra
+        (DRM_FORMAT_ARGB8888, value, ImageAlphaMode::Premultiplied | ImageAlphaMode::Straight) if value == bgra
     ) || matches!(
         (fourcc, format, alpha),
         (DRM_FORMAT_XRGB8888, value, ImageAlphaMode::Opaque) if value == bgra
@@ -275,7 +286,7 @@ mod linux {
     use ash::vk::{self, Handle};
 
     use super::{
-        DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_ABGR8888, DRM_FORMAT_ABGR16161616F, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
         DmaBufMetadata, ReleaseExportState, validate_metadata,
     };
     use crate::graphics::renderers::vulkan::device::DeviceInner;
@@ -463,7 +474,8 @@ mod linux {
             }
             if extent.width <= 0
                 || extent.height <= 0
-                || row_pitch < extent.width as u32 * 4
+                || u64::from(row_pitch) < extent.width.max(0) as u64
+                    * if drm_fourcc == DRM_FORMAT_ABGR16161616F { 8 } else { 4 }
                 || drm_modifier == super::DRM_FORMAT_MOD_INVALID
             {
                 return Err(RenderError::new(
@@ -914,7 +926,7 @@ mod linux {
         alpha_mode: ImageAlphaMode,
     }
 
-    fn format_candidates() -> [FormatCandidate; 8] {
+    fn format_candidates() -> [FormatCandidate; 9] {
         [
             FormatCandidate {
                 drm_fourcc: DRM_FORMAT_ABGR8888,
@@ -963,6 +975,12 @@ mod linux {
                 format: vk::Format::B8G8R8A8_SRGB,
                 color_encoding: ImageColorEncoding::Srgb,
                 alpha_mode: ImageAlphaMode::Opaque,
+            },
+            FormatCandidate {
+                drm_fourcc: DRM_FORMAT_ABGR16161616F,
+                format: vk::Format::R16G16B16A16_SFLOAT,
+                color_encoding: ImageColorEncoding::Linear,
+                alpha_mode: ImageAlphaMode::Premultiplied,
             },
         ]
     }
@@ -1317,6 +1335,7 @@ mod linux {
                 damage: import.damage,
                 ownership: ExternalImageOwnership::DmaBuf(resources),
                 state: std::sync::atomic::AtomicU64::new(UNUSED),
+                retained_owner: None,
             }))
         }
     }

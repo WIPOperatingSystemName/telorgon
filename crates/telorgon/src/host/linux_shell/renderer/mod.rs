@@ -1,3 +1,5 @@
+#[cfg(feature = "shell-screencast-linux")]
+mod capture_damage;
 mod scanout;
 mod capture;
 pub(super) use capture::{CaptureBuffer, CaptureJob, CaptureView, CaptureSubmitFailure};
@@ -65,11 +67,38 @@ impl ShellRenderer {
         }
     }
 
+    #[cfg(feature = "shell-screencast-linux")]
+    pub(super) fn preview_output_scene(&self, layout: crate::shell::capture::CaptureLayout) -> Option<super::capture_scene::CaptureScene> {
+        match self {
+            Self::Vulkan(renderer) => Some(renderer.preview_output_scene(layout)),
+            Self::Software(_) => None,
+        }
+    }
+
     pub(super) fn allocate_capture(&self, layout: crate::shell::capture::CaptureLayout) -> AppResult<CaptureBuffer> {
         match self {
             Self::Vulkan(renderer) => renderer.allocate_capture(layout),
             Self::Software(_) => Err(crate::host::application::AppError::new("software capture is not implemented")),
         }
+    }
+
+    #[cfg(feature = "shell-screencast-linux")]
+    pub(super) fn capture_memory_budget(&self) -> Option<std::sync::Arc<crate::media::video::MemoryBudget>> {
+        match self { Self::Vulkan(renderer) => Some(renderer.capture_memory_budget()), Self::Software(_) => None }
+    }
+
+    #[cfg(feature = "shell-screencast-linux")]
+    pub(super) fn screen_gpu_producer(&self, layout: crate::shell::capture::CaptureLayout, fps: u32) -> Option<Box<dyn crate::media::video::VideoGpuProducer>> {
+        match self { Self::Vulkan(renderer) => renderer.screen_gpu_producer(layout, fps), Self::Software(_) => None }
+    }
+    #[cfg(feature = "shell-screencast-linux")]
+    pub(super) fn allocate_video_capture(&self, layout: crate::shell::capture::CaptureLayout, format: crate::media::video::VideoFormat, gpu: bool) -> AppResult<CaptureBuffer> {
+        match self { Self::Vulkan(renderer) => renderer.allocate_video_capture(layout, format, gpu), Self::Software(_) => Err(crate::host::application::AppError::new("GPU capture requires Vulkan")) }
+    }
+
+    #[cfg(feature = "shell-screencast-linux")]
+    pub(super) fn capture_damage(&self, after: Option<u64>, layout: crate::shell::capture::CaptureLayout) -> (u64, Vec<crate::media::video::VideoRect>) {
+        match self { Self::Vulkan(renderer) => renderer.capture_damage(after, layout), Self::Software(_) => (0, Vec::new()) }
     }
 
     pub(super) fn submit_capture_recoverable(&mut self, job: CaptureJob) -> Result<(), CaptureSubmitFailure> {

@@ -1,9 +1,17 @@
 mod callbacks;
+mod timing;
+pub(crate) use timing::{TimingEvent, TimingObserver};
+mod clipboard;
 mod commit;
+mod frame_callbacks;
 mod compositor;
 mod configure;
 mod data_transfer;
+mod primary_selection;
 mod decoration;
+mod kde_decoration;
+#[cfg(test)]
+mod decoration_tests;
 mod destruction;
 mod dispatch;
 mod dmabuf;
@@ -22,7 +30,15 @@ pub use shm::{ShmBufferReader, ShmImage, ShmImageRegion};
 mod geometry;
 mod input;
 #[cfg(test)]
+mod output_membership_tests;
+#[cfg(test)]
 mod wire_tests;
+#[cfg(test)]
+mod buffer_lifetime_tests;
+#[cfg(test)]
+mod region_wire_tests;
+#[cfg(test)]
+mod subsurface_commit_tests;
 use geometry::*;
 
 mod capture;
@@ -59,11 +75,17 @@ mod dmabuf_feedback;
 use dmabuf_feedback::DmaBufFeedback;
 
 const IMPLEMENTED_GLOBALS: &[(&str, ResourceKind, u32)] = &[
+    (
+        "org_kde_kwin_server_decoration_manager",
+        ResourceKind::KdeDecorationManager,
+        1,
+    ),
     ("zxdg_output_manager_v1", ResourceKind::XdgOutputManager, 3),
     ("wl_compositor", ResourceKind::Compositor, 6),
     ("wl_shm", ResourceKind::Shm, 1),
     ("wl_subcompositor", ResourceKind::Subcompositor, 1),
     ("wl_data_device_manager", ResourceKind::DataDeviceManager, 3),
+    ("zwp_primary_selection_device_manager_v1", ResourceKind::PrimaryManager, 1),
     ("xdg_wm_base", ResourceKind::XdgWmBase, 7),
     (
         "zxdg_decoration_manager_v1",
@@ -146,12 +168,18 @@ enum ResourceKind {
     Keyboard(u32),
     Touch(u32),
     DataDeviceManager,
+    PrimaryManager,
+    PrimaryDevice(u32),
+    PrimarySource(ProtocolObjectId),
+    PrimaryOffer(ProtocolObjectId),
     DataDevice(u32),
     DataSource(ProtocolObjectId),
     DataOffer(ProtocolObjectId),
     LinuxDmaBuf,
     LinuxDmaBufFeedback,
     LinuxBufferParams(ProtocolObjectId),
+    KdeDecorationManager,
+    KdeDecoration(WaylandSurfaceId),
     DecorationManager,
     ToplevelDecoration(WaylandSurfaceId),
     CursorShapeManager,
@@ -219,12 +247,18 @@ impl ResourceKind {
             Self::Keyboard(_) => ProtocolObjectKind::Keyboard,
             Self::Touch(_) => ProtocolObjectKind::Touch,
             Self::DataDeviceManager => ProtocolObjectKind::DataDeviceManager,
+            Self::PrimaryManager => ProtocolObjectKind::DataDeviceManager,
+            Self::PrimaryDevice(_) => ProtocolObjectKind::DataDevice,
+            Self::PrimarySource(_) => ProtocolObjectKind::DataSource,
+            Self::PrimaryOffer(_) => ProtocolObjectKind::DataOffer,
             Self::DataDevice(_) => ProtocolObjectKind::DataDevice,
             Self::DataSource(_) => ProtocolObjectKind::DataSource,
             Self::DataOffer(_) => ProtocolObjectKind::DataOffer,
             Self::LinuxDmaBuf => ProtocolObjectKind::LinuxDmaBuf,
             Self::LinuxDmaBufFeedback => ProtocolObjectKind::LinuxDmaBufFeedback,
             Self::LinuxBufferParams(_) => ProtocolObjectKind::LinuxBufferParams,
+            Self::KdeDecorationManager => ProtocolObjectKind::DecorationManager,
+            Self::KdeDecoration(_) => ProtocolObjectKind::ToplevelDecoration,
             Self::DecorationManager => ProtocolObjectKind::DecorationManager,
             Self::ToplevelDecoration(_) => ProtocolObjectKind::ToplevelDecoration,
             Self::CursorShapeManager => ProtocolObjectKind::CursorShapeManager,
@@ -620,6 +654,7 @@ struct SuspendedFocus {
 }
 
 struct NativeState {
+    timing_observer: Option<TimingObserver>,
     foreign_toplevel: foreign_toplevel::NativeForeignToplevelState,
     capture: capture::NativeCaptureState,
     capture_access: Option<Rc<super::CaptureAccess>>,
@@ -628,9 +663,12 @@ struct NativeState {
     protocol: NativeProtocol,
     core: CompositorCore,
     output_revision: u64,
+    retired_outputs: BTreeSet<u32>,
+    manual_outputs: BTreeSet<u32>,
     clients: BTreeMap<usize, ClientId>,
     resources: BTreeMap<ProtocolObjectId, usize>,
     mapped_outputs: BTreeSet<WaylandSurfaceId>,
+    surface_outputs: BTreeMap<WaylandSurfaceId, BTreeSet<u32>>,
     entered_outputs: BTreeSet<(WaylandSurfaceId, ProtocolObjectId)>,
     regions: BTreeMap<ProtocolObjectId, Vec<RectI>>,
     shm_pools: BTreeMap<ProtocolObjectId, NativeShmPool>,
@@ -644,7 +682,9 @@ struct NativeState {
     committed_presentation_feedbacks: BTreeMap<(WaylandSurfaceId, u64), Vec<ProtocolObjectId>>,
     xdg_resources: BTreeMap<WaylandSurfaceId, ProtocolObjectId>,
     toplevels: BTreeMap<WaylandSurfaceId, XdgToplevelState>,
+    requested_toplevel_states: BTreeMap<WaylandSurfaceId, crate::integrations::wayland::compositor::ToplevelState>,
     decoration_policy: crate::DecorationPolicy,
+    decorations: BTreeMap<WaylandSurfaceId, kde_decoration::SurfaceDecorations>,
     committed_decorations:
         BTreeMap<WaylandSurfaceId, crate::integrations::wayland::compositor::DecorationMode>,
     toplevel_icons: BTreeMap<ProtocolObjectId, NativeToplevelIcon>,
@@ -683,6 +723,7 @@ struct NativeState {
     committed_releases: BTreeMap<(WaylandSurfaceId, u64), ProtocolObjectId>,
     initial_configures: BTreeSet<WaylandSurfaceId>,
     next_client: u32,
+    clipboard: Option<clipboard::NativeClipboard>,
     next_object: u32,
     next_surface: u32,
     next_buffer: u32,
@@ -784,3 +825,6 @@ impl fmt::Display for NativeCompositorError {
 }
 
 impl std::error::Error for NativeCompositorError {}
+
+#[cfg(test)]
+mod gtk_settings_tests;

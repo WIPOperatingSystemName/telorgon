@@ -1,6 +1,11 @@
 use super::scene::frame_content_clips;
 use super::*;
 use crate::graphics::render::{BoxInstance, ClipId, SpatialId};
+mod assets;
+pub(super) use assets::LayerAssets;
+mod frame_ownership;
+mod resize_preview;
+pub(super) use resize_preview::resize_preview_radii;
 
 pub(super) struct Layer {
     pub(super) runtime: ComposedAppRuntime,
@@ -11,16 +16,15 @@ impl Layer {
     pub(super) fn new(
         driver: CompositionDriver,
         extent: SizeI,
-        assets: AssetBundle,
+        assets: &LayerAssets,
         scale: crate::platform::contracts::ScaleFactor,
     ) -> AppResult<Self> {
+        let probe = stall_probe::begin();
         let mut runtime = ComposedAppRuntime::from_composition_driver(driver, extent)?;
-        runtime.register_fonts(assets)?;
+        runtime.register_fonts(assets.bundle)?;
         runtime.set_raster_scale(scale);
-        let mut media = AssetMediaCache::new(assets).map_err(app_error)?;
-        for resource in media.preload_render_resources().map_err(app_error)? {
-            runtime.set_image_resource(resource)?;
-        }
+        assets.install(&mut runtime)?;
+        stall_probe::finish("layer_create", probe, || format!("resources={}", assets.resources.len()));
         Ok(Self {
             runtime,
             pending_deltas: Vec::new(),
@@ -134,7 +138,7 @@ pub(super) fn refresh_window_frames(
     windows: &mut BTreeMap<WaylandSurfaceId, ClientWindow>,
     wayland: &NativeCompositor<'_>,
     config: &LinuxShellConfig,
-    assets: AssetBundle,
+    assets: &LayerAssets,
     fallback_icon: &crate::AppIconProfile,
     services: Option<&crate::authoring::compose::ShellServices>,
     wake: &EventNotifier,
@@ -143,21 +147,12 @@ pub(super) fn refresh_window_frames(
     work_area: RectI,
     configure_scheduler: &mut ConfigureScheduler,
 ) -> AppResult<()> {
+    frame_ownership::synchronize(windows, factory.is_some(), wayland.tiled_client_decorations());
     let Some(factory) = factory else {
         frames.clear();
-        for window in windows.values_mut() {
-            window.chrome_outer = None;
-            window.chrome_content_offset = None;
-            window.chrome = None;
-        }
         return Ok(());
     };
 
-    for window in windows.values_mut().filter(|window| !window_has_frame(window)) {
-        window.chrome_outer = None;
-        window.chrome_content_offset = None;
-        window.chrome = None;
-    }
     frames.retain(|surface, _| {
         windows
             .get(surface)
@@ -227,7 +222,7 @@ pub(super) fn refresh_window_frames(
         capabilities.maximize = !fixed && room_for_controls;
         capabilities.minimize = room_for_controls;
         let mut model = WindowChromeModel::new(u64::from(surface.get()), title)
-            .title_bar_visible(window_is_decorated(window))
+            .title_bar_visible(window_has_titlebar(window))
             .capabilities(capabilities)
             .state(state)
             .active(active == Some(surface));
@@ -250,7 +245,6 @@ pub(super) fn refresh_window_frames(
                 },
             ));
         }
-        model.frame_parts = window.decoration_policy.frame_parts(window.server_decorated);
         model.desktop_window_id = window.desktop_id;
         if let Some(name) = icon_name {
             model = model.app_icon_name(name);
@@ -261,6 +255,11 @@ pub(super) fn refresh_window_frames(
             model = model.app_icon(icon);
         }
         let content_style = factory.content_style(&model);
+        if content_style.and_then(|style| style.resize_preview).is_some_and(|preview| {
+            !preview.corner_radius.is_finite() || preview.corner_radius < 0.0
+        }) {
+            return Err(AppError::new("resize preview radius must be finite and nonnegative"));
+        }
         if content_style
             .and_then(|style| style.resize_preview)
             .is_some_and(|preview| !preview.border_is_valid())
@@ -604,24 +603,8 @@ pub(super) fn prepare_desktop_layers(
     }
 
     let placements = windows
-        .iter()
-        .map(|(surface, window)| {
-            let position = window
-                .parent
-                .and_then(|parent| windows.get(&parent))
-                .map_or(window.position, |parent| {
-                    let content_offset = if parent.role == SurfaceRole::Xwayland {
-                        window_content_offset(parent, config)
-                    } else {
-                        PointI::default()
-                    };
-                    PointI {
-                        x: parent.position.x + content_offset.x + window.offset.x,
-                        y: parent.position.y + content_offset.y + window.offset.y,
-                    }
-                });
-            (*surface, position)
-        })
+        .keys()
+        .map(|surface| (*surface, surface_tree_position(windows, *surface, config)))
         .collect::<BTreeMap<_, _>>();
     let content_clips = windows
         .iter()
@@ -683,6 +666,7 @@ pub(super) fn prepare_desktop_layers(
             }
         }
         let inherited_clip = owner.and_then(|id| content_clips.get(&id)).copied();
+        let tree_visible = client::surface_tree_visible(windows, *surface);
         let Some(window) = windows.get_mut(surface) else {
             continue;
         };
@@ -690,7 +674,7 @@ pub(super) fn prepare_desktop_layers(
             continue;
         }
         let visible = stacked.contains(surface)
-            && !window.minimized
+            && tree_visible
             && (window.role == SurfaceRole::SessionLock) == session_locked;
         let position = placements.get(surface).copied().unwrap_or(window.position);
         let outer = window
@@ -784,8 +768,7 @@ pub(super) fn prepare_desktop_layers(
         }
         if visible
             && !veiled
-            && window_has_frame(window)
-            && window_is_decorated(window)
+            && window_has_titlebar(window)
             && window.chrome.is_none()
             && window.backend.is_some()
         {
@@ -826,29 +809,17 @@ pub(super) fn prepare_desktop_layers(
             let appearance = content_style
                 .and_then(|style| style.resize_preview)
                 .unwrap_or(config.resize_preview);
-            let mut preview = ShellLayer::solid(
-                ShellLayerKey::ResizeVeil(surface.get()),
-                ShellSceneKey::ResizeVeil(surface.get()),
-                appearance.fill.color(),
-                RectI {
-                    x: position.x,
-                    y: position.y,
-                    width: outer.width,
-                    height: outer.height,
-                },
-            );
-            if let crate::Fill::Glass(style) = appearance.fill {
-                preview.glass = Some(style.normalized());
-            }
-            if let Some(border) = frames.get(surface).and_then(|frame| frame.border.as_ref()) {
-                preview = preview.with_frame_outline(border, position);
-            }
-            let border =
-                ShellLayer::resize_preview_border(surface.get(), &preview, appearance.border);
-            layers.push(preview);
-            layers.extend(border);
+            layers.extend(resize_preview::layers(
+                *surface, window, appearance,
+                frames.get(surface).and_then(|frame| frame.border.as_ref()),
+                position, outer,
+            ));
         }
         let placement = surface_placement(window, position, config);
+        crate::integrations::wayland::compositor::diagnostics::event(surface.get(), "placement", format_args!(
+            "role={:?} parent={:?} visible={visible} position={position:?} content={content_rect:?} logical={:?} raster={:?} target={:?} surface_clip={:?} frame_clip={inherited_clip:?}",
+            window.role, window.parent, window.presentation.size, window.presentation.image_size,
+            placement.target, placement.clip));
         let output_bounds = placement
             .clip
             .map_or(Some(placement.target), |clip| {
@@ -858,6 +829,11 @@ pub(super) fn prepare_desktop_layers(
             .and_then(|bounds| {
                 inherited_clip.map_or(Some(bounds), |(clip, _)| intersect_rect(bounds, clip))
             });
+        crate::integrations::wayland::compositor::diagnostics::event(
+            surface.get(), "scene", format_args!(
+                "app={:?} role={:?} parent={:?} stack={stacking_order:?} visible={visible} veiled={veiled} veil_owner={veil_owner:?} ready={} position={position:?} content={content_rect:?} clip={inherited_clip:?} image={:?} target={:?} output_bounds={output_bounds:?} motion_pending={} tile_hold={}",
+                window.application_identity, window.role, window.parent, window.presentation.content_ready,
+                window.presentation.image_size, placement.target, window.motion_veil_pending, window.tile_resize_hold));
         let mut client = ShellLayer::image(
             ShellLayerKey::Surface(surface.get()),
             ShellSceneKey::Surface(surface.get()),
@@ -875,6 +851,7 @@ pub(super) fn prepare_desktop_layers(
             visible && !veiled,
         );
         if let Some((bounds, clips)) = inherited_clip {
+            // Framed client trees inherit the compositor aperture, regardless of header ownership.
             client = client.with_content_clip(bounds, clips);
         }
         layers.push(client);

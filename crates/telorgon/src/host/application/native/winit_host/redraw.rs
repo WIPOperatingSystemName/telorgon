@@ -42,13 +42,12 @@ impl<S: NativeRuntimeSource, P: NativePresentation> NativeHost<S, P> {
             self.presentation.resize(update)?;
             resize_barrier_revision = resize_revision_to_synchronize(source, update);
             self.mark_redraw(RedrawReason::Resize);
+            let scale = self.layout_scale_factor();
             if self.drawable
                 && let Some(runtime) = self.runtime.as_mut()
             {
-                runtime.queue_input(PlatformInput::Resize(SizeF {
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                }));
+                runtime.set_raster_scale(crate::platform::contracts::ScaleFactor::new(scale).unwrap());
+                runtime.queue_input(PlatformInput::Resize(super::dpi::logical_extent(extent, scale)));
             }
         }
         if !self.redraw_eligible() {

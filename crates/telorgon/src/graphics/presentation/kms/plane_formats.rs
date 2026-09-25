@@ -1,8 +1,5 @@
 //! Checked decoding of the kernel's native-endian IN_FORMATS blob.
-use std::os::fd::AsRawFd;
-use std::ptr::NonNull;
-
-use super::{KmsDevice, KmsError, KmsErrorKind, KmsObjectProperties, ScanoutFormat, ffi};
+use super::{KmsDevice, KmsError, KmsErrorKind, KmsObjectProperties, ScanoutFormat};
 
 const MAX_BLOB: usize = 1024 * 1024;
 const MAX_TUPLES: usize = 16_384;
@@ -19,23 +16,8 @@ pub fn plane_formats(
         return Ok(None);
     }
     let id = u32::try_from(property.value).map_err(|_| malformed())?;
-    let raw = NonNull::new(unsafe { ffi::drmModeGetPropertyBlob(device.fd().as_raw_fd(), id) })
-        .ok_or_else(|| {
-            KmsError::last_os_error(KmsErrorKind::Native, "DRM IN_FORMATS query failed")
-        })?;
-    struct Blob(NonNull<ffi::drmModePropertyBlobRes>);
-    impl Drop for Blob {
-        fn drop(&mut self) {
-            unsafe { ffi::drmModeFreePropertyBlob(self.0.as_ptr()) };
-        }
-    }
-    let guard = Blob(raw);
-    let native = unsafe { guard.0.as_ref() };
-    if native.data.is_null() || native.length as usize > MAX_BLOB || native.length < 24 {
-        return Err(malformed());
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(native.data.cast(), native.length as usize) };
-    parse(bytes).map(Some)
+    let bytes = device.read_property_blob(id, MAX_BLOB)?;
+    parse(&bytes).map(Some)
 }
 
 fn malformed() -> KmsError {

@@ -1,18 +1,22 @@
+use crate::foundation::SizeI;
+#[cfg(target_os = "windows")]
 use crate::graphics::bridges::vulkan_dxgi as dxgi_bridge;
+#[cfg(target_os = "windows")]
 use crate::graphics::bridges::vulkan_dxgi::{
     AcquiredVulkanDxgiFrame, VulkanDxgiAcquireOutcome, VulkanDxgiBridge,
 };
-use crate::foundation::SizeI;
 use crate::graphics::presentation::wsi::{
-    AcquireOutcome, AcquiredVulkanFrame, PresentCompletion, PresentError, PresentErrorKind,
-    PresentOutcome, PresentResult, PresenterReconfigurePolicy, PresenterRecovery,
-    VulkanWinitPresenter, VulkanWinitSurface,
+    AcquireOutcome, AcquiredVulkanFrame, PresentCompletion, PresentOutcome, PresentResult,
+    PresenterReconfigurePolicy, PresenterRecovery, VulkanWinitPresenter, VulkanWinitSurface,
 };
+#[cfg(target_os = "windows")]
+use crate::graphics::presentation::wsi::{PresentError, PresentErrorKind};
 use crate::graphics::renderers::vulkan::{
     VulkanDevice, VulkanRecordedFrame, VulkanRecordingFrame, VulkanTarget,
 };
 
 pub(super) enum VulkanPresentationPipeline {
+    #[cfg(target_os = "windows")]
     Dxgi(Box<VulkanDxgiBridge>),
     Wsi(Box<VulkanWinitPresenter>),
 }
@@ -25,6 +29,7 @@ pub(super) enum PipelineAcquireOutcome<'presenter> {
 }
 
 pub(super) enum PipelineAcquiredFrame<'presenter> {
+    #[cfg(target_os = "windows")]
     Dxgi(AcquiredVulkanDxgiFrame<'presenter>),
     Wsi(AcquiredVulkanFrame<'presenter>),
 }
@@ -32,14 +37,17 @@ pub(super) enum PipelineAcquiredFrame<'presenter> {
 impl VulkanPresentationPipeline {
     pub fn recovery(&self) -> PresenterRecovery {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => presenter.recovery(),
             Self::Wsi(presenter) => presenter.recovery(),
         }
     }
 
     pub fn set_reconfigure_policy(&mut self, policy: PresenterReconfigurePolicy) {
-        if let Self::Wsi(presenter) = self {
-            presenter.set_reconfigure_policy(policy);
+        match self {
+            Self::Wsi(presenter) => presenter.set_reconfigure_policy(policy),
+            #[cfg(target_os = "windows")]
+            Self::Dxgi(_) => {}
         }
     }
 
@@ -48,6 +56,7 @@ impl VulkanPresentationPipeline {
         completion: PresentCompletion,
     ) -> PresentResult<bool> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => bridge_result(presenter.poll_present_completion(completion)),
             Self::Wsi(presenter) => presenter.poll_present_completion(completion),
         }
@@ -59,6 +68,7 @@ impl VulkanPresentationPipeline {
         maximum: usize,
     ) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => {
                 bridge_result(presenter.enforce_retirement_limit(device, maximum))
             }
@@ -68,6 +78,7 @@ impl VulkanPresentationPipeline {
 
     pub fn resize(&mut self, extent: SizeI) -> bool {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => presenter.resize(extent),
             Self::Wsi(presenter) => presenter.resize(extent),
         }
@@ -75,6 +86,7 @@ impl VulkanPresentationPipeline {
 
     pub fn suspend(&mut self) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => bridge_result(presenter.suspend()),
             Self::Wsi(presenter) => presenter.suspend(),
         }
@@ -82,6 +94,7 @@ impl VulkanPresentationPipeline {
 
     pub fn resume(&mut self, device: &VulkanDevice, extent: SizeI) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => bridge_result(presenter.resume(device, extent)),
             Self::Wsi(presenter) => presenter.resume(device, extent),
         }
@@ -94,6 +107,7 @@ impl VulkanPresentationPipeline {
         extent: SizeI,
     ) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => {
                 drop(surface);
                 bridge_result(presenter.resume(device, extent))
@@ -108,6 +122,7 @@ impl VulkanPresentationPipeline {
         frame: &VulkanRecordingFrame<'_>,
     ) -> PresentResult<PipelineAcquireOutcome<'a>> {
         Ok(match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => match bridge_result(presenter.acquire(device, frame))? {
                 VulkanDxgiAcquireOutcome::Ready(frame) => {
                     PipelineAcquireOutcome::Ready(PipelineAcquiredFrame::Dxgi(frame))
@@ -131,6 +146,7 @@ impl VulkanPresentationPipeline {
 
     pub fn shutdown(&mut self, device: &VulkanDevice) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(presenter) => bridge_result(presenter.shutdown(device)),
             Self::Wsi(presenter) => presenter.shutdown(device),
         }
@@ -140,6 +156,7 @@ impl VulkanPresentationPipeline {
 impl PipelineAcquiredFrame<'_> {
     pub fn target(&self) -> VulkanTarget<'_> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(frame) => frame.target(),
             Self::Wsi(frame) => frame.target(),
         }
@@ -151,6 +168,7 @@ impl PipelineAcquiredFrame<'_> {
         frame: VulkanRecordedFrame,
     ) -> PresentResult<PresentOutcome> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(acquired) => {
                 let outcome = bridge_result(acquired.submit_and_present(device, frame))?;
                 Ok(PresentOutcome {
@@ -167,12 +185,14 @@ impl PipelineAcquiredFrame<'_> {
 
     pub fn discard(self, device: &VulkanDevice) -> PresentResult<()> {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Dxgi(acquired) => bridge_result(acquired.discard(device)),
             Self::Wsi(acquired) => acquired.discard(device),
         }
     }
 }
 
+#[cfg(target_os = "windows")]
 fn bridge_result<T>(result: dxgi_bridge::PresentResult<T>) -> PresentResult<T> {
     result.map_err(|error| {
         let kind = match error.kind() {

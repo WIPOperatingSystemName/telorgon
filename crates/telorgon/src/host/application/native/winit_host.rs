@@ -33,10 +33,10 @@ use super::resize::{
 };
 #[cfg(all(
     feature = "application-software",
-    not(all(feature = "application-vulkan-windows", target_os = "windows"))
+    not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))
 ))]
 use super::software::SoftwarePresentation;
-#[cfg(not(all(feature = "application-vulkan-windows", target_os = "windows")))]
+#[cfg(not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))))]
 use crate::host::application::ReadyGuiApplication;
 use crate::host::application::{
     AppError, AppResult, AppRuntimeCore, Command, ComponentDriver, CompositionDriver,
@@ -73,7 +73,7 @@ pub(crate) fn create_managed_event_loop(
 }
 
 #[cfg(feature = "application-software")]
-#[cfg(not(all(feature = "application-vulkan-windows", target_os = "windows")))]
+#[cfg(not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))))]
 pub fn run_gui_software(application: ReadyGuiApplication) -> AppResult<()> {
     let (driver, options, renderer, assets, pointer) = application.into_parts()?;
     if renderer == crate::host::application::Renderer::Vulkan {
@@ -105,6 +105,10 @@ pub(crate) struct PreparedPresentationFrame {
 }
 
 pub(crate) trait NativePresentation {
+    /// Whether retained scenes use logical units rather than physical pixels.
+    fn uses_logical_coordinates(&self) -> bool {
+        false
+    }
     fn attach(&mut self, window: Arc<Window>) -> Result<(), String>;
     fn resume(&mut self, _window: Arc<Window>) -> Result<(), String> {
         Ok(())
@@ -900,6 +904,7 @@ fn flush_windows_compositor() {
     let _ = result;
 }
 
+mod dpi;
 mod pointer;
 mod scheduling;
 use pointer::{mouse_button, winit_cursor_icon};

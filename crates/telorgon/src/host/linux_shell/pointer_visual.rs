@@ -39,18 +39,23 @@ impl RenderedCursor {
                 "cursor image cannot fit the hardware cursor plane",
             ));
         }
-        let mut rgba = vec![0; size.width as usize * size.height as usize * 4];
-        for y in 0..size.height as usize {
-            for x in 0..size.width as usize {
-                let sx = (x * self.size.width as usize / size.width as usize)
-                    .min(self.size.width as usize - 1);
-                let sy = (y * self.size.height as usize / size.height as usize)
-                    .min(self.size.height as usize - 1);
-                let src = (sy * self.size.width as usize + sx) * 4;
-                let dst = (y * size.width as usize + x) * 4;
-                rgba[dst..dst + 4].copy_from_slice(&self.rgba[src..src + 4]);
+        let rgba = if size == self.size {
+            self.rgba.clone()
+        } else {
+            let mut rgba = vec![0; size.width as usize * size.height as usize * 4];
+            for y in 0..size.height as usize {
+                for x in 0..size.width as usize {
+                    let sx = (x * self.size.width as usize / size.width as usize)
+                        .min(self.size.width as usize - 1);
+                    let sy = (y * self.size.height as usize / size.height as usize)
+                        .min(self.size.height as usize - 1);
+                    let src = (sy * self.size.width as usize + sx) * 4;
+                    let dst = (y * size.width as usize + x) * 4;
+                    rgba[dst..dst + 4].copy_from_slice(&self.rgba[src..src + 4]);
+                }
             }
-        }
+            rgba
+        };
         Ok(Self {
             rgba,
             size,

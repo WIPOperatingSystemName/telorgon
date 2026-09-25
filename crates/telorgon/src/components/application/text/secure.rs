@@ -171,6 +171,32 @@ impl fmt::Debug for SecureField {
 }
 
 impl SecureField {
+    pub fn clipboard_command(
+        &self,
+        clipboard: &crate::services::clipboard::Clipboard,
+        action: crate::services::clipboard::ClipboardEditAction,
+    ) -> Result<Option<super::TextClipboardTransfer>, crate::services::clipboard::ClipboardError>
+    {
+        self.field.clipboard_command(clipboard, action)
+    }
+    pub fn invalidate_clipboard_requests(&mut self) {
+        self.field.invalidate_clipboard_requests();
+    }
+    pub fn paste_clipboard(
+        &mut self,
+        target: super::TextClipboardTarget,
+        text: &str,
+        now: crate::runtime::MonotonicInstant,
+    ) -> Result<SecureFieldOutput, crate::services::clipboard::ClipboardError> {
+        self.field
+            .paste_clipboard(target, text, now)
+            .map(|output| match output {
+                TextFieldOutput::Updated(update) => {
+                    SecureFieldOutput::Updated(SecureFieldUpdate::from(&update))
+                }
+                TextFieldOutput::Submitted(submitted) => SecureFieldOutput::Submitted(submitted),
+            })
+    }
     pub fn new(
         controller: TextController,
         label: impl Into<String>,

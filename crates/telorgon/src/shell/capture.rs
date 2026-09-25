@@ -7,6 +7,8 @@ use std::num::NonZeroU32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CaptureSource {
     Output(OutputId),
+    /// An isolated host-owned display, distinct from a physical monitor.
+    VirtualOutput(OutputId),
     Window(WindowId),
 }
 
@@ -15,6 +17,8 @@ pub enum CaptureCursorMode {
     #[default]
     Hidden,
     Embedded,
+    /// Cursor pixels are excluded from the image and delivered as stream metadata.
+    Metadata,
 }
 
 /// Validated stream preferences. The host may negotiate a lower frame rate.

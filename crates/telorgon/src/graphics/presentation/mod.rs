@@ -457,5 +457,5 @@ pub mod dxgi;
 pub mod softbuffer;
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod kms;
-#[cfg(feature = "application-vulkan-windows")]
+#[cfg(any(feature = "application-vulkan-windows", feature = "application-vulkan-linux"))]
 pub mod wsi;

@@ -133,6 +133,7 @@ fn output_mapping_scales_geometry_clips_and_damage_once_and_preserves_revisions(
     );
     rounded.inverted = true;
     let frame = ShellFrame {
+        frame_borders: Default::default(),
         glass_changed: BTreeSet::new(),
         glass: BTreeMap::new(),
         preview_borders: BTreeMap::new(),
@@ -784,4 +785,41 @@ fn hidden_image_revision_is_not_consumed_before_its_pixels_arrive() {
     let frame = composition.synchronize(extent, vec![visible]).unwrap();
     assert_eq!(frame.updates.len(), 1);
     assert_eq!(frame.updates[0].deltas[0].image_resources.len(), 1);
+}
+
+
+#[test]
+fn hover_without_pixel_damage_keeps_cursor_presentation_advancing() {
+    use super::super::presentation::{Commit, Scheduler, Submission, Work};
+    struct Flip(usize);
+    impl Commit for Flip {
+        fn primary_slot(&self) -> Option<usize> { Some(self.0) }
+    }
+    const MS: u64 = 1_000_000;
+    let extent = SizeI { width: 100, height: 100 };
+    let mut composition = ShellComposition::new(extent);
+    let mut scheduler = Scheduler::<Flip>::new(std::time::Duration::from_millis(16));
+    scheduler.modeset_completed(0);
+    let work = Work {
+        primary_damage: false, // hover can begin without a changed quantized color
+        primary_animation: true,
+        cursor_dirty: true,
+        scanout_available: true,
+    };
+    // No scanout callback will rescue an animation if the first unchanged frame is skipped.
+    for refresh in 0..10 {
+        let tick = refresh * 16 * MS;
+        let plan = scheduler.plan(work, tick + 8 * MS);
+        assert!(plan.render);
+        assert!(composition.synchronize_with_force(extent, vec![], false).is_none());
+        assert!(composition.synchronize_with_force(extent, vec![], plan.force_frame).is_some());
+        scheduler.begin_render(0, tick + 8 * MS);
+        scheduler.frame_ready(0, tick + 9 * MS).unwrap();
+        assert_eq!(scheduler.plan(work, tick + 13 * MS).submit, Some(Submission::Primary));
+        assert_eq!(scheduler.take_ready_frame(), Some(0));
+        scheduler.submitted(Flip(0)).unwrap();
+        assert!(scheduler.completed(tick + 16 * MS).is_some());
+    }
+    let stopped = Work { primary_animation: false, cursor_dirty: false, ..work };
+    assert!(!scheduler.plan(stopped, 200 * MS).render);
 }

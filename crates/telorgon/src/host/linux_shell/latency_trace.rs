@@ -1,10 +1,12 @@
 //! Bounded, opt-in flight recorder. No file writes, locks, or per-event allocations during capture.
 //! Times are owner-thread observations, never GPU timestamps or proof of input-to-photon latency.
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     fs::{File, OpenOptions},
     io::{self, BufWriter, Write},
     os::unix::fs::OpenOptionsExt,
+    rc::Rc,
     time::Instant,
 };
 
@@ -88,7 +90,7 @@ impl Recording {
 
 #[derive(Default)]
 pub(in crate::host::linux_shell) struct LatencyTrace {
-    recording: Option<Recording>,
+    recording: Option<Rc<RefCell<Recording>>>,
     output: Option<File>,
 }
 
@@ -108,9 +110,56 @@ impl LatencyTrace {
             "telorgon-latency: recording up to {CAPACITY} events in memory; writing on normal exit"
         );
         Ok(Self {
-            recording: Some(Recording::new(CAPACITY)),
+            recording: Some(Rc::new(RefCell::new(Recording::new(CAPACITY)))),
             output: Some(output),
         })
+    }
+
+    pub(super) fn protocol_observer(
+        &self,
+    ) -> Option<crate::integrations::wayland::compositor::TimingObserver> {
+        use crate::integrations::wayland::compositor::TimingEvent;
+        let recording = self.recording.clone()?;
+        Some(Box::new(move |event| {
+            let (name, values) = match event {
+                TimingEvent::CommitRequested {
+                    surface,
+                    current_revision,
+                    attaches_buffer,
+                    callbacks,
+                } => (
+                    "client_commit_request",
+                    [
+                        u64::from(surface),
+                        current_revision,
+                        u64::from(attaches_buffer),
+                        callbacks as u64,
+                    ],
+                ),
+                TimingEvent::CallbacksQueued {
+                    surface,
+                    revision,
+                    count,
+                    presented,
+                } => (
+                    "frame_callbacks_queued",
+                    [
+                        u64::from(surface),
+                        revision,
+                        count as u64,
+                        u64::from(presented),
+                    ],
+                ),
+            };
+            let mut recording = recording.borrow_mut();
+            let ts_us = recording.now();
+            recording.push(Event {
+                name,
+                values,
+                ts_us,
+                duration_us: None,
+            });
+        }))
     }
 
     pub(super) fn enabled(&self) -> bool {
@@ -119,6 +168,7 @@ impl LatencyTrace {
 
     pub(in crate::host::linux_shell) fn phase(&mut self, name: &'static str) {
         if let Some(recording) = &mut self.recording {
+            let mut recording = recording.borrow_mut();
             let now = recording.now();
             recording.finish_phase(now);
             recording.phase = Some((name, now));
@@ -127,9 +177,11 @@ impl LatencyTrace {
 
     pub(super) fn event(&mut self, name: &'static str, values: [u64; 4]) {
         if let Some(recording) = &mut self.recording {
+            let mut recording = recording.borrow_mut();
+            let ts_us = recording.now();
             recording.push(Event {
                 name,
-                ts_us: recording.now(),
+                ts_us,
                 duration_us: None,
                 values,
             });
@@ -140,7 +192,9 @@ impl LatencyTrace {
 impl Drop for LatencyTrace {
     fn drop(&mut self) {
         if let (Some(recording), Some(output)) = (&mut self.recording, self.output.take()) {
-            recording.finish_phase(recording.now());
+            let mut recording = recording.borrow_mut();
+            let now = recording.now();
+            recording.finish_phase(now);
             if let Err(error) = recording.write(BufWriter::new(output)) {
                 eprintln!("telorgon-latency: capture write failed: {error}");
             }

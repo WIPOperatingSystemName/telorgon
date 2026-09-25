@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RequesterId {
     Portal(u64),
+    PickerPreview(u64),
     Direct(crate::integrations::wayland::compositor::ClientId),
 }
 
@@ -54,6 +55,7 @@ pub(super) enum CaptureError {
 pub(super) struct CaptureLimits {
     pub sessions: usize,
     pub sessions_per_requester: usize,
+    pub streams_per_portal_session: usize,
     pub max_dimension: u32,
     pub max_frame_rate: u32,
     pub buffers_per_session: usize,
@@ -65,9 +67,11 @@ impl Default for CaptureLimits {
         Self {
             sessions: 8,
             sessions_per_requester: 2,
+            streams_per_portal_session: 8,
             max_dimension: 8192,
-            max_frame_rate: 60,
-            buffers_per_session: 3,
+            max_frame_rate: 240,
+            // Matches the screen producer's two native transport buffers.
+            buffers_per_session: 2,
             total_bytes: 512 * 1024 * 1024,
         }
     }
@@ -178,13 +182,23 @@ impl CaptureSessions {
         if !self.sources.contains(&source) {
             return Err(CaptureError::Unavailable);
         }
-        if self.sessions.len() >= self.limits.sessions
+        // The trusted picker may own one bounded thumbnail job in addition to application
+        // streams, so an in-flight preview cannot consume an application's last stream slot.
+        let application_sessions = self.sessions.values()
+            .filter(|s| !matches!(s.requester, RequesterId::PickerPreview(_))).count();
+        let preview_busy = self.sessions.values().any(|s| matches!(s.requester, RequesterId::PickerPreview(_)));
+        if (matches!(requester, RequesterId::PickerPreview(_)) && preview_busy)
+            || (!matches!(requester, RequesterId::PickerPreview(_)) && application_sessions >= self.limits.sessions)
             || self
                 .sessions
                 .values()
                 .filter(|s| s.requester == requester)
                 .count()
-                >= self.limits.sessions_per_requester
+                >= match requester {
+                    RequesterId::Portal(_) => self.limits.streams_per_portal_session,
+                    RequesterId::PickerPreview(_) => 1,
+                    RequesterId::Direct(_) => self.limits.sessions_per_requester,
+                }
             || options.max_frame_rate().get() > self.limits.max_frame_rate
         {
             return Err(CaptureError::Limit);
@@ -323,8 +337,9 @@ impl CaptureSessions {
     }
 
     fn layout_bytes(&self, layout: CaptureLayout) -> Result<usize, CaptureError> {
-        // Nominal producer, transport, staging and target storage. Exact native alignment and
-        // metadata accounting remains a separate release gate.
+        // Reserve for the largest offered packed format (RGBA float16, eight bytes/pixel),
+        // including producer, transport, staging and target storage. Exact native alignment
+        // and metadata accounting remains a separate release gate.
         if self.limits.buffers_per_session == 0
             || layout.width() > self.limits.max_dimension
             || layout.height() > self.limits.max_dimension
@@ -335,7 +350,7 @@ impl CaptureSessions {
             .buffers_per_session
             .checked_mul(2)
             .and_then(|slots| slots.checked_add(2))
-            .and_then(|slots| layout.byte_len().checked_mul(slots))
+            .and_then(|slots| layout.byte_len().checked_mul(2)?.checked_mul(slots))
             .ok_or(CaptureError::Limit)
     }
 
@@ -495,9 +510,34 @@ mod tests {
     }
 
     #[test]
+    fn high_refresh_capture_respects_its_requested_cadence_and_host_limit() {
+        let (mut engine, source, requester) = setup();
+        let options = CaptureOptions::new(
+            crate::shell::capture::CaptureCursorMode::Hidden,
+            NonZeroU32::new(240).unwrap(),
+        );
+        let id = engine.request(requester, source, options).unwrap();
+        engine.authorize(id, true).unwrap();
+        engine.negotiate(id, requester, layout()).unwrap();
+        engine.started(id, requester).unwrap();
+        let first = engine.begin_frame(id, 0, 1).unwrap().unwrap();
+        assert!(engine.finish_frame(first, true).unwrap());
+        assert!(engine.begin_frame(id, 4_166_666, 2).unwrap().is_none());
+        let next = engine.begin_frame(id, 4_166_667, 2).unwrap().unwrap();
+        assert!(engine.finish_frame(next, true).unwrap());
+        let too_fast = CaptureOptions::new(options.cursor(), NonZeroU32::new(241).unwrap());
+        assert_eq!(
+            engine.request(requester, source, too_fast),
+            Err(CaptureError::Limit)
+        );
+    }
+
+    #[test]
     fn shared_gpu_admission_waits_for_cancelled_other_transport_to_retire() {
         let (mut engine, source, portal) = setup();
-        let direct = RequesterId::Direct(crate::integrations::wayland::compositor::ClientId::from_raw(1).unwrap());
+        let direct = RequesterId::Direct(
+            crate::integrations::wayland::compositor::ClientId::from_raw(1).unwrap(),
+        );
         let p = engine
             .request(portal, source, CaptureOptions::default())
             .unwrap();
@@ -528,20 +568,28 @@ mod tests {
     #[test]
     fn portal_and_direct_requester_numbers_do_not_share_authority_or_quotas() {
         let (mut engine, source, portal) = setup();
-        let direct = RequesterId::Direct(crate::integrations::wayland::compositor::ClientId::from_raw(1).unwrap());
+        let direct = RequesterId::Direct(
+            crate::integrations::wayland::compositor::ClientId::from_raw(1).unwrap(),
+        );
         let p = engine
             .request(portal, source, CaptureOptions::default())
             .unwrap();
         engine
             .request(portal, source, CaptureOptions::default())
             .unwrap();
-        assert_eq!(
-            engine.request(portal, source, CaptureOptions::default()),
-            Err(CaptureError::Limit)
-        );
+        engine
+            .request(portal, source, CaptureOptions::default())
+            .unwrap();
         let d = engine
             .request(direct, source, CaptureOptions::default())
             .unwrap();
+        engine
+            .request(direct, source, CaptureOptions::default())
+            .unwrap();
+        assert_eq!(
+            engine.request(direct, source, CaptureOptions::default()),
+            Err(CaptureError::Limit)
+        );
         assert_eq!(
             engine.stop(p, direct, CaptureStopReason::Requested),
             Err(CaptureError::WrongRequester)
@@ -577,7 +625,7 @@ mod tests {
         let generation = engine.renegotiate(id, owner, replacement).unwrap();
         assert_eq!(
             engine.reserved_bytes,
-            (layout().byte_len() + replacement.byte_len()) * 8
+            (layout().byte_len() + replacement.byte_len()) * 12
         );
         assert_eq!(engine.started(id, owner), Err(CaptureError::InvalidState));
         assert_eq!(
@@ -588,7 +636,7 @@ mod tests {
         // GPU completion must not release memory still retained by a transport consumer.
         assert_eq!(
             engine.reserved_bytes,
-            (layout().byte_len() + replacement.byte_len()) * 8
+            (layout().byte_len() + replacement.byte_len()) * 12
         );
         assert_eq!(
             engine.generation_retired(id, owner, generation + 1),
@@ -599,7 +647,7 @@ mod tests {
             engine.generation_retired(id, owner, generation),
             Err(CaptureError::InvalidState)
         );
-        assert_eq!(engine.reserved_bytes, replacement.byte_len() * 8);
+        assert_eq!(engine.reserved_bytes, replacement.byte_len() * 12);
         engine.started(id, owner).unwrap();
         let next = engine.begin_frame(id, 0, 7).unwrap().unwrap();
         assert_ne!(old.generation, next.generation);
@@ -694,9 +742,21 @@ mod tests {
     }
 
     #[test]
+    fn default_budget_admits_one_3840_by_2400_share_and_remains_bounded() {
+        let (mut engine, source, owner) = setup();
+        let layout = CaptureLayout::rgba8(NonZeroU32::new(3840).unwrap(),
+            NonZeroU32::new(2400).unwrap(), 3840 * 4).unwrap();
+        let first = engine.request(owner, source, CaptureOptions::default()).unwrap();
+        engine.authorize(first, true).unwrap();
+        engine.negotiate(first, owner, layout).unwrap();
+        let second = engine.request(owner, source, CaptureOptions::default()).unwrap();
+        engine.authorize(second, true).unwrap();
+        assert_eq!(engine.negotiate(second, owner, layout), Err(CaptureError::Limit));
+    }
+    #[test]
     fn stopped_buffers_remain_charged_until_owner_retires_them() {
         let (mut engine, source, owner) = setup();
-        engine.limits.total_bytes = layout().byte_len() * 8;
+        engine.limits.total_bytes = layout().byte_len() * 12;
         let id = engine
             .request(owner, source, CaptureOptions::default())
             .unwrap();
@@ -768,6 +828,7 @@ mod tests {
     fn denial_disconnect_and_quotas_do_not_leak_sessions() {
         let (mut engine, source, owner) = setup();
         engine.limits.sessions_per_requester = 1;
+        engine.limits.streams_per_portal_session = 1;
         let id = engine
             .request(owner, source, CaptureOptions::default())
             .unwrap();

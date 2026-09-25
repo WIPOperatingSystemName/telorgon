@@ -1,8 +1,9 @@
 #version 450
 layout(set=0,binding=0,std140) uniform ViewBlock { vec4 clip_from_view_0; vec4 clip_from_view_1; vec4 clip_from_view_2; vec4 clip_from_view_3; vec4 view_size_scale; vec4 target_size_origin; vec4 render_size_inverse; uvec4 epoch_flags; vec4 placement_clip_rects[2]; vec4 placement_clip_radii[2]; } view_data;
-float placement_coverage(){
+float placement_coverage(bool shadow){
     float amount=1.0;
     for(int i=0;i<2;i++){
+        if(i==1&&(view_data.epoch_flags.w&8u)!=0u)continue;
         vec4 rect=view_data.placement_clip_rects[i];
         if(rect.z<0.0)continue;
         bool inverted=(view_data.epoch_flags.w&(1u<<uint(i+1)))!=0u;
@@ -15,11 +16,57 @@ float placement_coverage(){
         vec2 q=abs(p-half_size)-(half_size-vec2(radius));
         float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
         float coverage=clamp(.5-d,0.0,1.0);
-        amount=min(amount,inverted?1.0-coverage:coverage);
+        if(all(lessThanEqual(radii,vec4(0)))){
+            vec2 overlap=clamp(min(p+vec2(.5),rect.zw)-max(p-vec2(.5),vec2(0)),vec2(0),vec2(1));
+            coverage=overlap.x*overlap.y;
+        }
+        // The foreground will attenuate the shadow at partially covered edge pixels.
+        // Cutting it out fractionally here too leaves a bright fringe on light backdrops.
+        float kept=inverted?1.0-coverage:coverage;
+        if(shadow&&inverted)kept=coverage<1.0?1.0:0.0;
+        amount=min(amount,kept);
     }
     return amount;
 }
 
+
+// Slot 1 is a coverage denominator only while painting an isolated frame interior.
+float normalization_coverage(){
+    if((view_data.epoch_flags.w&8u)==0u)return 1.0;
+    vec4 rect=view_data.placement_clip_rects[1];
+    if(rect.z<=0.0||rect.w<=0.0)return 0.0;
+    vec2 p=gl_FragCoord.xy-rect.xy;
+    vec2 half_size=rect.zw*.5;
+    vec4 radii=view_data.placement_clip_radii[1];
+    float radius=p.x<half_size.x?(p.y<half_size.y?radii.x:radii.w):(p.y<half_size.y?radii.y:radii.z);
+    radius=clamp(radius,0.0,min(half_size.x,half_size.y));
+    vec2 q=abs(p-half_size)-(half_size-vec2(radius));
+    float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
+    if(all(lessThanEqual(radii,vec4(0)))){
+        vec2 overlap=clamp(min(p+vec2(.5),rect.zw)-max(p-vec2(.5),vec2(0)),vec2(0),vec2(1));
+        return overlap.x*overlap.y;
+    }
+    return clamp(.5-d,0.0,1.0);
+}
+
+// One physical pixel of paint clearance; hit testing and layout are unchanged.
+float interior_paint_coverage(){
+    if((view_data.epoch_flags.w&16u)==0u)return 1.0;
+    vec4 rect=view_data.placement_clip_rects[1]+vec4(1,1,-2,-2);
+    if(rect.z<=0.0||rect.w<=0.0)return 0.0;
+    vec2 p=gl_FragCoord.xy-rect.xy;
+    vec2 half_size=rect.zw*.5;
+    vec4 radii=max(view_data.placement_clip_radii[1]-vec4(1),vec4(0));
+    float radius=p.x<half_size.x?(p.y<half_size.y?radii.x:radii.w):(p.y<half_size.y?radii.y:radii.z);
+    radius=clamp(radius,0.0,min(half_size.x,half_size.y));
+    vec2 q=abs(p-half_size)-(half_size-vec2(radius));
+    float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;
+    if(all(lessThanEqual(radii,vec4(0)))){
+        vec2 overlap=clamp(min(p+vec2(.5),rect.zw)-max(p-vec2(.5),vec2(0)),vec2(0),vec2(1));
+        return overlap.x*overlap.y;
+    }
+    return clamp(.5-d,0.0,1.0);
+}
 
 struct GpuClip { vec4 view_bounds; vec4 local_rect; vec4 local_from_view_0; vec4 local_from_view_1; vec4 radii; vec4 mask_uv_from_view_0; vec4 mask_uv_from_view_1; uvec4 mode_mask_flags; };
 struct GpuBoxInstance {
@@ -58,7 +105,12 @@ float clip_coverage(uint slot,vec2 p){
     vec2 local=p-c.view_bounds.xy;
     // Only the per-primitive clip mode may branch before fwidth. A per-fragment bounds
     // return would leave derivatives in divergent control flow (including helper lanes).
-    if(c.mode_mask_flags.x!=2u)return all(greaterThanEqual(local,vec2(0)))&&all(lessThanEqual(local,c.view_bounds.zw))?1.0:0.0;
+    if(c.mode_mask_flags.x!=2u){
+        vec2 footprint=max(abs(dFdx(local))+abs(dFdy(local)),vec2(1e-4));
+        vec2 overlap=max(min(local+footprint*.5,c.view_bounds.zw)-max(local-footprint*.5,vec2(0)),vec2(0));
+        vec2 amount=clamp(overlap/footprint,vec2(0),vec2(1));
+        return amount.x*amount.y;
+    }
     vec2 half_size=c.view_bounds.zw*.5;
     float radius=local.x<half_size.x?(local.y<half_size.y?c.radii.x:c.radii.w):(local.y<half_size.y?c.radii.y:c.radii.z);
     radius=clamp(radius,0.0,min(half_size.x,half_size.y));
@@ -124,14 +176,21 @@ uint border_color(GpuBoxInstance item,vec2 p){
 void main(){
     GpuBoxInstance item=boxes.values[instance_slot];
     float clip_amount=clip_coverage(item.border_l_spatial_clip_flags.z,view_position);
-    float placement_amount=placement_coverage();
+    float placement_amount=placement_coverage(false);
+    float shadow_placement=placement_coverage(true);
     float body_clip=min(clip_amount,placement_amount);
+    if((item.border_l_spatial_clip_flags.w&4u)==0u){
+        body_clip=min(body_clip,interior_paint_coverage());
+        clip_amount=min(clip_amount,interior_paint_coverage());
+    }
+    float normalizer=normalization_coverage();
     vec2 size=item.rect.zw;
     vec2 p=local_position;
     vec4 result=vec4(0);
     uint shadow_count=item.outline_shadow_colors.w;
     if(shadow_count>1u)result=over(result,premul(item.outline_shadow_colors.z,shadow_coverage(p,size,item.radii,item.shadow_1),item.opacity));
     if(shadow_count>0u)result=over(result,premul(item.outline_shadow_colors.y,shadow_coverage(p,size,item.radii,item.shadow_0),item.opacity));
+    result*=shadow_placement;
 
     float outline_width=max(0.0,item.outline.x);
     if(outline_width>0.0){
@@ -139,7 +198,7 @@ void main(){
         float outer_amount=offset+outline_width;
         float outer=coverage(p+vec2(outer_amount),size+vec2(outer_amount*2.0),max(item.radii+vec4(outer_amount),vec4(0)));
         float inner=coverage(p+vec2(offset),size+vec2(offset*2.0),max(item.radii+vec4(offset),vec4(0)));
-        result=over(result,premul(item.outline_shadow_colors.x,clamp(outer-inner,0.0,1.0),item.opacity));
+        result=over(result,premul(item.outline_shadow_colors.x,clamp(outer-inner,0.0,1.0)*placement_amount,item.opacity));
     }
 
     // A matching rounded clip intersects this shape; it must not square its edge
@@ -150,14 +209,16 @@ void main(){
     vec2 inner_size=max(vec2(0),size-vec2(widths.w+widths.y,widths.x+widths.z));
     vec4 inner_radii=max(vec4(0),item.radii-vec4(max(widths.x,widths.w),max(widths.x,widths.y),max(widths.z,widths.y),max(widths.z,widths.w)));
     float inner=min(outer,coverage(p-inner_origin,inner_size,inner_radii));
+    outer=clamp(outer/max(normalizer,1e-6),0.0,1.0);
+    inner=clamp(inner/max(normalizer,1e-6),0.0,outer);
     uint flags=item.border_l_spatial_clip_flags.w;
     // Fill and border are disjoint coverage of one shape, not overlapping layers.
     vec4 body=vec4(0);
     if((flags&1u)!=0u)body+=premul(item.fill_border_t_r_b.x,inner,item.opacity);
     float ring=clamp(outer-inner,0.0,1.0);
     if((flags&2u)!=0u&&ring>0.0)body+=premul(border_color(item,p),ring,item.opacity);
-    result=over(result*(clip_amount*placement_amount),body);
+    result=over(result*clip_amount,body);
     // Finish all derivative-dependent coverage before any per-fragment discard.
-    if(result.a<=0.0)discard;
+    if(result.a<=0.0||normalizer<=0.0)discard;
     output_color=result;
 }

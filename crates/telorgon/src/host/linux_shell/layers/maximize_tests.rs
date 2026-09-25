@@ -20,9 +20,8 @@ impl Component for TestFrame {
 
 #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
 #[test]
-fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometry() {
+fn decoration_ownership_controls_complete_frames_and_clears_stale_geometry() {
     use super::super::client::maximize_preview_tests::test_window;
-    use crate::{DecorationNegotiation, FramePartPolicy, ResizeRegionPolicy};
     let declaration = crate::host::application::Compositor::new()
         .cursor_theme(crate::CursorTheme::new())
         .window_frame(|model: WindowChromeModel| TestFrame {
@@ -57,6 +56,7 @@ fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometr
         } else if index == 3 {
             window.role = SurfaceRole::XdgPopup;
             window.backend = None;
+            window.parent = Some(WaylandSurfaceId::from_raw(1).unwrap());
         }
         window.server_decorated = false;
         windows.insert(WaylandSurfaceId::from_raw(index).unwrap(), window);
@@ -65,14 +65,7 @@ fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometr
     let mut scheduler = ConfigureScheduler::default();
     for phase in 0..5 {
         for window in windows.values_mut() {
-            window.decoration_policy = crate::DecorationPolicy::DEFAULT;
-            if phase == 1 {
-                window.decoration_policy.outer_frame.rounded_clip = FramePartPolicy::Always;
-                window.decoration_policy.interaction.resize_regions =
-                    ResizeRegionPolicy::Enabled;
-            } else if phase == 2 {
-                window.decoration_policy.negotiation = DecorationNegotiation::PreferServer;
-            }
+            window.server_decorated = matches!(phase, 1 | 3);
             window.fullscreen = phase == 3;
         }
         refresh_window_frames(
@@ -81,7 +74,7 @@ fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometr
             &mut windows,
             &wayland,
             &config,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             &crate::AppIconProfile::default(),
             None,
             &wake,
@@ -92,17 +85,11 @@ fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometr
         )
         .unwrap();
         assert!(!frames.contains_key(&WaylandSurfaceId::from_raw(3).unwrap()));
-        if phase == 1 || phase == 2 {
+        if phase == 1 {
             assert_eq!(frames.len(), 2);
             for frame in frames.values() {
-                assert_eq!(frame.model.title_bar_visible, phase == 2);
-                assert_eq!(frame.model.frame_parts.border, phase == 2);
-                assert!(frame.model.frame_parts.rounded_clip);
-                assert!(frame.model.frame_parts.resize_regions);
-                assert_eq!(
-                    frame.snapshot.as_ref().unwrap().content.bounds.y,
-                    if phase == 2 { 37.0 } else { 0.0 }
-                );
+                assert!(frame.model.title_bar_visible);
+                assert_eq!(frame.snapshot.as_ref().unwrap().content.bounds.y, 37.0);
             }
         } else {
             assert!(frames.is_empty());
@@ -110,6 +97,19 @@ fn decoration_policy_selects_native_and_x11_frame_parts_and_clears_stale_geometr
                 assert!(window.chrome.is_none());
                 assert!(window.chrome_outer.is_none());
                 assert_eq!(window_content_offset(window, &config), PointI::default());
+            }
+            let order = windows.keys().copied().collect::<Vec<_>>();
+            let layers = prepare_desktop_layers(
+                false, SizeI { width: 1280, height: 800 }, phase, false,
+                &mut frames, &mut windows, &order, &mut [], &mut [], &mut None,
+                None, PointF::default(), None, PointF::default(), &config,
+            ).unwrap();
+            let visible = layers.into_iter().filter(|layer| layer.visible).collect::<Vec<_>>();
+            assert_eq!(visible.len(), windows.len());
+            for layer in visible {
+                assert!(matches!(layer.key, ShellLayerKey::Surface(_)),
+                    "client decorations must not acquire any shell frame or backing layers");
+                assert_eq!(layer.rounded_clips, [None; 2]);
             }
         }
     }
@@ -172,7 +172,7 @@ fn both_backends_draw_the_same_rgba_veil_and_hide_client_subtrees() {
             &mut windows,
             &wayland,
             &config,
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             &crate::AppIconProfile::default(),
             None,
             &EventNotifier::new("whole window preview").unwrap(),
@@ -333,7 +333,7 @@ fn native_and_x11_windows_use_the_same_composed_frame_template() {
         &mut windows,
         &wayland,
         &LinuxShellConfig::default(),
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         &crate::AppIconProfile::default(),
         None,
         &EventNotifier::new("frame parity").unwrap(),
@@ -393,7 +393,7 @@ fn native_and_x11_windows_use_the_same_composed_frame_template() {
         &mut windows,
         &wayland,
         &LinuxShellConfig::default(),
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         &crate::AppIconProfile::default(),
         None,
         &EventNotifier::new("resize frame").unwrap(),
@@ -458,7 +458,7 @@ fn measured_maximized_x11_frame_restarts_the_resize_veil() {
         &mut windows,
         &wayland,
         &config,
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         &crate::AppIconProfile::default(),
         None,
         &EventNotifier::new("maximized veil").unwrap(),
@@ -539,7 +539,7 @@ fn tile_outer_geometry_measures_the_actual_custom_content_slot() {
                 &mut windows,
                 &wayland,
                 &LinuxShellConfig::default(),
-                AssetBundle::default(),
+                &LayerAssets::new(AssetBundle::default()).unwrap(),
                 &crate::AppIconProfile::default(),
                 None,
                 &EventNotifier::new("tiled frame").unwrap(),
@@ -593,7 +593,7 @@ fn maximize_uses_work_area_instead_of_legacy_client_size_and_restore_keeps_clien
                     RuntimeTarget::Compositor,
                 ),
                 outer,
-                AssetBundle::default(),
+                &LayerAssets::new(AssetBundle::default()).unwrap(),
                 crate::platform::contracts::ScaleFactor::new(scale).unwrap(),
             )
             .unwrap();
@@ -625,5 +625,34 @@ fn maximize_uses_work_area_instead_of_legacy_client_size_and_restore_keeps_clien
             assert_eq!(restored.content.bounds.width, original.width as f32);
             assert_eq!(restored.content.bounds.height, original.height as f32);
         }
+    }
+}
+
+#[test]
+fn new_shell_layers_share_decoded_catalog_pixels() {
+    use crate::assets::{AssetEntry, AssetKey, AssetKind};
+    use crate::graphics::render::ImageResourceDelta;
+    const ENTRIES: &[AssetEntry] = &[AssetEntry::embedded(
+        AssetKey::new("icons/shared.svg"), AssetKind::Icon, "image/svg+xml",
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>"#,
+    )];
+    let assets = LayerAssets::new(AssetBundle::new(ENTRIES)).unwrap();
+    assert_eq!(assets.resources.len(), 1);
+    let expected = &assets.resources[0];
+    let extent = SizeI { width: 200, height: 100 };
+    for _ in 0..2 {
+        let mut layer = Layer::new(
+            CompositionDriver::for_target(TestFrame { title_height: 24.0 }, RuntimeTarget::Compositor),
+            extent, &assets, crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
+        ).unwrap();
+        layer.prepare(extent, 0, true).unwrap();
+        let resource = layer.take_deltas().into_iter()
+            .flat_map(|delta| delta.image_resources)
+            .find_map(|delta| match delta {
+                ImageResourceDelta::Write(update) if update.image == expected.image => Some(update),
+                _ => None,
+            }).expect("each layer must publish its catalog resource");
+        assert!(std::sync::Arc::ptr_eq(&resource.pixels, &expected.pixels),
+            "new runtimes must reuse decoded pixels rather than decode/copy the catalog");
     }
 }

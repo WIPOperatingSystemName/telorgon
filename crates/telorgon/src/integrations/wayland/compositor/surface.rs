@@ -49,6 +49,8 @@ pub struct SurfaceCommit {
 pub struct SurfaceStateSnapshot {
     pub surface: WaylandSurfaceId,
     pub revision: u64,
+    /// Commit that supplied the current attachment; state-only commits do not acquire it again.
+    pub attachment_revision: u64,
     pub role: Option<SurfaceRole>,
     pub attachment: Option<BufferAttachment>,
     pub damage: Vec<RectI>,
@@ -81,6 +83,7 @@ impl SurfaceState {
         let current = SurfaceStateSnapshot {
             surface,
             revision: 1,
+            attachment_revision: 1,
             role: None,
             attachment: None,
             damage: Vec::new(),
@@ -225,6 +228,7 @@ impl SurfaceState {
         let previous_buffer = self.current.attachment.map(|attachment| attachment.buffer);
         if let Some(attachment) = pending.attachment {
             self.current.attachment = attachment;
+            self.current.attachment_revision = revision;
         }
         if let Some(region) = pending.opaque_region {
             self.current.opaque_region = region;

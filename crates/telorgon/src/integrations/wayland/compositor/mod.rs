@@ -5,6 +5,8 @@ mod capture;
 mod foreign_toplevel;
 mod core;
 mod data_device;
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+pub(crate) mod diagnostics;
 mod id;
 mod object;
 mod output;
@@ -20,6 +22,8 @@ mod xdg;
 
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 mod native;
+#[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
+pub(crate) use native::{TimingEvent, TimingObserver};
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 mod capture_access;
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]

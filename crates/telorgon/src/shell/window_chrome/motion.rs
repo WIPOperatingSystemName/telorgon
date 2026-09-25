@@ -1,9 +1,10 @@
 //! Declarative desktop window motion. Durations are milliseconds; tracks never repeat.
 use crate::theme::Easing;
+mod persistence;
 
 /// Underdamped geometry spring. Frequency is radians/second; initial velocity is
 /// normalized distance/second and applies only when starting from rest.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct Spring {
     pub(crate) initial_velocity: f64,
     pub(crate) damping_ratio: f64,
@@ -64,7 +65,7 @@ impl Spring {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum GeometryMotion {
     Tween(WindowTween),
     Spring(Spring),
@@ -85,7 +86,7 @@ impl GeometryMotion {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowTween {
     pub duration_ms: u32,
     pub easing: Easing,
@@ -97,7 +98,7 @@ pub const fn tween_ms(duration_ms: u32, easing: Easing) -> WindowTween {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Minimize {
     pub(crate) tween: WindowTween,
 }
@@ -110,7 +111,7 @@ impl Minimize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentFade {
     pub(crate) entry: WindowTween,
     pub(crate) exit: WindowTween,
@@ -138,7 +139,7 @@ impl ContentFade {
 
 /// One style for window state changes and content handoffs. This does not own a clock.
 /// Native OS window animations are outside the desktop compositor's control.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct WindowMotion {
     maximize: GeometryMotion,
     restore: Option<GeometryMotion>,
@@ -147,6 +148,10 @@ pub struct WindowMotion {
     content: ContentFade,
     maximize_content: ContentFade,
     close: Option<Minimize>,
+    #[serde(default)]
+    open: Option<WindowTween>,
+    #[serde(default = "persistence::default_open_scale", deserialize_with = "persistence::deserialize_open_scale")]
+    open_scale: f32,
 }
 impl Default for WindowMotion {
     fn default() -> Self {
@@ -163,6 +168,8 @@ impl WindowMotion {
             content: ContentFade::new(90, 130),
             maximize_content: ContentFade::new(50, 130),
             close: None,
+            open: None,
+            open_scale: 1.0,
         }
     }
     /// Fluid maximize/restore presets from the spring specification; other effects stay smooth.
@@ -192,6 +199,8 @@ impl WindowMotion {
             content: ContentFade::new(0, 0),
             maximize_content: ContentFade::new(0, 0),
             close: None,
+            open: None,
+            open_scale: 1.0,
         }
     }
     /// Sets both directions unless an explicit restore override is present.
@@ -218,6 +227,29 @@ impl WindowMotion {
     pub const fn unminimize(mut self, effect: Minimize) -> Self {
         self.unminimize = Some(effect);
         self
+    }
+    /// Fades the whole window in on first presentation. Use `open_from_scale` to also grow it.
+    /// Disabled by default; a zero duration also disables the opening fade.
+    pub const fn open(mut self, tween: WindowTween) -> Self {
+        self.open = Some(tween);
+        self
+    }
+    /// Starting size relative to the final window, centered on its destination.
+    /// Must be greater than zero and at most one. One (the default) keeps opening fade-only.
+    /// Growth uses the duration and easing passed to `open`; it does not enable motion alone.
+    pub const fn open_from_scale(mut self, scale: f32) -> Self {
+        assert!(scale > 0.0 && scale <= 1.0, "opening scale must be greater than zero and at most one");
+        self.open_scale = scale;
+        self
+    }
+    pub const fn open_initial_scale(self) -> f32 {
+        self.open_scale
+    }
+    pub const fn open_transition(self) -> WindowTween {
+        match self.open {
+            Some(tween) => tween,
+            None => tween_ms(0, Easing::Linear),
+        }
     }
     /// Overrides the close shrink-and-fade effect. Defaults to the configured minimize effect.
     /// Zero duration removes the image immediately without delaying client shutdown.
@@ -284,6 +316,7 @@ impl WindowMotion {
             self.minimize_transition(true),
             self.minimize_transition(false),
             self.close_transition(),
+            self.open_transition(),
             self.content.entry,
             self.content.exit,
             self.maximize_content.entry,
@@ -297,6 +330,23 @@ impl WindowMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_scale_is_const_validated_and_independent_of_timing() {
+        const OPEN: WindowMotion = WindowMotion::none()
+            .open_from_scale(0.92)
+            .open(tween_ms(130, Easing::EaseOut));
+        assert_eq!(OPEN.open_initial_scale(), 0.92);
+        assert_eq!(OPEN.open_transition(), tween_ms(130, Easing::EaseOut));
+        assert_eq!(WindowMotion::smooth().open_initial_scale(), 1.0);
+        assert!(!WindowMotion::none().open_from_scale(0.5).enabled());
+        for scale in [f32::NAN, f32::INFINITY, -1.0, 0.0, 1.1] {
+            assert!(std::panic::catch_unwind(|| OPEN.open_from_scale(scale)).is_err());
+            let value = serde::de::value::F32Deserializer::<serde::de::value::Error>::new(scale);
+            assert!(persistence::deserialize_open_scale(value).is_err());
+        }
+        let value = serde::de::value::F32Deserializer::<serde::de::value::Error>::new(0.5);
+        assert_eq!(persistence::deserialize_open_scale(value).unwrap(), 0.5);
+    }
     #[test]
     fn close_is_const_independent_and_enables_close_only_motion() {
         const CLOSE: WindowMotion = WindowMotion::none().close(Minimize::shrink_and_fade(180));

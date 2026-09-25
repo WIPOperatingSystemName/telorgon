@@ -64,6 +64,14 @@ impl VulkanMaterializationTarget {
         extent: SizeI,
         phase: &mut dyn FnMut(&'static str),
     ) -> RenderResult<Self> {
+        Self::new_traced_accounted(device, extent, phase, |_| Ok(()))
+    }
+    pub(crate) fn new_traced_accounted(
+        device: &VulkanDevice,
+        extent: SizeI,
+        phase: &mut dyn FnMut(&'static str),
+        admit: impl FnOnce(u64) -> RenderResult<()>,
+    ) -> RenderResult<Self> {
         phase("dmabuf_alloc_format");
         if extent.width <= 0 || extent.height <= 0 {
             return Err(unsupported(
@@ -89,7 +97,7 @@ impl VulkanMaterializationTarget {
                 "Vulkan DMA-BUF materialization requires a filterable, blendable RGBA8 sRGB target",
             ));
         }
-        let image = std::sync::Arc::new(AllocatedImage::new_color_target_traced(
+        let image = std::sync::Arc::new(AllocatedImage::new_color_target_traced_accounted(
             device.inner.clone(),
             vk::Extent2D {
                 width: extent.width as u32,
@@ -98,6 +106,7 @@ impl VulkanMaterializationTarget {
             Self::FORMAT,
             "Telorgon DMA-BUF materialization target",
             phase,
+            admit,
         )?);
         Ok(Self {
             initialized: false,
@@ -164,6 +173,37 @@ pub(crate) struct VulkanCaptureTarget {
 }
 
 impl VulkanCaptureTarget {
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    pub(crate) fn new_budgeted(
+        device: &VulkanDevice,
+        extent: SizeI,
+        budget: std::sync::Arc<crate::media::video::MemoryBudget>,
+    ) -> RenderResult<Self> {
+        use crate::graphics::renderers::vulkan::error::internal;
+        let mut charge = crate::media::video::MemoryReservation::new(budget, 0)
+            .map_err(|e| internal(e.to_string()))?;
+        let mut source = VulkanMaterializationTarget::new_traced_accounted(
+            device,
+            extent,
+            &mut |_| {},
+            |bytes| {
+                charge
+                    .resize(
+                        usize::try_from(bytes)
+                            .map_err(|_| internal("capture image size overflow"))?,
+                    )
+                    .map_err(|e| internal(e.to_string()))
+            },
+        )?;
+        std::sync::Arc::get_mut(&mut source.image)
+            .expect("new capture image is exclusive")
+            .retain_capture_charge(charge);
+        Ok(Self {
+            image: source.image,
+            info: source.info,
+        })
+    }
+
     pub(crate) fn new(device: &VulkanDevice, extent: SizeI) -> RenderResult<Self> {
         // Reuse the existing sRGB attachment/transfer format qualification and allocator.
         let source = VulkanMaterializationTarget::new_traced(device, extent, &mut |_| {})?;
@@ -267,7 +307,9 @@ impl VulkanTarget<'_> {
 mod materialization_tests {
     use super::*;
     use crate::foundation::{ColorRgba8, RectI};
-    use crate::graphics::render::{ReadbackFormat, ReadbackRequest, RenderRequest, TargetLoad, TargetStore};
+    use crate::graphics::render::{
+        ReadbackFormat, ReadbackRequest, RenderRequest, TargetLoad, TargetStore,
+    };
     use crate::graphics::renderers::vulkan::{DeviceSelection, VulkanConfig, VulkanInstance};
 
     #[test]

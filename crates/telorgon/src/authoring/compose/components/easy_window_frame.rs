@@ -125,6 +125,11 @@ impl WindowChromeDesign {
         {
             return Err(WindowChromeDesignError::InvalidResizePreviewBorder);
         }
+        if self.resize_preview.is_some_and(|preview| {
+            !preview.corner_radius.is_finite() || preview.corner_radius < 0.0
+        }) {
+            return Err(WindowChromeDesignError::InvalidResizePreviewRadius);
+        }
         for palette in [self.active, self.inactive] {
             for side in [
                 palette.frame_border.top,
@@ -231,6 +236,8 @@ fn validate_nonnegative_insets(insets: Insets) -> Option<Insets> {
 pub enum WindowChromeDesignError {
     #[error("resize preview border widths must be finite and nonnegative")]
     InvalidResizePreviewBorder,
+    #[error("resize preview radius must be finite and nonnegative")]
+    InvalidResizePreviewRadius,
     #[error("window chrome frame border width must be finite and nonnegative")]
     InvalidFrameBorderWidth,
     #[error("window chrome title weight must be between 1 and 1000")]
@@ -310,16 +317,6 @@ impl Component for EasyWindowFrameComponent {
         }
         let mut state = design.state(self.model.state);
         state.title_bar_visible &= self.model.title_bar_visible;
-        if !self.model.frame_parts.border {
-            palette.frame_border = Border::default();
-        }
-        if !self.model.frame_parts.rounded_clip {
-            state.frame_radius = 0.0;
-        }
-        if !self.model.frame_parts.shadow {
-            state.shadow = None;
-        }
-        state.resize_regions &= self.model.frame_parts.resize_regions;
         let border = palette.frame_border;
         // Match the analytic box's inner contour: each corner subtracts its thicker adjacent side.
         let inner_radii = crate::ui::CornerRadii {
@@ -366,27 +363,9 @@ impl Component for EasyWindowFrameComponent {
                         0.0,
                         0.0,
                     ))
-                    .overflow(crate::ui::Overflow::Clip)
-                    .decoration(
-                        BoxDecoration::new()
-                            // The host paints content_style() inside the integer client bounds.
-                            // A second fill here starts at fractional layout coordinates and can
-                            // escape the host's cutout as a dark strip beside the client.
-                            .corner_radii(crate::ui::CornerRadii {
-                                top_left: if state.title_bar_visible {
-                                    0.0
-                                } else {
-                                    inner_radii.top_left
-                                },
-                                top_right: if state.title_bar_visible {
-                                    0.0
-                                } else {
-                                    inner_radii.top_right
-                                },
-                                bottom_right: inner_radii.bottom_right,
-                                bottom_left: inner_radii.bottom_left,
-                            }),
-                    ),
+                    // Content is rectangular. The enclosing frame owns the window contour;
+                    // assigning the slot its own radii creates a second rounded rectangle.
+                    .overflow(crate::ui::Overflow::Clip),
             )
     }
 }
@@ -407,8 +386,10 @@ impl WindowFrameTemplate for EasyWindowFrame {
 
     fn content_style(&self, _model: &WindowChromeModel) -> Option<WindowContentStyle> {
         Some(WindowContentStyle {
+            // Header ownership does not change the backing: transparent client corners
+            // must reveal this configured color, not holes through the compositor frame.
             background: self.design.content_background,
-            // The full-window inner border clip owns rounding; no second aperture is needed.
+            // Shell-owned backing follows the inner border; client pixels keep their alpha.
             corner_radius: 0.0,
             resize_preview: self.design.resize_preview,
         })

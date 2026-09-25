@@ -43,7 +43,7 @@ fn glass_pixels_never_enter_capture_or_interrupted_mix_snapshots() {
                 width: 900,
                 height: 600,
             },
-            content: SnapshotContent::Mix(vec![(1, 0.25), (99, 0.75)]),
+            content: SnapshotContent::Mix(vec![(1, 0.25).into(), (99, 0.75).into()]),
         },
         &BTreeMap::new(),
         &mut recipes,
@@ -55,7 +55,7 @@ fn glass_pixels_never_enter_capture_or_interrupted_mix_snapshots() {
                 width: 500,
                 height: 400,
             },
-            content: SnapshotContent::Mix(vec![(2, 0.4), (1, 0.6)]),
+            content: SnapshotContent::Mix(vec![(2, 0.4).into(), (1, 0.6).into()]),
         },
         &BTreeMap::new(),
         &mut recipes,
@@ -87,6 +87,7 @@ fn glass_pixels_never_enter_capture_or_interrupted_mix_snapshots() {
 #[test]
 fn a_shared_screen_pixel_keeps_its_backdrop_uv_while_the_lens_moves_and_resizes() {
     let sample = GlassSample {
+        mapping: crate::host::linux_shell::motion::SnapshotInput::from((0, 1.0)).target,
         border: None,
         placement: veil(),
         extent: capture(1).extent,
@@ -193,6 +194,7 @@ fn window() -> WindowState {
             .maximize(crate::tween_ms(200, crate::Easing::Linear))
             .maximize_content(crate::ContentFade::new(30, 40)),
         corner_radii: crate::CornerRadii::all(18.0),
+        client_decorated: false,
         shadows: Default::default(),
     }
 }
@@ -576,6 +578,7 @@ fn live_motion_glass_fixture(bordered: bool) {
 #[test]
 fn live_glass_uses_current_frame_bounds_instead_of_old_snapshot_shadow_padding() {
     let sample = GlassSample {
+        mapping: crate::host::linux_shell::motion::SnapshotInput::from((0, 1.0)).target,
         border: None,
         placement: ShellPlacement {
             target: RectI {
@@ -680,7 +683,7 @@ fn glass_preview_border_travels_with_optical_recipe_through_interrupted_fades() 
     let mixed = SnapshotCommand {
         id: 2,
         extent: command.extent,
-        content: SnapshotContent::Mix(vec![(1, 0.4), (99, 0.6)]),
+        content: SnapshotContent::Mix(vec![(1, 0.4).into(), (99, 0.6).into()]),
     };
     extract_recipe_with_borders(&mixed, &BTreeMap::new(), &BTreeMap::new(), &mut recipes);
     assert_eq!(recipes[&2][0].border, Some(border));
@@ -956,17 +959,17 @@ fn transparent_body_reduction_preserves_interrupted_mix_algebra() {
         &empty
     ));
     assert!(body_is_empty(
-        &SnapshotContent::Mix(vec![(1, 0.3), (2, 0.7), (9, 0.0)]),
+        &SnapshotContent::Mix(vec![(1, 0.3).into(), (2, 0.7).into(), (9, 0.0).into()]),
         &[],
         &empty
     ));
     assert!(!body_is_empty(
-        &SnapshotContent::Mix(vec![(1, 0.99), (9, 0.01)]),
+        &SnapshotContent::Mix(vec![(1, 0.99).into(), (9, 0.01).into()]),
         &[],
         &empty
     ));
     assert!(!body_is_empty(
-        &SnapshotContent::Mix(vec![(9, f32::NAN)]),
+        &SnapshotContent::Mix(vec![(9, f32::NAN).into()]),
         &[],
         &empty
     ));
@@ -986,3 +989,7 @@ fn direct_resolve_requires_zero_body_and_one_fully_weighted_lens() {
     assert!(!can_resolve_directly(true, samples));
     assert!(!can_resolve_directly(true, &[]));
 }
+
+#[path = "motion_alignment_tests.rs"]
+mod alignment_tests;
+

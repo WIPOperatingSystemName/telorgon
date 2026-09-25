@@ -2954,6 +2954,7 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "winit",
+ "x11rb",
  "x11rb-protocol",
  "zbus",
 ]

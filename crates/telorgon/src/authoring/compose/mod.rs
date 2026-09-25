@@ -83,3 +83,6 @@ pub use shell_services::{ShellContext, ShellWindows};
 
 pub(crate) mod window_tiling;
 pub use window_tiling::{TilePreviewDesign, TilePreviewMotion, TileTarget, WindowTiling};
+
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub mod portal;

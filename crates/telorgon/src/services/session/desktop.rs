@@ -21,6 +21,8 @@ enum Target {
 /// Installed desktop-file launch request. Resolution happens when launch is polled.
 pub struct ApplicationRequest {
     id: String,
+    pub(super) path: Option<PathBuf>,
+    pub(super) extra_args: Vec<OsString>,
     targets: Vec<Target>,
     restart: RestartPolicy,
     recover: bool,
@@ -33,6 +35,8 @@ impl ApplicationRequest {
     pub(crate) fn new(id: String) -> Self {
         Self {
             id,
+            path: None,
+            extra_args: Vec::new(),
             targets: Vec::new(),
             restart: RestartPolicy::OnFailure,
             recover: true,
@@ -91,7 +95,11 @@ impl ApplicationRequest {
                 if session.phase() != super::SessionPhase::Ready {
                     return Err(Error::Closing);
                 }
-                let path = resolve_id(&self.id, session.env())?;
+                let path = self
+                    .path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| session.applications().desktop_path(&self.id))?;
                 let entry = Entry::read(&path)?;
                 if entry.value("Type") != Some("Application")
                     || entry.value("Hidden") == Some("true")
@@ -100,7 +108,8 @@ impl ApplicationRequest {
                         "desktop entry is hidden or is not an application".into(),
                     ));
                 }
-                if entry.value("DBusActivatable") == Some("true")
+                if self.extra_args.is_empty()
+                    && entry.value("DBusActivatable") == Some("true")
                     && (self.prefer_dbus || entry.value("Exec").is_none())
                 {
                     let uris = self
@@ -146,7 +155,11 @@ impl ApplicationRequest {
     }
 
     fn resolve(&self, session: &SessionHandle) -> Result<Vec<Command>> {
-        let path = resolve_id(&self.id, session.env())?;
+        let path = self
+            .path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| session.applications().desktop_path(&self.id))?;
         let entry = Entry::read(&path)?;
         if entry.value("Type") != Some("Application") || entry.value("Hidden") == Some("true") {
             return Err(Error::Invalid(
@@ -182,6 +195,7 @@ impl ApplicationRequest {
         let mut commands = Vec::new();
         for targets in targets {
             let mut args = expand(&words, &entry, &path, &targets)?;
+            args.extend(self.extra_args.iter().cloned());
             if entry.value("Terminal") == Some("true") {
                 let terminal = if session.config().terminal.is_empty() {
                     [
@@ -418,7 +432,7 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
-fn resolve_id(id: &str, env: &Environment) -> Result<PathBuf> {
+pub(super) fn resolve_id(id: &str, env: &Environment) -> Result<PathBuf> {
     if !id.ends_with(".desktop") || id.contains(['/', '\\']) || id == ".desktop" {
         return Err(Error::Invalid(
             "application() expects an installed desktop-file ID, not a path".into(),
@@ -459,7 +473,7 @@ fn resolve_id(id: &str, env: &Environment) -> Result<PathBuf> {
     )))
 }
 
-fn find_nested(
+pub(super) fn find_nested(
     root: &Path,
     dir: &Path,
     id: &str,
@@ -502,7 +516,7 @@ fn find_nested(
     Ok(None)
 }
 
-fn executable(program: &OsStr, env: &Environment) -> bool {
+pub(super) fn executable(program: &OsStr, env: &Environment) -> bool {
     let check = |path: &Path| {
         #[cfg(unix)]
         {

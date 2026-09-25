@@ -178,7 +178,8 @@ pub enum ScrollCancelReason {
 }
 
 /// Clamping ballistic policy. Elapsed time is always supplied by the caller.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "SavedScrollPhysics", into = "SavedScrollPhysics")]
 pub struct ScrollPhysics {
     deceleration: f32,
     stop_velocity: f32,
@@ -858,3 +859,23 @@ fn subtract(left: PointF, right: PointF) -> PointF {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedScrollPhysics {
+    deceleration: f32,
+    stop_velocity: f32,
+}
+impl From<ScrollPhysics> for SavedScrollPhysics {
+    fn from(value: ScrollPhysics) -> Self {
+        Self {
+            deceleration: value.deceleration(),
+            stop_velocity: value.stop_velocity(),
+        }
+    }
+}
+impl TryFrom<SavedScrollPhysics> for ScrollPhysics {
+    type Error = &'static str;
+    fn try_from(value: SavedScrollPhysics) -> Result<Self, Self::Error> {
+        Self::new(value.deceleration, value.stop_velocity).map_err(|_| "invalid scroll physics")
+    }
+}

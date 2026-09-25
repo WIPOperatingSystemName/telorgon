@@ -1,22 +1,31 @@
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{collections::VecDeque, sync::Mutex};
 
 use crate::foundation::{PointI, RectI, SizeI};
 use crate::graphics::presentation::kms::ffi;
 use crate::graphics::presentation::kms::{
     AtomicProperty, DRM_FORMAT_MOD_INVALID, GbmBuffer, KmsFramebufferId, KmsPropertyId,
 };
-use crate::graphics::presentation::kms::{KmsConnectorId, KmsCrtcId, KmsObjectProperties, KmsPlaneId};
+use crate::graphics::presentation::kms::{
+    KmsConnectorId, KmsCrtcId, KmsObjectProperties, KmsPlaneId,
+};
 
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 const DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KmsPageFlip {
+    pub sequence: u32,
+    pub timestamp_us: u64,
+}
+
 pub struct KmsDevice {
     fd: OwnedFd,
-    page_flip_events: Box<AtomicU64>,
+    page_flip_events: Box<Mutex<VecDeque<KmsPageFlip>>>,
+    timestamp_monotonic: bool,
     cursor_plane_hotspot: bool,
 }
 
@@ -37,9 +46,14 @@ impl KmsDevice {
         let cursor_plane_hotspot = unsafe {
             ffi::drmSetClientCap(fd.as_raw_fd(), DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1) == 0
         };
+        let mut timestamp_monotonic = 0;
+        // DRM_CAP_TIMESTAMP_MONOTONIC: older drivers may use a different clock.
+        let timestamp_monotonic = unsafe { ffi::drmGetCap(fd.as_raw_fd(), 0x6, &mut timestamp_monotonic) == 0 }
+            && timestamp_monotonic == 1;
         Ok(Self {
             fd,
-            page_flip_events: Box::new(AtomicU64::new(0)),
+            timestamp_monotonic,
+            page_flip_events: Box::new(Mutex::new(VecDeque::new())),
             cursor_plane_hotspot,
         })
     }
@@ -79,8 +93,15 @@ impl KmsDevice {
 
     /// Takes the number of page flips completed since the previous call.
     pub fn take_completed_page_flips(&self) -> u64 {
-        self.page_flip_events.swap(0, Ordering::AcqRel)
+        self.take_page_flip_events().len() as u64
     }
+
+    /// Drain flip metadata in dispatch order. This consumes the same events as the count API.
+    pub fn take_page_flip_events(&self) -> Vec<KmsPageFlip> {
+        self.page_flip_events.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+    }
+
+    pub fn page_flip_timestamps_monotonic(&self) -> bool { self.timestamp_monotonic }
 
     pub fn capability(&self, capability: u64) -> Result<u64, KmsError> {
         let mut value = 0;
@@ -215,6 +236,44 @@ impl KmsDevice {
             device: self,
             id: KmsFramebufferId::from_raw(id).expect("successful AddFB2 returns a nonzero id"),
         })
+    }
+
+    /// Copy an existing kernel property blob with a caller-selected limit (at most 1 MiB).
+    /// The returned bytes own their storage and do not retain a native allocation.
+    pub fn read_property_blob(&self, id: u32, limit: usize) -> Result<Vec<u8>, KmsError> {
+        if id == 0 || limit == 0 || limit > 1024 * 1024 {
+            return Err(KmsError::new(
+                KmsErrorKind::InvalidState,
+                "invalid DRM blob bound",
+            ));
+        }
+        // SAFETY: the live device descriptor and scalar ID are valid query arguments.
+        let raw = NonNull::new(unsafe { ffi::drmModeGetPropertyBlob(self.fd.as_raw_fd(), id) })
+            .ok_or_else(|| {
+                KmsError::last_os_error(KmsErrorKind::Native, "DRM property blob query failed")
+            })?;
+        struct ReadBlob(NonNull<ffi::drmModePropertyBlobRes>);
+        impl Drop for ReadBlob {
+            fn drop(&mut self) {
+                // SAFETY: this guard uniquely owns the successful libdrm query result.
+                unsafe { ffi::drmModeFreePropertyBlob(self.0.as_ptr()) };
+            }
+        }
+        let guard = ReadBlob(raw);
+        // SAFETY: libdrm owns a live header until the guard is dropped.
+        let native = unsafe { guard.0.as_ref() };
+        let length = native.length as usize;
+        if length > limit || (length != 0 && native.data.is_null()) {
+            return Err(KmsError::new(
+                KmsErrorKind::InvalidState,
+                "invalid or oversized DRM property blob",
+            ));
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: libdrm provides length bytes of immutable data, retained by guard.
+        Ok(unsafe { std::slice::from_raw_parts(native.data.cast(), length) }.to_vec())
     }
 
     pub fn create_property_blob<'device>(
@@ -578,15 +637,18 @@ const fn signed_property_value(value: i32) -> u64 {
 
 unsafe extern "C" fn page_flip_handler(
     _fd: i32,
-    _sequence: u32,
-    _tv_sec: u32,
-    _tv_usec: u32,
+    sequence: u32,
+    tv_sec: u32,
+    tv_usec: u32,
     user_data: *mut std::ffi::c_void,
 ) {
-    let Some(events) = NonNull::new(user_data.cast::<AtomicU64>()) else {
+    let Some(events) = NonNull::new(user_data.cast::<Mutex<VecDeque<KmsPageFlip>>>()) else {
         return;
     };
-    unsafe { events.as_ref() }.fetch_add(1, Ordering::Release);
+    unsafe { events.as_ref() }.lock().unwrap_or_else(|e| e.into_inner()).push_back(KmsPageFlip {
+        sequence,
+        timestamp_us: u64::from(tv_sec) * 1_000_000 + u64::from(tv_usec),
+    });
 }
 
 impl Drop for AtomicRequest<'_> {
@@ -686,7 +748,23 @@ fn framebuffer_modifiers(handles: [u32; 4], modifier: u64) -> [u64; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::framebuffer_modifiers;
+    use super::{framebuffer_modifiers, page_flip_handler, KmsPageFlip};
+    use std::{collections::VecDeque, sync::Mutex};
+
+    #[test]
+    fn page_flip_callback_preserves_sequence_and_timestamp_in_order() {
+        let events = Box::new(Mutex::new(VecDeque::<KmsPageFlip>::new()));
+        let data = std::ptr::from_ref(events.as_ref()).cast_mut().cast();
+        unsafe {
+            page_flip_handler(0, u32::MAX, 123, 456, data);
+            page_flip_handler(0, 0, 123, 17_123, data);
+            page_flip_handler(0, 1, 0, 0, std::ptr::null_mut());
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], KmsPageFlip { sequence: u32::MAX, timestamp_us: 123_000_456 });
+        assert_eq!(events[1], KmsPageFlip { sequence: 0, timestamp_us: 123_017_123 });
+    }
 
     #[test]
     fn tiled_rgb_framebuffer_leaves_unused_modifiers_zero() {

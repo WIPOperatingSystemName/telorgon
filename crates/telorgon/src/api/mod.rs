@@ -3,11 +3,25 @@
 //! Subsystem ownership remains visible through focused modules while applications can import the
 //! ordinary authoring surface with `use telorgon::app::*`.
 
+pub use crate::services::session::{ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
+
 pub use crate::host::application::request_exit;
 pub use crate::host::application::{
     Capture, CaptureProtocols, CaptureSources, DirectCaptureAccess, InternalCapture, PortalCapture,
     PortalSessionIntegration, WaylandCapture,
 };
+
+/// Authoring API for shell-designed screen-cast portals.
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub mod portal {
+    pub use crate::host::application::{PortalPickerApplication, ReadyPortalPickerApplication, ScreenCastPortal, PortalPickerWindow, ShareAudio, AudioScope, PortalAudioDelivery, PortalAudioRequest, PortalAudioSession};
+    pub use crate::authoring::compose::portal::{
+        ScreenCastPortalContext, ScreenCastPortalSnapshot, SavedCapturePermission, PortalSourcePreview,
+        VirtualDisplayConfig, VirtualDisplaySnapshot,
+    };
+}
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+pub use portal::*;
 
 pub use crate::assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
@@ -33,12 +47,11 @@ pub use crate::ui::accessibility::{
 pub use telorgon_macros::{asset_catalog, component};
 
 pub use crate::shell::window_chrome::{
-    ContentFade, DecorationNegotiation, DecorationPolicy, FrameInteractionPolicy, FramePartPolicy,
-    GeometryMotion, Minimize, OuterFramePolicy, ResizePreviewDesign, ResizeRegionPolicy,
-    ShellActionId, Spring, TitleBarPolicy, WindowAction, WindowChromeCapabilities,
+    ContentFade, DecorationNegotiation, DecorationPolicy, GeometryMotion, Minimize,
+    ResizePreviewDesign, ShellActionId, Spring, WindowAction, WindowChromeCapabilities,
     WindowChromeError, WindowChromeHitSpec, WindowChromeModel, WindowChromeRegion,
     WindowChromeRole, WindowChromeSnapshot, WindowChromeState, WindowContentStyle, WindowEdgeMask,
-    WindowFrameParts, WindowMotion, WindowResizeEdge, WindowTilingState, WindowTween, tween_ms,
+    WindowMotion, WindowResizeEdge, WindowTilingState, WindowTween, tween_ms,
 };
 
 /// Imports shared by Telorgon's high-level application facade.
@@ -102,18 +115,18 @@ pub mod app {
         Capture, CaptureProtocols, CaptureSources, DirectCaptureAccess, InternalCapture,
         PortalCapture, PortalSessionIntegration, WaylandCapture,
     };
+    #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+    pub use crate::portal::*;
     pub use crate::services::session;
+    pub use crate::services::session::{ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
-    pub use crate::{
-        DecorationNegotiation, DecorationPolicy, FrameInteractionPolicy, FramePartPolicy,
-        OuterFramePolicy, ResizeRegionPolicy, TitleBarPolicy, WindowFrameParts,
-    };
+    pub use crate::{DecorationNegotiation, DecorationPolicy};
 }
 #[cfg(feature = "application-software")]
 pub use crate::host::application::HeadlessRuntime;
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 pub use crate::host::application::{

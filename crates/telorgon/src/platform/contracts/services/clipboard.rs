@@ -372,6 +372,7 @@ impl Error for ClipboardCapabilityError {}
 /// changing host preference order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardCapability {
+    arbitrary_mime_formats: bool,
     operations: ClipboardOperations,
     formats: Arc<[DataFormat]>,
     limits: ClipboardLimits,
@@ -410,6 +411,7 @@ impl ClipboardCapability {
         }
 
         Ok(Self {
+            arbitrary_mime_formats: false,
             operations,
             formats: distinct.into(),
             limits,
@@ -430,11 +432,20 @@ impl ClipboardCapability {
         &self.formats
     }
 
-    /// Returns whether this exact format is advertised.
+    /// Returns whether the host accepts this format, including opaque MIME support.
     pub fn supports_format(&self, format: &DataFormat) -> bool {
         self.formats.contains(format)
+            || (self.arbitrary_mime_formats
+                && format.kind() == super::data_transfer::DataFormatKind::Mime)
     }
-
+    /// Enables opaque transfer of any valid MIME representation without conversion.
+    pub fn with_arbitrary_mime_formats(mut self) -> Self {
+        self.arbitrary_mime_formats = true;
+        self
+    }
+    pub const fn accepts_arbitrary_mime_formats(&self) -> bool {
+        self.arbitrary_mime_formats
+    }
     /// Returns format-count and per-format byte limits.
     pub const fn limits(&self) -> &ClipboardLimits {
         &self.limits

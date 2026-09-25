@@ -1,3 +1,7 @@
+mod scaled;
+#[cfg(any(target_os = "linux", test))]
+mod frame_border;
+
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -27,6 +31,9 @@ pub struct SoftwareRenderer;
 
 #[derive(Clone, Debug, Default)]
 pub struct SoftwareScene {
+    frame_border: Option<BoxInstance>,
+    frame_cache: std::sync::Arc<std::sync::Mutex<Option<(u64, Box<SoftwareScene>)>>>,
+    coverage_normalization: Option<crate::graphics::render::frame_border::InteriorPaint>,
     epoch: u64,
     extent: SizeF,
     background: ColorRgba8,
@@ -282,9 +289,8 @@ impl RenderBackend for SoftwareRenderer {
 impl SoftwareRenderer {
     /// Composites independent retained scenes directly into one software framebuffer.
     ///
-    /// The caller supplies back-to-front placement order and output-space damage. No intermediate
-    /// layer surfaces are allocated, so this is the software pipeline rather than a bridge used by
-    /// another renderer.
+    /// The caller supplies back-to-front placement order and output-space damage. Ordinary scenes
+    /// draw directly; bordered frames cache an isolated interior and border resolve.
     pub(crate) fn render_composite(
         &self,
         surface: &mut SoftwareSurface,
@@ -344,6 +350,9 @@ impl SoftwareRenderer {
         let mut batches = 0_u32;
         let mut epoch = 0_u64;
         for layer in layers {
+            layer.scene.prepare_frame_border()?;
+            let cached = layer.scene.frame_cache.lock().expect("frame cache poisoned");
+            let scene = cached.as_ref().map_or(layer.scene, |(_, scene)| scene.as_ref());
             if layer.rounded_clips.iter().flatten().any(|c| !c.is_valid()) {
                 return Err(RenderError::new(
                     RenderErrorKind::HostContract,
@@ -384,8 +393,9 @@ impl SoftwareRenderer {
                     blend_mode: BlendMode::Alpha,
                     color_space: ColorSpace::Srgb,
                     rounded_clips: layer.rounded_clips,
+                    coverage_normalization: scene.coverage_normalization,
                 };
-                layer.scene.draw_region(&mut target, local);
+                scene.draw_region(&mut target, local);
                 batches = batches.saturating_add(
                     layer
                         .scene
@@ -571,6 +581,7 @@ impl SoftwareScene {
             blend_mode: BlendMode::Alpha,
             color_space,
             rounded_clips: [None; 2],
+            coverage_normalization: self.coverage_normalization,
         };
         self.draw_region(&mut target, region);
     }
@@ -646,6 +657,7 @@ impl SoftwareScene {
 }
 
 struct RasterTarget<'a> {
+    coverage_normalization: Option<crate::graphics::render::frame_border::InteriorPaint>,
     pixels: &'a mut [u8],
     width: usize,
     height: usize,
@@ -656,6 +668,18 @@ struct RasterTarget<'a> {
 }
 
 impl RasterTarget<'_> {
+    fn interior_paint_coverage(&self, x: i32, y: i32) -> f32 {
+        self.coverage_normalization.map_or(1.0, |paint| paint.coverage(
+            crate::foundation::PointF { x: x as f32 + 0.5, y: y as f32 + 0.5 }
+        ))
+    }
+    fn normalize_coverage(&self, coverage: f32, x: i32, y: i32) -> f32 {
+        let Some(clip) = self.coverage_normalization else { return coverage; };
+        let amount = clip.contour.coverage(crate::foundation::PointF {
+            x: x as f32 + 0.5, y: y as f32 + 0.5,
+        });
+        if amount <= 0.0 { 0.0 } else { (coverage / amount).clamp(0.0, 1.0) }
+    }
     fn blend_srgba(&mut self, x: i32, y: i32, source: ColorRgba8, opacity: f32) {
         let alpha = (f32::from(source.a) / 255.0) * opacity.clamp(0.0, 1.0);
         let rgb = [
@@ -686,16 +710,26 @@ impl RasterTarget<'_> {
     }
 
     fn placement_coverage(&self, x: i32, y: i32) -> f32 {
+        self.placement_coverage_with_shadow_overlap(x, y, false)
+    }
+
+    fn placement_coverage_with_shadow_overlap(&self, x: i32, y: i32, shadow: bool) -> f32 {
         let x = x.saturating_add(self.origin.x);
         let y = y.saturating_add(self.origin.y);
         self.rounded_clips
             .iter()
             .flatten()
             .fold(1.0_f32, |amount, clip| {
-                amount.min(clip.coverage(crate::foundation::PointF {
+                let coverage = clip.coverage(crate::foundation::PointF {
                     x: x as f32 + 0.5,
                     y: y as f32 + 0.5,
-                }))
+                });
+                // The foreground supplies edge AA; exclude only fully interior shadow pixels.
+                amount.min(if shadow && clip.inverted {
+                    if coverage > 0.0 { 1.0 } else { 0.0 }
+                } else {
+                    coverage
+                })
             })
     }
 
@@ -902,7 +936,10 @@ fn draw_box(
         for x in bounds.x.floor() as i32..bounds.right().ceil() as i32 {
             let point_x = x as f32 + 0.5;
             let point_y = y as f32 + 0.5;
-            let clip_amount = clip_coverage(point_x, point_y, clip);
+            let mut clip_amount = clip_coverage(point_x, point_y, clip);
+            if raster.coverage_normalization.is_some_and(|paint| paint.root != instance.node) {
+                clip_amount = clip_amount.min(raster.interior_paint_coverage(x, y));
+            }
             if clip_amount <= 0.0 {
                 continue;
             }
@@ -914,12 +951,12 @@ fn draw_box(
                 let coverage =
                     shadow_coverage(local.x, local.y, instance.rect, radii, *shadow, scale_min);
                 if coverage > 0.0 {
-                    raster.blend_srgba(
-                        x,
-                        y,
-                        shadow.color,
-                        coverage * instance.opacity * clip_amount,
-                    );
+                    let alpha = f32::from(shadow.color.a) / 255.0
+                        * (coverage * instance.opacity * clip_amount).clamp(0.0, 1.0)
+                        * raster.placement_coverage_with_shadow_overlap(x, y, true);
+                    let rgb = [shadow.color.r, shadow.color.g, shadow.color.b]
+                        .map(|channel| srgb_decode_byte(channel) * alpha);
+                    raster.blend_covered_linear_premultiplied(x, y, rgb, alpha);
                 }
             }
 
@@ -963,6 +1000,8 @@ fn draw_box(
             let inner_radii = inset_radii(radii, border_widths);
             let inner =
                 rounded_coverage(local.x, local.y, inner_rect, inner_radii, scale_min).min(outer);
+            let outer = raster.normalize_coverage(outer, x, y);
+            let inner = raster.normalize_coverage(inner, x, y).min(outer);
             // Fill and border partition one shape's coverage. Sum their premultiplied
             // contributions before source-over; blending them separately opens an alpha seam.
             let ring = (outer - inner).clamp(0.0, 1.0);
@@ -1047,6 +1086,12 @@ fn border_color_at(
 }
 
 fn rounded_coverage(x: f32, y: f32, rect: RectF, radii: [f32; 4], scale: f32) -> f32 {
+    if radii.iter().all(|r| *r <= 0.0) {
+        let half = 0.5 / scale.max(1e-4);
+        let horizontal = ((x + half).min(rect.right()) - (x - half).max(rect.x)).max(0.0) * scale;
+        let vertical = ((y + half).min(rect.bottom()) - (y - half).max(rect.y)).max(0.0) * scale;
+        return horizontal.clamp(0.0, 1.0) * vertical.clamp(0.0, 1.0);
+    }
     (0.5 - rounded_signed_distance(x, y, rect, radii) * scale).clamp(0.0, 1.0)
 }
 
@@ -1151,7 +1196,7 @@ fn draw_glyph(
         for x in target.x.floor() as i32..target.right().ceil() as i32 {
             let point_x = x as f32 + 0.5;
             let point_y = y as f32 + 0.5;
-            let clip_amount = clip_coverage(point_x, point_y, clip);
+            let clip_amount = raster.normalize_coverage(clip_coverage(point_x, point_y, clip).min(raster.interior_paint_coverage(x, y)), x, y);
             if clip_amount <= 0.0 {
                 continue;
             }
@@ -1205,7 +1250,7 @@ fn draw_image(
         for x in target.x.floor() as i32..target.right().ceil() as i32 {
             let point_x = x as f32 + 0.5;
             let point_y = y as f32 + 0.5;
-            let clip_amount = clip_coverage(point_x, point_y, clip);
+            let clip_amount = raster.normalize_coverage(clip_coverage(point_x, point_y, clip).min(raster.interior_paint_coverage(x, y)), x, y);
             if clip_amount <= 0.0 {
                 continue;
             }
@@ -1292,7 +1337,7 @@ fn draw_material(
         for x in target.x.floor() as i32..target.right().ceil() as i32 {
             let point_x = x as f32 + 0.5;
             let point_y = y as f32 + 0.5;
-            let clip_amount = clip_coverage(point_x, point_y, clip);
+            let clip_amount = raster.normalize_coverage(clip_coverage(point_x, point_y, clip).min(raster.interior_paint_coverage(x, y)), x, y);
             if clip_amount <= 0.0 {
                 continue;
             }
@@ -1325,12 +1370,6 @@ fn clip_coverage(x: f32, y: f32, clip: Option<&RenderClip>) -> f32 {
         return 1.0;
     };
     let point = crate::foundation::PointF { x, y };
-    if !clip.rect.contains(point) {
-        return 0.0;
-    }
-    if clip.corner_radii == crate::ui::CornerRadii::default() {
-        return 1.0; // Rectangular scissors retain their existing hard edge.
-    }
     crate::graphics::render::RoundedClip::new(clip.rect, clip.corner_radii).coverage(point)
 }
 

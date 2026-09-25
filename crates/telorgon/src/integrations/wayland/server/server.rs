@@ -296,17 +296,23 @@ pub struct EventLoopRef<'display> {
     marker: PhantomData<&'display Display>,
 }
 
+// libwayland accepts whole milliseconds. Rounding down turns short deadline waits
+// into busy polling; explicit zero remains a nonblocking dispatch.
+fn event_loop_timeout_ms(timeout: Option<Duration>) -> ServerResult<i32> {
+    match timeout {
+        None => Ok(-1),
+        Some(duration) => i32::try_from(duration.as_nanos().div_ceil(1_000_000)).map_err(|_| {
+            WaylandServerError::new(
+                WaylandServerErrorKind::InvalidTimeout,
+                "Wayland event-loop timeout exceeds i32 milliseconds",
+            )
+        }),
+    }
+}
+
 impl EventLoopRef<'_> {
     pub fn dispatch(&self, timeout: Option<Duration>) -> ServerResult<()> {
-        let timeout_ms = match timeout {
-            None => -1,
-            Some(duration) => i32::try_from(duration.as_millis()).map_err(|_| {
-                WaylandServerError::new(
-                    WaylandServerErrorKind::InvalidTimeout,
-                    "Wayland event-loop timeout exceeds i32 milliseconds",
-                )
-            })?,
-        };
+        let timeout_ms = event_loop_timeout_ms(timeout)?;
         let result = unsafe { ffi::wl_event_loop_dispatch(self.raw.as_ptr(), timeout_ms) };
         if result < 0 {
             Err(WaylandServerError::new(
@@ -700,6 +706,18 @@ fn native_zero(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fractional_event_loop_timeouts_wait_instead_of_polling() {
+        assert_eq!(event_loop_timeout_ms(None).unwrap(), -1);
+        assert_eq!(event_loop_timeout_ms(Some(Duration::ZERO)).unwrap(), 0);
+        for (ns, ms) in [(1, 1), (999_999, 1), (1_000_000, 1), (1_000_001, 2)] {
+            assert_eq!(event_loop_timeout_ms(Some(Duration::from_nanos(ns))).unwrap(), ms);
+        }
+        let maximum = Duration::from_millis(i32::MAX as u64);
+        assert_eq!(event_loop_timeout_ms(Some(maximum)).unwrap(), i32::MAX);
+        assert!(event_loop_timeout_ms(Some(maximum + Duration::from_nanos(1))).is_err());
+    }
+
     #[test]
     fn composed_global_policies_preserve_both_restrictions_and_fail_closed() {
         let mut policy = GlobalFilter(vec![Box::new(|client, _| client == 7)]);

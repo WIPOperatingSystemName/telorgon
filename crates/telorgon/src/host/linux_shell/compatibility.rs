@@ -35,7 +35,6 @@ pub(super) struct Compatibility {
     descendants: BTreeSet<WaylandSurfaceId>,
     desktop: super::x11_windows::X11Windows,
     policy_repaint: bool,
-    decoration_policy: crate::DecorationPolicy,
     closing: BTreeMap<crate::integrations::x11::association::XWindow, Option<u16>>,
     pending_focus: Option<(
         WaylandSurfaceId,
@@ -60,7 +59,6 @@ impl Compatibility {
         runtime: std::path::PathBuf,
         environment: crate::services::session::Environment,
         wake: EventNotifier,
-        decoration_policy: crate::DecorationPolicy,
     ) -> AppResult<Self> {
         let (send, receive) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -101,7 +99,6 @@ impl Compatibility {
             descendants: BTreeSet::new(),
             desktop: Default::default(),
             policy_repaint: false,
-            decoration_policy,
             closing: BTreeMap::new(),
             pending_focus: None,
             pending_raise: None,
@@ -267,7 +264,6 @@ impl Compatibility {
             for (id, unmanaged) in targets {
                 let extents = measured.get(&id).copied().unwrap_or_else(|| {
                     super::x11_windows::estimated_frame_extents(
-                        self.decoration_policy,
                         xwm.decorations(id),
                         unmanaged,
                         density,
@@ -339,8 +335,6 @@ impl Compatibility {
         }
         Ok(changed)
     }
-    /// Keep shutdown open while ordinary X11 windows exist, including unmapped
-    /// windows. Unknown/unsupported WM_DELETE_WINDOW never authorizes killing.
     pub(super) fn startup_complete(&self) -> bool {
         self.initialized || self.failed
     }
@@ -403,6 +397,8 @@ impl Compatibility {
         }
     }
 
+    // Unmapped helpers and withdrawn windows cannot keep logout alive. Shell minimization
+    // hides presentation without unmapping X11 windows, so minimized apps still participate.
     pub(super) fn request_close(&mut self) -> bool {
         let Some(xwm) = &mut self.xwm else {
             return false;
@@ -411,8 +407,7 @@ impl Compatibility {
             .windows()
             .map(|registry| {
                 registry
-                    .iter()
-                    .filter(|window| !window.override_redirect)
+                    .mapped_toplevels()
                     .map(|window| window.id)
                     .collect()
             })
@@ -579,7 +574,7 @@ impl Compatibility {
         }
         if !windows
             .get(&surface)
-            .is_some_and(|image| image.role == SurfaceRole::Xwayland && !image.minimized)
+            .is_some_and(|image| image.role == SurfaceRole::Xwayland && !image.hidden_on_primary())
         {
             return Ok(false);
         }
@@ -917,7 +912,7 @@ fn raise_family(
     if !family.contains(&surface)
         && windows
             .get(&surface)
-            .is_some_and(|window| !window.minimized)
+            .is_some_and(|window| !window.hidden_on_primary())
     {
         family.insert(0, surface);
     }

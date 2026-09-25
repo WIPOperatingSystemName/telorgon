@@ -5,6 +5,7 @@ mod buffer;
 #[cfg(target_os = "linux")]
 mod composite;
 mod config;
+pub(crate) mod staging_budget;
 mod descriptor;
 mod device;
 mod diagnostics;
@@ -15,6 +16,10 @@ mod executor;
 mod external_dma_buf;
 mod external_image;
 mod frame;
+mod submission_timing;
+pub(crate) use submission_timing::{GpuTiming, SubmissionTiming};
+#[cfg(target_os = "linux")]
+mod frame_border;
 #[path = "shaders/generated/metadata.rs"]
 mod generated_shader_bundle;
 mod hosted;
@@ -37,7 +42,7 @@ pub use device::{VulkanCapabilities, VulkanDevice, VulkanMemoryMetrics};
 pub use diagnostics::{VulkanDebugMessage, VulkanDiagnostics};
 pub use entry::{InstanceExtensionRequest, VulkanInstance};
 pub use external_dma_buf::{
-    DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR,
+    DRM_FORMAT_ABGR8888, DRM_FORMAT_ABGR16161616F, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR,
     DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
 };
 #[cfg(target_os = "linux")]
@@ -63,9 +68,22 @@ pub use hosted::{
     HostedImageUse, HostedMaintenanceStats, HostedRecordStats, HostedTargetDescriptor,
     HostedVulkanDeviceDescriptor, VulkanHostedFrame,
 };
-pub use readback::{PendingVulkanReadback, VulkanReadback};
 pub(crate) use readback::CaptureReadbackBuffer;
+pub use readback::{PendingVulkanReadback, VulkanReadback};
 pub use scene::{VulkanScene, VulkanSceneMetrics};
-pub(crate) use target::VulkanMaterializationTarget;
 pub(crate) use target::VulkanCaptureTarget;
+pub(crate) use target::VulkanMaterializationTarget;
 pub use target::{OffscreenVulkanTarget, VulkanTarget};
+
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+mod video_transfer;
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+pub use video_transfer::VulkanVideoTransfer;
+
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+mod video_export;
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+pub use video_export::{VulkanPendingVideoFrame, VulkanVideoRenderer};
+
+#[cfg(all(target_os = "linux", feature = "video-linux"))]
+mod video_output;

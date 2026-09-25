@@ -296,6 +296,20 @@ impl ShellContext {
     pub fn applications(&self) -> super::ApplicationCatalogHandle {
         self.services.applications.clone()
     }
+    pub fn clipboard(&self) -> Result<crate::services::clipboard::Clipboard, ShellServiceError> {
+        self.services
+            .service::<crate::services::clipboard::Clipboard>()
+            .map(|service| (*service).clone())
+    }
+    pub fn clipboard_contracts(
+        &self,
+    ) -> Result<std::rc::Rc<crate::services::clipboard::ClipboardContracts>, ShellServiceError>
+    {
+        self.services
+            .service::<std::rc::Rc<crate::services::clipboard::ClipboardContracts>>()
+            .map(|service| (*service).clone())
+    }
+
 }
 #[derive(Clone)]
 pub struct ShellWindows(ShellServices);
@@ -313,6 +327,15 @@ impl ShellWindows {
     }
     pub fn icon(&self, id: WindowId) -> crate::assets::ImageSource {
         self.resolve_icon(id, super::applications::IconRequest::new())
+    }
+    /// Resolve client or catalog artwork without substituting a placeholder.
+    pub fn try_resolve_icon(
+        &self,
+        id: WindowId,
+        request: super::applications::IconRequest,
+    ) -> Option<crate::assets::ImageSource> {
+        let icon = self.resolve_icon(id, request);
+        (icon.image_id() != super::applications::fallback_image().image).then_some(icon)
     }
     /// Resolve catalog artwork at the rendered logical size and output density.
     pub fn resolve_icon(

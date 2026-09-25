@@ -17,6 +17,17 @@ mod tests {
     use crate::foundation::ColorRgba8;
 
     #[test]
+    fn fractional_square_coverage_does_not_shrink_geometric_hit_bounds() {
+        let clip = RoundedClip::new(
+            RectF { x: 0.5, y: 0.5, width: 10.0, height: 10.0 },
+            CornerRadii::default(),
+        );
+        assert_eq!(clip.coverage(PointF { x: 0.5, y: 0.5 }), 0.25);
+        assert!(clip.contains(PointF { x: 0.51, y: 0.51 }));
+        assert!(!clip.contains(PointF { x: 0.49, y: 0.51 }));
+    }
+
+    #[test]
     fn resize_outset_and_containment_share_the_border_curve() {
         let outer = RoundedClip::new(
             RectF {
@@ -192,7 +203,8 @@ impl RoundedClip {
 
     /// Geometric input containment; antialiasing does not enlarge the hit target.
     pub fn contains(self, point: PointF) -> bool {
-        let inside = self.rect.contains(point) && self.inner_coverage(point) >= 0.5;
+        let inside = self.rect.contains(point)
+            && (self.radii == CornerRadii::default() || self.inner_coverage(point) >= 0.5);
         if self.inverted { !inside } else { inside }
     }
 
@@ -263,6 +275,11 @@ impl RoundedClip {
         let half_y = self.rect.height * 0.5;
         let x = point.x - self.rect.x;
         let y = point.y - self.rect.y;
+        if self.radii == CornerRadii::default() {
+            let horizontal = ((x + 0.5).min(self.rect.width) - (x - 0.5).max(0.0)).clamp(0.0, 1.0);
+            let vertical = ((y + 0.5).min(self.rect.height) - (y - 0.5).max(0.0)).clamp(0.0, 1.0);
+            return horizontal * vertical;
+        }
         let radius = if x < half_x {
             if y < half_y {
                 self.radii.top_left

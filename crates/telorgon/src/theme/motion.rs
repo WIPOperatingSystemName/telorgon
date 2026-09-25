@@ -1,6 +1,8 @@
 //! Validated transition values shared by theme compilation and per-view animation tracks.
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash,
+)]
 pub enum Easing {
     Linear,
     EaseIn,
@@ -32,14 +34,18 @@ impl Easing {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash,
+)]
 pub struct TransitionSpec {
     pub duration_ms: u32,
     pub easing: Easing,
     pub repeat: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash,
+)]
 pub enum MotionPreference {
     #[default]
     Full,

@@ -97,6 +97,8 @@ pub(crate) struct FrameCore {
     pub(crate) staging_bytes_used: usize,
     pub(crate) buffers: Vec<Arc<AllocatedBuffer>>,
     pub(crate) images: Vec<Arc<AllocatedImage>>,
+    // Additional owned targets follow the same submission/retirement lifetime as images.
+    pub(crate) resources: Vec<Arc<dyn Send + Sync>>,
     pub(crate) external_images: Vec<Arc<ExternalImageInner>>,
     pub(crate) rendered: bool,
     #[cfg(feature = "instrumentation")]
@@ -194,6 +196,8 @@ pub struct VulkanRecordedFrame {
     slot_index: Option<usize>,
     pub(crate) buffers: Vec<Arc<AllocatedBuffer>>,
     pub(crate) images: Vec<Arc<AllocatedImage>>,
+    // Additional owned targets follow the same submission/retirement lifetime as images.
+    pub(crate) resources: Vec<Arc<dyn Send + Sync>>,
     pub(crate) external_images: Vec<Arc<ExternalImageInner>>,
 }
 
@@ -220,11 +224,15 @@ impl CompletionPoint {
 
 #[must_use = "retain the receipt until completion or allow device-owned deferred retirement"]
 pub struct SubmissionReceipt {
+    timing: Option<super::submission_timing::TimingResult>,
+    submit_started: std::time::Instant,
+    submitted: std::time::Instant,
     device: Arc<DeviceInner>,
     frames: Arc<FrameSlots>,
     completion: CompletionPoint,
     buffers: Vec<Arc<AllocatedBuffer>>,
     images: Vec<Arc<AllocatedImage>>,
+    resources: Vec<Arc<dyn Send + Sync>>,
     external_images: Vec<Arc<ExternalImageInner>>,
     completed: bool,
 }
@@ -234,6 +242,7 @@ struct RetiredSubmission {
     frame_id: u64,
     _buffers: Vec<Arc<AllocatedBuffer>>,
     _images: Vec<Arc<AllocatedImage>>,
+    _resources: Vec<Arc<dyn Send + Sync>>,
     external_images: Vec<Arc<ExternalImageInner>>,
 }
 
@@ -263,6 +272,7 @@ struct FrameSlot {
 
 #[cfg(feature = "instrumentation")]
 struct ProfilerTimestampQueries {
+    timing: super::submission_timing::TimingResult,
     pool: vk::QueryPool,
     valid_bits: u32,
     period_ns: f32,
@@ -395,6 +405,7 @@ impl FrameSlot {
                 )
             } {
                 Ok(pool) => Some(ProfilerTimestampQueries {
+                    timing: Arc::new(Mutex::new(None)),
                     pool,
                     valid_bits: device.profiler_timestamp_valid_bits,
                     period_ns: device.profiler_timestamp_period_ns,
@@ -549,6 +560,7 @@ fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
         )
     };
     let mut stage_samples = Vec::new();
+    let mut stages_available = timestamps.scopes.is_empty();
     if !timestamps.scopes.is_empty() {
         let mut samples = vec![0_u64; timestamps.scopes.len() * 2];
         let result = unsafe {
@@ -560,6 +572,7 @@ fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
             )
         };
         if result.is_ok() {
+            stages_available = true;
             for (label, pair) in timestamps.scopes.iter().zip(samples.chunks_exact(2)) {
                 let start = ticks_to_ns(
                     timestamp_delta(values[0], pair[0], timestamps.valid_bits),
@@ -573,6 +586,14 @@ fn resolve_profiler_timestamps(slot: &mut FrameSlot) {
                 stage_samples.push((*label, elapsed));
             }
         }
+    }
+    if let Ok(mut timing) = timestamps.timing.lock() {
+        *timing = Some(super::GpuTiming {
+            total_ns: duration(0, 4),
+            upload_ns: duration(0, 1),
+            stages: stage_samples.clone(),
+            stages_available,
+        });
     }
     log_gpu_stats(duration(0, 4), stage_samples);
     crate::runtime::instrumentation::record_gpu_span("gpu.total", frame, 0, duration(0, 4));
@@ -730,6 +751,7 @@ impl FrameSlots {
         let profiler_query_pool = slot.profiler_timestamps.as_mut().map(|timestamps| {
             timestamps.pending = false;
             timestamps.frame = crate::runtime::instrumentation::current_frame_id();
+            timestamps.timing = Arc::new(Mutex::new(None));
             unsafe {
                 self.device.raw.cmd_reset_query_pool(
                     slot.command_buffer,
@@ -761,6 +783,7 @@ impl FrameSlots {
                 staging_bytes_used: 0,
                 buffers: Vec::new(),
                 images: Vec::new(),
+                resources: Vec::new(),
                 external_images: Vec::new(),
                 rendered: false,
                 #[cfg(feature = "instrumentation")]
@@ -839,9 +862,14 @@ impl FrameSlots {
         frame_id: u64,
         buffers: Vec<Arc<AllocatedBuffer>>,
         images: Vec<Arc<AllocatedImage>>,
+        resources: Vec<Arc<dyn Send + Sync>>,
         external_images: Vec<Arc<ExternalImageInner>>,
     ) {
-        if buffers.is_empty() && images.is_empty() && external_images.is_empty() {
+        if buffers.is_empty()
+            && images.is_empty()
+            && resources.is_empty()
+            && external_images.is_empty()
+        {
             return;
         }
         let mut retired = self
@@ -853,6 +881,7 @@ impl FrameSlots {
             frame_id,
             _buffers: buffers,
             _images: images,
+            _resources: resources,
             external_images,
         });
     }
@@ -973,6 +1002,7 @@ impl<'device> VulkanRecordingFrame<'device> {
             slot_index: Some(slot_index),
             buffers: core.buffers,
             images: core.images,
+            resources: core.resources,
             external_images: core.external_images,
         })
     }
@@ -1073,6 +1103,15 @@ impl Drop for VulkanRecordedFrame {
 }
 
 impl SubmissionReceipt {
+    pub(crate) fn timing(&self) -> super::SubmissionTiming {
+        super::SubmissionTiming {
+            point: self.completion,
+            submit_started: self.submit_started,
+            submitted: self.submitted,
+            gpu: self.timing.as_ref().and_then(|timing| timing.lock().ok()?.clone()),
+        }
+    }
+
     pub fn completion(&self) -> CompletionPoint {
         self.completion
     }
@@ -1154,6 +1193,7 @@ impl Drop for SubmissionReceipt {
         if self.completed {
             self.buffers.clear();
             self.images.clear();
+            self.resources.clear();
             self.external_images.clear();
         } else {
             self.frames.retire(
@@ -1161,6 +1201,7 @@ impl Drop for SubmissionReceipt {
                 self.completion.frame_id,
                 std::mem::take(&mut self.buffers),
                 std::mem::take(&mut self.images),
+                std::mem::take(&mut self.resources),
                 std::mem::take(&mut self.external_images),
             );
         }
@@ -1213,6 +1254,9 @@ fn submit_recorded(
     let slot_index = frame
         .slot_index
         .ok_or_else(|| internal("Vulkan recorded frame slot is unavailable"))?;
+    let timing;
+    let submit_started;
+    let submitted;
     {
         let mut slots = frame
             .frames
@@ -1229,6 +1273,15 @@ fn submit_recorded(
         {
             return Err(internal("Vulkan recorded frame-slot state is invalid"));
         }
+        #[cfg(feature = "instrumentation")]
+        {
+            timing = slot.profiler_timestamps.as_ref().map(|timestamps| Arc::clone(&timestamps.timing));
+        }
+        #[cfg(not(feature = "instrumentation"))]
+        {
+            timing = None;
+        }
+        submit_started = std::time::Instant::now();
         let _queue = frame
             .device
             .queue_lock
@@ -1241,6 +1294,7 @@ fn submit_recorded(
                 .queue_submit2(frame.device.queue, &submit, slot.fence)
         }
         .map_err(|result| vk_error("failed to submit Vulkan frame", result))?;
+        submitted = std::time::Instant::now();
         slot.state = SlotState::InFlight {
             frame_id: frame.frame_id,
             completion: completion_value,
@@ -1248,6 +1302,9 @@ fn submit_recorded(
     }
     frame.slot_index = None;
     Ok(SubmissionReceipt {
+        timing,
+        submit_started,
+        submitted,
         device: frame.device.clone(),
         frames: Arc::clone(&frame.frames),
         completion: CompletionPoint {
@@ -1257,6 +1314,7 @@ fn submit_recorded(
         },
         buffers: std::mem::take(&mut frame.buffers),
         images: std::mem::take(&mut frame.images),
+        resources: std::mem::take(&mut frame.resources),
         external_images: std::mem::take(&mut frame.external_images),
         completed: false,
     })

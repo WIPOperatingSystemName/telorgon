@@ -28,6 +28,9 @@ where
             );
             return;
         };
+        // The picker is short lived; report cold-start stages without logging its sources.
+        let picker_start = std::env::var_os("TELORGON_PORTAL_PICKER")
+            .map(|_| std::time::Instant::now());
         let options = &self.options;
         let window_icon = match source.window_icon(&options.icon) {
             Ok(icon) => icon,
@@ -59,6 +62,11 @@ where
                 f64::from(minimum.height.max(1)),
             )));
         }
+        if options.fixed_size {
+            attributes = attributes.with_resizable(false)
+                .with_min_inner_size(LogicalSize::new(options.size.width, options.size.height))
+                .with_max_inner_size(LogicalSize::new(options.size.width, options.size.height));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -66,6 +74,7 @@ where
                 return;
             }
         };
+        let window_ready = std::time::Instant::now();
         if let Err(error) = self.resize_signals.register_window(&window) {
             self.fail(event_loop, error);
             return;
@@ -87,6 +96,7 @@ where
             self.fail(event_loop, error);
             return;
         }
+        let renderer_ready = std::time::Instant::now();
         let mut runtime = match source.mount(options.size) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -94,12 +104,20 @@ where
                 return;
             }
         };
+        if let Some(start) = picker_start {
+            eprintln!("telorgon-portal: picker startup: window={}ms renderer={}ms mount={}ms total={}ms",
+                window_ready.duration_since(start).as_millis(),
+                renderer_ready.duration_since(window_ready).as_millis(),
+                renderer_ready.elapsed().as_millis(), start.elapsed().as_millis());
+        }
         let size = window.inner_size();
         self.drawable = size.width > 0 && size.height > 0;
-        runtime.queue_input(PlatformInput::Resize(SizeF {
-            width: size.width.max(1) as f32,
-            height: size.height.max(1) as f32,
-        }));
+        let scale = self.layout_scale_factor();
+        runtime.set_raster_scale(crate::platform::contracts::ScaleFactor::new(scale).unwrap());
+        runtime.queue_input(PlatformInput::Resize(super::dpi::logical_extent(
+            SizeI { width: size.width as i32, height: size.height as i32 },
+            scale,
+        )));
         self.runtime = Some(runtime);
         self.mark_redraw(RedrawReason::Startup);
     }
@@ -115,7 +133,7 @@ where
                 self.host_wake_pending = false;
                 self.poll_presentation(event_loop);
             }
-            #[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+            #[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
             HostEvent::PresentationWake => {
                 self.poll_presentation(event_loop);
             }
@@ -157,6 +175,16 @@ where
                 }
                 self.flush_commands();
                 event_loop.exit();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    let _ = self.pending_resize.queue_for_barrier(SizeI {
+                        width: size.width as i32,
+                        height: size.height as i32,
+                    });
+                }
+                self.mark_redraw(RedrawReason::Resize);
             }
             WindowEvent::Resized(size) => {
                 let event_extent = SizeI {
@@ -211,8 +239,8 @@ where
                 self.diagnostics.native_pointer_moves =
                     self.diagnostics.native_pointer_moves.saturating_add(1);
                 self.cursor_position = PointF {
-                    x: position.x as f32,
-                    y: position.y as f32,
+                    x: position.x as f32 / self.layout_scale_factor(),
+                    y: position.y as f32 / self.layout_scale_factor(),
                 };
                 if let Some(runtime) = self.runtime.as_mut() {
                     runtime.queue_input(InputEvent::mouse_moved(self.cursor_position));
@@ -263,8 +291,8 @@ where
                         y: y * 24.0,
                     },
                     MouseScrollDelta::PixelDelta(position) => PointF {
-                        x: position.x as f32,
-                        y: position.y as f32,
+                        x: position.x as f32 / self.layout_scale_factor(),
+                        y: position.y as f32 / self.layout_scale_factor(),
                     },
                 };
                 if let Some(runtime) = self.runtime.as_mut() {

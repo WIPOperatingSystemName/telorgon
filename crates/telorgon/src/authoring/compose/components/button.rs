@@ -34,6 +34,22 @@ pub struct Button {
 }
 
 impl Button {
+    pub fn label_color(mut self, color: ColorRgba8) -> Self {
+        self.element.label_style.color = color;
+        self
+    }
+    pub fn label_size(mut self, size: f32) -> Self {
+        if size.is_finite() && size > 0.0 {
+            self.element.label_style.size = size;
+            self.element.label_style.line_height = size * 1.25;
+        }
+        self
+    }
+    pub fn label_align(mut self, align: TextAlign) -> Self {
+        self.element.label_style.align = align;
+        self
+    }
+
     pub fn font_family(mut self, family: &'static str) -> Self {
         self.element.font_family = Some(family);
         self

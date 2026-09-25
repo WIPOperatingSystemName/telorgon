@@ -534,15 +534,19 @@ fn pending_recovery_does_not_exhaust_process_slots() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let env = Environment::inherited();
-    let (journal, _) = recovery::Journal::open(&fixture.config(), &env).unwrap().unwrap();
+    let (journal, _) = recovery::Journal::open(&fixture.config(), &env)
+        .unwrap()
+        .unwrap();
     // More recovery offers than the live-process limit must survive journal reload.
-    let entries = (1..=257).map(|id| recovery::RecoveryEntry {
-        id,
-        spec: command("/bin/true").recover(true).spec,
-        pid: 0,
-        process_identity: None,
-        generation: id,
-    }).collect();
+    let entries = (1..=257)
+        .map(|id| recovery::RecoveryEntry {
+            id,
+            spec: command("/bin/true").recover(true).spec,
+            pid: 0,
+            process_identity: None,
+            generation: id,
+        })
+        .collect();
     journal.write(entries).unwrap();
     drop(journal);
     let owner = SessionOwner::start(env, fixture.config()).unwrap();
@@ -558,10 +562,141 @@ fn pending_recovery_does_not_exhaust_process_slots() {
 fn queued_launches_still_enforce_process_limit() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
-    let owner = SessionOwner::start_waiting_for_x11(Environment::inherited(), fixture.config()).unwrap();
+    let owner =
+        SessionOwner::start_waiting_for_x11(Environment::inherited(), fixture.config()).unwrap();
     for _ in 0..256 {
         command("/bin/true").spawn().unwrap();
     }
-    assert!(matches!(command("/bin/true").spawn(), Err(Error::ProcessLimit)));
+    assert!(matches!(
+        command("/bin/true").spawn(),
+        Err(Error::ProcessLimit)
+    ));
     owner.close();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn registry_resolution_launch_and_old_session_handles() {
+    let _guard = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let apps = fixture.0.join("applications");
+    std::fs::create_dir(&apps).unwrap();
+    std::fs::write(
+        apps.join("editor.desktop"),
+        "[Desktop Entry]\nType=Application\nExec=/bin/true\n",
+    )
+    .unwrap();
+    let registry = ApplicationRegistry::new()
+        .binary_directory("/bin")
+        .desktop_entry_directory(&apps)
+        .register(
+            "echo",
+            ApplicationSpec::executable("echo").arg("literal $HOME"),
+        )
+        .register("editor", ApplicationSpec::desktop_entry("editor.desktop"));
+    let owner = SessionOwner::start(
+        Environment::inherited(),
+        fixture.config().applications(registry),
+    )
+    .unwrap();
+    let applications = applications().unwrap();
+    let helper = applications.executable("sh").unwrap();
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "printf '%s' \"$TELORGON_HELPER_TEST\""])
+        .env("TELORGON_HELPER_TEST", "private")
+        .stdout(std::process::Stdio::piped());
+    let output = helper
+        .spawn_helper(&mut command)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(output.stdout, b"private");
+    let echo = applications.get("echo").unwrap();
+    let output = wait(echo.command().unwrap().output()).unwrap();
+    assert_eq!(output.stdout, b"literal $HOME\n");
+    assert!(applications.get("unregistered").is_err());
+    assert!(applications.executable("../bin/echo").is_err());
+    assert!(
+        applications
+            .executable("no-such-telorgon-binary")
+            .unwrap_err()
+            .to_string()
+            .contains("/bin")
+    );
+    let desktop = applications.get("editor").unwrap();
+    assert!(desktop.executable_parts().is_err());
+    let launched = wait(desktop.launch()).unwrap();
+    assert_eq!(launched.children.len(), 1);
+    assert!(
+        applications
+            .desktop_entry("missing.desktop")
+            .unwrap_err()
+            .to_string()
+            .contains("XDG discovery disabled")
+    );
+    drop(owner);
+    let next = SessionOwner::start(Environment::inherited(), fixture.config()).unwrap();
+    assert!(matches!(echo.command(), Err(Error::Closing)));
+    assert!(matches!(applications.get("echo"), Err(Error::Closing)));
+    drop(next);
+}
+
+#[test]
+fn registry_rejects_ambiguous_configuration() {
+    assert!(
+        ApplicationRegistry::new()
+            .binary_directory("relative")
+            .validate()
+            .is_err()
+    );
+    assert!(
+        ApplicationRegistry::new()
+            .register("picker", ApplicationSpec::executable("one"))
+            .register("picker", ApplicationSpec::executable("two"))
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn desktop_settings_follow_managed_launches_and_session_lifetime() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = OWNER_TEST.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut env = Environment::inherited();
+    env.0.insert("XDG_RUNTIME_DIR".into(), fixture.0.as_os_str().into());
+    env.0.insert("XDG_CONFIG_DIRS".into(), "/existing/config:/etc/xdg".into());
+    let original = env.clone();
+    let config = fixture.config().desktop_settings(DesktopSettings::default());
+    let owner = SessionOwner::start(env, config.clone()).unwrap();
+    let handle = current().unwrap();
+    let paths = handle.environment("XDG_CONFIG_DIRS").unwrap();
+    let paths: Vec<_> = std::env::split_paths(&paths).collect();
+    assert_eq!(&paths[1..], &[PathBuf::from("/existing/config"), PathBuf::from("/etc/xdg")]);
+    let settings = paths[0].join("gtk-3.0/settings.ini");
+    assert_eq!(std::fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777, 0o700);
+    // Verify an actual managed child receives the generated config, without a launcher or
+    // process-global environment mutation and without starting GTK/a desktop service.
+    let output = wait(shell("IFS=:; set -- $XDG_CONFIG_DIRS; cat \"$1/gtk-3.0/settings.ini\"").output()).unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "[Settings]\ngtk-decoration-layout=menu:minimize,maximize,close\n");
+    assert_eq!(original.get("XDG_CONFIG_DIRS"), Some(std::ffi::OsStr::new("/existing/config:/etc/xdg")));
+    owner.close();
+    drop(owner);
+    assert!(!settings.exists(), "session-owned defaults must be removed on shutdown");
+    assert!(matches!(SessionOwner::start_gui(original, config), Err(Error::Unsupported(_))));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn desktop_settings_reject_injection_before_creating_runtime_files() {
+    let fixture = Fixture::new();
+    let env = Environment(BTreeMap::from([("XDG_RUNTIME_DIR".into(), fixture.0.as_os_str().into())]));
+    let config = fixture.config().desktop_settings(DesktopSettings {
+        decoration_layout: "menu:close\n[Settings]\ngtk-theme-name=bad".into(),
+    });
+    assert!(super::desktop_settings::prepare(env, &config).is_err());
+    assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
 }

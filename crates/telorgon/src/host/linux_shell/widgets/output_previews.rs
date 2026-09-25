@@ -115,9 +115,10 @@ fn eligible(source: &ShellLayer, overlays: &BTreeSet<u32>) -> bool {
 
 fn reference_content(content: &ShellLayerContent) -> ShellLayerContent {
     match content {
-        ShellLayerContent::Retained { scene, .. } => ShellLayerContent::Retained {
+        ShellLayerContent::Retained { scene, border, .. } => ShellLayerContent::Retained {
             scene: *scene,
             deltas: Vec::new(),
+            border: border.clone(),
         },
         ShellLayerContent::Image {
             scene,
@@ -175,7 +176,7 @@ mod tests {
                 width: 800,
                 height: 600,
             },
-            AssetBundle::default(),
+            &LayerAssets::new(AssetBundle::default()).unwrap(),
             crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
             &EventNotifier::new("preview test").unwrap(),
             host.services.clone(),

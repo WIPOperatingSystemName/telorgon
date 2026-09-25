@@ -55,9 +55,12 @@ impl<'display> NativeCompositor<'display> {
             protocol,
             core: CompositorCore::new(limits).map_err(error)?,
             output_revision: 0,
+            retired_outputs: BTreeSet::new(),
+            manual_outputs: BTreeSet::new(),
             clients: BTreeMap::new(),
             resources: BTreeMap::new(),
             mapped_outputs: BTreeSet::new(),
+            surface_outputs: BTreeMap::new(),
             entered_outputs: BTreeSet::new(),
             regions: BTreeMap::new(),
             shm_pools: BTreeMap::new(),
@@ -66,11 +69,14 @@ impl<'display> NativeCompositor<'display> {
             destroyed_buffers: BTreeMap::new(),
             callbacks: BTreeMap::new(),
             committed_callbacks: BTreeMap::new(),
+            timing_observer: None,
             pending_presentation_feedbacks: BTreeMap::new(),
             committed_presentation_feedbacks: BTreeMap::new(),
             xdg_resources: BTreeMap::new(),
             toplevels: BTreeMap::new(),
+            requested_toplevel_states: BTreeMap::new(),
             decoration_policy: crate::DecorationPolicy::DEFAULT,
+            decorations: BTreeMap::new(),
             committed_decorations: BTreeMap::new(),
             toplevel_icons: BTreeMap::new(),
             pending_toplevel_icons: BTreeMap::new(),
@@ -107,6 +113,7 @@ impl<'display> NativeCompositor<'display> {
             committed_releases: BTreeMap::new(),
             initial_configures: BTreeSet::new(),
             next_client: 0,
+            clipboard: None,
             next_object: 0,
             next_surface: 0,
             next_buffer: 0,
@@ -162,6 +169,14 @@ impl<'display> NativeCompositor<'display> {
             1
         }
     }
+    pub(crate) fn surface_process_id(&self, surface: WaylandSurfaceId) -> Option<u32> {
+        self.state.resource_for_kind(|kind| {
+            matches!(kind, ResourceKind::Surface(candidate) if candidate == surface)
+        }).ok().flatten().and_then(|resource| {
+            u32::try_from(resource.client().credentials().pid).ok()
+        })
+    }
+
     pub fn core(&self) -> &CompositorCore {
         &self.state.core
     }
@@ -172,7 +187,9 @@ impl<'display> NativeCompositor<'display> {
 
     pub fn advertised_globals(&self) -> usize {
         debug_assert_eq!(self.bind_contexts.len(), self.globals.len());
-        self.globals.len()
+        self.bind_contexts.iter().filter(|context| {
+            !matches!(context.kind, ResourceKind::Output(id) if self.state.retired_outputs.contains(&id))
+        }).count()
     }
 
     pub fn add_output(
@@ -182,7 +199,15 @@ impl<'display> NativeCompositor<'display> {
         output: crate::integrations::wayland::compositor::OutputState,
     ) -> Result<(), NativeCompositorError> {
         output.description.clone().validate().map_err(error)?;
+        if self.state.core.outputs.len() + self.state.retired_outputs.len()
+            >= outputs::MAX_OUTPUT_GLOBALS
+        {
+            return Err(NativeCompositorError::new(
+                "output global lifetime limit reached",
+            ));
+        }
         if id == 0
+            || self.state.retired_outputs.contains(&id)
             || output.current_mode >= output.description.modes.len()
             || self.state.core.outputs.contains_key(&id)
             || self
@@ -325,37 +350,8 @@ impl<'display> NativeCompositor<'display> {
             }
         }
         if preferred_scale_changed {
-            // Preserve the current first-enabled-output preference until the host
-            // has per-surface output membership and multi-output scale policy.
-            let scale = current_scale.map_or(1.0, |scale| scale.get());
-            for resource in self
-                .state
-                .resources_for_kind(|kind| matches!(kind, ResourceKind::FractionalScale))?
-            {
-                self.state.post_event(
-                    resource,
-                    "wp_fractional_scale_v1",
-                    "preferred_scale",
-                    &mut [ffi::wl_argument {
-                        u: (scale * 120.0).round() as u32,
-                    }],
-                )?;
-            }
-            for resource in self
-                .state
-                .resources_for_kind(|kind| matches!(kind, ResourceKind::Surface(_)))?
-            {
-                if resource.version() >= 6 {
-                    self.state.post_event(
-                        resource,
-                        "wl_surface",
-                        "preferred_buffer_scale",
-                        &mut [ffi::wl_argument {
-                            i: scale.ceil() as i32,
-                        }],
-                    )?;
-                }
-            }
+            self.state
+                .send_preferred_output_scale(current_scale.map_or(1.0, |scale| scale.get()))?;
         }
         Ok(true)
     }
@@ -686,13 +682,15 @@ impl<'display> NativeCompositor<'display> {
     }
 
     /// Shell startup configuration; set before accepting client toplevels.
+    pub(crate) fn tiled_client_decorations(&self) -> bool {
+        self.state.decoration_policy.tiled_client_decorations
+    }
+
     pub(crate) fn set_decoration_policy(&mut self, policy: crate::DecorationPolicy) {
         self.state.decoration_policy = policy;
     }
 
-    pub(crate) fn decoration_policy(&self) -> crate::DecorationPolicy {
-        self.state.decoration_policy
-    }
+
 
     pub fn decoration_mode(
         &self,
@@ -703,7 +701,7 @@ impl<'display> NativeCompositor<'display> {
                 .committed_decorations
                 .get(&surface)
                 .copied()
-                .unwrap_or(crate::integrations::wayland::compositor::DecorationMode::ServerSide)
+                .unwrap_or(crate::integrations::wayland::compositor::DecorationMode::ClientSide)
         })
     }
 
@@ -718,6 +716,13 @@ impl<'display> NativeCompositor<'display> {
     /// Returns the icon snapshot applied by the latest `wl_surface.commit` for a toplevel.
     pub fn toplevel_icon(&self, surface: WaylandSurfaceId) -> Option<&ToplevelIconSnapshot> {
         self.state.committed_toplevel_icons.get(&surface)
+    }
+
+    pub(crate) fn surface_logical_size(
+        &self,
+        surface: WaylandSurfaceId,
+    ) -> Result<crate::foundation::SizeI, NativeCompositorError> {
+        self.state.surface_logical_size(surface)
     }
 
     pub fn viewport(&self, surface: WaylandSurfaceId) -> Option<ViewportState> {

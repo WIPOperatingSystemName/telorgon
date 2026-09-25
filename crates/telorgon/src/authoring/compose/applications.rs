@@ -229,7 +229,7 @@ impl ApplicationCatalogHandle {
             .collect()
     }
     /// Match protocol identity, never the human-readable window title. Ambiguous aliases remain unmatched.
-    pub(crate) fn identify(&self, identity: &str) -> Option<ApplicationId> {
+    pub fn identify(&self, identity: &str) -> Option<ApplicationId> {
         if identity.is_empty() {
             return None;
         }
@@ -254,13 +254,23 @@ impl ApplicationCatalogHandle {
             |i| self.icon_named(&i.0),
         )
     }
+    /// Returns available artwork without substituting the generic icon. Pending lookups
+    /// still subscribe the view to asynchronous completion, so fallback chains remain reactive.
+    pub fn try_resolve_icon(&self, id: &ApplicationId, request: IconRequest) -> Option<ImageSource> {
+        let icon = self.resolve_icon(id, request);
+        (icon.image_id() != fallback_image().image).then_some(icon)
+    }
+    pub fn try_resolve_named_icon(&self, name: &str, request: IconRequest) -> Option<ImageSource> {
+        let icon = self.resolve_named_icon(name, request);
+        (icon.image_id() != fallback_image().image).then_some(icon)
+    }
     pub fn resolve_icon(&self, id: &ApplicationId, request: IconRequest) -> ImageSource {
         self.get(id).and_then(|a| a.icon).map_or_else(
             || context::bind_image(fallback_image()),
             |icon| self.resolve_named_icon(&icon.0, request),
         )
     }
-    pub(crate) fn resolve_named_icon(&self, name: &str, request: IconRequest) -> ImageSource {
+    pub fn resolve_named_icon(&self, name: &str, request: IconRequest) -> ImageSource {
         let scale = request
             .scale
             .map_or(self.raster_size as f32 / 32.0, |s| s.get());
@@ -743,7 +753,7 @@ fn find_icon(config: &ApplicationCatalog, name: &str, size: u32) -> Option<PathB
 }
 pub(crate) static NEXT_ICON: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0x6800_0000);
-fn decode_icon(path: &Path, size: u32) -> Result<ImageResource, String> {
+pub(crate) fn decode_icon(path: &Path, size: u32) -> Result<ImageResource, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();

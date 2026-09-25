@@ -324,7 +324,7 @@ pub(super) fn set_window_maximized(
                 width: (work_area.width - config.window_border * 2).max(1),
                 height: (work_area.height
                     - config.window_border * 2
-                    - if window_is_decorated(window) {
+                    - if window_has_titlebar(window) {
                         config.titlebar_height
                     } else {
                         0

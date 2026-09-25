@@ -179,9 +179,10 @@ impl NativeState {
             height: request.int(3).map_err(error)?,
         };
         if rectangle.width <= 0 || rectangle.height <= 0 {
-            return Err(NativeCompositorError::new(
-                "region rectangle must be positive",
-            ));
+            // Empty region operations have no effect. In particular, clients can
+            // send zero-sized rectangles while updating input/opaque regions;
+            // wl_region does not define a fatal invalid-size protocol error.
+            return Ok(DispatchOutcome::default());
         }
         let rectangles = self
             .regions
@@ -374,7 +375,7 @@ impl NativeState {
                             x: request.int(0).map_err(error)?,
                             y: request.int(1).map_err(error)?,
                         },
-                        above: None,
+                        above: self.core.subsurfaces.position(surface).and_then(|position| position.above),
                     },
                 )
                 .map_err(error)?,
@@ -404,7 +405,7 @@ impl NativeState {
                         .ok_or_else(|| NativeCompositorError::new("missing sibling"))?,
                 )?;
                 let position = crate::integrations::wayland::compositor::SubsurfacePosition {
-                    offset: PointI::default(),
+                    offset: self.core.subsurfaces.position(surface).map_or(PointI::default(), |position| position.offset),
                     above: (request.message().name == "place_above").then_some(sibling),
                 };
                 self.core
@@ -414,6 +415,10 @@ impl NativeState {
             }
             _ => return Err(unsupported_request(request)),
         }
+        super::super::diagnostics::event(surface.get(), "subsurface", format_args!(
+            "request={} parent={:?} position={:?} synchronized={}", request.message().name,
+            self.core.subsurfaces.parent(surface), self.core.subsurfaces.position(surface),
+            self.core.subsurfaces.effectively_synchronized(surface)));
         Ok(DispatchOutcome::default())
     }
 

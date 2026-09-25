@@ -1,7 +1,9 @@
 //! Immutable compositor snapshots recorded on the normal frame queue.
+use crate::host::linux_shell::motion::{SnapshotInput, position_images};
 use super::super::super::motion::{MotionFrame, SnapshotContent, image_scene};
 use super::*;
 use crate::graphics::renderers::vulkan::VulkanFrameContext;
+use super::super::super::preview_trace;
 
 pub(super) struct MotionSnapshot {
     pub target: VulkanMaterializationTarget,
@@ -19,7 +21,9 @@ pub(super) fn record_motion(
     live_glass: &mut super::motion_glass::MotionGlass,
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<bool> {
+    let _timing = super::super::super::preview_trace::span("snapshots");
     let mut targets = Vec::new();
+    let mut used_mix_scenes = Vec::new();
     for command in &motion.snapshots {
         let body = super::motion_glass::extract_recipe_with_borders(
             command,
@@ -49,6 +53,7 @@ pub(super) fn record_motion(
         {
             spares.swap_remove(index)
         } else {
+            let _allocation = super::super::super::preview_trace::span("snapshot_allocate");
             match VulkanMaterializationTarget::new_traced(
                 device,
                 if empty {
@@ -88,7 +93,9 @@ pub(super) fn record_motion(
             force: true,
             load: TargetLoad::Clear(ColorRgba8::rgba(0, 0, 0, 0)),
             store: TargetStore::Store,
-            region: None,
+            region: Some(full_rect(if live_glass.empty_bodies.contains(&command.id) {
+                SizeI { width: 1, height: 1 }
+            } else { command.extent })),
         };
         let transparent = SnapshotContent::Capture(Vec::new());
         let content = if live_glass.empty_bodies.contains(&command.id) {
@@ -98,6 +105,7 @@ pub(super) fn record_motion(
         };
         match content {
             SnapshotContent::Capture(_) => {
+                let _capture = preview_trace::span("snapshot_capture_encode");
                 let placements = &body;
                 let indices = scenes
                     .keys()
@@ -137,7 +145,14 @@ pub(super) fn record_motion(
                     .map_err(app_error)?;
             }
             SnapshotContent::Mix(inputs) => {
-                let mut source = sample_scene(device, snapshots, command.extent, inputs, true)?;
+                let prepare = preview_trace::span("snapshot_mix_prepare");
+                let mut source = match live_glass.mix_scenes.get_mut(&inputs.len()).and_then(Vec::pop) {
+                    Some(scene) => scene,
+                    None => device.create_scene().map_err(app_error)?,
+                };
+                update_sample_scene(device, &mut source, snapshots, command.extent, inputs, true)?;
+                drop(prepare);
+                let encode = preview_trace::span("snapshot_mix_encode");
                 device
                     .render_composite(
                         &mut [VulkanCompositeScene { scene: &mut source }],
@@ -154,6 +169,13 @@ pub(super) fn record_motion(
                         &request,
                     )
                     .map_err(app_error)?;
+                drop(encode);
+                // Recorded commands retain image pins. Release owner bindings so scratch
+                // scenes do not keep obsolete window-sized snapshots alive between frames.
+                for index in 0..inputs.len() {
+                    source.remove_materialized_image(ImageId(index as u32 + 1));
+                }
+                used_mix_scenes.push((inputs.len(), source));
             }
         }
         // Subsequent passes in this same command buffer sample the final SHADER_READ state.
@@ -195,16 +217,18 @@ pub(super) fn record_motion(
                 entry.insert(device.create_scene().map_err(app_error)?)
             }
         };
+        let _output = preview_trace::span("snapshot_output_update");
         update_sample_scene(
             device,
             scene,
             snapshots,
             output.extent,
-            &[(output.source, output.opacity)],
+            &[(output.source, output.opacity).into()],
             false,
         )?;
         live_glass.sampled.insert(output.id, sampled);
     }
+    let retire = preview_trace::span("snapshot_retire");
     super::motion_glass::retire_recipes(live_glass, motion);
     // Recorded image pins outlive these owner handles, including cancelled/replaced fades.
     let retired = snapshots
@@ -215,10 +239,21 @@ pub(super) fn record_motion(
     for id in retired {
         spares.push(snapshots.remove(&id).expect("retired snapshot").target);
     }
+    drop(retire);
     trim_spares(spares);
+    // Each scene is used at most once per recording; buffers from previous submissions
+    // are protected by the renderer's existing frame pins/copy-on-write updates.
+    let mut retained: usize = live_glass.mix_scenes.values().map(Vec::len).sum();
+    for (count, scene) in used_mix_scenes {
+        if retained >= 16 { break; }
+        live_glass.mix_scenes.entry(count).or_default().push(scene);
+        retained += 1;
+    }
+    live_glass.mix_scenes.retain(|_, scenes| !scenes.is_empty());
     Ok(true)
 }
 pub(super) fn trim_spares(spares: &mut Vec<VulkanMaterializationTarget>) {
+    let _trim = preview_trace::span("snapshot_spare_trim");
     while spares.len() > 16
         || spares.iter().map(|t| t.allocated_bytes()).sum::<u64>() > 64 * 1024 * 1024
     {
@@ -226,11 +261,12 @@ pub(super) fn trim_spares(spares: &mut Vec<VulkanMaterializationTarget>) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn sample_scene(
     device: &VulkanDevice,
     snapshots: &BTreeMap<u64, MotionSnapshot>,
     extent: SizeI,
-    inputs: &[(u64, f32)],
+    inputs: &[SnapshotInput],
     additive: bool,
 ) -> AppResult<VulkanScene> {
     let mut scene = device.create_scene().map_err(app_error)?;
@@ -242,18 +278,19 @@ pub(super) fn update_sample_scene(
     scene: &mut VulkanScene,
     snapshots: &BTreeMap<u64, MotionSnapshot>,
     extent: SizeI,
-    inputs: &[(u64, f32)],
+    inputs: &[SnapshotInput],
     additive: bool,
 ) -> AppResult<()> {
     let images = inputs
         .iter()
         .enumerate()
-        .map(|(i, (_, weight))| (ImageId(i as u32 + 1), *weight))
+        .map(|(i, input)| (ImageId(i as u32 + 1), input.weight))
         .collect::<Vec<_>>();
     let samples = inputs
         .iter()
         .zip(&images)
-        .map(|((id, _), (image, weight))| {
+        .map(|(input, (image, weight))| {
+            let id = &input.id;
             let snapshot = snapshots
                 .get(id)
                 .ok_or_else(|| AppError::new("motion snapshot missing"))?;
@@ -261,9 +298,12 @@ pub(super) fn update_sample_scene(
         })
         .collect::<AppResult<Vec<_>>>()?;
     let mut source = image_scene(extent, &images, additive);
+    position_images(&mut source, inputs);
     // Delta validation requires every referenced image to be bound already, just as
     // for client DMA-BUF scenes. Bind before publishing the sampled draw instances.
-    for ((snapshot, _), (image, _)) in inputs.iter().zip(images) {
+    let bind = preview_trace::span("snapshot_sample_bind");
+    for (input, (image, _)) in inputs.iter().zip(images) {
+        let snapshot = &input.id;
         let target = snapshots
             .get(snapshot)
             .ok_or_else(|| AppError::new("motion snapshot missing"))?;
@@ -271,12 +311,15 @@ pub(super) fn update_sample_scene(
             .bind_materialized_image(image, &target.target, ImageAlphaMode::Premultiplied)
             .map_err(app_error)?;
     }
+    drop(bind);
     let mut delta = source.take_delta().expect("new motion image scene");
     delta.epoch = scene
         .epoch()
         .checked_add(1)
         .expect("motion scene epoch exhausted");
+    let apply = preview_trace::span("snapshot_sample_delta");
     device.apply_scene_delta(scene, &delta).map_err(app_error)?;
+    drop(apply);
     for (image, _, active, capacity) in samples {
         scene.crop_materialized_image(image, active, capacity);
     }
@@ -336,7 +379,7 @@ mod tests {
             .collect();
         // No GPU commands are submitted: both output and crossfade scene construction
         // must accept the retained image resources during delta validation.
-        let mut output = sample_scene(&device, &snapshots, extent, &[(1, 1.0)], false).unwrap();
+        let mut output = sample_scene(&device, &snapshots, extent, &[(1, 1.0).into()], false).unwrap();
         let epoch = output.epoch();
         update_sample_scene(
             &device,
@@ -346,11 +389,11 @@ mod tests {
                 width: 24,
                 height: 24,
             },
-            &[(2, 0.5)],
+            &[(2, 0.5).into()],
             false,
         )
         .unwrap();
         assert_eq!(output.epoch(), epoch + 1);
-        sample_scene(&device, &snapshots, extent, &[(1, 0.4), (2, 0.6)], true).unwrap();
+        sample_scene(&device, &snapshots, extent, &[(1, 0.4).into(), (2, 0.6).into()], true).unwrap();
     }
 }

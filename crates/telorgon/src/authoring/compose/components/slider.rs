@@ -4,8 +4,10 @@ use crate::authoring::compose::{Component, ComponentCallback, Element, ElementKi
 #[derive(Clone, Debug)]
 pub struct SliderElement {
     pub label: String,
+    pub accessible_label: Option<String>,
     pub value: f32,
     pub enabled: bool,
+    pub width: crate::authoring::compose::Dimension,
     pub on_change: Option<ComponentCallback>,
 }
 
@@ -16,6 +18,17 @@ pub struct Slider {
 }
 
 impl Slider {
+    /// Overrides the semantic name independently of the visible label.
+    pub fn accessible_label(mut self, label: impl Into<String>) -> Self {
+        self.element.accessible_label = Some(label.into());
+        self
+    }
+
+    pub fn width(mut self, width: impl Into<crate::authoring::compose::Dimension>) -> Self {
+        self.element.width = width.into();
+        self
+    }
+
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self
@@ -59,8 +72,10 @@ pub fn slider(label: impl Into<String>, value: f32) -> Slider {
         key: None,
         element: SliderElement {
             label: label.into(),
+            accessible_label: None,
             value: value.clamp(0.0, 1.0),
             enabled: true,
+            width: crate::authoring::compose::Dimension::Shrink,
             on_change: None,
         },
     }

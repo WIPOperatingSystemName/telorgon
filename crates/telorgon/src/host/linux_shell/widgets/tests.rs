@@ -3,7 +3,11 @@ use crate::authoring::compose::{
     Component, ComponentFields, ShellSurfaceLayer, ShellWidget, Signal, SignalWriter, View,
     WidgetPlacement, text,
 };
+type ButtonEvents = std::rc::Rc<std::cell::RefCell<Vec<(crate::input::PointerButton, crate::input::ButtonState)>>>;
+
 struct Fixture {
+    scrollable: bool,
+    buttons: ButtonEvents,
     placement: Signal<ShellSurfaceSpec>,
     dismissals: std::rc::Rc<std::cell::Cell<u32>>,
 }
@@ -19,7 +23,20 @@ impl ComponentFields for Fixture {
 }
 impl Component for Fixture {
     fn view(&self) -> impl View {
-        text("shell")
+        if self.scrollable {
+            crate::authoring::compose::column()
+                .width(crate::authoring::compose::Dimension::FILL)
+                .height(crate::authoring::compose::Dimension::FILL)
+                .scrollable()
+                .children((0..5).map(|_| {
+                    crate::authoring::compose::column()
+                        .height(100.0)
+                        .child(text("shell"))
+                }))
+                .into_element()
+        } else {
+            text("shell").into_element()
+        }
     }
 }
 impl ShellWidget for Fixture {
@@ -30,6 +47,9 @@ impl ShellWidget for Fixture {
         self.dismissals.set(self.dismissals.get() + 1);
     }
     fn input(&mut self, event: crate::input::InputEvent) -> bool {
+        if let crate::input::InputEvent::PointerButton { button, state, .. } = &event {
+            self.buttons.borrow_mut().push((*button, *state));
+        }
         if matches!(
             event,
             crate::input::InputEvent::PointerMoved { .. }
@@ -53,9 +73,28 @@ fn fixture(
     SignalWriter<ShellSurfaceSpec>,
     std::rc::Rc<std::cell::Cell<u32>>,
 ) {
+    fixture_content(spec, false)
+}
+fn fixture_content(
+    spec: ShellSurfaceSpec,
+    scrollable: bool,
+) -> (
+    WidgetLayer,
+    SignalWriter<ShellSurfaceSpec>,
+    std::rc::Rc<std::cell::Cell<u32>>,
+) {
+    fixture_recording_buttons(spec, scrollable, Default::default())
+}
+fn fixture_recording_buttons(
+    spec: ShellSurfaceSpec,
+    scrollable: bool,
+    buttons: ButtonEvents,
+) -> (WidgetLayer, SignalWriter<ShellSurfaceSpec>, std::rc::Rc<std::cell::Cell<u32>>) {
     let (signal, writer) = Signal::new(spec);
     let dismissals = std::rc::Rc::new(std::cell::Cell::new(0));
     let (root, binding) = crate::authoring::compose::shell_widget::erase(Fixture {
+        scrollable,
+        buttons,
         placement: signal,
         dismissals: dismissals.clone(),
     });
@@ -71,7 +110,7 @@ fn fixture(
         7,
         registered,
         output(),
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
         &EventNotifier::new("widget test").unwrap(),
         services.services.clone(),
@@ -328,6 +367,55 @@ fn scroll_routes_only_to_hit_shell_and_never_while_locked() {
     );
     assert_eq!(count.get(), 1);
 }
+
+#[test]
+fn queued_motion_coalesces_and_button_flushes_it_before_delivery() {
+    let spec = ShellSurfaceSpec::new()
+        .placement(WidgetPlacement::positioned(PointF { x: 20.0, y: 20.0 })
+            .width(200.0).height(150.0))
+        .pointer(ShellPointer::Surface);
+    let buttons: ButtonEvents = Default::default();
+    let (widget, _, count) = fixture_recording_buttons(spec, false, buttons.clone());
+    let mut widgets = vec![widget];
+    let now = MonotonicInstant::from_nanos(1);
+    for x in 50..150 {
+        queue_widget_pointer_motion(&mut widgets, PointF { x: x as f32, y: 50.0 }, now, false).unwrap();
+    }
+    assert_eq!(count.get(), 0, "motion is deferred until a batch boundary");
+    assert!(widget_pointer_button(&mut widgets, PointF { x: 149.0, y: 50.0 }, 0x110, true, now, false).unwrap());
+    assert_eq!(count.get(), 1, "a click flushes the coalesced motion");
+    assert_eq!(buttons.borrow().len(), 1);
+    assert!(widgets[0].pending_motion.is_none());
+    // Capture continues outside the surface, and release cannot overtake that movement.
+    queue_widget_pointer_motion(&mut widgets, PointF { x: 700.0, y: 500.0 }, now, false).unwrap();
+    widget_pointer_button(&mut widgets, PointF { x: 700.0, y: 500.0 }, 0x110, false, now, false).unwrap();
+    assert_eq!(count.get(), 2);
+    assert_eq!(buttons.borrow().len(), 2);
+    assert!(widgets[0].captured.is_empty());
+}
+
+#[test]
+fn queued_motion_sends_one_leave_and_does_not_dispatch_to_unrelated_widgets() {
+    let spec = |x| ShellSurfaceSpec::new()
+        .placement(WidgetPlacement::positioned(PointF { x, y: 20.0 }).width(100.0).height(100.0))
+        .pointer(ShellPointer::Surface);
+    let (a, _, a_count) = fixture(spec(20.0));
+    let (mut b, _, b_count) = fixture(spec(200.0));
+    b.id = 8;
+    let mut widgets = vec![a, b];
+    let now = MonotonicInstant::from_nanos(1);
+    queue_widget_pointer_motion(&mut widgets, PointF { x: 50.0, y: 50.0 }, now, false).unwrap();
+    flush_widget_pointer_motion(&mut widgets, now).unwrap();
+    assert_eq!((a_count.get(), b_count.get()), (1, 0));
+    for _ in 0..10 {
+        queue_widget_pointer_motion(&mut widgets, PointF { x: 250.0, y: 50.0 }, now, false).unwrap();
+    }
+    flush_widget_pointer_motion(&mut widgets, now).unwrap();
+    assert_eq!((a_count.get(), b_count.get()), (2, 1));
+    queue_widget_pointer_motion(&mut widgets, PointF { x: 260.0, y: 50.0 }, now, false).unwrap();
+    flush_widget_pointer_motion(&mut widgets, now).unwrap();
+    assert_eq!((a_count.get(), b_count.get()), (2, 2));
+}
 #[test]
 fn preview_fits_portrait_and_landscape_without_stretching() {
     let slot = RectI {
@@ -379,9 +467,8 @@ fn reactive_geometry_keeps_component_identity_and_retargets_motion() {
         .runtime
         .composition_diagnostics()
         .components_mounted;
-    writer.publish_if_changed(
-        initial.placement(WidgetPlacement::edge(ShellEdge::Top).height(48.0)),
-    );
+    writer
+        .publish_if_changed(initial.placement(WidgetPlacement::edge(ShellEdge::Top).height(48.0)));
     widget
         .prepare(output(), shell_work_area_for_spec(output()), 10_000_000)
         .unwrap();
@@ -424,7 +511,7 @@ fn tile_widget_scene_survives_owner_close_and_fast_reentry() {
         7,
         registered,
         output(),
-        AssetBundle::default(),
+        &LayerAssets::new(AssetBundle::default()).unwrap(),
         crate::platform::contracts::ScaleFactor::new(1.0).unwrap(),
         &EventNotifier::new("tile retention test").unwrap(),
         crate::authoring::compose::shell_services::ShellServiceHost::new()
@@ -703,7 +790,7 @@ fn captured_pointer_stays_with_owner_above_another_surface() {
     let mut widgets = vec![left, right];
     let now = MonotonicInstant::from_nanos(0);
     assert!(
-        widget_pointer_button(&mut widgets, PointF { x: 20.0, y: 20.0 }, true, now, false)
+        widget_pointer_button(&mut widgets, PointF { x: 20.0, y: 20.0 }, 0x110, true, now, false)
             .unwrap()
     );
     assert!(
@@ -711,8 +798,8 @@ fn captured_pointer_stays_with_owner_above_another_surface() {
     );
     assert_eq!(left_events.get(), 1);
     assert_eq!(right_events.get(), 0);
-    assert!(widgets[0].captured);
-    assert!(!widgets[1].captured);
+    assert!(!widgets[0].captured.is_empty());
+    assert!(widgets[1].captured.is_empty());
 }
 #[test]
 fn content_sizing_and_overlapping_reservations_do_not_feed_back() {
@@ -752,4 +839,122 @@ fn reduced_motion_reaches_target_without_animation() {
         .unwrap();
     assert_eq!(widget.sampled.y, 0);
     assert!(!widget.animating());
+}
+
+#[test]
+fn linux_wheel_scrolls_widget_down_and_back_up() {
+    let (widget, _writer, _) = fixture_content(
+        ShellSurfaceSpec::new()
+            .placement(
+                WidgetPlacement::positioned(PointF { x: 20.0, y: 20.0 })
+                    .width(200.0)
+                    .height(150.0),
+            )
+            .pointer(ShellPointer::Surface),
+        true,
+    );
+    let mut widgets = vec![widget];
+    let extent = SizeI {
+        width: 200,
+        height: 150,
+    };
+    widgets[0].layer.prepare(extent, 0, true).unwrap();
+    let viewport = widgets[0]
+        .layer
+        .runtime
+        .ui()
+        .nodes
+        .alive()
+        .iter()
+        .copied()
+        .find(|n| widgets[0].layer.runtime.ui().kinds.get(*n) == Some(&crate::NodeKind::Scroll))
+        .unwrap();
+    let p = PointF { x: 50.0, y: 50.0 };
+    for (time, delta, expected) in [
+        (1, 15.0, 15.0),
+        (2, 15.0, 30.0),
+        (3, -15.0, 15.0),
+        (4, -15.0, 0.0),
+    ] {
+        assert!(
+            widget_pointer_scroll(
+                &mut widgets,
+                p,
+                PointF { x: 0.0, y: delta },
+                MonotonicInstant::from_nanos(time),
+                false
+            )
+            .unwrap()
+        );
+        widgets[0].layer.prepare(extent, time, false).unwrap();
+        let current = widgets[0]
+            .layer
+            .runtime
+            .ui()
+            .nodes
+            .alive()
+            .iter()
+            .copied()
+            .find(|n| widgets[0].layer.runtime.ui().kinds.get(*n) == Some(&crate::NodeKind::Scroll))
+            .unwrap();
+        assert_eq!(current, viewport, "scroll viewport must survive input");
+        assert_eq!(
+            widgets[0]
+                .layer
+                .runtime
+                .ui()
+                .layouts
+                .get(current)
+                .map(|l| l.scroll_offset.y)
+                .unwrap_or(0.0),
+            expected
+        );
+    }
+}
+
+#[test]
+fn wheel_notches_use_readable_steps_without_amplifying_touchpad_motion() {
+    assert_eq!(widget_scroll_distance(0.0, 15.0, 0, 1), PointF { x: 0.0, y: 48.0 });
+    assert_eq!(widget_scroll_distance(-30.0, 45.0, -2, 3), PointF { x: -96.0, y: 144.0 });
+    assert_eq!(widget_scroll_distance(1.25, -2.5, 0, 0), PointF { x: 1.25, y: -2.5 });
+    assert_eq!(widget_scroll_distance(1.25, -15.0, 0, -1), PointF { x: 1.25, y: -48.0 });
+}
+
+#[test]
+fn tray_buttons_preserve_identity_and_capture_until_all_released() {
+    use crate::input::{ButtonState::{Pressed, Released}, PointerButton};
+    let buttons = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (layer, _, _) = fixture_recording_buttons(
+        ShellSurfaceSpec::new()
+            .placement(WidgetPlacement::positioned(PointF { x: 0.0, y: 0.0 }).width(100.0).height(100.0))
+            .pointer(ShellPointer::Surface),
+        false,
+        buttons.clone(),
+    );
+    let mut widgets = vec![layer];
+    let now = MonotonicInstant::from_nanos(0);
+    let inside = PointF { x: 20.0, y: 20.0 };
+    let outside = PointF { x: 200.0, y: 200.0 };
+    assert!(!widget_pointer_button(&mut widgets, inside, 0x111, true, now, true).unwrap());
+    assert!(!widget_pointer_button(&mut widgets, inside, 0x111, false, now, false).unwrap());
+    for (button, pressed, position) in [
+        (0x110, true, inside),
+        (0x111, true, inside),
+        (0x111, false, outside),
+        (0x112, true, outside),
+        (0x112, false, outside),
+    ] {
+        assert!(widget_pointer_button(&mut widgets, position, button, pressed, now, false).unwrap());
+        assert!(widgets[0].captured.contains(&0x110));
+    }
+    assert!(widget_pointer_button(&mut widgets, outside, 0x110, false, now, false).unwrap());
+    assert!(widgets[0].captured.is_empty());
+    assert_eq!(*buttons.borrow(), vec![
+        (PointerButton::PRIMARY, Pressed),
+        (PointerButton::SECONDARY, Pressed),
+        (PointerButton::SECONDARY, Released),
+        (PointerButton::MIDDLE, Pressed),
+        (PointerButton::MIDDLE, Released),
+        (PointerButton::PRIMARY, Released),
+    ]);
 }

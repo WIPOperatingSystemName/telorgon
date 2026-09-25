@@ -1,0 +1,15 @@
+schema = 1
+name = "pipewire"
+version = "1.6.2"
+archive = "pipewire-1.6.2.tar.gz"
+url = "https://codeload.github.com/PipeWire/pipewire/tar.gz/refs/tags/1.6.2"
+sha256 = "2014c187fccdd6d245585be4eda7dabd781dcddd921604c40ab015bba6cb042d"
+source_root = "pipewire-1.6.2"
+# Archive identity recorded from upstream; detached signature provenance not qualified.
+release_qualified = false
+licenses = ["MIT", "LGPL-2.1-or-later", "GPL-2.0-only"]
+target = "x86_64-unknown-linux-gnu"
+minimum_glibc = "2.39"
+# Reuse the existing pinned Ubuntu native build root, without installing it here.
+build_inventory = "../xwayland/build-packages.lock.tsv"
+build_archives = "../xwayland/build-debs.lock.json"

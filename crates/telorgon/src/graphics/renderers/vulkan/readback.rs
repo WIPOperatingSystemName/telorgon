@@ -10,7 +10,9 @@ use gpu_allocator::MemoryLocation;
 
 use crate::graphics::renderers::vulkan::buffer::AllocatedBuffer;
 use crate::graphics::renderers::vulkan::error::internal;
-use crate::graphics::renderers::vulkan::{SubmissionReceipt, VulkanDevice, VulkanFrameContext, VulkanTarget};
+use crate::graphics::renderers::vulkan::{
+    SubmissionReceipt, VulkanDevice, VulkanFrameContext, VulkanTarget,
+};
 
 /// One reusable staging allocation. Pending work is pinned by the frame receipt even if dropped.
 /// This is internal streaming plumbing, not a shell permission or a PipeWire buffer.
@@ -22,6 +24,39 @@ pub(crate) struct CaptureReadbackBuffer {
 }
 
 impl CaptureReadbackBuffer {
+    #[cfg(all(target_os = "linux", feature = "video-linux"))]
+    pub(crate) fn new_budgeted(
+        device: &VulkanDevice,
+        extent: SizeI,
+        budget: Arc<crate::media::video::MemoryBudget>,
+    ) -> RenderResult<Self> {
+        let len = capture_byte_len(extent)?;
+        let mut charge = crate::media::video::MemoryReservation::new(budget, 0)
+            .map_err(|e| internal(e.to_string()))?;
+        let mut buffer = AllocatedBuffer::new_accounted(
+            device.inner.clone(),
+            len as u64,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "Telorgon capture staging",
+            |bytes| {
+                charge
+                    .resize(
+                        usize::try_from(bytes)
+                            .map_err(|_| internal("capture staging size overflow"))?,
+                    )
+                    .map_err(|e| internal(e.to_string()))
+            },
+        )?;
+        buffer.retain_capture_charge(charge);
+        Ok(Self {
+            device_id: device.inner.id,
+            extent,
+            buffer: Arc::new(buffer),
+            pending_frame: None,
+        })
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         self.pending_frame.is_some()
     }

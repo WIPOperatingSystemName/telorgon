@@ -13,6 +13,7 @@ pub struct WindowOptions {
     pub title: String,
     pub size: SizeI,
     pub min_size: Option<SizeI>,
+    pub fixed_size: bool,
     pub decorations: WindowDecorationMode,
     pub icon: AppIconProfile,
 }
@@ -29,6 +30,7 @@ impl Default for WindowOptions {
                 width: 320,
                 height: 240,
             }),
+            fixed_size: false,
             decorations: WindowDecorationMode::System,
             icon: AppIconProfile::new(),
         }

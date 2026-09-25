@@ -140,6 +140,8 @@ impl NativeState {
                 self.toplevels.insert(surface, XdgToplevelState::default());
             }
             "ack_configure" => {
+                super::super::diagnostics::event(surface.get(), "ack-configure", format_args!(
+                    "serial={}", request.uint(0).map_err(error)?));
                 self.core
                     .xdg_surface_mut(surface)
                     .ok_or_else(|| NativeCompositorError::new("unknown xdg_surface"))?

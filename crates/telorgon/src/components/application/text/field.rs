@@ -1,6 +1,9 @@
 //! Basic single-line application text field policy, semantics, commands, and mounting.
 
 use std::fmt;
+#[path = "clipboard.rs"]
+mod clipboard;
+pub use clipboard::{TextClipboardTarget, TextClipboardTransfer};
 
 use crate::foundation::{ColorRgba8, EdgeInsets};
 use crate::runtime::{MonotonicInstant, RuntimeError, RuntimeResult, Ui};
@@ -173,6 +176,8 @@ pub struct TextFieldCommandAvailability {
 
 /// One basic single-line field owning exactly one application text controller.
 pub struct TextField {
+    clipboard_identity: std::sync::Arc<()>,
+    clipboard_epoch: u64,
     controller: TextController,
     label: String,
     mode: TextFieldMode,
@@ -213,6 +218,8 @@ impl TextField {
             controller.disable_edit_history();
         }
         Ok(Self {
+            clipboard_identity: std::sync::Arc::new(()),
+            clipboard_epoch: 0,
             controller,
             label,
             mode,

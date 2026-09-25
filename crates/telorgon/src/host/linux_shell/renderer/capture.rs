@@ -7,13 +7,16 @@ use crate::shell::capture::CaptureCursorMode;
 pub(in crate::host::linux_shell) struct CaptureBuffer {
     pub layout: crate::shell::capture::CaptureLayout,
     pub slot: VulkanCaptureSlot,
+    #[cfg(feature = "shell-screencast-linux")]
+    pub pixels: crate::media::video::CapturePixels,
+    #[cfg(not(feature = "shell-screencast-linux"))]
     pub pixels: Vec<u8>,
 }
 
 pub(in crate::host::linux_shell) enum CaptureView {
     Output,
     #[cfg(feature = "shell-screencast-linux")]
-    Window(super::super::capture_window::WindowCapture),
+    Scene(super::super::capture_scene::CaptureScene),
 }
 
 pub(in crate::host::linux_shell) struct CaptureJob {
@@ -44,7 +47,7 @@ impl CaptureRevisions {
     }
     pub fn get(&self, mode: CaptureCursorMode) -> u64 {
         match mode {
-            CaptureCursorMode::Hidden => self.output,
+            CaptureCursorMode::Hidden | CaptureCursorMode::Metadata => self.output,
             CaptureCursorMode::Embedded => self.combined,
         }
     }
@@ -60,6 +63,7 @@ mod tests {
         let output = revisions.get(CaptureCursorMode::Hidden);
         revisions.cursor_changed();
         assert_eq!(revisions.get(CaptureCursorMode::Hidden), output);
+        assert_eq!(revisions.get(CaptureCursorMode::Metadata), output);
         assert_ne!(revisions.get(CaptureCursorMode::Embedded), output);
         let embedded = revisions.get(CaptureCursorMode::Embedded);
         revisions.output_changed();

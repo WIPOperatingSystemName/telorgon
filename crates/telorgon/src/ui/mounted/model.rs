@@ -507,6 +507,8 @@ impl Default for BoxStyle {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Flow {
+    /// Fixed-size cells wrap to the available width.
+    Grid { cell_width: u16, cell_height: u16 },
     Horizontal,
     #[default]
     Vertical,

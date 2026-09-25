@@ -430,7 +430,7 @@ impl X11Windows {
             }
             let density = window.surface_scale.max(1);
             let mut constrained_pixels = None;
-            if !window.maximized && !window.fullscreen {
+            if !window.maximized && !window.fullscreen && window.virtual_output.is_none() {
                 let hints = xwm.normal_hints(*id).unwrap_or_default();
                 window.tile_size_hints = Some(hints);
                 let logical = |size: SizeI| SizeI {
@@ -585,18 +585,7 @@ pub(super) fn apply_decorations(
     if window.server_decorated == decorated {
         return;
     }
-    let old_title = window
-        .decoration_policy
-        .title_bar_visible(window.server_decorated);
-    let new_title = window.decoration_policy.title_bar_visible(decorated);
-    let old_parts = window
-        .decoration_policy
-        .frame_parts(window.server_decorated);
-    let new_parts = window.decoration_policy.frame_parts(decorated);
-    if old_title == new_title && old_parts == new_parts {
-        window.server_decorated = decorated;
-        return;
-    }
+    let was_decorated = window.server_decorated;
     let old_offset = window_content_offset(window, config);
     let old_outer = if window_has_frame(window) {
         window
@@ -632,17 +621,16 @@ pub(super) fn apply_decorations(
     if let Some((position, _)) = &mut window.restore_geometry {
         // Restore geometry describes a non-fullscreen frame, even when the current frame is hidden.
         let border_delta =
-            (i32::from(old_parts.border) - i32::from(new_parts.border)) * config.window_border;
+            (i32::from(was_decorated) - i32::from(decorated)) * config.window_border;
         position.x = position.x.saturating_add(border_delta);
         position.y = position.y.saturating_add(
-            border_delta + (i32::from(old_title) - i32::from(new_title)) * config.titlebar_height,
+            border_delta + (i32::from(was_decorated) - i32::from(decorated)) * config.titlebar_height,
         );
     }
 }
 
 /// Pre-map estimate uses the same ownership policy as measured managed windows.
 pub(super) fn estimated_frame_extents(
-    policy: crate::DecorationPolicy,
     decorated: bool,
     unmanaged: bool,
     density: i32,
@@ -651,16 +639,8 @@ pub(super) fn estimated_frame_extents(
     if unmanaged {
         return [0; 4];
     }
-    let border = if policy.frame_parts(decorated).border {
-        config.window_border
-    } else {
-        0
-    };
-    let title = if policy.title_bar_visible(decorated) {
-        config.titlebar_height
-    } else {
-        0
-    };
+    let border = if decorated { config.window_border } else { 0 };
+    let title = if decorated { config.titlebar_height } else { 0 };
     [border, border, border + title, border]
         .map(|value| value.max(0).saturating_mul(density.max(1)) as u32)
 }

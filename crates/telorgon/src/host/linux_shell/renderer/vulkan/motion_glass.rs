@@ -18,6 +18,26 @@ pub(super) fn target_capacity(extent: SizeI) -> SizeI {
         height: round(extent.height),
     }
 }
+// Grow by 50% instead of reallocating at each 64-pixel animation step. Keep the
+// existing two-times retention limit and charge this capacity to the resolve budget.
+fn growing_capacity(extent: SizeI, previous: Option<SizeI>, output: SizeI) -> SizeI {
+    let Some(previous) = previous else { return target_capacity(extent); };
+    if previous.width >= extent.width && previous.height >= extent.height {
+        return target_capacity(extent);
+    }
+    // Grow both axes together so aspect-preserving animation does not alternate
+    // width and height reallocations on adjacent frames.
+    let axis = |required: i32, old: i32, limit: i32| {
+        required.max(old.saturating_add(old / 2))
+            .min(required.max(1).saturating_mul(2).max(64))
+            .min(limit.max(required))
+    };
+    target_capacity(SizeI {
+        width: axis(extent.width, previous.width, output.width),
+        height: axis(extent.height, previous.height, output.height),
+    })
+}
+
 pub(super) fn capacity_fits(capacity: SizeI, extent: SizeI) -> bool {
     capacity.width >= extent.width
         && capacity.height >= extent.height
@@ -60,6 +80,7 @@ fn resolve_fits(output: SizeI, extent: SizeI, bordered_samples: usize, other_byt
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct GlassSample {
+    mapping: RectF,
     placement: ShellPlacement,
     extent: SizeI,
     style: crate::GlassStyle,
@@ -98,6 +119,7 @@ struct ResolvedGlass {
 
 #[derive(Default)]
 pub(super) struct MotionGlass {
+    pub(super) mix_scenes: BTreeMap<usize, Vec<VulkanScene>>,
     pub(super) recipes: BTreeMap<u64, Vec<GlassSample>>,
     pub(super) empty_bodies: std::collections::BTreeSet<u64>,
     // A stable output must not republish an identical scene every cursor-only frame:
@@ -116,7 +138,7 @@ pub(super) fn body_is_empty(
         SnapshotContent::Capture(_) => body.is_empty(),
         SnapshotContent::Mix(inputs) => inputs
             .iter()
-            .all(|(id, weight)| *weight == 0.0 || empty.contains(id)),
+            .all(|input| input.weight == 0.0 || empty.contains(&input.id)),
     }
 }
 
@@ -150,6 +172,7 @@ pub(super) fn extract_recipe_with_borders(
                 if let Some(style) = styles.get(&p.scene) {
                     samples.push(GlassSample {
                         placement: *p,
+                        mapping: super::super::super::motion::SnapshotInput::from((0, 1.0)).target,
                         extent: command.extent,
                         style: *style,
                         weight: 1.0,
@@ -163,15 +186,23 @@ pub(super) fn extract_recipe_with_borders(
             }
         }
         SnapshotContent::Mix(inputs) => {
-            for (id, weight) in inputs {
-                if *weight <= 0.0 {
+            for input in inputs {
+                let (id, weight) = (&input.id, input.weight);
+                if weight <= 0.0 {
                     continue;
                 }
                 for sample in recipes.get(id).into_iter().flatten() {
                     let mut sample = sample.clone();
                     sample.weight *= weight;
+                    sample.mapping = RectF {
+                        x: input.target.x + sample.mapping.x * input.target.width,
+                        y: input.target.y + sample.mapping.y * input.target.height,
+                        width: sample.mapping.width * input.target.width,
+                        height: sample.mapping.height * input.target.height,
+                    };
                     if let Some(existing) = samples.iter_mut().find(|old| {
-                        old.placement == sample.placement
+                        old.mapping == sample.mapping
+                            && old.placement == sample.placement
                             && old.extent == sample.extent
                             && old.style == sample.style
                             && old.border == sample.border
@@ -212,7 +243,13 @@ fn map_placement(mut p: ShellPlacement, from: SizeI, to: RectI) -> ShellPlacemen
 }
 
 fn lens_placement(sample: &GlassSample, output: ShellPlacement) -> ShellPlacement {
-    let mut p = map_placement(sample.placement, sample.extent, output.target);
+    let mapped = RectI {
+        x: (output.target.x as f32 + sample.mapping.x * output.target.width as f32).round() as i32,
+        y: (output.target.y as f32 + sample.mapping.y * output.target.height as f32).round() as i32,
+        width: (sample.mapping.width * output.target.width as f32).round() as i32,
+        height: (sample.mapping.height * output.target.height as f32).round() as i32,
+    };
+    let mut p = map_placement(sample.placement, sample.extent, mapped);
     // Maximize/restore deliberately strips the snapshot's rounded contour. Apply the
     // current physical contour to the live optical surface instead of scaling its radius.
     if let Some(outer) = output.rounded_clips[0].filter(|c| !c.inverted) {
@@ -273,6 +310,7 @@ fn render_into(
     scene: &mut VulkanScene,
     placement: VulkanCompositePlacement,
     target: &mut VulkanMaterializationTarget,
+    active_extent: SizeI,
     clear: bool,
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<()> {
@@ -293,7 +331,8 @@ fn render_into(
                     TargetLoad::Preserve
                 },
                 store: TargetStore::Store,
-                region: None,
+                // Capacity padding is never sampled; avoid clearing/shading it on shrink.
+                region: Some(full_rect(active_extent)),
             },
         )
         .map_err(app_error)?;
@@ -462,6 +501,7 @@ pub(super) fn record_output(
     frame: &ShellFrame,
     context: &mut VulkanFrameContext<'_>,
 ) -> AppResult<Option<Vec<ShellPlacement>>> {
+    let _timing = super::super::super::preview_trace::span("glass_resolve");
     let active = frame
         .motion
         .outputs
@@ -556,7 +596,7 @@ pub(super) fn record_output(
             target
                 .filter(|t| capacity_fits(t.extent(), endpoint.extent))
                 .map_or_else(
-                    || resolve_bytes(target_capacity(endpoint.extent), 0),
+                    || resolve_bytes(growing_capacity(endpoint.extent, target.map(|t| t.extent()), frame.extent), 0),
                     |t| t.allocated_bytes(),
                 )
         };
@@ -588,15 +628,18 @@ pub(super) fn record_output(
             .get(&id)
             .is_some_and(|r| capacity_fits(r.target.extent(), endpoint.extent))
         {
+            let capacity = growing_capacity(endpoint.extent,
+                state.resolved.get(&id).map(|r| r.target.extent()), frame.extent);
             let target = if let Some(i) = spares
                 .iter()
-                .position(|t| t.extent() == target_capacity(endpoint.extent) && t.can_recycle())
+                .position(|t| t.extent() == capacity && t.can_recycle())
             {
                 spares.swap_remove(i)
             } else {
+                let _allocation = super::super::super::preview_trace::span("resolve_allocate");
                 let Ok(target) = VulkanMaterializationTarget::new_traced(
                     device,
-                    target_capacity(endpoint.extent),
+                    capacity,
                     &mut |_| {},
                 ) else {
                     eprintln!(
@@ -642,7 +685,7 @@ pub(super) fn record_output(
                         body,
                         snapshots,
                         endpoint.extent,
-                        &[(endpoint.source, 1.0)],
+                        &[(endpoint.source, 1.0).into()],
                         true,
                     )?;
                     resolved.body_state = Some(body_state);
@@ -657,6 +700,7 @@ pub(super) fn record_output(
                         rounded_clips: [None; 2],
                     },
                     &mut resolved.target,
+                    endpoint.extent,
                     true,
                     context,
                 )?;
@@ -748,6 +792,7 @@ pub(super) fn record_output(
                         scene,
                         lens_placement,
                         &mut resolved.target,
+                        endpoint.extent,
                         true,
                         context,
                     )?;
@@ -770,6 +815,7 @@ pub(super) fn record_output(
                             rounded_clips: [None; 2],
                         },
                         &mut resolved.target,
+                        endpoint.extent,
                         false,
                         context,
                     )?;
@@ -780,9 +826,11 @@ pub(super) fn record_output(
                         .as_ref()
                         .is_some_and(|b| capacity_fits(b.target.extent(), endpoint.extent))
                     {
+                        let capacity = growing_capacity(endpoint.extent,
+                            bordered.as_ref().map(|b| b.target.extent()), frame.extent);
                         let Ok(target) = VulkanMaterializationTarget::new_traced(
                             device,
-                            target_capacity(endpoint.extent),
+                            capacity,
                             &mut |_| {},
                         ) else {
                             return Ok(None);
@@ -799,6 +847,7 @@ pub(super) fn record_output(
                         scene,
                         lens_placement,
                         &mut bordered.target,
+                        endpoint.extent,
                         true,
                         context,
                     )?;
@@ -821,6 +870,7 @@ pub(super) fn record_output(
                         &mut bordered.border,
                         placement,
                         &mut bordered.target,
+                        endpoint.extent,
                         false,
                         context,
                     )?;
@@ -852,6 +902,7 @@ pub(super) fn record_output(
                         &mut bordered.sample,
                         placement,
                         &mut resolved.target,
+                        endpoint.extent,
                         false,
                         context,
                     )?;
@@ -863,6 +914,7 @@ pub(super) fn record_output(
                         scene,
                         lens_placement,
                         &mut resolved.target,
+                        endpoint.extent,
                         direct,
                         context,
                     )?;
@@ -890,3 +942,27 @@ pub(super) fn retire_recipes(state: &mut MotionGlass, motion: &MotionFrame) {
 #[cfg(test)]
 #[path = "motion_glass_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    #[test]
+    fn transition_capacity_growth_avoids_reallocating_every_animation_step() {
+        let output = SizeI { width: 3840, height: 2304 };
+        let mut capacity = None;
+        let mut allocations = 0;
+        for width in (1024..=3840).step_by(64) {
+            let extent = SizeI { width, height: width * 3 / 5 };
+            if capacity.is_none_or(|old| !capacity_fits(old, extent)) {
+                capacity = Some(growing_capacity(extent, capacity, output));
+                allocations += 1;
+            }
+            assert!(capacity_fits(capacity.unwrap(), extent));
+            assert!(capacity.unwrap().width <= output.width);
+            assert!(capacity.unwrap().height <= output.height);
+        }
+        assert!(allocations <= 5, "capacity should grow geometrically: {allocations}");
+        let small = SizeI { width: 100, height: 100 };
+        assert_eq!(growing_capacity(small, capacity, output), target_capacity(small));
+    }
+}

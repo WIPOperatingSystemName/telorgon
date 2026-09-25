@@ -108,7 +108,7 @@ fn x11_focus_owner(
     let mut surface = surface?;
     for _ in 0..windows.len() {
         let window = windows.get(&surface)?;
-        if window.minimized {
+        if window.hidden_on_primary() {
             return None;
         }
         if window.role == SurfaceRole::Xwayland {

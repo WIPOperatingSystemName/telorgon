@@ -88,6 +88,17 @@ impl InputBatch {
             }),
         ]
     }
+    pub(super) fn probe(&self, flushed_us: Option<u64>, context: impl Fn() -> String) {
+        if !super::stall_probe::enabled() { return; }
+        let cpu = self.started.elapsed();
+        super::stall_probe::observe("input_batch_cpu", cpu, &context);
+        if self.queue_age.samples > 0 {
+            super::stall_probe::observe("input_queue", self.queue_age.max, &context);
+        }
+        if let Some(age) = self.oldest_age(flushed_us) {
+            super::stall_probe::observe("input_to_flush", age, context);
+        }
+    }
     fn oldest_age(&self, flushed_us: Option<u64>) -> Option<Duration> {
         let (oldest, flushed) = (self.oldest_us?, flushed_us?);
         flushed.checked_sub(oldest).map(Duration::from_micros)

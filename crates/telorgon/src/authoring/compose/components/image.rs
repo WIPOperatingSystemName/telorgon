@@ -22,6 +22,13 @@ pub struct Image {
 }
 
 impl Image {
+    /// Bind owned pixels while evaluating a composed view. The host admits the exact
+    /// resource revision with this image's draw and releases it when no longer referenced.
+    pub fn resource(resource: crate::graphics::render::ImageResource) -> Self {
+        let revision = resource.content_version;
+        image(crate::authoring::compose::context::bind_image(resource)).content_version(revision)
+    }
+
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self

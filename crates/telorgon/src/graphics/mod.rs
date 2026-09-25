@@ -1,6 +1,7 @@
 
 #[cfg(any(
     feature = "application-vulkan-windows",
+    feature = "application-vulkan-linux",
     feature = "shell-wayland-linux",
     feature = "embedded-vulkan"
 ))]

@@ -275,6 +275,11 @@ impl Windows {
     pub fn iter(&self) -> impl Iterator<Item = &Window> {
         self.windows.values()
     }
+    pub(crate) fn mapped_toplevels(&self) -> impl Iterator<Item = &Window> {
+        self.iter().filter(|window| {
+            window.mapped && window.parent == self.root && !window.override_redirect
+        })
+    }
     pub fn get(&self, xid: u32) -> Option<&Window> {
         self.windows.get(&xid)
     }
@@ -513,6 +518,43 @@ mod tests {
         }
         .into();
         w.event(&bytes).unwrap();
+    }
+    #[test]
+    fn logout_windows_follow_mapping_and_withdrawal_without_needing_a_surface() {
+        let mut windows = registry();
+        let id = create(&mut windows, false);
+        assert_eq!(windows.mapped_toplevels().count(), 0);
+        map(&mut windows, false);
+        assert_eq!(windows.presentable_surface(id), None);
+        assert_eq!(
+            windows.mapped_toplevels().map(|w| w.id).collect::<Vec<_>>(),
+            vec![id]
+        );
+
+        let unmap: [u8; 32] = xproto::UnmapNotifyEvent {
+            response_type: xproto::UNMAP_NOTIFY_EVENT,
+            event: 1,
+            window: 10,
+            ..Default::default()
+        }
+        .into();
+        windows.event(&unmap).unwrap();
+        assert!(windows.get(10).is_some());
+        assert_eq!(windows.mapped_toplevels().count(), 0);
+
+        map(&mut windows, true);
+        assert_eq!(windows.mapped_toplevels().count(), 0);
+        map(&mut windows, false);
+        let reparent: [u8; 32] = xproto::ReparentNotifyEvent {
+            response_type: xproto::REPARENT_NOTIFY_EVENT,
+            event: 1,
+            window: 10,
+            parent: 20,
+            ..Default::default()
+        }
+        .into();
+        windows.event(&reparent).unwrap();
+        assert_eq!(windows.mapped_toplevels().count(), 0);
     }
     fn finish(w: &mut Windows, token: Inspection) -> Vec<Action> {
         w.finish_inspection(

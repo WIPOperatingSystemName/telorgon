@@ -291,26 +291,31 @@ pub(super) struct SliderStyles {
     pub(super) track: BoxStyle,
     pub(super) fill: BoxStyle,
     pub(super) thumb: BoxStyle,
+    pub(super) before_thumb: BoxStyle,
+    pub(super) after_thumb: BoxStyle,
 }
 
-pub(super) fn slider_styles(value: f32, enabled: bool) -> SliderStyles {
+pub(super) fn slider_styles(value: f32, enabled: bool, width: SizeRule) -> SliderStyles {
     let value = value.clamp(0.0, 1.0);
     let opacity = if enabled { 255 } else { 180 };
     let accent = ColorRgba8::rgba(54, 104, 210, opacity);
+    let track_width = if width == SizeRule::Shrink { SizeRule::Logical(160.0) } else { SizeRule::Fill(1.0) };
     SliderStyles {
         container: BoxStyle {
+            width,
+            height: SizeRule::Logical(32.0),
             min_size: SizeRule2D {
                 width: SizeRule::Logical(32.0),
                 height: SizeRule::Logical(32.0),
             },
-            padding: EdgeInsets::all(5.0),
+            padding: EdgeInsets { top: 5.0, bottom: 5.0, left: 0.0, right: 0.0 },
             ..BoxStyle::default()
         },
         track: BoxStyle {
-            width: SizeRule::Logical(160.0),
+            width: track_width,
             height: SizeRule::Logical(6.0),
             max_size: SizeRule2D {
-                width: SizeRule::Logical(160.0),
+                width: track_width,
                 height: SizeRule::Logical(6.0),
             },
             decoration: crate::ui::BoxDecoration {
@@ -321,7 +326,7 @@ pub(super) fn slider_styles(value: f32, enabled: bool) -> SliderStyles {
             ..BoxStyle::default()
         },
         fill: BoxStyle {
-            width: SizeRule::Logical(160.0 * value),
+            width: SizeRule::Percent(value),
             height: SizeRule::Logical(6.0),
             decoration: crate::ui::BoxDecoration {
                 background: Background::Color(accent),
@@ -343,14 +348,9 @@ pub(super) fn slider_styles(value: f32, enabled: bool) -> SliderStyles {
                 corner_radii: CornerRadii::all(9.0),
                 ..crate::ui::BoxDecoration::default()
             },
-            transform: Transform2D {
-                translation: PointF {
-                    x: (160.0 - 18.0) * value,
-                    y: (6.0 - 18.0) * 0.5,
-                },
-                ..Transform2D::default()
-            },
             ..BoxStyle::default()
         },
+        before_thumb: BoxStyle { width: SizeRule::Fill(value), ..BoxStyle::default() },
+        after_thumb: BoxStyle { width: SizeRule::Fill(1.0 - value), ..BoxStyle::default() },
     }
 }

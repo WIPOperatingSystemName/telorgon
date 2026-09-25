@@ -161,6 +161,8 @@ enum MountedKind {
         props: ToggleElement,
     },
     Slider {
+        before_thumb: UiNodeId,
+        after_thumb: UiNodeId,
         node: UiNodeId,
         track: UiNodeId,
         fill: UiNodeId,

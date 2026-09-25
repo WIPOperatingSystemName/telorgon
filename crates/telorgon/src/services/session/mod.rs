@@ -31,14 +31,20 @@
 mod bus;
 mod command;
 mod desktop;
+mod desktop_settings;
 mod environment;
 mod recovery;
+mod registry;
+pub use registry::{
+    ApplicationHandle, ApplicationRef, ApplicationRegistry, ApplicationSpec, SessionApplications,
+};
 mod supervisor;
 #[cfg(test)]
 mod tests;
 
 pub use command::{Command, ManagedChild, ProcessOutput, RestartPolicy, Stream};
 pub use desktop::{ApplicationLaunch, ApplicationRequest};
+pub use desktop_settings::DesktopSettings;
 pub(crate) use environment::Environment;
 pub use recovery::RecoveryEntry;
 pub(crate) use supervisor::SessionOwner;
@@ -56,6 +62,10 @@ static SESSION: Mutex<Option<SessionHandle>> = Mutex::new(None);
 pub struct SessionConfig {
     /// Stable ID used for desktop identity and recovery storage, independent of display names.
     pub identity: String,
+    pub applications: ApplicationRegistry,
+    /// Linux desktop defaults supplied to session applications. User/toolkit settings retain
+    /// their normal precedence; ordinary GUI applications must not set this.
+    pub desktop_settings: Option<DesktopSettings>,
     /// Explicit terminal executable and arguments before the application command (e.g. foot -e).
     pub terminal: Vec<String>,
     /// Persist recoverable launches. No environment variables or arbitrary application memory are
@@ -78,6 +88,16 @@ impl SessionConfig {
         }
     }
 
+    pub fn applications(mut self, applications: ApplicationRegistry) -> Self {
+        self.applications = applications;
+        self
+    }
+
+    pub fn desktop_settings(mut self, settings: DesktopSettings) -> Self {
+        self.desktop_settings = Some(settings);
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if self.identity.is_empty()
             || self.identity.len() > 128
@@ -94,7 +114,10 @@ impl SessionConfig {
                 "invalid session identity or shutdown timeout".into(),
             ));
         }
-        Ok(())
+        if let Some(settings) = &self.desktop_settings {
+            settings.validate()?;
+        }
+        self.applications.validate()
     }
 }
 
@@ -102,6 +125,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             identity: "telorgon".into(),
+            applications: ApplicationRegistry::new().discover_xdg_applications(),
+            desktop_settings: None,
             terminal: Vec::new(),
             recovery: true,
             recovery_directory: None,
@@ -171,4 +196,8 @@ pub fn application(desktop_id: impl Into<String>) -> ApplicationRequest {
 /// Previous unclean-run launches, offered to the shell/application for user-selected recovery.
 pub fn pending_recovery() -> Result<Vec<RecoveryEntry>> {
     current()?.pending_recovery()
+}
+
+pub fn applications() -> Result<SessionApplications> {
+    Ok(current()?.applications())
 }

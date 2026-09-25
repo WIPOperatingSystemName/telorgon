@@ -15,6 +15,7 @@ fn widget_and_previews_share_one_opacity_group_without_capturing_other_layers() 
         rounded_clips: [None; 2],
     };
     let mut frame = ShellFrame {
+        frame_borders: Default::default(),
         glass_changed: Default::default(),
         glass: Default::default(),
         preview_borders: Default::default(),
@@ -74,6 +75,7 @@ fn later_surface_gets_animation_budget_before_idle_windows() {
         minimized: false,
         veiled: false,
         style: WindowMotion::smooth(),
+        client_decorated: false,
         corner_radii: Default::default(),
         shadows: Default::default(),
     };
@@ -135,4 +137,51 @@ fn retarget_continues_from_sample_and_zero_duration_settles() {
     t.retarget(1.0, crate::tween_ms(0, crate::Easing::Linear), 100_000_000);
     assert_eq!(t.sample(100_000_000), 1.0);
     assert!(!t.active(100_000_000));
+}
+
+#[test]
+fn opening_and_frontmost_close_keep_priority_under_snapshot_pressure() {
+    use super::super::scene::{ShellComposition, ShellLayer};
+    let extent = SizeI { width: 3840, height: 2400 };
+    let initial = WindowState {
+        bounds: RectI { x: 0, y: 0, width: 3000, height: 2000 },
+        maximized: false,
+        tiled: None,
+        interactive: false,
+        move_pointer: None,
+        minimized: false,
+        veiled: false,
+        style: WindowMotion::smooth(),
+        client_decorated: false,
+        corner_radii: Default::default(),
+        shadows: Default::default(),
+    };
+    let mut states: BTreeMap<_, _> = (1..=5).map(|id| (id, initial)).collect();
+    let owners = (1..=6).map(|id| (id, id)).collect();
+    let mut composition = ShellComposition::new(extent);
+    let mut controller = WindowMotionController::default();
+    for now in [0, 1, 50_000_001, 100_000_001, 200_000_001, 500_000_001] {
+        if now == 1 {
+            states.insert(6, WindowState {
+                style: initial.style.open(crate::tween_ms(100, crate::Easing::Linear)).open_from_scale(0.92),
+                ..initial
+            });
+        }
+        if now == 500_000_001 {
+            controller.close(6, 200_000_002);
+            states.remove(&6);
+        }
+        let layers = states.iter().map(|(id, state)| ShellLayer::solid(
+            ShellLayerKey::ContentBackground(*id), ShellSceneKey::ContentBackground(*id),
+            crate::foundation::ColorRgba8::rgba(20, 30, 40, 255), state.bounds,
+        )).collect();
+        let mut frame = composition.synchronize_with_force(extent, layers, true).unwrap();
+        controller.apply(&mut frame, states.clone(), &owners, now, MotionPreference::Full);
+        if now != 0 {
+            let output = frame.motion.outputs.iter().find(|output| output.id == 6)
+                .expect("new/frontmost window must retain its animation snapshot");
+            let expected = match now { 1 => 0.0, 50_000_001 => 0.5, _ => 1.0 };
+            assert_eq!(output.opacity, expected);
+        }
+    }
 }

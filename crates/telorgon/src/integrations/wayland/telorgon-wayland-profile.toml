@@ -211,3 +211,12 @@ path = "staging/ext-image-capture-source/ext-image-capture-source-v1.xml"
 [[understood_source]]
 name = "ext-image-copy-capture-v1"
 path = "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"
+
+[[global]]
+name = "org_kde_kwin_server_decoration_manager"
+max_version = 1
+availability = "gtk-decoration-preferences-applied-on-surface-commit"
+
+[[understood_source]]
+name = "server-decoration"
+path = "third_party/protocols/plasma-wayland-protocols/server-decoration.xml"

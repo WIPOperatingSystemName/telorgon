@@ -177,7 +177,8 @@ impl LayoutEngine {
             ui.interactions.get(*node).is_some_and(|interaction| {
                 interaction.visible
                     && interaction.enabled
-                    && (interaction.focusable || interaction.listener_mask != 0)
+                    && (interaction.focusable || interaction.listener_mask != 0
+                        || interaction.behavior == crate::ui::ControlBehavior::Scroll)
             }) && self.computed.get(*node).is_some_and(|layout| {
                 layout.visible_rect.contains(point)
                     && layout.world_transform.inverse().is_some_and(|inverse| {
@@ -219,7 +220,20 @@ impl LayoutEngine {
         let layout = ui.layouts.get(node).copied().unwrap_or_default();
         let children: Vec<_> = ui.nodes.children(node).collect();
         let intrinsic = self.intrinsic_size(ui, text, node, &style, &children, scale);
-        let border_size = resolve_border_size(&style, slot, intrinsic, is_root);
+        let mut border_size = resolve_border_size(&style, slot, intrinsic, is_root);
+        if let Flow::Grid {cell_width,cell_height} = layout.flow {
+            let chrome = style.padding.horizontal() + border_insets(&style).horizontal();
+            let available = (border_size.width - chrome).max(0.0);
+            let gap = layout.gap.max(0.0);
+            let columns = ((available + gap) / (f32::from(cell_width.max(1)) + gap)).floor().max(1.0) as usize;
+            if style.height == SizeRule::Shrink {
+                let rows = children.len().div_ceil(columns);
+                let height = rows as f32 * f32::from(cell_height.max(1))
+                    + rows.saturating_sub(1) as f32 * gap
+                    + style.padding.vertical() + border_insets(&style).vertical();
+                border_size.height = constrain_size(height, style.min_size.height, style.max_size.height, slot.height, height);
+            }
+        }
         let margin_rect = RectF {
             x: slot.x,
             y: slot.y,
@@ -260,10 +274,23 @@ impl LayoutEngine {
         self.diagnostics.arranged += 1;
 
         let gap = layout.gap.max(0.0);
+        if let Flow::Grid {cell_width,cell_height} = layout.flow {
+            let width = f32::from(cell_width.max(1)).min(content_rect.width);
+            let height = f32::from(cell_height.max(1));
+            let columns = ((content_rect.width + gap) / (width + gap)).floor().max(1.0) as usize;
+            for (index, child) in children.into_iter().enumerate() {
+                self.arrange_node(ui, text, child, RectF {
+                    x: content_rect.x + (index % columns) as f32 * (width + gap),
+                    y: content_rect.y + (index / columns) as f32 * (height + gap),
+                    width, height,
+                }, false, scale);
+            }
+            return SizeF {width:margin_rect.width,height:margin_rect.height};
+        }
         let gap_total = gap * children.len().saturating_sub(1) as f32;
         let main_available = match layout.flow {
             Flow::Horizontal => content_rect.width,
-            Flow::Vertical | Flow::Overlay => content_rect.height,
+            Flow::Vertical | Flow::Overlay | Flow::Grid {..} => content_rect.height,
         };
         let mut fixed_main = 0.0;
         let mut fill_weight = 0.0;
@@ -273,7 +300,7 @@ impl LayoutEngine {
                 let rule = match layout.flow {
                     Flow::Horizontal => child_style.width,
                     Flow::Vertical => child_style.height,
-                    Flow::Overlay => unreachable!(),
+                    Flow::Overlay | Flow::Grid {..} => unreachable!(),
                 };
                 let weight = fill_weight_of(rule);
                 if weight > 0.0 {
@@ -295,7 +322,7 @@ impl LayoutEngine {
                     fixed_main += match layout.flow {
                         Flow::Horizontal => estimate.width + child_style.margin.horizontal(),
                         Flow::Vertical => estimate.height + child_style.margin.vertical(),
-                        Flow::Overlay => 0.0,
+                        Flow::Overlay | Flow::Grid {..} => 0.0,
                     };
                 }
             }
@@ -358,7 +385,7 @@ impl LayoutEngine {
                         content_rect.height
                     },
                 },
-                Flow::Overlay => RectF {
+                Flow::Overlay | Flow::Grid {..} => RectF {
                     x: cross_axis_offset(
                         layout.cross_axis_alignment,
                         content_rect.width,
@@ -377,7 +404,7 @@ impl LayoutEngine {
             cursor += match layout.flow {
                 Flow::Horizontal => arranged.width,
                 Flow::Vertical => arranged.height,
-                Flow::Overlay => 0.0,
+                Flow::Overlay | Flow::Grid {..} => 0.0,
             } + gap;
         }
         SizeF {

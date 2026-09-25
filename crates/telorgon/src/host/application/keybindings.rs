@@ -1,4 +1,4 @@
-//! Named-function bindings for Linux compositor shortcuts.
+//! Named-function and explicitly authorized desktop-action compositor shortcuts.
 
 use super::{ShellKeyAction, ShellKeyEvent};
 
@@ -67,6 +67,11 @@ impl ShortcutKey {
     pub const F10: Self = Self::from_keysym(0xffc7);
     pub const F11: Self = Self::from_keysym(0xffc8);
     pub const F12: Self = Self::from_keysym(0xffc9);
+
+    pub const AudioVolumeDown: Self = Self::from_keysym(0x1008ff11);
+    pub const AudioVolumeMute: Self = Self::from_keysym(0x1008ff12);
+    pub const AudioVolumeUp: Self = Self::from_keysym(0x1008ff13);
+    pub const MicrophoneMute: Self = Self::from_keysym(0x1008ffb2);
 
     pub const Space: Self = Self::from_keysym(0x20);
     pub const Enter: Self = Self::from_keysym(0xff0d);
@@ -175,7 +180,7 @@ impl KeyChord {
     }
 }
 
-/// A collection of compositor shortcuts backed by ordinary `fn()` pointers.
+/// Compositor shortcuts backed by ordinary `fn()` pointers or opt-in desktop audio actions.
 ///
 /// Matched keys run once per fresh press and consume that key's press, repeats, and release.
 /// Unmatched keys forward normally. The desktop host disables shortcuts during session lock.
@@ -195,7 +200,52 @@ impl KeyChord {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct KeyBindings {
-    bindings: Vec<(KeyChord, fn())>,
+    bindings: Vec<(KeyChord, ShortcutHandler)>,
+}
+
+#[derive(Clone)]
+enum ShortcutHandler {
+    #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+    Mixer { handle: super::audio_mixer::AudioMixerHandle, action: crate::services::audio::AudioSystemAction, on_error: fn(crate::integrations::pipewire::MediaError) },
+    Function(fn()),
+    #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+    Audio {
+        handle: super::desktop_audio::DesktopAudioHandle,
+        action: crate::services::audio::AudioSystemAction,
+        on_error: fn(crate::integrations::pipewire::MediaError),
+    },
+}
+impl std::fmt::Debug for ShortcutHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Function(_) => f.write_str("Function"),
+            #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+            Self::Mixer { action, .. } => f.debug_tuple("Mixer").field(action).finish(),
+            #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+            Self::Audio { action, .. } => f.debug_tuple("Audio").field(action).finish(),
+        }
+    }
+}
+impl ShortcutHandler {
+    fn invoke(&self) {
+        match self {
+            Self::Function(handler) => handler(),
+            #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+            Self::Mixer { handle, action, on_error } => {
+                if let Err(error) = handle.execute(super::audio_mixer::MixerAction::System(*action)) { on_error(error); }
+            },
+            #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+            Self::Audio {
+                handle,
+                action,
+                on_error,
+            } => {
+                if let Err(error) = handle.execute(*action) {
+                    on_error(error);
+                }
+            }
+        }
+    }
 }
 
 impl KeyBindings {
@@ -218,13 +268,117 @@ impl KeyBindings {
                 .any(|(existing, _)| existing.overlaps(chord)),
             "duplicate compositor shortcut: {chord:?}"
         );
-        self.bindings.push((chord, handler));
+        self.bindings
+            .push((chord, ShortcutHandler::Function(handler)));
         self
+    }
+
+    /// Bind media keys to the reconnecting mixer shared with shell widgets.
+    #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+    pub fn mixer_media_keys(mut self, handle: super::audio_mixer::AudioMixerHandle, step_ui: f32,
+        on_error: fn(crate::integrations::pipewire::MediaError)) -> Result<Self, crate::integrations::pipewire::MediaError> {
+        use crate::services::audio::{AudioControlTarget as Target, AudioSystemAction as Action, Amplification};
+        if !step_ui.is_finite() || step_ui <= 0.0 || step_ui > 1.0 { return Err(crate::integrations::pipewire::MediaError::InvalidArgument("audio key volume step")); }
+        for (key, action) in [
+            (ShortcutKey::AudioVolumeDown, Action::AdjustVolume { target: Target::DefaultOutput, delta_ui: -step_ui, amplification: Amplification::Forbid }),
+            (ShortcutKey::AudioVolumeUp, Action::AdjustVolume { target: Target::DefaultOutput, delta_ui: step_ui, amplification: Amplification::Forbid }),
+            (ShortcutKey::AudioVolumeMute, Action::ToggleMute { target: Target::DefaultOutput }),
+            (ShortcutKey::MicrophoneMute, Action::ToggleMute { target: Target::DefaultInput }),
+        ] {
+            let chord = KeyChord::new(key);
+            assert!(!self.bindings.iter().any(|(existing, _)| existing.overlaps(chord)), "duplicate compositor shortcut: {chord:?}");
+            self.bindings.push((chord, ShortcutHandler::Mixer { handle: handle.clone(), action, on_error }));
+        }
+        Ok(self)
+    }
+
+    /// Bind an explicit audio capability; construction never creates a connection or sends
+    /// a request. Matched presses remain consumed even if admission fails, preventing a
+    /// second handler from applying them. Admission errors call on_error on the host thread;
+    /// native completion/errors remain visible in the shared DesktopAudio snapshot.
+    /// Keep on_error short and nonblocking. Duplicate chords panic, as with bind().
+    #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+    pub fn bind_audio(
+        mut self,
+        chord: KeyChord,
+        handle: super::desktop_audio::DesktopAudioHandle,
+        action: crate::services::audio::AudioSystemAction,
+        on_error: fn(crate::integrations::pipewire::MediaError),
+    ) -> Self {
+        assert!(
+            !self
+                .bindings
+                .iter()
+                .any(|(existing, _)| existing.overlaps(chord)),
+            "duplicate compositor shortcut: {chord:?}"
+        );
+        self.bindings.push((
+            chord,
+            ShortcutHandler::Audio {
+                handle,
+                action,
+                on_error,
+            },
+        ));
+        self
+    }
+
+    /// Opt into the four unmodified XF86 output volume/mute and microphone-mute keys.
+    /// Each fresh press uses the widget service queue; held-key repeats remain suppressed
+    /// by the shell's shortcut contract. Do not enable on devices where firmware already
+    /// performs the same operation. Keep the DesktopAudio/Connection owners alive.
+    #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+    pub fn audio_media_keys(
+        self,
+        handle: super::desktop_audio::DesktopAudioHandle,
+        step_ui: f32,
+        on_error: fn(crate::integrations::pipewire::MediaError),
+    ) -> Result<Self, crate::integrations::pipewire::MediaError> {
+        use crate::services::audio::{Amplification, AudioControlTarget, AudioSystemAction};
+        if !step_ui.is_finite() || !(0.0..=1.0).contains(&step_ui) || step_ui == 0.0 {
+            return Err(crate::integrations::pipewire::MediaError::InvalidArgument(
+                "audio key volume step",
+            ));
+        }
+        let mut bindings = self;
+        for (key, delta_ui) in [
+            (ShortcutKey::AudioVolumeDown, -step_ui),
+            (ShortcutKey::AudioVolumeUp, step_ui),
+        ] {
+            bindings = bindings.bind_audio(
+                KeyChord::new(key),
+                handle.clone(),
+                AudioSystemAction::AdjustVolume {
+                    target: AudioControlTarget::DefaultOutput,
+                    delta_ui,
+                    amplification: Amplification::Forbid,
+                },
+                on_error,
+            );
+        }
+        for (key, target) in [
+            (
+                ShortcutKey::AudioVolumeMute,
+                AudioControlTarget::DefaultOutput,
+            ),
+            (
+                ShortcutKey::MicrophoneMute,
+                AudioControlTarget::DefaultInput,
+            ),
+        ] {
+            bindings = bindings.bind_audio(
+                KeyChord::new(key),
+                handle.clone(),
+                AudioSystemAction::ToggleMute { target },
+                on_error,
+            );
+        }
+        Ok(bindings)
     }
 
     pub(crate) fn handle(&self, event: ShellKeyEvent) -> ShellKeyAction {
         if let Some((_, handler)) = self.bindings.iter().find(|(chord, _)| chord.matches(event)) {
-            handler();
+            handler.invoke();
             ShellKeyAction::Consume
         } else {
             ShellKeyAction::Forward
@@ -457,10 +611,7 @@ mod tests {
             }),
             ShellKeyAction::Forward
         );
-        assert_eq!(
-            KeyBindings::new().handle(matched),
-            ShellKeyAction::Forward
-        );
+        assert_eq!(KeyBindings::new().handle(matched), ShellKeyAction::Forward);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Bounded backend state. D-Bus identity is checked before entering this state machine.
 
-use super::{Lease, StartRequest, StreamInfo};
+use super::{Lease, StartCompletion, StartRequest};
 use crate::shell::capture::CaptureOptions;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,13 +9,16 @@ use zbus::zvariant::OwnedValue;
 pub(super) type Options = std::collections::HashMap<String, OwnedValue>;
 pub(super) const MAX_SESSIONS: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Selection {
     options: CaptureOptions,
     source_types: u32,
+    multiple: bool,
+    persistence: u32,
+    restore: Option<super::restore::RestoreData>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
     Created,
     Selected(Selection),
@@ -36,6 +39,8 @@ pub(super) struct Session {
 pub(super) struct Sessions {
     next_id: u64,
     pub available_source_types: u32,
+    pub failures: std::collections::VecDeque<String>,
+    pub grant_revision: u64,
     pub entries: BTreeMap<String, Session>,
 }
 
@@ -44,6 +49,8 @@ impl Default for Sessions {
         Self {
             next_id: 1,
             available_source_types: super::AVAILABLE_SOURCE_TYPES,
+            failures: Default::default(),
+            grant_revision: 0,
             entries: BTreeMap::new(),
         }
     }
@@ -131,6 +138,14 @@ impl Sessions {
             if selection.source_types == 0 {
                 Err(())
             } else {
+                selection.restore = options.get("restore_data").and_then(|value| {
+                    super::restore::RestoreData::decode(
+                        value,
+                        app_id,
+                        selection.source_types,
+                        selection.multiple,
+                    )
+                });
                 Ok(selection)
             }
         });
@@ -151,7 +166,7 @@ impl Sessions {
     ) -> Result<
         (
             StartRequest,
-            async_channel::Receiver<Result<StreamInfo, u32>>,
+            async_channel::Receiver<Result<StartCompletion, u32>>,
         ),
         (),
     > {
@@ -164,7 +179,7 @@ impl Sessions {
             return Err(());
         }
         let session = self.owned(path, owner, app_id)?;
-        let Phase::Selected(selection) = session.phase else {
+        let Phase::Selected(selection) = session.phase.clone() else {
             return Err(());
         };
         session.phase = Phase::Starting;
@@ -177,6 +192,9 @@ impl Sessions {
                 lease: session.lease.clone(),
                 options: selection.options,
                 source_types: selection.source_types,
+                multiple: selection.multiple,
+                persistence: selection.persistence,
+                restore: selection.restore,
                 reply,
             },
             receive,
@@ -194,6 +212,47 @@ impl Sessions {
         }
         session.phase = Phase::Streaming;
         true
+    }
+
+    pub fn attach_restore(
+        &mut self,
+        lease: &Arc<Lease>,
+        grant: super::restore::RestoreData,
+        revision: u64,
+    ) -> bool {
+        if revision == u64::MAX
+            || self.grant_revision != revision
+            || lease.closed()
+            || !self
+                .entries
+                .values()
+                .any(|s| Arc::ptr_eq(&s.lease, lease) && s.app_id == grant.app_id)
+        {
+            return false;
+        }
+        *lease.saved.lock().unwrap_or_else(|e| e.into_inner()) = Some(grant);
+        true
+    }
+    pub fn invalidate_application(&mut self, app: &str) {
+        self.grant_revision = self.grant_revision.saturating_add(1);
+        for session in self.entries.values().filter(|s| s.app_id == app) {
+            session.lease.close();
+        }
+    }
+    pub fn invalidate_grant(&mut self, app: &str, grant_id: &str) {
+        self.grant_revision = self.grant_revision.saturating_add(1);
+        for session in self.entries.values() {
+            if session
+                .lease
+                .saved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|g| g.app_id == app && g.grant_id == grant_id)
+            {
+                session.lease.close();
+            }
+        }
     }
 
     pub fn revoke_except(&self, owner: Option<&str>) {
@@ -223,24 +282,27 @@ fn selection(options: &Options) -> Result<Selection, ()> {
     if types == 0
         || types & !7 != 0
         || types & super::AVAILABLE_SOURCE_TYPES == 0
-        || !matches!(cursor, 1 | 2)
+        || !matches!(cursor, 1 | 2 | 4)
     {
         return Err(());
     }
-    if let Some(multiple) = options.get("multiple") {
-        let _ = bool::try_from(multiple).map_err(|_| ())?;
-    }
-    // Version 3 has no persistent grants. Refuse them rather than accidentally agreeing to persist.
-    if uint(options, "persist_mode", 0)? != 0 {
+    let multiple = options
+        .get("multiple")
+        .map_or(Ok(false), |value| bool::try_from(value).map_err(|_| ()))?;
+    let persistence = uint(options, "persist_mode", 0)?;
+    if persistence > 2 {
         return Err(());
     }
     Ok(Selection {
         source_types: types,
+        multiple,
+        persistence,
+        restore: None,
         options: CaptureOptions::new(
-            if cursor == 2 {
-                crate::shell::capture::CaptureCursorMode::Embedded
-            } else {
-                crate::shell::capture::CaptureCursorMode::Hidden
+            match cursor {
+                2 => crate::shell::capture::CaptureCursorMode::Embedded,
+                4 => crate::shell::capture::CaptureCursorMode::Metadata,
+                _ => crate::shell::capture::CaptureCursorMode::Hidden,
             },
             CaptureOptions::default().max_frame_rate(),
         ),
@@ -260,6 +322,109 @@ mod tests {
         let lease = s.create(&path(i), ":1.2", app, Arc::new(|| {})).unwrap();
         assert!(s.registered(&path(i), lease.id));
         lease
+    }
+
+    #[test]
+    fn forgetting_an_application_closes_its_pending_and_active_leases_only() {
+        let mut state = Sessions::default();
+        let a = create(&mut state, 1, "app.a");
+        let b = create(&mut state, 2, "app.a");
+        let other = create(&mut state, 3, "app.b");
+        state.invalidate_application("app.a");
+        assert!(a.closed());
+        assert!(b.closed());
+        assert!(!other.closed());
+        assert_eq!(state.grant_revision, 1);
+    }
+
+    #[test]
+    fn revocation_closes_all_matching_leases_and_rejects_racing_lookup_results() {
+        let mut sessions = Sessions::default();
+        let a = create(&mut sessions, 1, "app");
+        let b = create(&mut sessions, 2, "app");
+        let other = create(&mut sessions, 3, "other");
+        let pending = sessions
+            .create(&path(4), ":1.3", "app", Arc::new(|| {}))
+            .unwrap();
+        assert!(sessions.registered(&path(4), pending.id));
+        let grant = super::super::restore::RestoreData {
+            app_id: "app".into(),
+            grant_id: "0".repeat(64),
+            sources: vec![super::super::restore::RestoreSource {
+                kind: 1,
+                identity: "output".into(),
+            }],
+        };
+        let revision = sessions.grant_revision;
+        assert!(sessions.attach_restore(&a, grant.clone(), revision));
+        assert!(sessions.attach_restore(&b, grant.clone(), revision));
+        sessions.invalidate_grant("app", &grant.grant_id);
+        assert!(a.closed());
+        assert!(b.closed());
+        assert!(!other.closed());
+        assert!(!sessions.attach_restore(&pending, grant, revision));
+        assert!(!pending.has_saved_grant());
+        assert!(!pending.closed());
+    }
+
+    #[test]
+    fn restore_hints_are_app_bound_and_malformed_hints_fall_back_to_consent() {
+        use super::super::restore::{RestoreData, RestoreSource};
+        let record = RestoreData {
+            app_id: "app".into(),
+            grant_id: "01".repeat(32),
+            sources: vec![RestoreSource {
+                kind: 1,
+                identity: "host-output-key".into(),
+            }],
+        };
+        for case in 0..4 {
+            let mut sessions = Sessions::default();
+            let app = if case == 1 { "other" } else { "app" };
+            create(&mut sessions, 1, app);
+            let mut options = Options::from([
+                ("persist_mode".into(), 2u32.into()),
+                (
+                    "restore_data".into(),
+                    if case == 2 {
+                        42u32.into()
+                    } else {
+                        record.encode().unwrap()
+                    },
+                ),
+            ]);
+            if case == 3 {
+                options.insert("types".into(), 2u32.into());
+            }
+            sessions.select(&path(1), ":1.2", app, &options).unwrap();
+            let (start, _) = sessions.begin(&path(1), ":1.2", app, &request(1)).unwrap();
+            assert_eq!(start.persistence, 2);
+            assert_eq!(start.restore.is_some(), case == 0);
+            // A well-formed hint still starts an ordinary host consent request.
+            assert_eq!(sessions.entries[&path(1)].phase, Phase::Starting);
+            assert!(!start.lease.closed());
+        }
+    }
+
+    #[test]
+    fn multiple_selection_survives_until_host_start() {
+        for multiple in [false, true] {
+            let mut sessions = Sessions::default();
+            create(&mut sessions, 1, "app");
+            sessions
+                .select(
+                    &path(1),
+                    ":1.2",
+                    "app",
+                    &Options::from([("multiple".into(), multiple.into())]),
+                )
+                .unwrap();
+            let (start, _) = sessions
+                .begin(&path(1), ":1.2", "app", &request(1))
+                .unwrap();
+            assert_eq!(start.multiple, multiple);
+        }
+        assert!(!selection(&Options::new()).unwrap().multiple);
     }
 
     #[test]
@@ -367,10 +532,10 @@ mod tests {
         for options in [
             Options::from([("types".into(), 4u32.into())]),
             Options::from([("types".into(), 0u32.into())]),
-            Options::from([("cursor_mode".into(), 4u32.into())]),
+            Options::from([("cursor_mode".into(), 8u32.into())]),
             Options::from([("cursor_mode".into(), 3u32.into())]),
             Options::from([("multiple".into(), 1u32.into())]),
-            Options::from([("persist_mode".into(), 1u32.into())]),
+            Options::from([("persist_mode".into(), 3u32.into())]),
         ] {
             assert!(selection(&options).is_err());
         }
@@ -380,6 +545,15 @@ mod tests {
                 ("multiple".into(), true.into())
             ]))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn separate_cursor_choice_is_preserved_for_host_admission() {
+        let selected = selection(&Options::from([("cursor_mode".into(), 4u32.into())])).unwrap();
+        assert_eq!(
+            selected.options.cursor(),
+            crate::shell::capture::CaptureCursorMode::Metadata
         );
     }
 

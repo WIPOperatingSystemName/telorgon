@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::graphics::bridges::vulkan_dxgi::VulkanDxgiBridge;
 use crate::foundation::SizeI;
+#[cfg(target_os = "windows")]
+use crate::graphics::bridges::vulkan_dxgi::VulkanDxgiBridge;
 use crate::graphics::presentation::wsi::{
     VulkanPresentModePreference, VulkanWinitPresenter, VulkanWinitSurface,
     required_instance_extensions,
@@ -46,7 +47,10 @@ pub(crate) fn create_vulkan_presentation(
     let display = event_loop.owned_display_handle();
     let extensions =
         required_instance_extensions(&display).map_err(|error| AppError::new(error.to_string()))?;
-    let config = VulkanConfig::default();
+    let mut config = VulkanConfig::default();
+    if cfg!(target_os = "linux") {
+        config.enable_dxgi_presenter = false;
+    }
     let instance = VulkanInstance::load(&config, &extensions)
         .map_err(|error| AppError::new(error.to_string()))?;
     Ok(VulkanPresentation::new(
@@ -101,7 +105,19 @@ impl VulkanPresentation {
 }
 
 impl NativePresentation for VulkanPresentation {
+    fn uses_logical_coordinates(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
     fn attach(&mut self, window: Arc<Window>) -> Result<(), String> {
+        let extent = Self::extent(&window);
+        self.config.staging_budget_bytes = self.config.staging_budget_bytes.max(
+            crate::graphics::renderers::vulkan::staging_budget::surface_budget(
+                extent,
+                self.config.frames_in_flight,
+            )
+            .map_err(|error| error.to_string())?,
+        );
         let instance = self
             .instance
             .as_ref()
@@ -116,12 +132,12 @@ impl NativePresentation for VulkanPresentation {
         let scene = device
             .create_scene()
             .map_err(|error| format!("failed to create Vulkan scene: {error}"))?;
-        let extent = Self::extent(&window);
         let present_mode = if self.config.prefer_mailbox_present {
             VulkanPresentModePreference::MailboxWithFifoFallback
         } else {
             VulkanPresentModePreference::Fifo
         };
+        #[cfg(target_os = "windows")]
         let presenter = if self.config.enable_dxgi_presenter && device.capabilities().dxgi_interop {
             let presenter =
                 VulkanDxgiBridge::new(&*window, &device, extent, self.config.frames_in_flight)
@@ -148,6 +164,21 @@ impl NativePresentation for VulkanPresentation {
                 .map_err(|error| format!("failed to create Vulkan presenter: {error}"))?,
             ))
         };
+        #[cfg(not(target_os = "windows"))]
+        let presenter = VulkanPresentationPipeline::Wsi(Box::new(
+            VulkanWinitPresenter::new_with_present_mode(
+                surface,
+                &device,
+                extent,
+                self.config.frames_in_flight,
+                present_mode,
+            )
+            .map_err(|error| format!("failed to create Vulkan presenter: {error}"))?,
+        ));
+        eprintln!(
+            "telorgon-app: using Vulkan renderer (upload staging: {} bytes per slot)",
+            self.config.staging_budget_bytes / self.config.frames_in_flight.max(1) as u64
+        );
         let instance = self
             .instance
             .take()
@@ -339,7 +370,7 @@ fn select_present_device(
         return Ok(device);
     }
     Err(format!(
-        "no Vulkan adapter can present to this Windows surface: {}",
+        "no Vulkan adapter can present to this native surface: {}",
         failures.join("; ")
     ))
 }

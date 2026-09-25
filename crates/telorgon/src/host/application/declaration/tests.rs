@@ -16,20 +16,56 @@ fn capture_startup_validation_precedes_device_and_session_creation() {
 
 #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
 #[test]
-fn custom_capture_factory_survives_cursor_configuration_and_runs_once() {
-    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
-    let invoked = calls.clone();
-    let mut compositor = Compositor::new()
-        .capture_chooser(move |ui| {
-            invoked.set(invoked.get() + 1);
-            crate::components::shell::capture::CapturePicker::new(ui)
+fn portal_factories_survive_cursor_configuration_and_share_one_context() {
+    let contexts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let picker = contexts.clone();
+    let sharing = contexts.clone();
+    let design = crate::ScreenCastPortal::new()
+        .picker(move |context| {
+            picker.borrow_mut().push(context);
+            Root
         })
+        .sharing(move |context| {
+            sharing.borrow_mut().push(context);
+            Root
+        });
+    let mut compositor = Compositor::new()
+        .screen_cast_portal(design)
         .cursor_theme(CursorTheme::new());
-    assert_eq!(calls.get(), 0);
-    let factory = compositor.take_capture_chooser().unwrap();
-    assert!(compositor.take_capture_chooser().is_none());
-    let _widget = factory(crate::CaptureUi::default());
-    assert_eq!(calls.get(), 1);
+    assert!(contexts.borrow().is_empty());
+    let design = compositor.take_screen_cast_portal().unwrap();
+    assert!(compositor.take_screen_cast_portal().is_none());
+    let context = crate::ScreenCastPortalContext::default();
+    let widgets = design.compose(context.clone()).unwrap();
+    assert_eq!(widgets.widgets.len(), 2);
+    let contexts = contexts.borrow();
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts.iter().all(|value| value == &context));
+}
+
+#[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
+#[test]
+fn portal_design_is_validated_before_device_startup() {
+    for (design, expected) in [
+        (None, "Compositor::screen_cast_portal"),
+        (Some(crate::ScreenCastPortal::new()), "shell-defined picker"),
+        (Some(crate::ScreenCastPortal::new().picker(|_| Root)), "sharing controls"),
+        (Some(crate::ScreenCastPortal::new().sharing(|_| Root)), "shell-defined picker"),
+    ] {
+        let mut compositor = Compositor::new().cursor_theme(CursorTheme::new());
+        if let Some(design) = design {
+            compositor = compositor.screen_cast_portal(design);
+        }
+        let error = Application::shell_environment("Portal validation")
+            .capture(super::super::Capture::desktop())
+            .renderer(Renderer::Vulkan)
+            .compositor(compositor)
+            .into_ready()
+            .into_parts()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]

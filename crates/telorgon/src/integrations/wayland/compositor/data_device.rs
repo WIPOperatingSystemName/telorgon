@@ -80,9 +80,8 @@ impl DataSource {
     }
 
     pub fn offer(&mut self, mime_type: MimeType) -> Result<(), DataDeviceError> {
-        if self.used {
-            return Err(DataDeviceError::SourceAlreadyUsed);
-        }
+        // Unlike set_actions, wl_data_source.offer has no unused-source restriction.
+        // Toolkits can advertise more formats after assigning the selection.
         if self.mime_types.contains(&mime_type) {
             return Ok(());
         }
@@ -114,6 +113,7 @@ pub struct DataDeviceState {
     sources: BTreeMap<ProtocolObjectId, DataSource>,
     offers: BTreeMap<ProtocolObjectId, DataOffer>,
     selection: Option<ProtocolObjectId>,
+    primary_selection: Option<ProtocolObjectId>,
     drag_source: Option<ProtocolObjectId>,
     drag_origin: Option<WaylandSurfaceId>,
 }
@@ -141,6 +141,16 @@ impl DataDeviceState {
 
     pub fn selection(&self) -> Option<ProtocolObjectId> {
         self.selection
+    }
+    pub fn primary_selection(&self) -> Option<ProtocolObjectId> { self.primary_selection }
+    pub fn set_primary_selection(&mut self, owner: ClientId, source: Option<ProtocolObjectId>) -> Result<(), DataDeviceError> {
+        if let Some(id) = source {
+            let source = self.sources.get_mut(&id).ok_or(DataDeviceError::UnknownSource)?;
+            if source.owner != owner || source.used || source.actions_set { return Err(DataDeviceError::InvalidSource); }
+            source.used = true;
+        }
+        self.primary_selection = source;
+        Ok(())
     }
 
     pub fn set_selection(
@@ -229,8 +239,9 @@ impl DataDeviceState {
             return false;
         }
         self.offers.retain(|_, offer| offer.source != object);
-        let selection_changed = self.selection == Some(object);
-        if selection_changed {
+        let selection_changed = self.selection == Some(object) || self.primary_selection == Some(object);
+        if self.primary_selection == Some(object) { self.primary_selection = None; }
+        if self.selection == Some(object) {
             self.selection = None;
         }
         if self.drag_source == Some(object) {
@@ -282,6 +293,7 @@ impl DataDeviceState {
             .iter()
             .filter_map(|(id, source)| (source.owner == client).then_some(*id))
             .collect();
+        if self.primary_selection.is_some_and(|source| removed_sources.contains(&source)) { self.primary_selection = None; }
         self.sources.retain(|_, source| source.owner != client);
         self.offers
             .retain(|_, offer| offer.target != client && !removed_sources.contains(&offer.source));
@@ -386,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn mime_bound_counts_distinct_offers_and_keeps_used_sources_immutable() {
+    fn mime_bound_counts_distinct_offers_even_after_source_is_used() {
         let mut source = DataSource {
             owner: client(1),
             object: object(1),
@@ -409,10 +421,24 @@ mod tests {
         );
         assert_eq!(source.mime_types.len(), 128);
         source.used = true;
-        assert_eq!(
-            source.offer(duplicate),
-            Err(DataDeviceError::SourceAlreadyUsed)
-        );
+        source.offer(duplicate).unwrap();
+        assert_eq!(source.mime_types.len(), 128);
+    }
+
+    #[test]
+    fn selected_source_can_advertise_another_format() {
+        let mut state = DataDeviceState::default();
+        state.create_source(DataSource {
+            owner: client(1), object: object(1), mime_types: vec![],
+            actions: DataAction::NONE, actions_set: false, used: false,
+        }).unwrap();
+        state.set_selection(client(1), Some(object(1))).unwrap();
+        let source = state.source_mut(object(1)).unwrap();
+        source.offer(MimeType::new("text/plain").unwrap()).unwrap();
+        source.offer(MimeType::new("text/plain;charset=utf-8").unwrap()).unwrap();
+        assert_eq!(source.mime_types.len(), 2);
+        assert!(source.set_actions(DataAction::COPY).is_err());
+        assert!(state.set_selection(client(1), Some(object(1))).is_err());
     }
 
     #[test]
