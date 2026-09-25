@@ -60,6 +60,7 @@ pub use crate::shell::window_chrome::{
 /// This module is intentionally private: application authors should import one of the entry-point
 /// modules instead, such as `use telorgon::app::*`.
 mod common {
+    pub use crate::assets::fonts;
     pub use crate::authoring::compose::{
         Button, Checkbox, Container, EasyWindowFrame, Image, PointerViewExt, Slider, Switch, Text,
         WindowChromeDesign, WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle,
