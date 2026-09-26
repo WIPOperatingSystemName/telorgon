@@ -22,6 +22,8 @@ pub struct ContainerElement {
 pub struct Container {
     key: Option<Key>,
     element: ContainerElement,
+    explicit_width: bool,
+    explicit_height: bool,
 }
 
 impl Container {
@@ -125,6 +127,8 @@ impl Container {
 
     pub fn box_style(mut self, style: BoxStyle) -> Self {
         self.element.style = style;
+        self.explicit_width = true;
+        self.explicit_height = true;
         self
     }
 
@@ -204,19 +208,34 @@ impl Container {
         self
     }
 
+    /// Derives an automatic axis from the other using width divided by height.
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.element.style.aspect_ratio = Some(ratio);
+        self
+    }
+
     pub fn width(mut self, width: impl Into<Dimension>) -> Self {
         self.element.style.width = width.into().into();
+        self.explicit_width = true;
         self
     }
 
     pub fn height(mut self, height: impl Into<Dimension>) -> Self {
         self.element.style.height = height.into().into();
+        self.explicit_height = true;
         self
     }
 }
 
 impl View for Container {
-    fn into_element(self) -> Element {
+    fn into_element(mut self) -> Element {
+        if self.element.style.aspect_ratio.is_some() {
+            if self.explicit_width && !self.explicit_height {
+                self.element.style.height = SizeRule::Shrink;
+            } else if self.explicit_height && !self.explicit_width {
+                self.element.style.width = SizeRule::Shrink;
+            }
+        }
         Element::from_kind(self.key, ElementKind::Container(self.element))
     }
 }
@@ -224,6 +243,8 @@ impl View for Container {
 fn container(flow: Flow) -> Container {
     Container {
         key: None,
+        explicit_width: false,
+        explicit_height: false,
         element: ContainerElement {
             inline_style: None,
             hover_within: false,
@@ -257,7 +278,7 @@ pub fn stack() -> Container {
 
 /// Flexible empty space for rows and columns.
 pub fn spacer() -> Container {
-    column().width(Dimension::FILL).height(Dimension::FILL)
+    column()
 }
 
 /// A neutral content surface. This is a convenience, not a requirement for grouping content.

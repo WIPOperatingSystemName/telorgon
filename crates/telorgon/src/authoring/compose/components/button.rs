@@ -169,6 +169,12 @@ impl Button {
         self
     }
 
+    /// Derives an automatic axis from the other using width divided by height.
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.element.style.aspect_ratio = Some(ratio);
+        self
+    }
+
     pub fn width(mut self, width: impl Into<crate::authoring::compose::Dimension>) -> Self {
         self.element.style.width = width.into().into();
         self

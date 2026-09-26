@@ -132,6 +132,11 @@ impl<State> WindowFrame<State> {
         self
     }
 
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.root = self.root.aspect_ratio(ratio);
+        self
+    }
+
     pub fn width(mut self, width: impl Into<Dimension>) -> Self {
         self.root = self.root.width(width);
         self
@@ -253,6 +258,11 @@ impl WindowContentSlot {
 
     pub fn overflow(mut self, overflow: Overflow) -> Self {
         self.content = self.content.overflow(overflow);
+        self
+    }
+
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.content = self.content.aspect_ratio(ratio);
         self
     }
 

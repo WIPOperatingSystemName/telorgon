@@ -26,6 +26,12 @@ impl Text {
         self
     }
 
+    /// Derives an automatic axis from the other using width divided by height.
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.element.box_style.aspect_ratio = Some(ratio);
+        self
+    }
+
     pub fn width(mut self, width: impl Into<Dimension>) -> Self {
         self.element.box_style.width = width.into().into();
         self

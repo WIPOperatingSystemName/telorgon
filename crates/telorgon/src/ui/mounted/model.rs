@@ -475,6 +475,8 @@ pub struct BoxStyle {
     pub sizing: BoxSizing,
     pub width: SizeRule,
     pub height: SizeRule,
+    /// Preferred width / height when exactly one dimension is automatic (`Shrink`).
+    pub aspect_ratio: Option<f32>,
     pub min_size: SizeRule2D,
     pub max_size: SizeRule2D,
     pub margin: EdgeInsets,
@@ -490,6 +492,7 @@ impl Default for BoxStyle {
             sizing: BoxSizing::BorderBox,
             width: SizeRule::Shrink,
             height: SizeRule::Shrink,
+            aspect_ratio: None,
             min_size: SizeRule2D::default(),
             max_size: SizeRule2D {
                 width: SizeRule::Fill(1.0),

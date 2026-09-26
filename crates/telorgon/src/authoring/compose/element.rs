@@ -273,6 +273,16 @@ fn validate_element(
     element: &Element,
     component: Option<(TypeId, &'static str)>,
 ) -> Result<(), ViewError> {
+    let style = match &element.kind {
+        ElementKind::Container(value) => Some(&value.style),
+        ElementKind::Button(value) => Some(&value.style),
+        ElementKind::Image(value) => Some(&value.style),
+        ElementKind::Text(value) => Some(&value.box_style),
+        _ => None,
+    };
+    if style.and_then(|style| style.aspect_ratio).is_some_and(|ratio| !ratio.is_finite() || ratio <= 0.0) {
+        return Err(ViewError::InvalidNumber("aspect ratio"));
+    }
     match &element.kind {
         ElementKind::Container(container) => {
             if !container.layout.gap.is_finite() {
