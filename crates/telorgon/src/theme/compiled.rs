@@ -61,6 +61,22 @@ pub struct ResolvedSlotStyle<'a> {
 }
 
 impl CompiledComponentStyle {
+    /// Merge an authored effect layer without losing theme focus/pressed/disabled states.
+    pub(crate) fn overlay_effects(&mut self, effects: &Self) {
+        for (slot, value) in &effects.slots { self.slots.entry(*slot).or_default().overlay(value); }
+        for (state, value) in &effects.states {
+            let target = self.states.entry(*state).or_default();
+            for (slot, patch) in &value.slots { target.slots.entry(*slot).or_default().overlay(patch); }
+            if value.transition.is_some() { target.transition = value.transition; }
+        }
+        for (slot, patch) in &effects.controlled_slots { self.controlled_slots.entry(*slot).or_default().overlay(*patch); }
+        self.controlled_font_families.extend(effects.controlled_font_families.iter().copied());
+        self.relevant_states = InteractionFlags::from_bits(self.relevant_states.bits() | effects.relevant_states.bits());
+        self.state_precedence.retain(|state| *state != InteractionState::Hovered);
+        self.state_precedence.insert(0, InteractionState::Hovered);
+        self.transition = effects.transition;
+    }
+
     /// Resolves one mounted slot without allocating. The owned `resolve` form remains available
     /// for diagnostics and tooling, while the frame pipeline uses this path.
     pub fn resolve_slot<'a>(
@@ -94,7 +110,7 @@ impl CompiledComponentStyle {
         let flags = InteractionFlags::from_bits(flags.bits() & self.relevant_states.bits());
         let mut transition = self.transition;
         for state in &self.state_precedence {
-            if !flags.contains(state.flag()) {
+            if !flags.contains(state.flag()) || (*state == InteractionState::Hovered && flags.contains(InteractionFlags::DISABLED)) {
                 continue;
             }
             if let Some(state_style) = self.states.get(state) {
@@ -131,7 +147,7 @@ impl CompiledComponentStyle {
         }
         let flags = InteractionFlags::from_bits(flags.bits() & self.relevant_states.bits());
         for state in &self.state_precedence {
-            if !flags.contains(state.flag()) {
+            if !flags.contains(state.flag()) || (*state == InteractionState::Hovered && flags.contains(InteractionFlags::DISABLED)) {
                 continue;
             }
             if let Some(overlay) = self.states.get(state) {

@@ -112,8 +112,31 @@ impl LayoutEngine {
             });
         let mut preorder = std::mem::take(&mut self.preorder_scratch);
         preorder.clear();
-        if needs_layout || needs_spatial {
+        if needs_layout {
             preorder.extend_from_slice(ui.nodes.preorder());
+        } else if needs_spatial {
+            // Only changed roots and descendants need new world transforms and clips.
+            // Discard roots already covered by a dirty ancestor.
+            let roots: std::collections::HashSet<_> = dirty.iter().copied().filter(|node| {
+                ui.nodes.core(*node).is_some_and(|core| core.dirty.intersects(
+                    DirtyFlags::SPATIAL | DirtyFlags::CLIP | DirtyFlags::VISIBILITY,
+                ))
+            }).collect();
+            let mut stack = Vec::new();
+            for root in roots.iter().copied() {
+                let mut parent = ui.nodes.core(root).and_then(|core| core.parent);
+                let mut covered = false;
+                while let Some(node) = parent {
+                    if roots.contains(&node) { covered = true; break; }
+                    parent = ui.nodes.core(node).and_then(|core| core.parent);
+                }
+                if covered { continue; }
+                stack.push(root);
+                while let Some(node) = stack.pop() {
+                    preorder.push(node);
+                    stack.extend(ui.nodes.children(node));
+                }
+            }
         }
         #[cfg(feature = "instrumentation")]
         drop(dirty_span);

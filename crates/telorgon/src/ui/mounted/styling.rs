@@ -58,15 +58,22 @@ impl MountedUi {
         if text.style == style {
             return false;
         }
+        let metrics_changed = text.style.size != style.size
+            || text.style.line_height != style.line_height
+            || text.style.family != style.family || text.style.weight != style.weight
+            || text.style.fit_height != style.fit_height;
+        let alignment_changed = text.style.align != style.align || text.style.vertical_align != style.vertical_align;
         text.style = style;
-        text.revision = text.revision.wrapping_add(1).max(1);
+        let mut dirty = DirtyFlags::PAINT;
+        if metrics_changed {
+            text.revision = text.revision.wrapping_add(1).max(1);
+            dirty |= DirtyFlags::TEXT | DirtyFlags::LAYOUT;
+        }
+        if alignment_changed { dirty |= DirtyFlags::LAYOUT; }
         if let Some(core) = self.nodes.core_mut(node) {
             core.content_revision = core.content_revision.wrapping_add(1).max(1);
         }
-        self.nodes.mark_dirty(
-            node,
-            DirtyFlags::TEXT | DirtyFlags::MEASURE | DirtyFlags::PAINT,
-        );
+        self.nodes.mark_dirty(node, dirty);
         true
     }
 
@@ -216,6 +223,23 @@ impl MountedUi {
         self.nodes
             .mark_dirty(node, DirtyFlags::STYLE | DirtyFlags::PAINT);
         true
+    }
+
+    pub(crate) fn set_local_style_overlay(&mut self, node: NodeId, overlay: bool) {
+        let Some(index) = self.style_bindings.iter().position(|binding| binding.state_root == node && binding.slots.iter().any(|slot| slot.node == node && slot.slot == StyleSlotId::named("root"))) else { return; };
+        if self.style_bindings[index].local_style_overlay != overlay {
+            self.style_bindings[index].local_style_overlay = overlay;
+            self.style_bindings[index].theme_revision = 0;
+            self.enqueue_style_binding(index);
+        }
+    }
+
+    pub(crate) fn reset_local_style_motion(&mut self, node: NodeId) {
+        if let Some(index) = self.style_bindings.iter().position(|binding| binding.state_root == node) {
+            self.style_bindings[index].reset_style_motion = true;
+            self.style_bindings[index].theme_revision = 0;
+            self.enqueue_style_binding(index);
+        }
     }
 
     /// Requalifies automatically mounted foundation bindings for an application or shell view.
@@ -383,11 +407,14 @@ impl MountedUi {
                 || next.max_size != style.max_size
                 || next.margin != style.margin
                 || next.padding != style.padding
-                || next.decoration.border != style.decoration.border
+                || next.decoration.border.top.width != style.decoration.border.top.width
+                || next.decoration.border.right.width != style.decoration.border.right.width
+                || next.decoration.border.bottom.width != style.decoration.border.bottom.width
+                || next.decoration.border.left.width != style.decoration.border.left.width
             {
                 dirty |= DirtyFlags::LAYOUT;
             }
-            if next.transform != style.transform {
+            if next.transform != style.transform || next.overflow != style.overflow {
                 dirty |= DirtyFlags::SPATIAL | DirtyFlags::CLIP;
             }
             dirty |= DirtyFlags::STYLE | DirtyFlags::PAINT;
@@ -411,14 +438,14 @@ impl MountedUi {
                 text.style.weight = value;
             }
             if text.style != old {
-                text.revision = text.revision.wrapping_add(1).max(1);
-                dirty |= DirtyFlags::TEXT | DirtyFlags::PAINT;
+                dirty |= DirtyFlags::PAINT;
                 if text.style.size != old.size
                     || text.style.line_height != old.line_height
                     || text.style.family != old.family
                     || text.style.weight != old.weight
                 {
-                    dirty |= DirtyFlags::LAYOUT;
+                    text.revision = text.revision.wrapping_add(1).max(1);
+                    dirty |= DirtyFlags::TEXT | DirtyFlags::LAYOUT;
                 }
             }
         }

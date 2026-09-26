@@ -712,6 +712,29 @@ pub struct StylePropertyPatch {
 impl StylePropertyPatch {
     /// Overlays only authored properties from `other`.
     pub fn overlay(&mut self, other: Self) {
+        // A complete value supersedes partial fields from an earlier layer.
+        // Partial fields in this same layer are applied by the overlay below.
+        if other.border.is_some() {
+            self.border_width = None;
+            self.border_color = None;
+        }
+        if other.outline.is_some() {
+            self.outline_width = None;
+            self.outline_offset = None;
+            self.outline_color = None;
+        }
+        if other.corner_radii.is_some() {
+            self.radius = None;
+        }
+        if other.transform.is_some() {
+            self.translation_x = None;
+            self.translation_y = None;
+            self.scale_x = None;
+            self.scale_y = None;
+            self.rotation = None;
+            self.origin_x = None;
+            self.origin_y = None;
+        }
         macro_rules! overlay {
             ($($field:ident),+ $(,)?) => {$ (
                 if other.$field.is_some() {
@@ -780,6 +803,8 @@ pub struct StyleBinding {
     pub variants: Vec<StyleVariantSelection>,
     pub local_overrides: Vec<(StyleSlotId, StylePropertyPatch)>,
     pub local_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
+    pub(crate) local_style_overlay: bool,
+    pub(crate) reset_style_motion: bool,
     pub theme_revision: u64,
     pub interaction_revision: u64,
 }
@@ -794,6 +819,8 @@ impl StyleBinding {
             variants: Vec::new(),
             local_overrides: Vec::new(),
             local_style: None,
+            local_style_overlay: false,
+            reset_style_motion: false,
             theme_revision: 0,
             interaction_revision: 0,
         }

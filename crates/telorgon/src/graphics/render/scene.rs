@@ -686,6 +686,14 @@ impl RenderScene {
         removed
     }
 
+    pub(crate) fn patch_glyph(&mut self, index: usize, glyph: GlyphInstance) {
+        if self.glyphs[index] != glyph {
+            self.draw_order_dirty |= self.glyphs[index].clip != glyph.clip;
+            self.glyphs[index] = glyph;
+            self.glyph_dirty.add(index..index + 1);
+        }
+    }
+
     pub fn set_glyphs(&mut self, glyphs: Vec<GlyphInstance>) {
         if self.glyphs != glyphs {
             let end = self.glyphs.len().max(glyphs.len());

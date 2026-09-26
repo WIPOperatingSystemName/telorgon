@@ -49,17 +49,26 @@ impl StyleProcessor {
             .retain(|key, _| ui.nodes.contains(key.state_root) && ui.nodes.contains(key.node));
         self.baselines
             .retain(|key, _| ui.nodes.contains(key.state_root) && ui.nodes.contains(key.node));
+        self.binding_scratch.clear();
+        ui.swap_dirty_style_bindings(&mut self.binding_scratch);
+        let mut bindings = ui.take_style_bindings_for_processing();
+        for index in &self.binding_scratch {
+            let Some(binding) = bindings.get_mut(*index) else { continue; };
+            if std::mem::take(&mut binding.reset_style_motion) {
+                // Reconciliation supplied a new authored root style. Do not overwrite it
+                // with an old animation sample, especially after an effect is removed.
+                self.tracks.retain(|key, _| key.state_root != binding.state_root || key.node != binding.state_root);
+                self.baselines.retain(|key, _| key.state_root != binding.state_root || key.node != binding.state_root);
+            }
+        }
         let mut changed = {
             #[cfg(feature = "instrumentation")]
             let _span = crate::runtime::instrumentation::span!("theme.motion");
             self.sample_tracks(ui, now, preference)
         };
-        self.binding_scratch.clear();
-        ui.swap_dirty_style_bindings(&mut self.binding_scratch);
-        let mut bindings = ui.take_style_bindings_for_processing();
         if !runtime.pending_changed_styles.is_empty() {
             for (index, binding) in bindings.iter().enumerate() {
-                if binding.local_style.is_none()
+                if (binding.local_style.is_none() || binding.local_style_overlay)
                     && runtime
                         .pending_changed_styles
                         .contains(&binding.component_style)
@@ -82,9 +91,16 @@ impl StyleProcessor {
                 .get(binding.state_root)
                 .copied()
                 .unwrap_or_default();
+            let mut merged_style;
             let (compiled_style, style_revision) =
                 if let Some(style) = binding.local_style.as_deref() {
-                    (style, 1)
+                    if binding.local_style_overlay {
+                        if let Some((base, revision)) = runtime.resolve_binding_style(binding.scope, binding.component_style) {
+                            merged_style = base.clone();
+                            merged_style.overlay_effects(style);
+                            (&merged_style, revision)
+                        } else { (style, 1) }
+                    } else { (style, 1) }
                 } else {
                     let Some(resolved) =
                         runtime.resolve_binding_style(binding.scope, binding.component_style)

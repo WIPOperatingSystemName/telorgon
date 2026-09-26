@@ -335,30 +335,7 @@ impl VulkanScene {
             convert_glyph,
             &mut self.glyph_dirty,
         );
-        let rebuild_images = !delta.images.is_empty() || !delta.image_resources.is_empty();
-        apply_patches(&mut self.images, &delta.images, delta.image_len);
-        if rebuild_images {
-            let image_resources = &self.image_resources;
-            let external_images = &self.external_images;
-            self.gpu_images = self
-                .images
-                .iter()
-                .map(|instance| {
-                    let alpha = image_resources
-                        .get(&instance.image)
-                        .map(|resource| resource.alpha_mode)
-                        .or_else(|| {
-                            external_images
-                                .get(&instance.image)
-                                .map(|resource| resource.image.alpha_mode)
-                        });
-                    convert_image(instance, alpha)
-                })
-                .collect();
-            self.image_dirty.add(0..self.gpu_images.len());
-        } else {
-            self.gpu_images.truncate(delta.image_len);
-        }
+        self.patch_images(delta);
         let rebuild_materials = !delta.materials.is_empty() || !delta.material_resources.is_empty();
         apply_patches(&mut self.materials, &delta.materials, delta.material_len);
         if rebuild_materials {
@@ -367,17 +344,7 @@ impl VulkanScene {
             self.gpu_materials.truncate(delta.material_len);
         }
 
-        let rebuild_clips = !delta.clips.is_empty() || delta.clip_len != self.clips.len();
-        apply_patches(&mut self.clips, &delta.clips, delta.clip_len);
-        if rebuild_clips {
-            self.rebuild_clips();
-        }
-        let rebuild_spatial =
-            !delta.spatial_nodes.is_empty() || delta.spatial_len != self.spatial.len();
-        apply_patches(&mut self.spatial, &delta.spatial_nodes, delta.spatial_len);
-        if rebuild_spatial {
-            self.rebuild_spatial();
-        }
+        self.patch_spatial_tables(delta);
 
         if let Some(order) = &delta.draw_order {
             self.draw_order = order.to_vec();
@@ -1515,3 +1482,5 @@ pub(crate) fn validate_texture_count(order: &[DrawItem]) -> Result<(), &'static 
 mod tests;
 
 mod image_updates;
+
+mod incremental;
