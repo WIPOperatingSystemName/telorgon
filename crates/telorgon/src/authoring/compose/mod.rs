@@ -31,7 +31,7 @@ pub use component::{
     Component, ComponentFields, ComponentInstanceId, ErasedComponent, RenderedView,
 };
 pub use components::{
-    HoverEffect, Button, ButtonElement, Checkbox, Container, ContainerElement, EasyWindowFrame,
+    HoverEffect, InteractionEffect, Button, ButtonElement, Checkbox, Container, ContainerElement, EasyWindowFrame,
     EasyWindowFrameComponent, HasContent, Image, ImageElement, MissingContent, Slider,
     SliderElement, Switch, Text, TextElement, ToggleElement, ToggleKind, WindowChromeDesign,
     WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle, WindowChromeViewExt,

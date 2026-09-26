@@ -1,8 +1,8 @@
 //! Built-in composition builders, split by component.
 
 mod button;
-mod hover;
-pub use hover::HoverEffect;
+mod interaction;
+pub use interaction::{HoverEffect, InteractionEffect};
 mod checkbox;
 mod container;
 mod easy_window_frame;

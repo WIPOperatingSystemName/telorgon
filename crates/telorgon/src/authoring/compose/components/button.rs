@@ -23,35 +23,55 @@ pub struct ButtonElement {
     pub style_override: StylePropertyPatch,
     pub inline_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
     pub on_press: Option<ComponentCallback>,
-    pub(crate) invalid_hover_effect: bool,
-    pub(crate) hover_properties: u8,
-    pub(crate) hover_overlay: bool,
+    pub(crate) invalid_interaction_effect: bool,
+    pub(crate) effect_properties: u8,
+    pub(crate) effect_overlay: bool,
 }
 
 #[derive(Debug)]
 pub struct Button {
     key: Option<Key>,
     element: ButtonElement,
-    hover_effects: Vec<super::hover::HoverEffect>,
-    hover_transition: crate::theme::TransitionSpec,
+    hover_effects: Vec<super::interaction::InteractionEffect>,
+    hover_transition: Option<crate::theme::TransitionSpec>,
+    press_effects: Vec<super::interaction::InteractionEffect>,
+    press_transition: Option<crate::theme::TransitionSpec>,
 }
 
 impl Button {
-    pub fn hover_effect(mut self, effect: super::hover::HoverEffect) -> Self {
+    pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
         self.hover_effects.push(effect);
         self
     }
 
     pub fn hover_effects(
         mut self,
-        effects: impl IntoIterator<Item = super::hover::HoverEffect>,
+        effects: impl IntoIterator<Item = super::interaction::InteractionEffect>,
     ) -> Self {
         self.hover_effects.extend(effects);
         self
     }
 
     pub fn hover_transition(mut self, transition: crate::theme::TransitionSpec) -> Self {
-        self.hover_transition = transition;
+        self.hover_transition = Some(transition);
+        self
+    }
+
+    pub fn press_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
+        self.press_effects.push(effect);
+        self
+    }
+
+    pub fn press_effects(
+        mut self,
+        effects: impl IntoIterator<Item = super::interaction::InteractionEffect>,
+    ) -> Self {
+        self.press_effects.extend(effects);
+        self
+    }
+
+    pub fn press_transition(mut self, transition: crate::theme::TransitionSpec) -> Self {
+        self.press_transition = Some(transition);
         self
     }
 
@@ -187,16 +207,30 @@ impl Button {
 
 impl View for Button {
     fn into_element(mut self) -> Element {
-        if !self.hover_effects.is_empty() {
-            self.element.hover_properties = self.hover_effects.iter().fold(0, |mask, effect| mask | effect.property());
-            self.element.hover_overlay = self.element.inline_style.is_none();
-            self.element.invalid_hover_effect =
-                self.hover_effects.iter().any(|effect| !effect.valid())
-                    || self.hover_transition.repeat;
-            self.element.inline_style = Some(super::hover::compile(
+        if !self.hover_effects.is_empty()
+            || !self.press_effects.is_empty()
+            || self.hover_transition.is_some()
+            || self.press_transition.is_some()
+        {
+            self.element.effect_properties = self
+                .hover_effects
+                .iter()
+                .chain(&self.press_effects)
+                .fold(0, |mask, effect| mask | effect.property());
+            self.element.effect_overlay = self.element.inline_style.is_none();
+            self.element.invalid_interaction_effect = self
+                .hover_effects
+                .iter()
+                .chain(&self.press_effects)
+                .any(|effect| !effect.valid())
+                || self.hover_transition.is_some_and(|spec| spec.repeat)
+                || self.press_transition.is_some_and(|spec| spec.repeat);
+            self.element.inline_style = Some(super::interaction::compile(
                 &self.element,
                 &self.hover_effects,
                 self.hover_transition,
+                &self.press_effects,
+                self.press_transition,
             ));
             self.element.style_override = StylePropertyPatch::default();
         }
@@ -227,10 +261,9 @@ pub fn button() -> Button {
     Button {
         key: None,
         hover_effects: Vec::new(),
-        hover_transition: crate::theme::TransitionSpec {
-            duration_ms: 120,
-            ..Default::default()
-        },
+        hover_transition: None,
+        press_effects: Vec::new(),
+        press_transition: None,
         element: ButtonElement {
             accessible_label: None,
             children: Vec::new(),
@@ -242,9 +275,9 @@ pub fn button() -> Button {
             style_override: StylePropertyPatch::default(),
             inline_style: None,
             on_press: None,
-            invalid_hover_effect: false,
-            hover_properties: 0,
-            hover_overlay: false,
+            invalid_interaction_effect: false,
+            effect_properties: 0,
+            effect_overlay: false,
         },
     }
 }

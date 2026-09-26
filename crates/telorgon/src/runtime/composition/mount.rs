@@ -162,7 +162,7 @@ impl CompositionDriver {
                 if let Some(style) = props.inline_style.clone() {
                     binding = binding.local_style(style);
                 }
-                binding.local_style_overlay = props.hover_overlay;
+                binding.local_style_overlay = props.effect_overlay;
                 writer.style_binding(binding);
                 if props.style_override != StylePropertyPatch::default() {
                     writer.style_override(

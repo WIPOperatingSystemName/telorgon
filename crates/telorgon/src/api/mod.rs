@@ -63,7 +63,7 @@ mod common {
     pub use crate::assets::fonts;
     pub use crate::theme::{Easing, TransitionSpec};
     pub use crate::authoring::compose::{
-        HoverEffect, Button, Checkbox, Container, EasyWindowFrame, Image, PointerViewExt, Slider, Switch, Text,
+        HoverEffect, InteractionEffect, Button, Checkbox, Container, EasyWindowFrame, Image, PointerViewExt, Slider, Switch, Text,
         WindowChromeDesign, WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle,
         WindowChromeViewExt, WindowContentSlot, WindowControlButtonStyle, WindowControlDesign,
         WindowControlVisual, WindowControlsDesign, WindowFrame, WindowTitleBarStyle,
@@ -142,7 +142,7 @@ pub use crate::host::application::{
 };
 pub type Result<T> = crate::host::application::AppResult<T>;
 pub use crate::authoring::compose::{
-    HoverEffect, Alignment, Component, ComponentFields, ComponentInstanceId, Dimension, EasyWindowFrame,
+    HoverEffect, InteractionEffect, Alignment, Component, ComponentFields, ComponentInstanceId, Dimension, EasyWindowFrame,
     Element, EventContext, EventHandler, InputsChangedContext, Insets, Key, MountContext,
     PointerViewExt, RuntimeTarget, Signal, SignalSnapshot, SignalWriter, TextStyle,
     UnmountContext as CompositionUnmountContext, View, ViewError, WindowChromeDesign,

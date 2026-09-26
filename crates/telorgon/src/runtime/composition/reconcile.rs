@@ -204,7 +204,7 @@ impl CompositionDriver {
                 // The mounted style includes resolved theme/inline properties. A parent
                 // update must not reset those to identical authored defaults: unchanged
                 // bindings will not resolve again until an interaction state changes.
-                if props.style != candidate.style || (props.hover_properties & !candidate.hover_properties != 0) {
+                if props.style != candidate.style || (props.effect_properties & !candidate.effect_properties != 0) {
                     ui.set_box_style(*node, candidate.style);
                     ui.reset_local_style_motion(*node);
                 }
@@ -223,7 +223,7 @@ impl CompositionDriver {
                 ui.set_style_id(*node, candidate.style_id);
                 ui.set_style_override(*node, StyleSlotId::named("root"), candidate.style_override);
                 ui.set_local_component_style(*node, candidate.inline_style.clone());
-                ui.set_local_style_overlay(*node, candidate.hover_overlay);
+                ui.set_local_style_overlay(*node, candidate.effect_overlay);
                 let name = candidate.accessible_label.as_ref()
                     .map(|label| SemanticName::Text(ui.intern(label)))
                     .unwrap_or(SemanticName::Contents);

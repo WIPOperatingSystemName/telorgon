@@ -8,9 +8,9 @@ use crate::ui::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-/// Composable changes to a button's hovered appearance. Later effects win per property.
+/// Composable changes to a button's interaction appearance. Later effects win per property.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum HoverEffect {
+pub enum InteractionEffect {
     Background(ColorRgba8),
     Border(Border),
     BorderColor(ColorRgba8),
@@ -22,7 +22,7 @@ pub enum HoverEffect {
     Scale(f32),
 }
 
-impl HoverEffect {
+impl InteractionEffect {
     pub(crate) fn property(self) -> u8 {
         match self {
             Self::Background(_) => 1,
@@ -55,28 +55,75 @@ impl HoverEffect {
     }
 }
 
+/// Compatibility name for existing hover declarations.
+pub type HoverEffect = InteractionEffect;
+
 pub(super) fn compile(
     props: &super::button::ButtonElement,
-    effects: &[HoverEffect],
+    hover: &[InteractionEffect],
+    hover_transition: Option<TransitionSpec>,
+    press: &[InteractionEffect],
+    press_transition: Option<TransitionSpec>,
+) -> Arc<CompiledComponentStyle> {
+    let default = TransitionSpec {
+        duration_ms: 120,
+        ..Default::default()
+    };
+    let hover_spec = hover_transition.unwrap_or(default);
+    let press_spec = press_transition.unwrap_or(default);
+    let has_hover = !hover.is_empty() || hover_transition.is_some();
+    let has_press = !press.is_empty() || press_transition.is_some();
+    let mut style = if has_hover {
+        compile_layer(
+            props,
+            props.inline_style.as_deref(),
+            hover,
+            hover_spec,
+            InteractionState::Hovered,
+        )
+    } else {
+        compile_layer(
+            props,
+            props.inline_style.as_deref(),
+            press,
+            press_spec,
+            InteractionState::Pressed,
+        )
+    };
+    if has_hover && has_press {
+        style = compile_layer(
+            props,
+            Some(style.as_ref()),
+            press,
+            press_spec,
+            InteractionState::Pressed,
+        );
+        Arc::make_mut(&mut style).transition = hover_spec;
+    }
+    style
+}
+
+fn compile_layer(
+    props: &super::button::ButtonElement,
+    base_style: Option<&CompiledComponentStyle>,
+    effects: &[InteractionEffect],
     transition: TransitionSpec,
+    state: InteractionState,
 ) -> Arc<CompiledComponentStyle> {
     let root = StyleSlotId::named("root");
-    let mut style =
-        props
-            .inline_style
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| CompiledComponentStyle {
-                id: props.style_id,
-                slots: BTreeMap::new(),
-                variants: BTreeMap::new(),
-                states: BTreeMap::new(),
-                state_precedence: Vec::new(),
-                relevant_states: InteractionFlags::default(),
-                transition,
-                controlled_slots: BTreeMap::new(),
-                controlled_font_families: Default::default(),
-            });
+    let mut style = base_style
+        .cloned()
+        .unwrap_or_else(|| CompiledComponentStyle {
+            id: props.style_id,
+            slots: BTreeMap::new(),
+            variants: BTreeMap::new(),
+            states: BTreeMap::new(),
+            state_precedence: Vec::new(),
+            relevant_states: InteractionFlags::default(),
+            transition,
+            controlled_slots: BTreeMap::new(),
+            controlled_font_families: Default::default(),
+        });
     let mut resting = StylePropertyPatch::default();
     let mut target = StylePropertyPatch::default();
     let base = style
@@ -132,7 +179,7 @@ pub(super) fn compile(
     }
     for effect in effects {
         match *effect {
-            HoverEffect::Background(color) => {
+            InteractionEffect::Background(color) => {
                 resting.background = Some(
                     authored
                         .background
@@ -140,34 +187,50 @@ pub(super) fn compile(
                 );
                 target.background = Some(Background::Color(color));
             }
-            HoverEffect::Border(value) => {
+            InteractionEffect::Border(value) => {
                 resting.border = Some(normal_border);
                 border = value;
                 target.border = Some(border);
+                target.border_color = None;
             }
-            HoverEffect::BorderColor(color) => {
+            InteractionEffect::BorderColor(color) => {
                 resting.border = Some(normal_border);
                 border = recolor(border, color);
-                target.border = Some(border);
+                if state == InteractionState::Pressed {
+                    target.border_color = Some(color);
+                } else {
+                    target.border = Some(border);
+                }
             }
-            HoverEffect::Outline(value) => {
+            InteractionEffect::Outline(value) => {
                 resting.outline = Some(normal_outline);
                 target.outline = Some(value);
             }
-            HoverEffect::Shadow(value) => {
+            InteractionEffect::Shadow(value) => {
                 resting.shadows = Some(authored.shadows.unwrap_or(props.style.decoration.shadows));
                 target.shadows = Some(ShadowList::one(value));
             }
-            HoverEffect::Lift(value) => {
+            // Press patches only the affected transform axes so hover lift and
+            // press scale compose without resetting each other.
+            InteractionEffect::Lift(value) => {
                 resting.transform = Some(normal_transform);
                 transform.translation.y = normal_transform.translation.y - value;
-                target.transform = Some(transform);
+                if state == InteractionState::Pressed {
+                    target.translation_y = Some(transform.translation.y);
+                } else {
+                    target.transform = Some(transform);
+                }
             }
-            HoverEffect::Scale(value) => {
+            InteractionEffect::Scale(value) => {
                 resting.transform = Some(normal_transform);
                 transform.scale.x = normal_transform.scale.x * value;
                 transform.scale.y = normal_transform.scale.y * value;
-                target.transform = Some(transform);
+                if state == InteractionState::Pressed {
+                    target.scale_x = Some(transform.scale.x);
+                    target.scale_y = Some(transform.scale.y);
+                } else {
+                    target.transform = Some(transform);
+                }
             }
         }
     }
@@ -178,26 +241,26 @@ pub(super) fn compile(
         .patch
         .overlay(props.style_override);
     style.slots.entry(root).or_default().patch.overlay(resting);
-    let hovered = style
+    let state_style = style
         .states
-        .entry(InteractionState::Hovered)
+        .entry(state)
         .or_insert_with(CompiledStateStyle::default);
-    hovered
+    state_style
         .slots
         .entry(root)
         .or_insert_with(CompiledSlotStyle::default)
         .patch
         .overlay(target);
-    hovered.transition = Some(transition);
-    // Explicit pressed/disabled declarations override hover, regardless of builder order.
-    style
-        .state_precedence
-        .retain(|state| *state != InteractionState::Hovered);
-    style.state_precedence.insert(0, InteractionState::Hovered);
+    state_style.transition = Some(transition);
+    style.state_precedence.retain(|value| *value != state);
+    let index = if state == InteractionState::Pressed {
+        usize::from(style.state_precedence.first() == Some(&InteractionState::Hovered))
+    } else {
+        0
+    };
+    style.state_precedence.insert(index, state);
     style.relevant_states = InteractionFlags::from_bits(
-        style.relevant_states.bits()
-            | InteractionFlags::HOVERED.bits()
-            | InteractionFlags::DISABLED.bits(),
+        style.relevant_states.bits() | state.flag().bits() | InteractionFlags::DISABLED.bits(),
     );
     style.transition = transition;
     style

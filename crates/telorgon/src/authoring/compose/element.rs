@@ -307,8 +307,8 @@ fn validate_element(
             }
         }
         ElementKind::Button(button) => {
-            if button.invalid_hover_effect {
-                return Err(ViewError::InvalidNumber("hover effect or repeating hover transition"));
+            if button.invalid_interaction_effect {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
             }
             if button.accessible_label.as_ref().is_some_and(|label| label.trim().is_empty()) {
                 return Err(ViewError::MissingButtonLabel);
