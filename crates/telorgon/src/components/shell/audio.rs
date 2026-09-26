@@ -107,24 +107,24 @@ impl Component for AudioVolume {
                     .height(32.0)
                     .gap(6.0)
                     .child(
-                        button("−")
+                        button().child(text("−").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .width(32.0)
                             .enabled(enabled && gain.is_some())
                             .on_press(|this: &mut Self| this.adjust(-0.05)),
                     )
                     .child(text(label).size(14.0))
                     .child(
-                        button("+")
+                        button().child(text("+").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .width(32.0)
                             .enabled(enabled && gain.is_some())
                             .on_press(|this: &mut Self| this.adjust(0.05)),
                     )
                     .child(
-                        button(if node.is_some_and(|node| node.mute == Some(true)) {
+                        button().child(text(if node.is_some_and(|node| node.mute == Some(true)) {
                             "Unmute"
                         } else {
                             "Mute"
-                        })
+                        }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                         .enabled(enabled && node.is_some_and(|node| node.mute.is_some()))
                         .on_press(|this: &mut Self| this.toggle()),
                     ),

@@ -140,8 +140,7 @@ enum MountedKind {
     },
     Button {
         node: UiNodeId,
-        icon_node: UiNodeId,
-        label_node: UiNodeId,
+        children: Vec<MountedElement>,
         props: ButtonElement,
     },
     Checkbox {

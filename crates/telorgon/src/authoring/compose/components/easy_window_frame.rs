@@ -509,10 +509,13 @@ fn window_controls(model: &WindowChromeModel, design: WindowControlsDesign) -> V
 }
 
 fn control(label: &'static str, design: WindowControlDesign, action: WindowAction) -> Element {
-    button(label)
-        .icon(design.icon)
-        .icon_tint(design.style.resting.icon_tint)
-        .icon_size(design.style.icon_size)
+    button()
+        .accessible_label(label)
+        .child(crate::compose::image(design.icon)
+            .tint(design.style.resting.icon_tint)
+            .width(design.style.icon_size)
+            .height(design.style.icon_size))
+        .content_style_slot(StyleSlotId::named("icon"))
         .width(design.style.width)
         .height(design.style.height)
         .decoration(design.style.resting.decoration)

@@ -56,13 +56,13 @@ impl Component for AudioLevelMeter {
                     .gap(8.0)
                     .height(32.0)
                     .child(
-                        button("Previous channels")
+                        button().child(text("Previous channels").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(page > 0)
                             .on_press(move |this: &mut Self| this.page = page.saturating_sub(1)),
                     )
                     .child(text(format!("{}/{}", page + 1, last + 1)))
                     .child(
-                        button("Next channels")
+                        button().child(text("Next channels").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(page < last)
                             .on_press(move |this: &mut Self| this.page = (page + 1).min(last)),
                     ),

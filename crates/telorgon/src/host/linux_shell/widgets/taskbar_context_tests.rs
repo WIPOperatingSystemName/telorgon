@@ -40,7 +40,7 @@ impl Component for Entries {
             let icon = windows.icon(id);
             seen.push((id, icon.image_id()));
             row = row.child(
-                button(window.title)
+                button().child(text(window.title).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .key(format!("{}:{}", id.slot(), id.generation()))
                     .icon(icon)
                     .width(40.0)

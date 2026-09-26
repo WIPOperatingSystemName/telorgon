@@ -161,12 +161,17 @@ impl CompositionDriver {
                 Ok(())
             }
             (MountedKind::Image { node, props }, ElementKind::Image(candidate)) => {
-                ui.set_image_visual_tinted(
-                    *node,
-                    candidate.image,
-                    candidate.content_version,
-                    candidate.tint,
-                );
+                if props.image != candidate.image
+                    || props.content_version != candidate.content_version
+                    || props.tint != candidate.tint
+                {
+                    ui.set_image_visual_tinted(
+                        *node,
+                        candidate.image,
+                        candidate.content_version,
+                        candidate.tint,
+                    );
+                }
                 ui.set_box_style(*node, candidate.style);
                 ui.set_layout_style(*node, candidate.layout);
                 match &candidate.accessible_label {
@@ -191,11 +196,10 @@ impl CompositionDriver {
             (
                 MountedKind::Button {
                     node,
-                    icon_node,
-                    label_node,
+                    children,
                     props,
                 },
-                ElementKind::Button(candidate),
+                ElementKind::Button(mut candidate),
             ) => {
                 // The mounted style includes resolved theme/inline properties. A parent
                 // update must not reset those to identical authored defaults: unchanged
@@ -203,37 +207,24 @@ impl CompositionDriver {
                 if props.style != candidate.style {
                     ui.set_box_style(*node, candidate.style);
                 }
-                ui.set_image_visual_tinted(
-                    *icon_node,
-                    candidate.icon.unwrap_or(crate::ui::ImageId(0)),
-                    1,
-                    candidate.icon_tint,
-                );
-                ui.set_box_style(*icon_node, button_icon_style(&candidate));
-                ui.set_dynamic_text(*label_node, &candidate.label);
-                // Slot styling is resolved independently of authored button props. Preview or
-                // label-content updates must not overwrite an unchanged themed font/layout.
-                if props.label_style != candidate.label_style
-                    || props.font_family != candidate.font_family
-                {
-                    let mut label_style = candidate.label_style;
-                    if let Some(family) = candidate.font_family {
-                        label_style.family = ui.intern(family);
+                let previous = std::mem::take(children);
+                *children = match self.reconcile_children(
+                    ui, *node, previous, std::mem::take(&mut candidate.children), owner,
+                ) {
+                    Ok(children) => children,
+                    Err((previous, error)) => {
+                        *children = previous;
+                        return Err((old, error));
                     }
-                    ui.set_text_style(*label_node, label_style);
-                }
-                let label_box_style = button_label_box_style(&candidate);
-                if button_label_box_style(props) != label_box_style {
-                    ui.set_box_style(*label_node, label_box_style);
-                }
+                };
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_busy(*node, candidate.busy);
                 ui.set_style_id(*node, candidate.style_id);
                 ui.set_style_override(*node, StyleSlotId::named("root"), candidate.style_override);
                 ui.set_local_component_style(*node, candidate.inline_style.clone());
-                let Some(name) = ui.texts.get(*label_node).map(|text| text.content) else {
-                    return Err((old, ViewError::MissingButtonLabel));
-                };
+                let name = candidate.accessible_label.as_ref()
+                    .map(|label| SemanticName::Text(ui.intern(label)))
+                    .unwrap_or(SemanticName::Contents);
                 let _ = ui.set_semantics(*node, button_semantics(name, &candidate));
                 match &candidate.on_press {
                     Some(handler) => {
@@ -468,8 +459,13 @@ impl CompositionDriver {
                 }
             }
             MountedKind::Text { .. } | MountedKind::Image { .. } => {}
-            MountedKind::Button { node, .. }
-            | MountedKind::Checkbox { node, .. }
+            MountedKind::Button { node, children, .. } => {
+                self.handlers.remove(node);
+                for child in std::mem::take(children) {
+                    self.teardown_metadata(child);
+                }
+            }
+            MountedKind::Checkbox { node, .. }
             | MountedKind::Switch { node, .. }
             | MountedKind::Slider { node, .. } => {
                 self.handlers.remove(node);

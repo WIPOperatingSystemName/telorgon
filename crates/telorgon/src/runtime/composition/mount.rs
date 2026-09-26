@@ -141,44 +141,24 @@ impl CompositionDriver {
                     },
                 }
             }
-            ElementKind::Button(props) => {
-                let mut label_style = props.label_style;
-                if let Some(family) = props.font_family {
-                    label_style.family = writer.intern(family);
-                }
-                let mut icon_node = None;
-                let mut label_node = None;
+            ElementKind::Button(mut props) => {
+                let mut mounted_children = Vec::new();
                 let control = writer.button_node(props.style, |writer| {
-                    icon_node = Some(
-                        writer
-                            .dynamic_image_tinted(
-                                props.icon.unwrap_or(crate::ui::ImageId(0)),
-                                1,
-                                props.icon_tint,
-                                button_icon_style(&props),
-                                crate::ui::LayoutStyle::default(),
-                            )
-                            .node,
-                    );
-                    label_node = Some(
-                        writer
-                            .dynamic_text(
-                                props.label.clone(),
-                                label_style,
-                                button_label_box_style(&props),
-                                crate::ui::LayoutStyle::default(),
-                            )
-                            .node,
-                    );
+                    for child in std::mem::take(&mut props.children) {
+                        mounted_children.push(self.mount_element(writer, child, owner));
+                    }
                 });
+                let children = mounted_children.into_iter().collect::<Result<Vec<_>, _>>()?;
+                writer.hover_within(control.node, true);
                 writer.style_id(control.node, props.style_id);
-                let icon_node = icon_node.expect("button always mounts its icon slot");
-                let label_node = label_node.expect("button always mounts its label");
                 let mut binding =
                     StyleBinding::new(control.node, ThemeScopeId::new(0, 1), props.style_id)
-                        .slot(StyleSlotId::named("root"), control.node)
-                        .slot(StyleSlotId::named("icon"), icon_node)
-                        .slot(StyleSlotId::named("label"), label_node);
+                        .slot(StyleSlotId::named("root"), control.node);
+                if let Some(slot) = props.content_style_slot
+                    && let Some(node) = children.first().and_then(|child| self.root_node(child))
+                {
+                    binding = binding.slot(slot, node);
+                }
                 if let Some(style) = props.inline_style.clone() {
                     binding = binding.local_style(style);
                 }
@@ -192,9 +172,9 @@ impl CompositionDriver {
                 }
                 writer.disabled(control.node, !props.enabled);
                 writer.busy(control.node, props.busy);
-                let name = writer
-                    .text_content(label_node)
-                    .ok_or(ViewError::MissingButtonLabel)?;
+                let name = props.accessible_label.as_ref()
+                    .map(|label| SemanticName::Text(writer.intern(label)))
+                    .unwrap_or(SemanticName::Contents);
                 writer
                     .semantic_node(control.node, button_semantics(name, &props))
                     .map_err(|_| ViewError::MissingButtonLabel)?;
@@ -206,8 +186,7 @@ impl CompositionDriver {
                     key: None,
                     kind: MountedKind::Button {
                         node: control.node,
-                        icon_node,
-                        label_node,
+                        children,
                         props,
                     },
                 }

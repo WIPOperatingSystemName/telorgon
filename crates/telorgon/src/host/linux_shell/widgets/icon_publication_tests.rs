@@ -23,7 +23,7 @@ impl Component for LateIcon {
         }
         let windows = self.context::<ShellContext>().windows();
         let window = windows.open().remove(0);
-        button(window.title).icon(windows.icon(window.id))
+        button().accessible_label(window.title).child(crate::compose::image(windows.icon(window.id)).width(18.0).height(18.0))
     }
 }
 impl ShellWidget for LateIcon {

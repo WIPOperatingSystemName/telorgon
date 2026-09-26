@@ -52,7 +52,7 @@ impl Component for AudioSettings {
                 .padding(12.0)
                 .gap(10.0)
                 .child(
-                    button("Back to streams and defaults")
+                    button().child(text("Back to streams and defaults").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                         .on_press(|this: &mut Self| this.show_devices = false),
                 )
                 .child(super::audio_devices::AudioDeviceSettings::new(
@@ -71,7 +71,7 @@ impl Component for AudioSettings {
             .padding(12.0)
             .child(text("Devices and application streams"))
             .child(
-                button("Device profiles and routes")
+                button().child(text("Device profiles and routes").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .on_press(|this: &mut Self| this.show_devices = true),
             )
             .child(
@@ -87,7 +87,7 @@ impl Component for AudioSettings {
                     .gap(8.0)
                     .child(text(format!("Move: {}", stream.description)))
                     .child(
-                        button("Cancel selection")
+                        button().child(text("Cancel selection").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .on_press(|this: &mut Self| this.selected_stream = None),
                     ),
             );
@@ -130,23 +130,23 @@ impl Component for AudioSettings {
                 .gap(8.0)
                 .child(text(level).size(13.0))
                 .child(
-                    button("−")
+                    button().child(text("−").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                         .width(32.0)
                         .enabled(node.can_set_volume && gain.is_some())
                         .on_press(move |this: &mut Self| this.adjust(target, -0.05)),
                 )
                 .child(
-                    button("+")
+                    button().child(text("+").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                         .width(32.0)
                         .enabled(node.can_set_volume && gain.is_some())
                         .on_press(move |this: &mut Self| this.adjust(target, 0.05)),
                 )
                 .child(
-                    button(if node.mute == Some(true) {
+                    button().child(text(if node.mute == Some(true) {
                         "Unmute"
                     } else {
                         "Mute"
-                    })
+                    }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .enabled(node.can_set_volume && node.mute.is_some())
                     .on_press(move |this: &mut Self| {
                         this.execute(AudioSystemAction::ToggleMute {
@@ -156,11 +156,11 @@ impl Component for AudioSettings {
                 );
             if let Some(kind) = kind {
                 controls = controls.child(
-                    button(if is_default {
+                    button().child(text(if is_default {
                         "Default"
                     } else {
                         "Use by default"
-                    })
+                    }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .enabled(!is_default && snapshot.pending == 0)
                     .on_press(move |this: &mut Self| {
                         this.execute(AudioSystemAction::Direct(AudioAction::Default {
@@ -178,7 +178,7 @@ impl Component for AudioSettings {
                 }) {
                     let stream = stream.handle;
                     controls = controls.child(
-                        button("Move here").enabled(snapshot.pending == 0).on_press(
+                        button().child(text("Move here").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).enabled(snapshot.pending == 0).on_press(
                             move |this: &mut Self| {
                                 this.execute(AudioSystemAction::Direct(AudioAction::MoveStream {
                                     stream,
@@ -193,11 +193,11 @@ impl Component for AudioSettings {
                 "Stream/Output/Audio" | "Stream/Input/Audio"
             ) {
                 controls = controls.child(
-                    button(if self.selected_stream == Some(target) {
+                    button().child(text(if self.selected_stream == Some(target) {
                         "Selected"
                     } else {
                         "Choose destination"
-                    })
+                    }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .on_press(move |this: &mut Self| this.selected_stream = Some(target)),
                 );
             }
@@ -215,12 +215,12 @@ impl Component for AudioSettings {
                         .gap(10.0)
                         .height(32.0)
                         .child(
-                            button("Previous").enabled(page > 0).on_press(
+                            button().child(text("Previous").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).enabled(page > 0).on_press(
                                 move |this: &mut Self| this.page = page.saturating_sub(1),
                             ),
                         )
                         .child(text(format!("{} / {}", page + 1, last_page + 1)))
-                        .child(button("Next").enabled(page < last_page).on_press(
+                        .child(button().child(text("Next").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).enabled(page < last_page).on_press(
                             move |this: &mut Self| this.page = (page + 1).min(last_page),
                         )),
                 );

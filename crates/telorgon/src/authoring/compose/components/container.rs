@@ -231,6 +231,7 @@ fn container(flow: Flow) -> Container {
             style: BoxStyle {
                 width: SizeRule::Fill(1.0),
                 height: SizeRule::Fill(1.0),
+                overflow: crate::ui::Overflow::Clip,
                 ..BoxStyle::default()
             },
             layout: LayoutStyle {

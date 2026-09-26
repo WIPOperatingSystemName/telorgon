@@ -114,22 +114,22 @@ mod linux {
                         .gap(8.0)
                         .height(36.0)
                         .child(
-                            button("Play from start")
+                            button().child(text("Play from start").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(!status.pending)
                                 .on_press(|this: &mut Self| this.send(Command::Play)),
                         )
                         .child(
-                            button("Pause")
+                            button().child(text("Pause").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(active && !status.pending)
                                 .on_press(|this: &mut Self| this.send(Command::Pause)),
                         )
                         .child(
-                            button("Resume")
+                            button().child(text("Resume").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(active && !status.pending && !status.exhausted)
                                 .on_press(|this: &mut Self| this.send(Command::Resume)),
                         )
                         .child(
-                            button("Stop")
+                            button().child(text("Stop").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(active)
                                 .on_press(|this: &mut Self| this.send(Command::Stop)),
                         ),
@@ -139,15 +139,15 @@ mod linux {
                         .gap(8.0)
                         .height(36.0)
                         .child(
-                            button("Quieter")
+                            button().child(text("Quieter").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .on_press(|this: &mut Self| this.send(Command::Quieter)),
                         )
                         .child(text(format!("{:.0}% local gain", status.gain * 100.0)))
                         .child(
-                            button("Louder").on_press(|this: &mut Self| this.send(Command::Louder)),
+                            button().child(text("Louder").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))).on_press(|this: &mut Self| this.send(Command::Louder)),
                         )
                         .child(
-                            button(if status.mute { "Unmute" } else { "Mute" })
+                            button().child(text(if status.mute { "Unmute" } else { "Mute" }).color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .on_press(|this: &mut Self| this.send(Command::Mute)),
                         ),
                 )

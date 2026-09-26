@@ -25,7 +25,7 @@ fn text(value: impl ToString) -> Text {
     crate::authoring::compose::text(value).color(crate::ColorRgba8::rgba(232, 235, 243, 255))
 }
 fn button(label: impl Into<String>) -> Button {
-    crate::authoring::compose::button(label)
+    crate::authoring::compose::button().child(text(label.into()))
         .width(Dimension::FILL)
         .height(36.0)
         .corner_radius(5.0)

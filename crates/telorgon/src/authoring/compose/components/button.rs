@@ -1,59 +1,64 @@
 use std::sync::Arc;
 
-use crate::assets::ImageSource;
 use crate::foundation::{ColorRgba8, EdgeInsets};
 use crate::ui::{
-    Background, Border, BoxDecoration, BoxStyle, ComponentStyleId, CornerRadii, ImageId, SizeRule,
-    SizeRule2D, StylePropertyPatch, TextAlign, TextStyle as RetainedTextStyle, ThemeDomainId,
+    Background, Border, BoxDecoration, BoxStyle, ComponentStyleId, CornerRadii, SizeRule,
+    SizeRule2D, StylePropertyPatch, ThemeDomainId,
 };
 
-use crate::authoring::compose::{Component, ComponentCallback, Element, ElementKind, Insets, Key, View};
+use crate::authoring::compose::{
+    Component, ComponentCallback, Element, ElementKind, Insets, Key, View,
+};
 
 #[doc(hidden)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ButtonElement {
-    pub label: String,
-    pub font_family: Option<&'static str>,
+    pub accessible_label: Option<String>,
+    pub children: Vec<Element>,
+    pub(crate) content_style_slot: Option<crate::ui::StyleSlotId>,
     pub enabled: bool,
     pub busy: bool,
     pub style: BoxStyle,
-    pub label_style: RetainedTextStyle,
     pub style_id: ComponentStyleId,
     pub style_override: StylePropertyPatch,
     pub inline_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
-    pub icon: Option<ImageId>,
-    pub icon_tint: Option<ColorRgba8>,
-    pub icon_size: f32,
     pub on_press: Option<ComponentCallback>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Button {
     key: Option<Key>,
     element: ButtonElement,
 }
 
 impl Button {
-    pub fn label_color(mut self, color: ColorRgba8) -> Self {
-        self.element.label_style.color = color;
-        self
-    }
-    pub fn label_size(mut self, size: f32) -> Self {
-        if size.is_finite() && size > 0.0 {
-            self.element.label_style.size = size;
-            self.element.label_style.line_height = size * 1.25;
-        }
-        self
-    }
-    pub fn label_align(mut self, align: TextAlign) -> Self {
-        self.element.label_style.align = align;
+    pub(crate) fn content_style_slot(mut self, slot: crate::ui::StyleSlotId) -> Self {
+        self.element.content_style_slot = Some(slot);
         self
     }
 
-    pub fn font_family(mut self, family: &'static str) -> Self {
-        self.element.font_family = Some(family);
+    pub fn child(mut self, child: impl View) -> Self {
+        self.element.children.push(child.into_element());
         self
     }
+
+    pub fn children<I, V>(mut self, children: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: View,
+    {
+        self.element
+            .children
+            .extend(children.into_iter().map(View::into_element));
+        self
+    }
+
+    /// Overrides the accessible name normally derived from child content.
+    pub fn accessible_label(mut self, label: impl Into<String>) -> Self {
+        self.element.accessible_label = Some(label.into());
+        self
+    }
+
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self
@@ -86,31 +91,6 @@ impl Button {
 
     pub fn box_style(mut self, style: BoxStyle) -> Self {
         self.element.style = style;
-        self
-    }
-
-    /// Replaces the visible text with registered icon artwork while retaining `label` as the
-    /// button's accessible name.
-    pub fn icon(mut self, icon: impl Into<ImageSource>) -> Self {
-        let source = icon.into();
-        self.element.icon = Some(source.image_id());
-        self.element.icon_tint = source.tint_color();
-        self
-    }
-
-    /// Recolors icon artwork from its alpha mask without affecting the accessible label.
-    pub fn icon_tint(mut self, color: ColorRgba8) -> Self {
-        self.element.icon_tint = Some(color);
-        self
-    }
-
-    pub fn without_icon_tint(mut self) -> Self {
-        self.element.icon_tint = None;
-        self
-    }
-
-    pub fn icon_size(mut self, size: f32) -> Self {
-        self.element.icon_size = size.max(1.0);
         self
     }
 
@@ -149,6 +129,11 @@ impl Button {
         self
     }
 
+    pub fn overflow(mut self, overflow: crate::ui::Overflow) -> Self {
+        self.element.style.overflow = overflow;
+        self
+    }
+
     pub fn padding(mut self, padding: impl Into<Insets>) -> Self {
         self.element.style.padding = padding.into().0;
         self
@@ -183,8 +168,9 @@ impl View for Button {
     }
 }
 
-pub fn button(label: impl Into<String>) -> Button {
+pub fn button() -> Button {
     let style = BoxStyle {
+        overflow: crate::ui::Overflow::Clip,
         min_size: SizeRule2D {
             width: SizeRule::Logical(32.0),
             height: SizeRule::Logical(32.0),
@@ -205,27 +191,15 @@ pub fn button(label: impl Into<String>) -> Button {
     Button {
         key: None,
         element: ButtonElement {
-            label: label.into(),
-            font_family: None,
+            accessible_label: None,
+            children: Vec::new(),
+            content_style_slot: None,
             enabled: true,
             busy: false,
             style,
-            label_style: RetainedTextStyle {
-                color: ColorRgba8::rgba(248, 249, 252, 255),
-                size: 14.0,
-                line_height: 17.5,
-                family: crate::ui::StringId(1),
-                weight: 400,
-                align: TextAlign::Center,
-                vertical_align: crate::ui::TextAlign::Start,
-                fit_height: false,
-            },
             style_id: ComponentStyleId::named(ThemeDomainId::APPLICATION, "button", "default"),
             style_override: StylePropertyPatch::default(),
             inline_style: None,
-            icon: None,
-            icon_tint: None,
-            icon_size: 18.0,
             on_press: None,
         },
     }

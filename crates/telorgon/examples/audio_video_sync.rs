@@ -62,7 +62,7 @@ mod linux {
                         .height(36.0)
                         .gap(10.0)
                         .child(
-                            button("Start / resume")
+                            button().child(text("Start / resume").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(!audio.pending && audio.state != AudioState::Streaming)
                                 .on_press(|this: &mut Self| {
                                     this.error = this
@@ -74,7 +74,7 @@ mod linux {
                                 }),
                         )
                         .child(
-                            button("Pause")
+                            button().child(text("Pause").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                                 .enabled(!audio.pending && audio.state == AudioState::Streaming)
                                 .on_press(|this: &mut Self| {
                                     this.error = this

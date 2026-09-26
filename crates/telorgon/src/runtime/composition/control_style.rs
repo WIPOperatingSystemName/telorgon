@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn button_semantics(name: crate::ui::StringId, props: &ButtonElement) -> SemanticNode {
+pub(super) fn button_semantics(name: SemanticName, props: &ButtonElement) -> SemanticNode {
     let mut actions = SemanticActions::NONE;
     if props.enabled {
         actions |= SemanticActions::FOCUS;
@@ -10,7 +10,7 @@ pub(super) fn button_semantics(name: crate::ui::StringId, props: &ButtonElement)
     }
     SemanticNode {
         role: SemanticRole::Button,
-        name: SemanticName::Text(name),
+        name,
         state: SemanticState {
             disabled: !props.enabled,
             busy: props.busy,
@@ -19,33 +19,6 @@ pub(super) fn button_semantics(name: crate::ui::StringId, props: &ButtonElement)
         },
         actions,
         ..SemanticNode::default()
-    }
-}
-
-pub(super) fn button_icon_style(props: &ButtonElement) -> BoxStyle {
-    let (size, opacity) = if props.icon.is_some() {
-        (props.icon_size.max(1.0), 1.0)
-    } else {
-        (0.0, 0.0)
-    };
-    BoxStyle {
-        width: SizeRule::Logical(size),
-        height: SizeRule::Logical(size),
-        opacity,
-        ..BoxStyle::default()
-    }
-}
-
-pub(super) fn button_label_box_style(props: &ButtonElement) -> BoxStyle {
-    if props.icon.is_none() {
-        BoxStyle::default()
-    } else {
-        BoxStyle {
-            width: SizeRule::Logical(0.0),
-            height: SizeRule::Logical(0.0),
-            opacity: 0.0,
-            ..BoxStyle::default()
-        }
     }
 }
 

@@ -29,7 +29,8 @@ impl Component for Counter {
                     .style(TextStyle::new().size(32.0).weight(600)),
             )
             .child(
-                button("Increment")
+                button()
+                    .child(text("Increment").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                     .primary()
                     .on_press(|this: &mut Self| this.count += 1),
             )
@@ -75,7 +76,9 @@ struct InvalidCallbackOwner {}
 
 impl Component for InvalidCallbackOwner {
     fn view(&self) -> impl View {
-        button("Invalid").on_press(|_: &mut ForeignCallbackOwner| {})
+        button()
+            .child(text("Invalid").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
+            .on_press(|_: &mut ForeignCallbackOwner| {})
     }
 }
 
@@ -141,11 +144,13 @@ fn counter_rerenders_dynamic_text_without_remounting_the_button() {
 
 #[test]
 fn sealed_application_declaration_owns_initial_content() {
-    let application = Application::gui("org.telorgon.examples.counter", "Counter").renderer(Renderer::Auto).window(
-        Window::new("Counter")
-            .size(480, 320)
-            .content(Counter::new("Example")),
-    );
+    let application = Application::gui("org.telorgon.examples.counter", "Counter")
+        .renderer(Renderer::Auto)
+        .window(
+            Window::new("Counter")
+                .size(480, 320)
+                .content(Counter::new("Example")),
+        );
     let debug = format!("{application:?}");
     assert!(debug.contains("has_content: true"));
     assert!(debug.contains("renderer: Auto"));
@@ -175,7 +180,8 @@ impl Component for FrameFixture {
                     .window_drag_region(),
             )
             .child(
-                button("Close")
+                button()
+                    .child(text("Close").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                     .width(32.0)
                     .height(32.0)
                     .corner_radius(8.0)
@@ -228,7 +234,11 @@ impl Component for PointerFixture {
     fn view(&self) -> impl View {
         row()
             .child(text("Editable").pointer_icon(telorgon::PointerIcon::Text))
-            .child(button("Open").pointer_icon(telorgon::PointerIcon::Pointer))
+            .child(
+                button()
+                    .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
+                    .pointer_icon(telorgon::PointerIcon::Pointer),
+            )
             .child(spacer().hide_pointer())
     }
 }
@@ -257,11 +267,14 @@ struct IconControlFixture {}
 
 impl Component for IconControlFixture {
     fn view(&self) -> impl View {
-        button("Close")
-            .icon(telorgon::IconAsset::new(telorgon::AssetKey::new(
+        button().accessible_label("Close").child(
+            image(telorgon::IconAsset::new(telorgon::AssetKey::new(
                 "icons/close.svg",
             )))
-            .icon_tint(ColorRgba8::rgba(255, 255, 255, 255))
+            .width(18.0)
+            .height(18.0)
+            .tint(ColorRgba8::rgba(255, 255, 255, 255)),
+        )
     }
 }
 
@@ -485,7 +498,12 @@ impl KeyedItem {
 
 impl Component for KeyedItem {
     fn view(&self) -> impl View {
-        button(format!("{}: {}", self.name, self.count)).on_press(|this: &mut Self| this.count += 1)
+        button()
+            .child(
+                text(format!("{}: {}", self.name, self.count))
+                    .color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)),
+            )
+            .on_press(|this: &mut Self| this.count += 1)
     }
 }
 
@@ -500,7 +518,11 @@ impl Component for KeyedList {
         let first = if self.reversed { "B" } else { "A" };
         let second = if self.reversed { "A" } else { "B" };
         column()
-            .child(button("Reverse").on_press(|this: &mut Self| this.reversed = !this.reversed))
+            .child(
+                button()
+                    .child(text("Reverse").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
+                    .on_press(|this: &mut Self| this.reversed = !this.reversed),
+            )
             .child(KeyedItem::new(first).keyed(first))
             .child(KeyedItem::new(second).keyed(second))
     }
@@ -515,12 +537,14 @@ fn keyed_component_reorder_preserves_local_state_and_control_identity() {
             .semantics
             .iter()
             .find_map(|(node, semantic)| {
-                let telorgon::SemanticName::Text(text) = semantic.name else {
-                    return None;
-                };
-                (semantic.role == telorgon::SemanticRole::Button
-                    && runtime.ui().string(text) == Some(name))
-                .then_some(node)
+                let child_matches = runtime.ui().nodes.children(node).any(|child| {
+                    runtime
+                        .ui()
+                        .texts
+                        .get(child)
+                        .is_some_and(|text| runtime.ui().string(text.content) == Some(name))
+                });
+                (semantic.role == telorgon::SemanticRole::Button && child_matches).then_some(node)
             })
             .unwrap()
     };
@@ -561,10 +585,10 @@ fn buttons_with_equal_labels_do_not_share_mutable_accessible_names() {
     assert_eq!(buttons.len(), 2);
     let name = |runtime: &ViewRuntime<telorgon::CompositionDriver>, node| {
         let semantic = runtime.ui().semantics.get(node).unwrap();
-        let telorgon::SemanticName::Text(text) = semantic.name else {
-            panic!("button has no name");
-        };
-        runtime.ui().string(text).unwrap().to_owned()
+        assert_eq!(semantic.name, telorgon::SemanticName::Contents);
+        let child = runtime.ui().nodes.children(node).next().unwrap();
+        let text = runtime.ui().texts.get(child).unwrap();
+        runtime.ui().string(text.content).unwrap().to_owned()
     };
     assert_eq!(name(&runtime, buttons[0]), "Same: 0");
     assert_eq!(name(&runtime, buttons[1]), "Same: 0");
@@ -612,7 +636,7 @@ struct InvalidInitialView {
 
 impl Component for InvalidInitialView {
     fn view(&self) -> impl View {
-        button("")
+        button().accessible_label("")
     }
 }
 
@@ -634,10 +658,17 @@ impl Component for InputAuthority {
     fn view(&self) -> impl View {
         column()
             .child(text(&self.title))
-            .child(button("Attempt input write").on_press(|this: &mut Self| {
-                this.title = "child-owned".to_owned();
-                this.attempts += 1;
-            }))
+            .child(
+                button()
+                    .child(
+                        text("Attempt input write")
+                            .color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)),
+                    )
+                    .on_press(|this: &mut Self| {
+                        this.title = "child-owned".to_owned();
+                        this.attempts += 1;
+                    }),
+            )
             .child(text(format!("Attempts: {}", self.attempts)))
     }
 }
@@ -673,4 +704,112 @@ fn event_callbacks_cannot_take_authority_over_input_fields() {
         runtime.composition_diagnostics().input_mutations_restored,
         1
     );
+}
+
+#[component]
+struct ContainerButton {
+    #[state]
+    expanded: bool,
+}
+
+impl Component for ContainerButton {
+    fn view(&self) -> impl View {
+        button()
+            .child(
+                row()
+                    .height(40.0)
+                    .child(
+                        text(if self.expanded {
+                            "Expanded"
+                        } else {
+                            "Collapsed"
+                        })
+                        .size(23.0)
+                        .key("title"),
+                    )
+                    .maybe(self.expanded, DefaultCounter::default().keyed("nested")),
+            )
+            .on_press(|this: &mut Self| this.expanded = !this.expanded)
+    }
+}
+
+#[test]
+fn button_children_reconcile_and_unmount_nested_components() {
+    let mut runtime = ViewRuntime::from_composed(ContainerButton::default()).unwrap();
+    let root = runtime
+        .ui()
+        .kinds
+        .iter()
+        .find_map(|(node, kind)| (*kind == NodeKind::Button).then_some(node))
+        .unwrap();
+    let row = runtime.ui().nodes.children(root).next().unwrap();
+    let title = runtime.ui().nodes.children(row).next().unwrap();
+    assert_eq!(runtime.ui().texts.get(title).unwrap().style.size, 23.0);
+    assert_eq!(
+        runtime.ui().nodes.children(root).count(),
+        1,
+        "no hidden label or icon nodes"
+    );
+    assert!(runtime.dispatch_activation(root, ChangeSource::Programmatic));
+    assert_eq!(runtime.ui().nodes.children(row).next(), Some(title));
+    assert_eq!(
+        runtime
+            .ui()
+            .string(runtime.ui().texts.get(title).unwrap().content),
+        Some("Expanded")
+    );
+    let mounted = runtime.composition_diagnostics().components_mounted;
+    assert!(runtime.dispatch_activation(root, ChangeSource::Programmatic));
+    assert_eq!(runtime.ui().nodes.children(row).count(), 1);
+    assert!(runtime.composition_diagnostics().components_unmounted > 0);
+    assert_eq!(
+        runtime.composition_diagnostics().components_mounted,
+        mounted
+    );
+}
+
+#[component]
+struct InvalidButtonChildren {}
+impl Component for InvalidButtonChildren {
+    fn view(&self) -> impl View {
+        button().children([text("A").key("duplicate"), text("B").key("duplicate")])
+    }
+}
+
+#[test]
+fn button_rejects_duplicate_child_keys() {
+    assert!(ViewRuntime::from_composed(InvalidButtonChildren::default()).is_err());
+}
+
+#[component]
+struct ReplacingButton {
+    #[state]
+    replaced: bool,
+}
+impl Component for ReplacingButton {
+    fn view(&self) -> impl View {
+        if self.replaced {
+            text("Done").into_element()
+        } else {
+            button()
+                .child(DefaultCounter::default())
+                .on_press(|this: &mut Self| this.replaced = true)
+                .into_element()
+        }
+    }
+}
+
+#[test]
+fn replacing_a_button_tears_down_its_child_components() {
+    let mut runtime = ViewRuntime::from_composed(ReplacingButton::default()).unwrap();
+    let node = runtime
+        .ui()
+        .kinds
+        .iter()
+        .find_map(|(node, kind)| (*kind == NodeKind::Button).then_some(node))
+        .unwrap();
+    assert!(runtime.dispatch_action(node));
+    assert!(!runtime.ui().nodes.contains(node));
+    assert_eq!(runtime.composition_diagnostics().components_unmounted, 1);
+    assert!(!runtime.dispatch_action(node));
 }

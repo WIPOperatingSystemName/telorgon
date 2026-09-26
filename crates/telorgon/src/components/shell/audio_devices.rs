@@ -66,7 +66,7 @@ impl Component for AudioDeviceSettings {
                     .height(32.0)
                     .gap(8.0)
                     .child(
-                        button("Previous device")
+                        button().child(text("Previous device").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(index > 0)
                             .on_press(move |this: &mut Self| this.device(index.saturating_sub(1))),
                     )
@@ -77,7 +77,7 @@ impl Component for AudioDeviceSettings {
                         snapshot.devices.len()
                     )))
                     .child(
-                        button("Next device")
+                        button().child(text("Next device").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(snapshot.devices.len() > 1)
                             .on_press(move |this: &mut Self| this.device(next)),
                     ),
@@ -107,7 +107,7 @@ impl Component for AudioDeviceSettings {
                         }
                     )))
                     .child(
-                        button(if active { "Active" } else { "Select" })
+                        button().child(text(if active { "Active" } else { "Select" }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(
                                 !active
                                     && profile.available != Some(false)
@@ -129,14 +129,14 @@ impl Component for AudioDeviceSettings {
                     .height(28.0)
                     .gap(8.0)
                     .child(
-                        button("Previous profiles")
+                        button().child(text("Previous profiles").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(profile_page > 0)
                             .on_press(move |this: &mut Self| {
                                 this.profile_page = profile_page.saturating_sub(1)
                             }),
                     )
                     .child(
-                        button("More profiles")
+                        button().child(text("More profiles").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(profile_page < profile_last)
                             .on_press(move |this: &mut Self| this.profile_page = profile_page + 1),
                     ),
@@ -192,7 +192,7 @@ impl Component for AudioDeviceSettings {
                         }
                     )))
                     .child(
-                        button(if active { "Active" } else { "Select" })
+                        button().child(text(if active { "Active" } else { "Select" }).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(
                                 !active
                                     && route.available != Some(false)
@@ -217,11 +217,11 @@ impl Component for AudioDeviceSettings {
                 row()
                     .height(28.0)
                     .gap(8.0)
-                    .child(button("Previous routes").enabled(route_page > 0).on_press(
+                    .child(button().child(text("Previous routes").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).enabled(route_page > 0).on_press(
                         move |this: &mut Self| this.route_page = route_page.saturating_sub(1),
                     ))
                     .child(
-                        button("More routes")
+                        button().child(text("More routes").color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                             .enabled(route_page < route_last)
                             .on_press(move |this: &mut Self| this.route_page = route_page + 1),
                     ),

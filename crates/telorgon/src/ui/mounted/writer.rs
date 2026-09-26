@@ -39,11 +39,6 @@ impl<'a, A> MountWriter<'a, A> {
     pub fn intern(&mut self, text: impl AsRef<str>) -> StringId {
         self.ui.intern(text)
     }
-    /// Reuse a label owned by the same control subtree. Global interning can return another
-    /// node's mutable text slot, which may be cleared while replacing that node.
-    pub(crate) fn text_content(&self, node: NodeId) -> Option<StringId> {
-        self.ui.texts.get(node).map(|text| text.content)
-    }
     pub fn root(
         &mut self,
         style: BoxStyle,

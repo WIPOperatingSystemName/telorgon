@@ -307,8 +307,15 @@ fn validate_element(
             }
         }
         ElementKind::Button(button) => {
-            if button.label.trim().is_empty() {
+            if button.accessible_label.as_ref().is_some_and(|label| label.trim().is_empty()) {
                 return Err(ViewError::MissingButtonLabel);
+            }
+            let mut keys = HashSet::new();
+            for child in &button.children {
+                if let Some(key) = child.key_ref() && !keys.insert(key) {
+                    return Err(ViewError::DuplicateKey(key.clone()));
+                }
+                validate_element(child, component)?;
             }
             validate_callback(button.on_press.as_ref(), component)?;
         }

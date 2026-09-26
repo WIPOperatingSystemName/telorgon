@@ -636,7 +636,7 @@ impl Component for AdvancedFrame {
                     .child(text(&self.model.title).window_title())
                     .child(spacer())
                     .child(
-                        button("Pin")
+                        button().child(text("Pin").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
                             .window_shell_action(PIN_WINDOW)
                             .pointer_icon(telorgon::PointerIcon::Pointer),
                     )

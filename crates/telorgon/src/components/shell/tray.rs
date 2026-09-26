@@ -94,7 +94,7 @@ impl Component for TrayArea {
                         )
                     })
                 };
-                let mut control = button(&item.title)
+                let mut control = button().accessible_label(&item.title)
                     .key(item.id.as_str())
                     .width(self.style.cell_size)
                     .height(self.style.cell_size)
@@ -108,10 +108,10 @@ impl Component for TrayArea {
                         }
                     });
                 if let Some(source) = source {
-                    control = control
-                        .icon(source)
-                        .icon_size(self.style.icon_size)
-                        .without_icon_tint();
+                    control = control.child(image(source)
+                        .width(self.style.icon_size).height(self.style.icon_size).without_tint());
+                } else {
+                    control = control.child(text(&item.title).color(ColorRgba8::rgba(248, 249, 252, 255)));
                 }
                 line = line.child(control);
             }
@@ -207,7 +207,9 @@ impl Component for TrayMenuView {
                 } else {
                     self.style.item
                 };
-                let control = button(label)
+                let control = button().child(text(label)
+                        .color(if item.enabled { self.style.label_color } else { self.style.disabled_label_color })
+                        .size(self.style.label_size).text_align(Alignment::Start))
                     .key(format!("menu-{id}"))
                     .box_style(BoxStyle {
                         min_size: crate::ui::SizeRule2D {
@@ -216,13 +218,6 @@ impl Component for TrayMenuView {
                         },
                         ..style
                     })
-                    .label_color(if item.enabled {
-                        self.style.label_color
-                    } else {
-                        self.style.disabled_label_color
-                    })
-                    .label_size(self.style.label_size)
-                    .label_align(crate::ui::TextAlign::Start)
                     .inline_style(menu_row_style(
                         style,
                         self.style.highlighted_item,
@@ -354,11 +349,10 @@ mod geometry_tests {
                             .height(style.cell_size)
                             .gap(style.gap)
                             .children((0..5).map(|_| {
-                                button("tray")
+                                button().accessible_label("tray")
                                     .width(style.cell_size)
                                     .height(style.cell_size)
-                                    .icon(crate::ui::ImageId(0))
-                                    .icon_size(style.icon_size)
+                                    .child(image(crate::ui::ImageId(0)).width(style.icon_size).height(style.icon_size))
                             }))
                     })),
                 )

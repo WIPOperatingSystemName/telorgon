@@ -31,7 +31,7 @@ impl Component for Example {
     fn view(&self) -> impl View {
         column()
             .child(text(format!("{}: {}", self.title, self.count)))
-            .child(button("Increment").on_press(|this: &mut Self| this.count += 1))
+            .child(button().child(text("Increment").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).on_press(|this: &mut Self| this.count += 1))
     }
 }
 
@@ -68,11 +68,11 @@ fn component_view_is_valid_and_input_mutation_is_restored() {
 }
 
 #[test]
-fn button_labels_are_center_aligned_by_default() {
-    let button = crate::authoring::compose::button("Increment").into_element();
+fn button_content_is_authored_as_children() {
+    let button = crate::authoring::compose::button().child(text("Increment").color(crate::ColorRgba8::rgba(248, 249, 252, 255))).into_element();
     let crate::authoring::compose::ElementKind::Button(button) = button.kind() else {
         panic!("expected a button")
     };
 
-    assert_eq!(button.label_style.align, crate::ui::TextAlign::Center);
+    assert_eq!(button.children.len(), 1);
 }
