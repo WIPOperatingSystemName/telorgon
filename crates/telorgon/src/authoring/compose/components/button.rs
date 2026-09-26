@@ -276,7 +276,7 @@ pub fn button() -> Button {
     };
     Button {
         key: None,
-        pointer_request: Some(crate::PointerRequest::Hidden),
+        pointer_request: Some(crate::PointerRequest::Semantic(crate::PointerIcon::Pointer)),
         hover_effects: Vec::new(),
         hover_transition: Some(transition),
         press_effects: Vec::new(),

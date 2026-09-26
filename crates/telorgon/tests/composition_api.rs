@@ -245,7 +245,7 @@ impl Component for PointerFixture {
             .child(spacer().cursor(CursorIcon::None))
             .child(button().cursor(CursorIcon::None).height(32.0).child(text("Hidden")))
             .child(button().cursor(CursorIcon::Default).child(text("Default")))
-            .child(button().child(text("Default hidden cursor")))
+            .child(button().child(text("Default pointer cursor")))
     }
 }
 
@@ -272,7 +272,8 @@ fn composed_views_retain_semantic_pointer_requests() {
         .collect();
     assert!(button_requests.contains(&Some(telorgon::PointerRequest::Hidden)));
     assert!(button_requests.contains(&Some(telorgon::PointerRequest::Semantic(telorgon::PointerIcon::Default))));
-    assert_eq!(button_requests.iter().filter(|request| **request == Some(telorgon::PointerRequest::Hidden)).count(), 2);
+    assert_eq!(button_requests.iter().filter(|request| **request == Some(telorgon::PointerRequest::Hidden)).count(), 1);
+    assert_eq!(button_requests.iter().filter(|request| **request == Some(telorgon::PointerRequest::Semantic(telorgon::PointerIcon::Pointer))).count(), 2);
 }
 
 #[component]
