@@ -24,6 +24,7 @@ pub mod portal {
 pub use portal::*;
 
 pub use crate::ui::text::Typography;
+pub use crate::platform::contracts::PointerIcon as CursorIcon;
 pub use crate::assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
     AssetResolver, AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,
@@ -76,7 +77,7 @@ mod common {
     pub use crate::{
         Typography, Alignment, AppIconProfile, AssetBundle, AssetCatalog, AssetKey, Background, Border,
         BorderSide, BoxDecoration, BoxDecorationError, BoxSizing, BoxStyle, ColorRgba8, Component,
-        ComponentFields, ComponentInstanceId, CornerRadii, CrossAxisAlignment, Dimension,
+        ComponentFields, ComponentInstanceId, CornerRadii, CrossAxisAlignment, CursorIcon, Dimension,
         EdgeInsets, Element, EventContext, EventHandler, Flow, FontAsset, Icon, IconAsset,
         ImageAsset, ImageSource, InputsChangedContext, Insets, Key, LayoutStyle, MainAxisAlignment,
         MountContext, Outline, Overflow, PointF, RectF, Result, RuntimeTarget, SemanticCheckState,

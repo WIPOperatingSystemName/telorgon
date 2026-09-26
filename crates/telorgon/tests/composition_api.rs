@@ -237,7 +237,7 @@ impl Component for PointerFixture {
             .child(
                 button()
                     .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
-                    .pointer_icon(telorgon::PointerIcon::Pointer),
+                    .cursor(CursorIcon::Pointer),
             )
             .child(spacer().hide_pointer())
     }

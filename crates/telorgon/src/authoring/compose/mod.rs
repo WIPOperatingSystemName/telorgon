@@ -52,9 +52,14 @@ pub use style::{Alignment, Dimension, Insets, TextStyle};
 /// The host resolves the request through the application's pointer overrides, registered cursor
 /// theme, and finally the system cursor. This keeps cursor artwork out of component layout code.
 pub trait PointerViewExt: View + Sized {
-    fn pointer_icon(self, icon: crate::PointerIcon) -> Element {
+    fn cursor(self, icon: crate::CursorIcon) -> Element {
         self.into_element()
             .with_pointer_request(crate::PointerRequest::Semantic(icon))
+    }
+
+    /// Compatibility name for `cursor`.
+    fn pointer_icon(self, icon: crate::PointerIcon) -> Element {
+        self.cursor(icon)
     }
 
     fn hide_pointer(self) -> Element {
