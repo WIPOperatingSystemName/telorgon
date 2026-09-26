@@ -24,7 +24,7 @@ pub mod portal {
 pub use portal::*;
 
 pub use crate::ui::text::Typography;
-pub use crate::platform::contracts::PointerIcon as CursorIcon;
+pub use crate::authoring::compose::CursorIcon;
 pub use crate::assets::{
     AppIconProfile, AppIconProfileError, AppIconVariant, AssetBundle, AssetCatalog,
     AssetResolver, AssetCatalogError, AssetEntry, AssetError, AssetKey, AssetKind, AssetMediaCache,

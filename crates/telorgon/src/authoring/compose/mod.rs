@@ -47,20 +47,19 @@ pub use key::{Key, hashed_key};
 pub use signal::{Signal, SignalDependency, SignalSnapshot, SignalSubscription, SignalWriter};
 pub use style::{Alignment, Dimension, Insets, TextStyle};
 
+mod cursor;
+pub use cursor::CursorIcon;
+
 /// Adds a semantic pointer request to any composed view.
 ///
 /// The host resolves the request through the application's pointer overrides, registered cursor
 /// theme, and finally the system cursor. This keeps cursor artwork out of component layout code.
 pub trait PointerViewExt: View + Sized {
-    fn cursor(self, icon: crate::CursorIcon) -> Element {
+    fn cursor(self, icon: impl Into<CursorIcon>) -> Element {
         self.into_element()
-            .with_pointer_request(crate::PointerRequest::Semantic(icon))
+            .with_pointer_request(icon.into().into())
     }
 
-    fn hide_pointer(self) -> Element {
-        self.into_element()
-            .with_pointer_request(crate::PointerRequest::Hidden)
-    }
 }
 
 impl<T: View> PointerViewExt for T {}

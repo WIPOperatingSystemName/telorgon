@@ -236,13 +236,16 @@ impl Component for PointerFixture {
             .child(text("Editable").cursor(CursorIcon::Text))
             .child(
                 button()
-                    .hide_pointer()
+                    .cursor(CursorIcon::None)
                     .cursor(CursorIcon::Pointer)
                     .height(32.0)
                     .hover_effect(InteractionEffect::Lift(2.0))
                     .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))),
             )
-            .child(spacer().hide_pointer())
+            .child(spacer().cursor(CursorIcon::None))
+            .child(button().cursor(CursorIcon::None).height(32.0).child(text("Hidden")))
+            .child(button().cursor(CursorIcon::Default).child(text("Default")))
+            .child(button().child(text("Automatic")))
     }
 }
 
@@ -263,6 +266,13 @@ fn composed_views_retain_semantic_pointer_requests() {
         telorgon::PointerIcon::Pointer
     )));
     assert!(requests.contains(&telorgon::PointerRequest::Hidden));
+    let button_requests: Vec<_> = runtime.ui().kinds.iter()
+        .filter(|(_, kind)| **kind == telorgon::NodeKind::Button)
+        .map(|(node, _)| runtime.ui().pointer_requests.get(node).copied())
+        .collect();
+    assert!(button_requests.contains(&Some(telorgon::PointerRequest::Hidden)));
+    assert!(button_requests.contains(&Some(telorgon::PointerRequest::Semantic(telorgon::PointerIcon::Default))));
+    assert!(button_requests.contains(&None));
 }
 
 #[component]

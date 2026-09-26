@@ -40,15 +40,11 @@ pub struct Button {
 }
 
 impl Button {
-    pub fn cursor(mut self, icon: crate::CursorIcon) -> Self {
-        self.pointer_request = Some(crate::PointerRequest::Semantic(icon));
+    pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
+        self.pointer_request = Some(icon.into().into());
         self
     }
 
-    pub fn hide_pointer(mut self) -> Self {
-        self.pointer_request = Some(crate::PointerRequest::Hidden);
-        self
-    }
 
     pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
         self.hover_effects.push(effect);
