@@ -1,3 +1,5 @@
+mod color;
+
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -20,6 +22,16 @@ pub struct AssetRasterSize {
 }
 
 impl AssetRasterSize {
+    pub(crate) fn for_display(width: f32, height: f32) -> Option<Self> {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            width: width.ceil().clamp(1.0, MAX_DIMENSION as f32) as u32,
+            height: height.ceil().clamp(1.0, MAX_DIMENSION as f32) as u32,
+        })
+    }
+
     pub fn new(width: u32, height: u32) -> Result<Self, AssetMediaError> {
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(AssetMediaError::InvalidRasterSize { width, height });
@@ -51,7 +63,13 @@ impl DecodedAssetImage {
             color_encoding: ImageColorEncoding::Srgb,
             alpha_mode: self.alpha_mode,
             pixel_format: ImagePixelFormat::Rgba8,
-            pixels: Arc::clone(&self.pixels_rgba8),
+            // Decoders/native icon APIs use premultiplied sRGB bytes. Renderers decode
+            // sRGB before blending and therefore require premultiplication in linear light.
+            pixels: if self.alpha_mode == ImageAlphaMode::Premultiplied {
+                color::premultiplied_linear_srgb(&self.pixels_rgba8)
+            } else {
+                Arc::clone(&self.pixels_rgba8)
+            },
         }
     }
 }
@@ -137,6 +155,12 @@ impl AssetMediaCache {
             resources.push(decoded.render_resource());
         }
         Ok(resources)
+    }
+
+    // Dynamic scene sizing retains only the current texture, not every resize step.
+    pub(crate) fn rasterize_svg(&self, key: AssetKey, size: AssetRasterSize) -> Result<DecodedAssetImage, AssetMediaError> {
+        let entry = self.resolver.get(key).ok_or(AssetError::NotFound(key))?;
+        decode_svg(entry, Some(size))
     }
 
     fn decode(

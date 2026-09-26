@@ -507,6 +507,10 @@ impl Default for RenderScene {
     }
 }
 impl RenderScene {
+    pub(crate) fn image_resource_version(&self, image: ImageId) -> Option<u64> {
+        self.image_resources.get(&image).map(|resource| resource.content_version)
+    }
+
     pub fn set_image_resource(&mut self, resource: ImageResource) -> RenderResult<()> {
         validate_image_resource(&resource)?;
         if self

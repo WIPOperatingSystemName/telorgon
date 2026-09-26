@@ -1,3 +1,5 @@
+mod assets;
+
 use crate::foundation::{MonotonicInstant, PointF, SizeF, SizeI};
 #[cfg(all(test, feature = "application-software"))]
 use crate::input::PointerButton;
@@ -90,6 +92,7 @@ pub struct AppRuntimeCore<D: ComponentDriver> {
     image_bindings: Option<crate::authoring::compose::context::ImageBindings>,
     bound_image_versions: std::collections::BTreeMap<ImageId, u64>,
     compiler: SceneCompiler,
+    scene_assets: Option<assets::SceneAssets>,
     deltas: SceneDeltaQueue,
     input: InputCoalescer,
     extent: SizeF,
@@ -275,6 +278,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             image_bindings: None,
             bound_image_versions: Default::default(),
             compiler: SceneCompiler::default(),
+            scene_assets: None,
             deltas: SceneDeltaQueue::new(3),
             input: InputCoalescer::default(),
             extent: SizeF {
@@ -334,7 +338,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         self.extent
     }
 
-    /// Change glyph raster density while preserving logical layout and input coordinates.
+    /// Change text and SVG raster density while preserving logical layout and input coordinates.
     pub fn set_raster_scale(&mut self, scale: crate::platform::contracts::ScaleFactor) {
         if self.text.raster_scale() != scale {
             self.text.set_raster_scale(scale);
@@ -716,6 +720,9 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             )
         };
         self.sync_bound_images()?;
+        if let Some(assets) = &mut self.scene_assets {
+            assets.update(&mut self.scene, &self.layout, self.text.raster_scale().get())?;
+        }
         let delta = {
             #[cfg(feature = "profiler")]
             let _span = crate::runtime::instrumentation::span!("scene.delta.take");

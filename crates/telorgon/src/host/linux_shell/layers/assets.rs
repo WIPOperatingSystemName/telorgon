@@ -14,6 +14,7 @@ impl LayerAssets {
         Ok(Self { bundle, resources, typography: Default::default() })
     }
     pub(super) fn install(&self, runtime: &mut ComposedAppRuntime) -> AppResult<()> {
+        runtime.register_svg_assets(self.bundle)?;
         runtime.set_typography(self.typography.clone());
         for resource in &self.resources {
             runtime.set_image_resource(resource.clone())?;
