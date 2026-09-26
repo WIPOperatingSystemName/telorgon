@@ -61,6 +61,7 @@ pub use crate::shell::window_chrome::{
 /// modules instead, such as `use telorgon::app::*`.
 mod common {
     pub use crate::assets::fonts;
+    pub use crate::theme::{Easing, TransitionSpec};
     pub use crate::authoring::compose::{
         HoverEffect, Button, Checkbox, Container, EasyWindowFrame, Image, PointerViewExt, Slider, Switch, Text,
         WindowChromeDesign, WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle,

@@ -1,6 +1,6 @@
 use telorgon::app::*;
 use telorgon::compose::ElementKind;
-use telorgon::theme::{Easing, MotionPreference, ThemeRuntime, TransitionSpec};
+use telorgon::theme::{MotionPreference, ThemeRuntime};
 use telorgon::ui::{InteractionFlags, StyleSlotId};
 use telorgon::{MonotonicInstant, ViewRuntime};
 
