@@ -102,6 +102,8 @@ impl LabelTextStyle {
             family,
             weight: self.weight,
             align: crate::ui::TextAlign::Start,
+            vertical_align: crate::ui::TextAlign::Start,
+            fit_height: false,
         }
     }
 }

@@ -208,6 +208,8 @@ impl<'a, A> MountWriter<'a, A> {
                     family: StringId(1),
                     weight: 400,
                     align: TextAlign::Start,
+                    vertical_align: crate::ui::TextAlign::Start,
+                    fit_height: false,
                 },
                 revision: 1,
             },

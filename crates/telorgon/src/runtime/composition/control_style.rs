@@ -61,6 +61,8 @@ pub(super) fn control_label_style(enabled: bool) -> crate::ui::TextStyle {
         family: crate::ui::StringId(1),
         weight: 400,
         align: crate::ui::TextAlign::Start,
+        vertical_align: crate::ui::TextAlign::Start,
+        fit_height: false,
     }
 }
 

@@ -15,6 +15,8 @@ pub struct TextStyle {
     pub line_height: Option<f32>,
     pub weight: Option<u16>,
     pub text_align: Option<Alignment>,
+    pub vertical_align: Option<Alignment>,
+    pub fit_height: Option<bool>,
 }
 
 #[cfg(test)]
@@ -52,6 +54,8 @@ impl TextStyle {
             line_height: None,
             weight: None,
             text_align: None,
+            vertical_align: None,
+            fit_height: None,
         }
     }
 
@@ -95,6 +99,16 @@ impl TextStyle {
         self
     }
 
+    pub const fn vertical_align(mut self, alignment: Alignment) -> Self {
+        self.vertical_align = Some(alignment);
+        self
+    }
+
+    pub const fn fit_height(mut self, enabled: bool) -> Self {
+        self.fit_height = Some(enabled);
+        self
+    }
+
     #[doc(hidden)]
     pub fn resolve(self) -> RetainedTextStyle {
         let size = self.size.unwrap_or(14.0);
@@ -105,6 +119,8 @@ impl TextStyle {
             family: crate::ui::StringId(1),
             weight: self.weight.unwrap_or(400),
             align: self.text_align.unwrap_or_default().into(),
+            vertical_align: self.vertical_align.unwrap_or_default().into(),
+            fit_height: self.fit_height.unwrap_or(false),
         }
     }
 }

@@ -1,7 +1,9 @@
 use crate::foundation::ColorRgba8;
 use crate::ui::{BoxStyle, LayoutStyle};
 
-use crate::authoring::compose::{Alignment, Element, ElementKind, Key, TextStyle, View};
+use crate::authoring::compose::{
+    Alignment, Dimension, Element, ElementKind, Insets, Key, TextStyle, View,
+};
 
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +23,39 @@ pub struct Text {
 impl Text {
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
+        self
+    }
+
+    pub fn width(mut self, width: impl Into<Dimension>) -> Self {
+        self.element.box_style.width = width.into().into();
+        self
+    }
+
+    pub fn height(mut self, height: impl Into<Dimension>) -> Self {
+        self.element.box_style.height = height.into().into();
+        self
+    }
+
+    pub fn padding(mut self, padding: impl Into<Insets>) -> Self {
+        self.element.box_style.padding = padding.into().0;
+        self
+    }
+
+    pub fn box_style(mut self, style: BoxStyle) -> Self {
+        self.element.box_style = style;
+        self
+    }
+
+    /// Fits one line's height to the content box, independently of text width.
+    /// Overrides font size and line spacing using a 1.25 line-height ratio.
+    /// Shrink-to-content height uses the normal font size to avoid circular sizing.
+    pub fn fit_height(mut self, enabled: bool) -> Self {
+        self.element.style.fit_height = Some(enabled);
+        self
+    }
+
+    pub fn vertical_align(mut self, alignment: Alignment) -> Self {
+        self.element.style.vertical_align = Some(alignment);
         self
     }
 

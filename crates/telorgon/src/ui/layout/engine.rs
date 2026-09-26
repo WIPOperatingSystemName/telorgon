@@ -266,7 +266,11 @@ impl LayoutEngine {
                 content_rect,
                 baseline: content_rect.y
                     + measured_text
-                        .map(|measurement| measurement.baseline)
+                        .map(|measurement| {
+                            measurement.baseline + ui.texts.get(node).map_or(0.0, |visual| {
+                                visual.style.vertical_offset(content_rect.height, measurement.size.height)
+                            })
+                        })
                         .unwrap_or(content_rect.height.min(16.0) * 0.8),
             },
         );
@@ -418,12 +422,20 @@ impl LayoutEngine {
         ui: &MountedUi,
         text_system: &mut RetainedTextSystem,
         node: NodeId,
-        _style: &BoxStyle,
+        style: &BoxStyle,
         children: &[NodeId],
         scale: f32,
     ) -> SizeF {
         self.diagnostics.intrinsic_passes += 1;
-        if let Some(measurement) = self.measure_text(ui, text_system, node, None, None, scale) {
+        let chrome = border_insets(style);
+        let height = match style.height {
+            SizeRule::Logical(height) => positive_constraint(match style.sizing {
+                BoxSizing::BorderBox => (height - style.padding.vertical() - chrome.vertical()).max(0.0),
+                BoxSizing::ContentBox => height,
+            }),
+            _ => None,
+        };
+        if let Some(measurement) = self.measure_text(ui, text_system, node, None, height, scale) {
             return measurement.size;
         }
         if children.is_empty() {
@@ -450,8 +462,8 @@ impl LayoutEngine {
         let visual = ui.texts.get(node)?;
         let content = ui.string(visual.content).unwrap_or("");
         let family = ui.string(visual.style.family).unwrap_or("sans-serif");
-        let font_size = visual.style.size.ceil().max(1.0);
-        let line_height = visual.style.line_height.ceil().max(font_size);
+        let box_style = ui.box_styles.get(node).cloned().unwrap_or_default();
+        let (font_size, line_height) = visual.style.metrics(max_height, &box_style);
         let key = TextRunKey::new(
             visual.revision,
             1,

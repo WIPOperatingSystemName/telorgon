@@ -264,8 +264,10 @@ impl SceneCompiler {
                         .unwrap_or_default()
                         .opacity;
                     let family = ui.string(visual.style.family).unwrap_or("sans-serif");
-                    let font_size = visual.style.size.ceil().max(1.0);
-                    let line_height = visual.style.line_height.ceil().max(font_size);
+                    let box_style = ui.box_styles.get(*node).cloned().unwrap_or_default();
+                    let (font_size, line_height) = visual.style.metrics(
+                        Some(computed.local_content_rect.height), &box_style,
+                    );
                     let max_width = positive_constraint(computed.local_content_rect.width);
                     let max_height = positive_constraint(computed.local_content_rect.height);
                     let key = TextRunKey::new(
@@ -301,7 +303,9 @@ impl SceneCompiler {
                         let raster_scale = text.raster_scale().get();
                         let (run_origin_x, run_origin_y) = snap_text_run_origin(
                             computed.local_content_rect.x + alignment_offset_x,
-                            computed.local_content_rect.y,
+                            computed.local_content_rect.y + visual.style.vertical_offset(
+                                computed.local_content_rect.height, run.height_px,
+                            ),
                             computed.world_transform,
                             raster_scale,
                         );
@@ -609,6 +613,8 @@ mod tests {
                                         family: crate::ui::StringId(1),
                                         weight: 400,
                                         align: TextAlign::Center,
+                                        vertical_align: crate::ui::TextAlign::Start,
+                                        fit_height: false,
                                     },
                                     BoxStyle::default(),
                                     LayoutStyle::default(),

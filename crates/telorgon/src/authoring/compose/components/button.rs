@@ -217,6 +217,8 @@ pub fn button(label: impl Into<String>) -> Button {
                 family: crate::ui::StringId(1),
                 weight: 400,
                 align: TextAlign::Center,
+                vertical_align: crate::ui::TextAlign::Start,
+                fit_height: false,
             },
             style_id: ComponentStyleId::named(ThemeDomainId::APPLICATION, "button", "default"),
             style_override: StylePropertyPatch::default(),

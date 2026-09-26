@@ -581,6 +581,8 @@ pub struct TextStyle {
     pub family: StringId,
     pub weight: u16,
     pub align: TextAlign,
+    pub vertical_align: TextAlign,
+    pub fit_height: bool,
 }
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TextVisual {

@@ -140,6 +140,8 @@ impl WindowTitlebar {
                         family,
                         weight: self.style.title_weight,
                         align: crate::ui::TextAlign::Start,
+                        vertical_align: crate::ui::TextAlign::Start,
+                        fit_height: false,
                     },
                     revision: self.snapshot.revision().get(),
                 },
