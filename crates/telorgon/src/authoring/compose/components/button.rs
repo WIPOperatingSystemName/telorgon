@@ -250,6 +250,11 @@ impl View for Button {
 }
 
 pub fn button() -> Button {
+    let transition = crate::theme::TransitionSpec {
+        duration_ms: 0,
+        easing: crate::theme::Easing::Linear,
+        repeat: false,
+    };
     let style = BoxStyle {
         overflow: crate::ui::Overflow::Clip,
         min_size: SizeRule2D {
@@ -271,11 +276,11 @@ pub fn button() -> Button {
     };
     Button {
         key: None,
-        pointer_request: None,
+        pointer_request: Some(crate::PointerRequest::Hidden),
         hover_effects: Vec::new(),
-        hover_transition: None,
+        hover_transition: Some(transition),
         press_effects: Vec::new(),
-        press_transition: None,
+        press_transition: Some(transition),
         element: ButtonElement {
             accessible_label: None,
             children: Vec::new(),
