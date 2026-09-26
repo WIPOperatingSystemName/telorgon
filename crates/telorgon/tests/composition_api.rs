@@ -233,11 +233,14 @@ struct PointerFixture {}
 impl Component for PointerFixture {
     fn view(&self) -> impl View {
         row()
-            .child(text("Editable").pointer_icon(telorgon::PointerIcon::Text))
+            .child(text("Editable").cursor(CursorIcon::Text))
             .child(
                 button()
-                    .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
-                    .cursor(CursorIcon::Pointer),
+                    .hide_pointer()
+                    .cursor(CursorIcon::Pointer)
+                    .height(32.0)
+                    .hover_effect(InteractionEffect::Lift(2.0))
+                    .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))),
             )
             .child(spacer().hide_pointer())
     }

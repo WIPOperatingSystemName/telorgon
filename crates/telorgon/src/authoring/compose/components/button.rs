@@ -31,6 +31,7 @@ pub struct ButtonElement {
 #[derive(Debug)]
 pub struct Button {
     key: Option<Key>,
+    pointer_request: Option<crate::PointerRequest>,
     element: ButtonElement,
     hover_effects: Vec<super::interaction::InteractionEffect>,
     hover_transition: Option<crate::theme::TransitionSpec>,
@@ -39,6 +40,16 @@ pub struct Button {
 }
 
 impl Button {
+    pub fn cursor(mut self, icon: crate::CursorIcon) -> Self {
+        self.pointer_request = Some(crate::PointerRequest::Semantic(icon));
+        self
+    }
+
+    pub fn hide_pointer(mut self) -> Self {
+        self.pointer_request = Some(crate::PointerRequest::Hidden);
+        self
+    }
+
     pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
         self.hover_effects.push(effect);
         self
@@ -234,7 +245,11 @@ impl View for Button {
             ));
             self.element.style_override = StylePropertyPatch::default();
         }
-        Element::from_kind(self.key, ElementKind::Button(self.element))
+        let element = Element::from_kind(self.key, ElementKind::Button(self.element));
+        match self.pointer_request {
+            Some(request) => element.with_pointer_request(request),
+            None => element,
+        }
     }
 }
 
@@ -260,6 +275,7 @@ pub fn button() -> Button {
     };
     Button {
         key: None,
+        pointer_request: None,
         hover_effects: Vec::new(),
         hover_transition: None,
         press_effects: Vec::new(),

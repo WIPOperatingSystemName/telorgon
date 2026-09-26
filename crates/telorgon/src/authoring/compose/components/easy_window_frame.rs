@@ -472,7 +472,7 @@ fn window_icon(model: &WindowChromeModel, style: WindowTitleBarStyle) -> Option<
         );
     Some(
         if style.app_icon_opens_system_menu && model.capabilities.system_menu {
-            crate::authoring::compose::PointerViewExt::pointer_icon(
+            crate::authoring::compose::PointerViewExt::cursor(
                 region.window_system_menu(),
                 crate::PointerIcon::Default,
             )

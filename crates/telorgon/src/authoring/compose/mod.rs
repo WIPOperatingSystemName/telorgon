@@ -57,11 +57,6 @@ pub trait PointerViewExt: View + Sized {
             .with_pointer_request(crate::PointerRequest::Semantic(icon))
     }
 
-    /// Compatibility name for `cursor`.
-    fn pointer_icon(self, icon: crate::PointerIcon) -> Element {
-        self.cursor(icon)
-    }
-
     fn hide_pointer(self) -> Element {
         self.into_element()
             .with_pointer_request(crate::PointerRequest::Hidden)
