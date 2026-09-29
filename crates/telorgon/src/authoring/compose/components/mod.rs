@@ -2,6 +2,7 @@
 
 mod button;
 mod interaction;
+pub(crate) use interaction::compile_slot_effects;
 pub use interaction::{HoverEffect, InteractionEffect};
 mod checkbox;
 mod container;

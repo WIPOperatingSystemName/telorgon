@@ -9,6 +9,8 @@ pub struct ObjectHandle {
     pub(crate) id: u32,
 }
 impl ObjectHandle {
+    pub fn epoch(self) -> u64 { self.epoch }
+    pub fn incarnation(self) -> u64 { self.incarnation }
     /// Informational native ID; use the complete handle in requests.
     pub fn id(self) -> u32 {
         self.id

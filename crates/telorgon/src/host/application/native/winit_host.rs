@@ -33,10 +33,10 @@ use super::resize::{
 };
 #[cfg(all(
     feature = "application-software",
-    not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))
+    not(all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")))
 ))]
 use super::software::SoftwarePresentation;
-#[cfg(not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))))]
+#[cfg(not(all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))))]
 use crate::host::application::ReadyGuiApplication;
 use crate::host::application::{
     AppError, AppResult, AppRuntimeCore, Command, ComponentDriver, CompositionDriver,
@@ -73,7 +73,7 @@ pub(crate) fn create_managed_event_loop(
 }
 
 #[cfg(feature = "application-software")]
-#[cfg(not(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))))]
+#[cfg(not(all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))))]
 pub fn run_gui_software(application: ReadyGuiApplication) -> AppResult<()> {
     let (driver, options, renderer, assets, pointer) = application.into_parts()?;
     if renderer == crate::host::application::Renderer::Vulkan {

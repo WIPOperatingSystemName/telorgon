@@ -199,21 +199,27 @@ impl LayoutEngine {
     }
 
     pub fn hit_test(&self, ui: &mut MountedUi, point: PointF) -> Option<NodeId> {
-        ui.nodes.preorder().iter().rev().copied().find(|node| {
-            ui.interactions.get(*node).is_some_and(|interaction| {
+        for index in (0..ui.nodes.preorder().len()).rev() {
+            let node = ui.nodes.preorder()[index];
+            let control = ui.interactions.get(node).is_some_and(|interaction| {
                 interaction.visible
                     && interaction.enabled
                     && (interaction.focusable || interaction.listener_mask != 0
                         || interaction.behavior == crate::ui::ControlBehavior::Scroll)
-            }) && self.computed.get(*node).is_some_and(|layout| {
+            });
+            let contains = self.computed.get(node).is_some_and(|layout| {
                 layout.visible_rect.contains(point)
                     && layout.world_transform.inverse().is_some_and(|inverse| {
                         layout
                             .local_border_rect
                             .contains(inverse.transform_point(point))
                     })
-            })
-        })
+            });
+            if contains && (control || visual_hit_ancestor(ui, node)) {
+                return Some(node);
+            }
+        }
+        None
     }
 
     pub fn focus_order(&self, ui: &mut MountedUi) -> Vec<NodeId> {
@@ -727,6 +733,25 @@ impl VirtualCollection {
                 .push(self.prefix.last().copied().unwrap_or(0.0) + *extent);
         }
     }
+}
+
+fn visual_hit_ancestor(ui: &MountedUi, node: NodeId) -> bool {
+    let mut current = Some(node);
+    let mut visual = false;
+    while let Some(node) = current {
+        if let Some(interaction) = ui.interactions.get(node) {
+            if !interaction.visible {
+                return false;
+            }
+            visual |= matches!(interaction.behavior,
+                crate::ui::ControlBehavior::None | crate::ui::ControlBehavior::Scroll)
+                && (interaction.visual_hover || interaction.visual_press || interaction.hover_within);
+        }
+        current = ui.nodes.core(node).and_then(|core| core.parent);
+    }
+    // Keep the actual descendant hit so self-only effects do not activate through a label.
+    // Disabled descendants still block a self-only ancestor; the router suppresses their effects.
+    visual
 }
 
 #[cfg(test)]

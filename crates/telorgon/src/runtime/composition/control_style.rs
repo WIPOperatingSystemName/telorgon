@@ -96,7 +96,6 @@ pub(super) fn slider_semantics(
 
 #[derive(Clone, Copy)]
 pub(super) struct CheckboxStyles {
-    pub(super) container: BoxStyle,
     pub(super) indicator: BoxStyle,
     pub(super) check_first: BoxStyle,
     pub(super) check_second: BoxStyle,
@@ -138,14 +137,6 @@ pub(super) fn checkbox_styles(value: SemanticCheckState, enabled: bool) -> Check
         Background::None
     };
     CheckboxStyles {
-        container: BoxStyle {
-            min_size: SizeRule2D {
-                width: SizeRule::Logical(32.0),
-                height: SizeRule::Logical(32.0),
-            },
-            padding: EdgeInsets::all(5.0),
-            ..BoxStyle::default()
-        },
         indicator,
         check_first: mark_segment(
             PointF { x: 20.0, y: 6.0 },
@@ -199,7 +190,6 @@ pub(super) fn mark_segment(start: PointF, end: PointF, background: Background) -
 
 #[derive(Clone, Copy)]
 pub(super) struct SwitchStyles {
-    pub(super) container: BoxStyle,
     pub(super) track: BoxStyle,
     pub(super) thumb: BoxStyle,
 }
@@ -212,14 +202,6 @@ pub(super) fn switch_styles(value: bool, enabled: bool) -> SwitchStyles {
         ColorRgba8::rgba(75, 84, 102, opacity)
     };
     SwitchStyles {
-        container: BoxStyle {
-            min_size: SizeRule2D {
-                width: SizeRule::Logical(32.0),
-                height: SizeRule::Logical(32.0),
-            },
-            padding: EdgeInsets::all(5.0),
-            ..BoxStyle::default()
-        },
         track: BoxStyle {
             width: SizeRule::Logical(38.0),
             height: SizeRule::Logical(22.0),
@@ -262,7 +244,6 @@ pub(super) fn switch_styles(value: bool, enabled: bool) -> SwitchStyles {
 
 #[derive(Clone, Copy)]
 pub(super) struct SliderStyles {
-    pub(super) container: BoxStyle,
     pub(super) track: BoxStyle,
     pub(super) fill: BoxStyle,
     pub(super) thumb: BoxStyle,
@@ -276,16 +257,6 @@ pub(super) fn slider_styles(value: f32, enabled: bool, width: SizeRule) -> Slide
     let accent = ColorRgba8::rgba(54, 104, 210, opacity);
     let track_width = if width == SizeRule::Shrink { SizeRule::Logical(160.0) } else { SizeRule::Fill(1.0) };
     SliderStyles {
-        container: BoxStyle {
-            width,
-            height: SizeRule::Logical(32.0),
-            min_size: SizeRule2D {
-                width: SizeRule::Logical(32.0),
-                height: SizeRule::Logical(32.0),
-            },
-            padding: EdgeInsets { top: 5.0, bottom: 5.0, left: 0.0, right: 0.0 },
-            ..BoxStyle::default()
-        },
         track: BoxStyle {
             width: track_width,
             height: SizeRule::Logical(6.0),
@@ -327,5 +298,48 @@ pub(super) fn slider_styles(value: f32, enabled: bool, width: SizeRule) -> Slide
         },
         before_thumb: BoxStyle { width: SizeRule::Fill(value), ..BoxStyle::default() },
         after_thumb: BoxStyle { width: SizeRule::Fill(1.0 - value), ..BoxStyle::default() },
+    }
+}
+
+
+pub(super) fn compound_effect_binding(
+    mut binding: StyleBinding,
+    effects: Option<Arc<crate::theme::CompiledComponentStyle>>,
+) -> StyleBinding {
+    binding.local_style = effects;
+    binding.local_style_overlay = true;
+    binding
+}
+
+pub(super) fn reconcile_compound_box(
+    ui: &mut crate::ui::MountedUi,
+    root: UiNodeId,
+    slot: &str,
+    node: UiNodeId,
+    previous: BoxStyle,
+    candidate: BoxStyle,
+    effects_removed: bool,
+) {
+    if previous != candidate || effects_removed {
+        ui.set_box_style(node, candidate);
+        ui.reset_style_slot_motion(root, StyleSlotId::named(slot));
+    }
+}
+
+
+pub(super) fn reconcile_compound_label_gap(
+    ui: &mut crate::ui::MountedUi,
+    label: UiNodeId,
+    previous: &str,
+    candidate: &str,
+) {
+    if previous.is_empty() == candidate.is_empty() {
+        return;
+    }
+    // Compound labels are direct children of their private content row.
+    if let Some(content) = ui.nodes.core(label).and_then(|core| core.parent) {
+        let mut layout = ui.layouts.get(content).copied().unwrap_or_default();
+        layout.gap = if candidate.is_empty() { 0.0 } else { 8.0 };
+        ui.set_layout_style(content, layout);
     }
 }

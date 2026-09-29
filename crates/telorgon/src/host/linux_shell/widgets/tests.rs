@@ -349,17 +349,17 @@ fn scroll_routes_only_to_hit_shell_and_never_while_locked() {
     let now = MonotonicInstant::from_nanos(1);
     let p = PointF { x: 50.0, y: 50.0 };
     assert!(
-        widget_pointer_scroll(&mut widgets, p, PointF { x: 0.0, y: 15.0 }, now, false).unwrap()
+        widget_pointer_scroll(&mut widgets, p, widget_scroll_input(0.0, 15.0, 0, 0), now, false).unwrap()
     );
     assert_eq!(count.get(), 1);
     assert!(
-        !widget_pointer_scroll(&mut widgets, p, PointF { x: 0.0, y: 15.0 }, now, true).unwrap()
+        !widget_pointer_scroll(&mut widgets, p, widget_scroll_input(0.0, 15.0, 0, 0), now, true).unwrap()
     );
     assert!(
         !widget_pointer_scroll(
             &mut widgets,
             PointF { x: 500.0, y: 500.0 },
-            PointF::default(),
+            widget_scroll_input(0.0, 0.0, 0, 0),
             now,
             false
         )
@@ -880,7 +880,7 @@ fn linux_wheel_scrolls_widget_down_and_back_up() {
             widget_pointer_scroll(
                 &mut widgets,
                 p,
-                PointF { x: 0.0, y: delta },
+                widget_scroll_input(0.0, delta as f64, 0, 0),
                 MonotonicInstant::from_nanos(time),
                 false
             )
@@ -914,10 +914,14 @@ fn linux_wheel_scrolls_widget_down_and_back_up() {
 
 #[test]
 fn wheel_notches_use_readable_steps_without_amplifying_touchpad_motion() {
-    assert_eq!(widget_scroll_distance(0.0, 15.0, 0, 1), PointF { x: 0.0, y: 48.0 });
-    assert_eq!(widget_scroll_distance(-30.0, 45.0, -2, 3), PointF { x: -96.0, y: 144.0 });
-    assert_eq!(widget_scroll_distance(1.25, -2.5, 0, 0), PointF { x: 1.25, y: -2.5 });
-    assert_eq!(widget_scroll_distance(1.25, -15.0, 0, -1), PointF { x: 1.25, y: -48.0 });
+    use crate::input::InputEvent;
+    let [precise, wheel] = widget_scroll_input(1.25, -15.0, 0, -1);
+    assert_eq!(precise, InputEvent::mouse_scroll(PointF { x: -1.25, y: 0.0 }));
+    assert_eq!(wheel, InputEvent::mouse_wheel(PointF { x: 0.0, y: 1.0 }));
+    let [precise, wheel] = widget_scroll_input(-30.0, 45.0, -2, 3);
+    assert_eq!(precise, InputEvent::mouse_scroll(PointF::default()));
+    assert_eq!(wheel, InputEvent::mouse_wheel(PointF { x: 2.0, y: -3.0 }));
+
 }
 
 #[test]

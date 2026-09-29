@@ -2,6 +2,7 @@ use crate::foundation::PointF;
 
 use crate::input::{
     KeyEvent, PointerButton, PointerDeviceKind, PointerEvent, PointerId, ScrollEvent,
+    ScrollPrecision,
 };
 
 /// Platform-neutral pressed/released state shared by pointer buttons and keyboard keys.
@@ -78,7 +79,9 @@ pub enum InputEvent {
     Scroll {
         pointer: PointerId,
         device: PointerDeviceKind,
+        /// Content movement in logical pixels (positive moves content down/right).
         delta: PointF,
+        precision: ScrollPrecision,
     },
     Key(KeyEvent),
 }
@@ -101,11 +104,29 @@ impl InputEvent {
         }
     }
 
+    /// Precise logical-pixel input, including platform-supplied momentum. No extra smoothing.
     pub const fn mouse_scroll(delta: PointF) -> Self {
         Self::Scroll {
             pointer: PointerId::PRIMARY,
             device: PointerDeviceKind::Mouse,
             delta,
+            precision: ScrollPrecision::Precise,
+        }
+    }
+
+    /// Discrete wheel steps; fractional steps from high-resolution wheels are preserved.
+    pub const fn mouse_wheel(steps: PointF) -> Self {
+        Self::Scroll {
+            pointer: PointerId::PRIMARY,
+            device: PointerDeviceKind::Mouse,
+            delta: PointF {
+                x: steps.x * DEFAULT_WHEEL_STEP,
+                y: steps.y * DEFAULT_WHEEL_STEP,
+            },
+            precision: ScrollPrecision::Discrete,
         }
     }
 }
+
+/// Default logical distance for one normalized wheel step.
+pub const DEFAULT_WHEEL_STEP: f32 = 48.0;

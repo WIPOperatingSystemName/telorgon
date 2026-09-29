@@ -51,8 +51,6 @@ outline_color = { token = "color.invalid" }
 outline_width = { token = "length.outline" }
 [components.text.default]
 transition = { duration = { token = "duration.fast" }, easing = { token = "easing.standard" } }
-[components.text.default.states.hovered.slots.root]
-foreground = { token = "color.text_active" }
 [components.text.default.states.pressed.slots.root]
 foreground = { token = "color.text_active" }
 [components.text.default.states.busy.slots.root]
@@ -83,7 +81,6 @@ domain = "shell"
 [tokens.color]
 button_hovered = "#424a5cff"
 button_pressed = "#2a303dff"
-text_active = "#ffffffff"
 text_disabled = "#999da8ff"
 focus = "#a6dbffff"
 [tokens.length]
@@ -102,8 +99,6 @@ background = { token = "color.button_pressed" }
 outline_color = { token = "color.focus" }
 outline_width = { token = "length.outline" }
 outline_offset = 2
-[components.text.default.states.hovered.slots.root]
-foreground = { token = "color.text_active" }
 [components.text.default.states.disabled.slots.root]
 foreground = { token = "color.text_disabled" }
 "##;

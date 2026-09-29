@@ -11,7 +11,7 @@ description = "Retained, component-based UI framework with software and Vulkan r
 tray-linux = []
 # Ordinary applications compile both managed desktop backends. Runtime entrypoint declarations
 # choose between them; downstream applications do not select a renderer with Cargo features.
-default = ["application-software", "application-vulkan-windows", "bundled-fonts"]
+default = ["application-software", "application-vulkan", "bundled-fonts"]
 bundled-fonts = ["font-inter", "font-instrument-sans", "font-source-serif-4", "font-jetbrains-mono", "font-atkinson-hyperlegible-next"]
 font-inter = []
 font-instrument-sans = []
@@ -28,11 +28,7 @@ application-software = [
     "dep:winit",
     "dep:windows-sys",
 ]
-application-vulkan-linux = [
-    "dep:ash", "dep:ash-window", "dep:bytemuck", "dep:gpu-allocator",
-    "dep:raw-window-handle", "dep:sha2", "dep:winit",
-]
-application-vulkan-windows = [
+application-vulkan = [
     "dep:ash",
     "dep:ash-window",
     "dep:bytemuck",
@@ -43,6 +39,9 @@ application-vulkan-windows = [
     "dep:windows",
     "dep:windows-sys",
 ]
+# Compatibility aliases; the compilation target selects the platform backend.
+application-vulkan-linux = ["application-vulkan"]
+application-vulkan-windows = ["application-vulkan"]
 shell-wayland-linux = [
     "dep:roxmltree",
     "dep:ash",

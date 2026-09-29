@@ -9,6 +9,8 @@ use crate::input::{
 use crate::graphics::scene::NodeId;
 use crate::ui::{ControlBehavior, InteractionFlags, MountedUi};
 
+mod passive;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InteractionDiagnostics {
     pub state_publications: u64,
@@ -38,12 +40,13 @@ pub(crate) struct KeyRouting {
     pub changed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PointerRoute {
     position: PointF,
     raw_hovered: Option<NodeId>,
     hovered: Option<NodeId>,
     captured: Option<NodeId>,
+    visual_pressed: Vec<NodeId>,
 }
 
 /// Per-view owner for hover, capture, activation, and focus publication.
@@ -91,14 +94,15 @@ impl InteractionRouter {
         position: PointF,
         raw_hit: Option<NodeId>,
     ) -> PointerRouting {
-        self.sync(ui);
+        let synchronized = self.sync(ui);
         let hit = raw_hit.and_then(|node| ui.nearest_control(node));
+        let hovered_hit = hit.filter(|node| self.behavior(ui, *node).is_some());
         let previous_hover = self.pointers.get(&pointer).and_then(|route| route.hovered);
         {
             let route = self.pointers.entry(pointer).or_default();
             route.position = position;
             route.raw_hovered = raw_hit;
-            route.hovered = hit;
+            route.hovered = hovered_hit;
         }
 
         let mut routing = PointerRouting {
@@ -108,9 +112,10 @@ impl InteractionRouter {
                 .and_then(|route| route.captured)
                 .or(hit)
                 .or(raw_hit),
+            changed: synchronized,
             ..PointerRouting::default()
         };
-        if previous_hover != hit {
+        if previous_hover != hovered_hit {
             if let Some(old) = previous_hover {
                 let still_hovered = self
                     .pointers
@@ -119,12 +124,12 @@ impl InteractionRouter {
                 routing.changed |=
                     self.publish_flag(ui, old, InteractionFlags::HOVERED, still_hovered);
             }
-            if let Some(new) = hit {
+            if let Some(new) = hovered_hit {
                 routing.changed |= self.publish_flag(ui, new, InteractionFlags::HOVERED, true);
             }
         }
 
-        routing.changed |= self.publish_container_hover(ui);
+        routing.changed |= self.publish_visual_interaction(ui);
         let Some(captured) = self.pointers.get(&pointer).and_then(|route| route.captured) else {
             return routing;
         };
@@ -150,12 +155,14 @@ impl InteractionRouter {
         state: ButtonState,
         raw_hit: Option<NodeId>,
     ) -> PointerRouting {
-        self.sync(ui);
+        let synchronized = self.sync(ui);
         let hit = raw_hit.and_then(|node| ui.nearest_control(node));
+        let visual_changed = self.visual_pointer_button(ui, pointer, button, state, raw_hit);
         let captured = self.pointers.get(&pointer).and_then(|route| route.captured);
         let control = captured.or(hit);
         let mut routing = PointerRouting {
             target: control.or(raw_hit),
+            changed: synchronized | visual_changed,
             ..PointerRouting::default()
         };
         let Some(target) = control else {
@@ -292,8 +299,9 @@ impl InteractionRouter {
             route.captured = None;
             route.hovered = None;
             route.raw_hovered = None;
+            route.visual_pressed.clear();
         }
-        changed |= self.publish_container_hover(ui);
+        changed |= self.publish_visual_interaction(ui);
         let focus = self.set_focus(ui, None, false);
         changed | (focus.old != focus.new)
     }
@@ -373,16 +381,20 @@ impl InteractionRouter {
 
         let pointer_ids: Vec<_> = self.pointers.keys().copied().collect();
         for pointer in pointer_ids {
-            let Some(route) = self.pointers.get(&pointer).copied() else {
+            let Some((hovered, captured)) = self.pointers.get(&pointer)
+                .map(|route| (route.hovered, route.captured)) else {
                 continue;
             };
-            if route.hovered.is_some_and(|node| !ui.nodes.contains(node)) {
+            if let Some(hovered) = hovered
+                && (!ui.nodes.contains(hovered) || self.behavior(ui, hovered).is_none())
+            {
+                changed |= self.publish_flag(ui, hovered, InteractionFlags::HOVERED, false);
                 if let Some(route) = self.pointers.get_mut(&pointer) {
                     route.hovered = None;
                 }
                 self.diagnostics.stale_owners_rejected += 1;
             }
-            if let Some(captured) = route.captured {
+            if let Some(captured) = captured {
                 let eligible = ui.interactions.get(captured).is_some_and(|interaction| {
                     interaction.enabled
                         && interaction.visible
@@ -412,7 +424,8 @@ impl InteractionRouter {
             changed |= focus.old != focus.new;
             self.diagnostics.stale_owners_rejected += 1;
         }
-        changed | self.publish_container_hover(ui)
+        self.sync_visual_presses(ui);
+        changed | self.publish_visual_interaction(ui)
     }
 
     fn behavior(&self, ui: &MountedUi, node: NodeId) -> Option<ControlBehavior> {
@@ -460,10 +473,13 @@ impl InteractionRouter {
         } else {
             return ActivationRouting::default();
         };
-        let pressed = self
-            .controls
-            .get(&node)
-            .is_some_and(ActivationStateMachine::is_visually_armed);
+        // Value controls remain engaged throughout a captured drag, including outside
+        // their bounds. Activating controls still disarm visually when the pointer leaves.
+        let value_control = ui.interactions.get(node)
+            .is_some_and(|interaction| interaction.behavior == ControlBehavior::Value);
+        let pressed = self.controls.get(&node).is_some_and(|machine| {
+            if value_control { machine.is_armed() } else { machine.is_visually_armed() }
+        });
         let changed = self.publish_flag(ui, node, InteractionFlags::PRESSED, pressed);
         let activation = match outcome.transition {
             ActivationTransition::Activated(activation) => {
@@ -512,30 +528,9 @@ impl InteractionRouter {
         }
         if let Some(route) = self.pointers.get_mut(&pointer) {
             route.captured = None;
+            route.visual_pressed.clear();
         }
-        changed
-    }
-
-    fn publish_container_hover(&mut self, ui: &mut MountedUi) -> bool {
-        let containers: Vec<_> = ui.nodes.alive().iter().copied()
-            .filter(|node| ui.kinds.get(*node) == Some(&crate::NodeKind::Box)
-                && ui.interactions.get(*node).is_some_and(|interaction| {
-                    interaction.hover_within || interaction.flags.contains(InteractionFlags::HOVERED)
-                }))
-            .collect();
-        let mut changed = false;
-        for node in containers {
-            let enabled = ui.interactions.get(node).is_some_and(|interaction| {
-                interaction.hover_within && interaction.enabled && interaction.visible
-            });
-            let hovered = enabled && self.pointers.values().any(|route| {
-                route.raw_hovered.is_some_and(|hit| {
-                    ui.nodes.contains(hit) && ui.is_descendant_or_self(hit, node)
-                })
-            });
-            changed |= self.publish_flag(ui, node, InteractionFlags::HOVERED, hovered);
-        }
-        changed
+        changed | self.publish_visual_interaction(ui)
     }
 
     fn publish_flag(
@@ -564,14 +559,14 @@ mod tests {
     use crate::foundation::ColorRgba8;
     use crate::ui::{BoxStyle, LayoutStyle, MountWriter};
 
-    struct Fixture {
-        ui: MountedUi,
-        first: NodeId,
-        first_label: NodeId,
-        second: NodeId,
+    pub(super) struct Fixture {
+        pub(super) ui: MountedUi,
+        pub(super) first: NodeId,
+        pub(super) first_label: NodeId,
+        pub(super) second: NodeId,
     }
 
-    fn fixture() -> Fixture {
+    pub(super) fn fixture() -> Fixture {
         let mut ui = MountedUi::default();
         let mut first = None;
         let mut first_label = None;
@@ -601,7 +596,7 @@ mod tests {
         }
     }
 
-    fn has(ui: &MountedUi, node: NodeId, flag: InteractionFlags) -> bool {
+    pub(super) fn has(ui: &MountedUi, node: NodeId, flag: InteractionFlags) -> bool {
         ui.interactions
             .get(node)
             .is_some_and(|interaction| interaction.flags.contains(flag))
@@ -715,6 +710,36 @@ mod tests {
     }
 
     #[test]
+    fn value_control_stays_pressed_during_outside_drag_until_release_or_cancel() {
+        for cancel in [false, true] {
+            let mut fixture = fixture();
+            fixture.ui.set_control_behavior(fixture.first, ControlBehavior::Value);
+            let mut router = InteractionRouter::default();
+            let pointer = PointerId::new(22);
+            router.pointer_button(
+                &mut fixture.ui, pointer, PointerButton::PRIMARY,
+                ButtonState::Pressed, Some(fixture.first),
+            );
+            let moved = router.pointer_moved(
+                &mut fixture.ui, pointer, PointF::default(), Some(fixture.second),
+            );
+            assert_eq!(moved.value, Some((fixture.first, ValueChangePhase::Update)));
+            assert!(has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+            assert!(!has(&fixture.ui, fixture.second, InteractionFlags::PRESSED));
+            if cancel {
+                router.capture_lost(&mut fixture.ui, pointer);
+            } else {
+                router.pointer_button(
+                    &mut fixture.ui, pointer, PointerButton::PRIMARY,
+                    ButtonState::Released, Some(fixture.second),
+                );
+            }
+            assert!(!has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+            assert!(router.pointers[&pointer].captured.is_none());
+        }
+    }
+
+    #[test]
     fn secondary_button_never_arms_or_activates() {
         let mut fixture = fixture();
         let mut router = InteractionRouter::default();
@@ -807,6 +832,8 @@ mod tests {
             .set_enabled(false);
         assert!(router.sync(&mut fixture.ui));
         assert!(!has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+        router.pointer_moved(&mut fixture.ui, pointer, PointF::default(), Some(fixture.first));
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
         let release = router.pointer_button(
             &mut fixture.ui,
             pointer,

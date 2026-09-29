@@ -77,6 +77,7 @@ use window_identity::WindowIdentities;
 mod cursor_plane;
 mod dma_buf_readiness;
 mod event_source;
+mod display_settings;
 mod frame_stats;
 mod stall_probe;
 mod transition_probe;
@@ -183,23 +184,23 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             connector.status == ConnectorStatus::Connected && !connector.modes.is_empty()
         })
         .ok_or_else(|| AppError::new("no connected KMS output with a display mode was found"))?;
-    let mode_index = connector
-        .modes
-        .iter()
-        .position(|mode| mode.preferred())
-        .unwrap_or(0);
-    let mode = connector.modes[mode_index];
-    let physical_extent = mode.size();
-    let output_scale = config
-        .output_scale
-        .resolve(physical_extent, connector.physical_millimeters)?;
-    let selected_output = output_state(connector, mode_index, output_scale)?;
-    let extent = selected_output.logical_size();
+    let initial_display = config.display_control.as_ref().map(|c| c.initial().clone())
+        .filter(|wanted| display_settings::mode_index(connector, wanted).map_err(|error| {
+            eprintln!("telorgon-display: saved output unavailable, using defaults: {error}");
+        }).is_ok());
+    let mut mode_index = initial_display.as_ref()
+        .and_then(|wanted| display_settings::mode_index(connector, wanted).ok())
+        .unwrap_or_else(|| connector.modes.iter().position(|m| m.preferred()).unwrap_or(0));
+    let mut mode = connector.modes[mode_index];
+    let mut physical_extent = mode.size();
+    let scale_policy = initial_display.as_ref().map_or(config.output_scale, |c|
+        c.scale.map_or(crate::host::application::OutputScale::Auto, crate::host::application::OutputScale::Fixed));
+    let mut output_scale = scale_policy.resolve(physical_extent, connector.physical_millimeters)?;
+    let mut selected_output = output_state(connector, mode_index, output_scale)?;
+    let mut extent = selected_output.logical_size();
     #[cfg(feature = "shell-screencast-linux")]
     let capture_output_restore_key = capture_config.configured_portal()
         .and_then(|_| capture_restore::output_key(&kms, connector, &drm_path));
-    #[cfg(feature = "shell-screencast-linux")]
-    let capture_output_label = format!("{} ({} × {})", selected_output.description.name, physical_extent.width, physical_extent.height);
     eprintln!(
         "telorgon-kms: {}x{} pixels, {}x{} mm, {:.0}% scale, {}x{} logical units ({:?})",
         physical_extent.width,
@@ -211,9 +212,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         extent.height,
         config.output_scale
     );
-    let refresh_period =
+    let mut refresh_period =
         Duration::from_nanos(1_000_000_000_000_u64 / u64::from(mode.refresh_millihertz().max(1)));
-    let mode_blob = kms.create_mode_blob(&mode).map_err(app_error)?;
     let gbm = match GbmDevice::new(kms.fd()) {
         Ok(gbm) => Some(gbm),
         Err(error) if error.retryable() => {
@@ -222,6 +222,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
         Err(error) => return Err(app_error(error)),
     };
+    let mut mode_blob = kms.create_mode_blob(&mode).map_err(app_error)?;
     eprintln!(
         "telorgon-kms: negotiating {renderer:?} scanout on {}",
         drm_path.display()
@@ -230,15 +231,26 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     // Rust drops locals in reverse declaration order, including on every error return.
     #[allow(unused_mut)]
     let mut display = Display::new().map_err(app_error)?;
-    let mut scanout = renderer::prepare(
-        &kms,
-        gbm.as_ref(),
-        &topology,
-        connector,
-        mode_blob.id(),
-        physical_extent,
-        renderer,
-    )?;
+    let mut scanout = match renderer::prepare(&kms, gbm.as_ref(), &topology, connector,
+        mode_blob.id(), physical_extent, renderer) {
+        Ok(scanout) => scanout,
+        Err(error) => {
+            let preferred = connector.modes.iter().position(|m| m.preferred()).unwrap_or(0);
+            if mode_index == preferred { return Err(error); }
+            eprintln!("telorgon-display: saved mode could not be prepared; falling back to the preferred mode: {error}");
+            mode_index = preferred;
+            mode = connector.modes[mode_index];
+            physical_extent = mode.size();
+            output_scale = scale_policy.resolve(physical_extent, connector.physical_millimeters)?;
+            selected_output = output_state(connector, mode_index, output_scale)?;
+            extent = selected_output.logical_size();
+            refresh_period = Duration::from_nanos(1_000_000_000_000_u64 / u64::from(mode.refresh_millihertz().max(1)));
+            mode_blob = kms.create_mode_blob(&mode).map_err(app_error)?;
+            renderer::prepare(&kms, gbm.as_ref(), &topology, connector, mode_blob.id(), physical_extent, renderer)?
+        }
+    };
+    #[cfg(feature = "shell-screencast-linux")]
+    let capture_output_label = format!("{} ({} × {})", selected_output.description.name, physical_extent.width, physical_extent.height);
     let crtc_index = scanout.crtc_index;
     let crtc = scanout.crtc;
     let plane = topology
@@ -250,7 +262,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let crtc_properties = &scanout.crtc_properties;
     let plane_properties = &scanout.plane_properties;
     let scanout_buffers = &mut scanout.buffers;
-    let framebuffers = &scanout.framebuffers;
+    let framebuffers = &mut scanout.framebuffers;
     let desktop_renderer = &mut scanout.renderer;
     let mut frame_slots = framebuffers
         .iter()
@@ -386,7 +398,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 .join("telorgon/xwayland")
         });
         match compatibility::Compatibility::prepare(
-            xwayland_access,
+            xwayland_access.clone(),
             crate::integrations::x11::payload::embedded(),
             cache,
             runtime_directory.clone(),
@@ -721,6 +733,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     let mut widget_keys = BTreeSet::new();
     let mut shutdown_started = None::<Instant>;
     let mut close_requested = std::collections::BTreeSet::new();
+    let mut live_display = display_settings::DisplaySession::new(config.display_control.clone(),
+        connector, mode_index, scale_policy, output_scale.get(), &runtime_wake);
 
     loop {
         wayland.dispatch_clipboard(session_locked);
@@ -854,6 +868,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                 portal.previews.wait(wait, start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
             })
         } else { wait };
+        let wait = live_display.wait(wait);
         // Service deadlines may shorten pacing, but known IO must never be delayed.
         let wait = if io_ready { Some(Duration::ZERO) } else { wait };
         display.dispatch_and_flush(wait).map_err(app_error)?;
@@ -998,6 +1013,72 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
             }
         }
 
+
+        // Display changes run only after both KMS and GPU ownership have returned.
+        if !first_modeset && seat.state() == SeatState::Enabled && presentation.pending().is_none()
+            && frame_slots.iter().all(|s| !matches!(s.state,
+                FrameSlotState::Rendering | FrameSlotState::GpuSubmitted | FrameSlotState::FlipQueued)) {
+            let changed = live_display.process(session_locked, |desired, previous_pool| {
+                let applied = display_settings::apply(desired, previous_pool, &kms, gbm.as_ref(), connector,
+                    mode_index, crtc, plane.id, connector_properties, crtc_properties, plane_properties,
+                    desktop_renderer, scanout_buffers, framebuffers)?;
+                // OutputState was validated before the modeset. Updating this known output also
+                // sends wl_output and fractional-scale notifications to connected clients.
+                if let Err(error) = wayland.update_output(1, applied.output.clone()) {
+                    eprintln!("telorgon-display: output announcement failed: {error}");
+                }
+                let mode_changed = applied.blob.is_some();
+                if let Some(blob) = applied.blob { mode_blob = blob; }
+                mode_index = applied.index;
+                physical_extent = connector.modes[mode_index].size();
+                output_scale = applied.scale;
+                extent = applied.output.logical_size();
+                if mode_changed {
+                    refresh_period = Duration::from_nanos(1_000_000_000_000_u64 /
+                        u64::from(connector.modes[mode_index].refresh_millihertz().max(1)));
+                    presentation = presentation::Scheduler::new(refresh_period);
+                    frame_slots = framebuffers.iter().enumerate().map(|(i, fb)| FrameSlot::new(i, fb.id())).collect();
+                    frame_slots[0].state = FrameSlotState::ScanningOut;
+                    current_scanout = Some(0);
+                    frame_surface_revisions.iter_mut().for_each(Vec::clear);
+                    transition_probes = transition_probe::Probe::new(refresh_period);
+                    capture_cursor = capture_cursor::CaptureCursor::new(physical_extent);
+                    capture_cursor_visual = None;
+                }
+                if !mode_changed {
+                    while let Some(slot) = presentation.take_ready_frame() {
+                        if let Err(error) = frame_slots[slot].discard_ready() {
+                            eprintln!("telorgon-display: stale frame could not be retired: {error}");
+                        }
+                        frame_surface_revisions[slot].clear();
+                    }
+                    presentation = presentation::Scheduler::new(refresh_period);
+                }
+                #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
+                xwayland_access.set_coordinate_scale(output_scale.get().ceil() as i32);
+                for frame in frame_layers.values_mut() { frame.layer.runtime.set_raster_scale(output_scale); }
+                for widget in &mut widgets { widget.layer.runtime.set_raster_scale(output_scale); }
+                for (_, icon) in &mut icon_layers { icon.runtime.set_raster_scale(output_scale); }
+                if let Some(pointer) = &mut pointer { pointer.runtime.set_raster_scale(output_scale); }
+                widget_services.publish_output_size(SizeF { width: extent.width as f32, height: extent.height as f32 });
+                pointer_position.x = pointer_position.x.clamp(0.0, (extent.width - 1).max(0) as f32);
+                pointer_position.y = pointer_position.y.clamp(0.0, (extent.height - 1).max(0) as f32);
+                if let Some(cursor) = &mut hardware_cursor { cursor.move_to(output_scale.physical_point(pointer_position)); }
+                for window in windows.values_mut().filter(|w| !w.fullscreen && !w.maximized && w.virtual_output.is_none()) {
+                    window.position.x = window.position.x.clamp(0, (extent.width - window.requested_size.width).max(0));
+                    window.position.y = window.position.y.clamp(0, (extent.height - config.titlebar_height).max(0));
+                    window.last_policy_request = None;
+                }
+                let fullscreen = windows.iter().filter(|(_, w)| w.fullscreen).map(|(id, _)| *id).collect::<Vec<_>>();
+                for id in fullscreen {
+                    if let Err(error) = set_window_fullscreen(&mut windows, &mut configure_scheduler, id, true, extent, &config) {
+                        eprintln!("telorgon-display: fullscreen resize failed: {error}");
+                    }
+                }
+                Ok(output_scale.get())
+            });
+            if changed { repaint = true; continue; }
+        }
 
         latency_trace.phase("xwm_dispatch");
         #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
@@ -1954,7 +2035,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         if widget_pointer_scroll(
                             &mut widgets,
                             pointer_position,
-                            widget_scroll_distance(horizontal, vertical, discrete_x, discrete_y),
+                            widget_scroll_input(horizontal, vertical, discrete_x, discrete_y),
                             schedule_now,
                             session_locked,
                         )? {
@@ -4354,9 +4435,10 @@ fn output_state(
     OutputState::new(
         OutputDescription {
             name: name.clone(),
-            description: format!("Telorgon output {name}"),
-            make: "Unknown".to_owned(),
-            model: name,
+            description: connector.identity.name.as_ref()
+                .map_or_else(|| connector.name(), |model| format!("{model} ({})", connector.name())),
+            make: connector.identity.manufacturer.clone().unwrap_or_else(|| "Unknown".to_owned()),
+            model: connector.identity.name.clone().unwrap_or_else(|| connector.name()),
             physical_millimeters: connector.physical_millimeters,
             logical_position: PointI::default(),
             scale,

@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use crate::foundation::{ColorRgba8, EdgeInsets};
 use crate::ui::{
-    Background, Border, BoxDecoration, BoxStyle, ComponentStyleId, CornerRadii, SizeRule,
-    SizeRule2D, StylePropertyPatch, ThemeDomainId,
+    Background, Border, BoxDecoration, BoxStyle, ComponentStyleId, CornerRadii, LayoutStyle,
+    Outline, Shadow, ShadowList, SizeRule, SizeRule2D, StylePropertyPatch, ThemeDomainId,
 };
 
 use crate::authoring::compose::{
-    Component, ComponentCallback, Element, ElementKind, Insets, Key, View,
+    Alignment, Component, ComponentCallback, Element, ElementKind, EventContext, Insets, Key, View,
 };
 
 #[doc(hidden)]
@@ -19,6 +19,7 @@ pub struct ButtonElement {
     pub enabled: bool,
     pub busy: bool,
     pub style: BoxStyle,
+    pub layout: LayoutStyle,
     pub style_id: ComponentStyleId,
     pub style_override: StylePropertyPatch,
     pub inline_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
@@ -44,7 +45,6 @@ impl Button {
         self.pointer_request = Some(icon.into().into());
         self
     }
-
 
     pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
         self.hover_effects.push(effect);
@@ -103,6 +103,10 @@ impl Button {
         self
     }
 
+    pub fn maybe(self, condition: bool, child: impl View) -> Self {
+        if condition { self.child(child) } else { self }
+    }
+
     /// Overrides the accessible name normally derived from child content.
     pub fn accessible_label(mut self, label: impl Into<String>) -> Self {
         self.element.accessible_label = Some(label.into());
@@ -114,14 +118,20 @@ impl Button {
         self
     }
 
-    pub fn on_press<C, F>(mut self, callback: F) -> Self
+    pub fn on_press<C, F>(self, callback: F) -> Self
     where
         C: Component,
         F: Fn(&mut C) + 'static,
     {
-        self.element.on_press = Some(ComponentCallback::for_component(
-            move |component, _event| callback(component),
-        ));
+        self.on_press_event(move |component, _event| callback(component))
+    }
+
+    pub fn on_press_event<C, F>(mut self, callback: F) -> Self
+    where
+        C: Component,
+        F: Fn(&mut C, &mut EventContext) + 'static,
+    {
+        self.element.on_press = Some(ComponentCallback::for_component(callback));
         self
     }
 
@@ -142,6 +152,31 @@ impl Button {
     pub fn box_style(mut self, style: BoxStyle) -> Self {
         self.element.style = style;
         self
+    }
+
+    pub fn layout_style(mut self, layout: LayoutStyle) -> Self {
+        self.element.layout = layout;
+        self
+    }
+
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.element.layout.gap = gap;
+        self
+    }
+
+    pub fn justify_content(mut self, alignment: Alignment) -> Self {
+        self.element.layout.main_axis_alignment = alignment.into();
+        self
+    }
+
+    pub fn align_items(mut self, alignment: Alignment) -> Self {
+        self.element.layout.cross_axis_alignment = alignment.into();
+        self
+    }
+
+    pub fn center_content(self) -> Self {
+        self.justify_content(Alignment::Center)
+            .align_items(Alignment::Center)
     }
 
     #[deprecated(since = "0.1.12", note = "use `box_style` for normalized vocabulary")]
@@ -169,6 +204,36 @@ impl Button {
         self
     }
 
+    pub fn corner_radii(mut self, radii: CornerRadii) -> Self {
+        self.element.style.decoration.corner_radii = radii;
+        self
+    }
+
+    pub fn border_sides(mut self, border: Border) -> Self {
+        self.element.style.decoration.border = border;
+        self
+    }
+
+    pub fn outline(mut self, outline: Outline) -> Self {
+        self.element.style.decoration.outline = outline;
+        self
+    }
+
+    pub fn shadow(mut self, shadow: Shadow) -> Self {
+        self.element.style.decoration.shadows = ShadowList::one(shadow);
+        self
+    }
+
+    pub fn shadows(mut self, shadows: ShadowList) -> Self {
+        self.element.style.decoration.shadows = shadows;
+        self
+    }
+
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.element.style.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
     /// Derives an automatic axis from the other using width divided by height.
     pub fn aspect_ratio(mut self, ratio: f32) -> Self {
         self.element.style.aspect_ratio = Some(ratio);
@@ -192,6 +257,11 @@ impl Button {
 
     pub fn padding(mut self, padding: impl Into<Insets>) -> Self {
         self.element.style.padding = padding.into().0;
+        self
+    }
+
+    pub fn margin(mut self, margin: impl Into<Insets>) -> Self {
+        self.element.style.margin = margin.into().0;
         self
     }
 
@@ -294,6 +364,11 @@ pub fn button() -> Button {
             enabled: true,
             busy: false,
             style,
+            layout: LayoutStyle {
+                main_axis_alignment: Alignment::Center.into(),
+                cross_axis_alignment: Alignment::Center.into(),
+                ..LayoutStyle::default()
+            },
             style_id: ComponentStyleId::named(ThemeDomainId::APPLICATION, "button", "default"),
             style_override: StylePropertyPatch::default(),
             inline_style: None,

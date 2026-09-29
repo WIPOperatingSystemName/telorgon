@@ -11,6 +11,7 @@ use crate::authoring::compose::{Alignment, Dimension, Element, ElementKind, Inse
 pub struct ContainerElement {
     pub inline_style: Option<std::sync::Arc<crate::theme::CompiledComponentStyle>>,
     pub hover_within: bool,
+    pub effects: super::interaction::InteractionEffects,
     pub scrollable: bool,
     pub style: BoxStyle,
     pub layout: LayoutStyle,
@@ -21,15 +22,56 @@ pub struct ContainerElement {
 #[derive(Debug)]
 pub struct Container {
     key: Option<Key>,
+    pointer_request: Option<crate::PointerRequest>,
     element: ContainerElement,
     explicit_width: bool,
     explicit_height: bool,
 }
 
 impl Container {
+    pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
+        self.pointer_request = Some(icon.into().into());
+        self
+    }
+
+    pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
+        self.element.effects.hover.push(effect);
+        self
+    }
+    pub fn hover_effects(
+        mut self,
+        effects: impl IntoIterator<Item = super::interaction::InteractionEffect>,
+    ) -> Self {
+        self.element.effects.hover.extend(effects);
+        self
+    }
+    pub fn hover_transition(mut self, transition: crate::theme::TransitionSpec) -> Self {
+        self.element.effects.hover_transition = Some(transition);
+        self
+    }
+
+    pub fn press_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
+        self.element.effects.press.push(effect);
+        self
+    }
+    pub fn press_effects(
+        mut self,
+        effects: impl IntoIterator<Item = super::interaction::InteractionEffect>,
+    ) -> Self {
+        self.element.effects.press.extend(effects);
+        self
+    }
+    pub fn press_transition(mut self, transition: crate::theme::TransitionSpec) -> Self {
+        self.element.effects.press_transition = Some(transition);
+        self
+    }
+
     /// Installs a code-defined state style without registering it in the application theme.
     /// Styling alone does not enable descendant hover tracking.
-    pub fn inline_style(mut self, style: std::sync::Arc<crate::theme::CompiledComponentStyle>) -> Self {
+    pub fn inline_style(
+        mut self,
+        style: std::sync::Arc<crate::theme::CompiledComponentStyle>,
+    ) -> Self {
         self.element.inline_style = Some(style);
         self
     }
@@ -51,7 +93,10 @@ impl Container {
 
     /// Wraps equal-size cells into as many columns as the available width permits.
     pub fn grid(mut self, cell_width: u16, cell_height: u16) -> Self {
-        self.element.layout.flow = Flow::Grid { cell_width: cell_width.max(1), cell_height: cell_height.max(1) };
+        self.element.layout.flow = Flow::Grid {
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
+        };
         self.element.style.height = SizeRule::Shrink;
         self.element.style.max_size.height = SizeRule::Logical(f32::MAX);
         self
@@ -236,18 +281,24 @@ impl View for Container {
                 self.element.style.width = SizeRule::Shrink;
             }
         }
-        Element::from_kind(self.key, ElementKind::Container(self.element))
+        let element = Element::from_kind(self.key, ElementKind::Container(self.element));
+        match self.pointer_request {
+            Some(request) => element.with_pointer_request(request),
+            None => element,
+        }
     }
 }
 
 fn container(flow: Flow) -> Container {
     Container {
         key: None,
+        pointer_request: None,
         explicit_width: false,
         explicit_height: false,
         element: ContainerElement {
             inline_style: None,
             hover_within: false,
+            effects: Default::default(),
             scrollable: false,
             style: BoxStyle {
                 width: SizeRule::Fill(1.0),

@@ -112,34 +112,35 @@ impl CompositionDriver {
                     node,
                     style,
                     layout,
+                    effect_properties,
+                    has_local_style,
                     children,
                 },
                 ElementKind::Container(candidate),
             ) if (ui.kinds.get(*node) == Some(&crate::ui::NodeKind::Scroll)) == candidate.scrollable => {
-                ui.set_box_style(*node, candidate.style);
+                let local_style = candidate.effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "box", "default"),
+                    &candidate.style, StylePropertyPatch::default(), candidate.inline_style.as_deref(),
+                ).or(candidate.inline_style.clone());
+                if *style != candidate.style
+                    || (*effect_properties & !candidate.effects.mask()) != 0
+                    || (*has_local_style && local_style.is_none())
+                {
+                    ui.set_box_style(*node, candidate.style);
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("root"));
+                }
                 let mut next_layout = candidate.layout;
                 if candidate.scrollable {
                     next_layout.scroll_offset = ui.layouts.get(*node).map_or(crate::PointF::default(), |l| l.scroll_offset);
                 }
                 ui.set_layout_style(*node, next_layout);
                 ui.set_hover_within(*node, candidate.hover_within);
-                if let Some(style) = candidate.inline_style.as_ref() {
-                    ui.set_style_id(*node, style.id);
-                    if !ui
-                        .style_bindings()
-                        .iter()
-                        .any(|binding| binding.state_root == *node)
-                    {
-                        ui.register_style_binding(
-                            StyleBinding::new(*node, ThemeScopeId::new(0, 1), style.id)
-                                .slot(StyleSlotId::named("root"), *node)
-                                .local_style(style.clone()),
-                        );
-                    }
-                }
-                ui.set_local_component_style(*node, candidate.inline_style.clone());
+                ui.set_visual_interaction(*node, candidate.effects.has_hover(), candidate.effects.has_press());
+                *has_local_style = local_style.is_some();
+                ui.set_visual_style(*node, local_style, *has_local_style || candidate.hover_within, candidate.inline_style.is_none());
                 *style = candidate.style;
                 *layout = candidate.layout;
+                *effect_properties = candidate.effects.mask();
                 let previous = std::mem::take(children);
                 *children =
                     match self.reconcile_children(ui, *node, previous, candidate.children, owner) {
@@ -153,10 +154,21 @@ impl CompositionDriver {
             }
             (MountedKind::Text { node, props }, ElementKind::Text(candidate)) => {
                 ui.set_dynamic_text(*node, &candidate.content);
-                let style = candidate.style.resolve_with(|family| ui.intern(family));
-                ui.set_text_style(*node, style);
-                ui.set_box_style(*node, candidate.box_style);
+                if props.style != candidate.style {
+                    let style = candidate.style.resolve_with(|family| ui.intern(family));
+                    ui.set_text_style(*node, style);
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("root"));
+                }
+                if props.box_style != candidate.box_style || props.effects.mask() & !candidate.effects.mask() != 0 {
+                    ui.set_box_style(*node, candidate.box_style);
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("root"));
+                }
                 ui.set_layout_style(*node, candidate.layout);
+                ui.set_visual_interaction(*node, candidate.effects.has_hover(), false);
+                ui.set_visual_style(*node, candidate.effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "text", "default"),
+                    &candidate.box_style, StylePropertyPatch::default(), None,
+                ), candidate.effects.active(), true);
                 *props = candidate;
                 Ok(())
             }
@@ -172,8 +184,16 @@ impl CompositionDriver {
                         candidate.tint,
                     );
                 }
-                ui.set_box_style(*node, candidate.style);
+                if props.style != candidate.style || props.effects.mask() & !candidate.effects.mask() != 0 {
+                    ui.set_box_style(*node, candidate.style);
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("root"));
+                }
                 ui.set_layout_style(*node, candidate.layout);
+                ui.set_visual_interaction(*node, candidate.effects.has_hover(), false);
+                ui.set_visual_style(*node, candidate.effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "image", "default"),
+                    &candidate.style, StylePropertyPatch::default(), None,
+                ), candidate.effects.active(), true);
                 match &candidate.accessible_label {
                     Some(label) => {
                         let name = ui.intern(label);
@@ -201,6 +221,7 @@ impl CompositionDriver {
                 },
                 ElementKind::Button(mut candidate),
             ) => {
+                ui.set_layout_style(*node, candidate.layout);
                 // The mounted style includes resolved theme/inline properties. A parent
                 // update must not reset those to identical authored defaults: unchanged
                 // bindings will not resolve again until an interaction state changes.
@@ -252,18 +273,25 @@ impl CompositionDriver {
                 },
                 ElementKind::Toggle(candidate),
             ) => {
+                let previous = checkbox_styles(props.value, props.enabled);
                 let styles = checkbox_styles(candidate.value, candidate.enabled);
-                ui.set_box_style(*node, styles.container);
-                ui.set_box_style(*indicator, styles.indicator);
-                ui.set_box_style(*check_first, styles.check_first);
-                ui.set_box_style(*check_second, styles.check_second);
-                ui.set_box_style(*mixed, styles.mixed);
+                reconcile_compound_box(ui, *node, "root", *node, props.style, candidate.style,
+                    props.effects.mask() & !candidate.effects.mask() != 0);
+                reconcile_compound_box(ui, *node, "indicator", *indicator, previous.indicator, styles.indicator, false);
+                reconcile_compound_box(ui, *node, "check-start", *check_first, previous.check_first, styles.check_first, false);
+                reconcile_compound_box(ui, *node, "check-end", *check_second, previous.check_second, styles.check_second, false);
+                reconcile_compound_box(ui, *node, "mixed", *mixed, previous.mixed, styles.mixed, false);
+                ui.set_local_component_style(*node, candidate.local_style());
+                reconcile_compound_label_gap(ui, *label, &props.label, &candidate.label);
                 ui.set_dynamic_text(*label, &candidate.label);
-                ui.set_text_style(*label, control_label_style(candidate.enabled));
+                if props.enabled != candidate.enabled {
+                    ui.set_text_style(*label, control_label_style(candidate.enabled));
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("label"));
+                }
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_checked(*node, candidate.value != SemanticCheckState::Unchecked);
                 ui.set_mixed(*node, candidate.value == SemanticCheckState::Mixed);
-                let name = ui.intern(&candidate.label);
+                let name = ui.intern(candidate.accessible_label.as_deref().unwrap_or(&candidate.label));
                 let _ = ui.set_semantics(*node, toggle_semantics(name, &candidate));
                 match &candidate.on_change {
                     Some(handler) => {
@@ -292,20 +320,26 @@ impl CompositionDriver {
                 },
                 ElementKind::Toggle(candidate),
             ) => {
-                let mut styles = switch_styles(
+                let previous = switch_styles(props.value == SemanticCheckState::Checked, props.enabled);
+                let styles = switch_styles(
                     candidate.value == SemanticCheckState::Checked,
                     candidate.enabled,
                 );
-                if let Some(width) = candidate.width { styles.container.width = crate::ui::SizeRule::Logical(width); }
-                ui.set_box_style(*node, styles.container);
-                ui.set_box_style(*track, styles.track);
-                ui.set_box_style(*thumb, styles.thumb);
+                reconcile_compound_box(ui, *node, "root", *node, props.style, candidate.style,
+                    props.effects.mask() & !candidate.effects.mask() != 0);
+                reconcile_compound_box(ui, *node, "track", *track, previous.track, styles.track, false);
+                reconcile_compound_box(ui, *node, "thumb", *thumb, previous.thumb, styles.thumb, false);
+                ui.set_local_component_style(*node, candidate.local_style());
+                reconcile_compound_label_gap(ui, *label, &props.label, &candidate.label);
                 ui.set_dynamic_text(*label, &candidate.label);
-                ui.set_text_style(*label, control_label_style(candidate.enabled));
+                if props.enabled != candidate.enabled {
+                    ui.set_text_style(*label, control_label_style(candidate.enabled));
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("label"));
+                }
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_checked(*node, candidate.value == SemanticCheckState::Checked);
                 ui.set_mixed(*node, false);
-                let name = ui.intern(&candidate.label);
+                let name = ui.intern(candidate.accessible_label.as_deref().unwrap_or(&candidate.label));
                 let _ = ui.set_semantics(*node, toggle_semantics(name, &candidate));
                 match &candidate.on_change {
                     Some(handler) => {
@@ -337,15 +371,23 @@ impl CompositionDriver {
                 },
                 ElementKind::Slider(candidate),
             ) => {
-                let styles = slider_styles(candidate.value, candidate.enabled, candidate.width.into());
-                ui.set_box_style(*node, styles.container);
-                ui.set_box_style(*track, styles.track);
-                ui.set_box_style(*fill, styles.fill);
-                ui.set_box_style(*thumb, styles.thumb);
+                let previous = slider_styles(props.value, props.enabled, props.style.width);
+                let styles = slider_styles(candidate.value, candidate.enabled, candidate.style.width);
+                reconcile_compound_box(ui, *node, "root", *node, props.style, candidate.style,
+                    props.effects.mask() & !candidate.effects.mask() != 0);
+                reconcile_compound_box(ui, *node, "track", *track, previous.track, styles.track, false);
+                reconcile_compound_box(ui, *node, "fill", *fill, previous.fill, styles.fill, false);
+                reconcile_compound_box(ui, *node, "thumb", *thumb, previous.thumb, styles.thumb,
+                    props.thumb_effect_mask() & !candidate.thumb_effect_mask() != 0);
+                ui.set_local_component_style(*node, candidate.local_style(&styles.thumb));
                 ui.set_box_style(*before_thumb, styles.before_thumb);
                 ui.set_box_style(*after_thumb, styles.after_thumb);
+                reconcile_compound_label_gap(ui, *label, &props.label, &candidate.label);
                 ui.set_dynamic_text(*label, &candidate.label);
-                ui.set_text_style(*label, control_label_style(candidate.enabled));
+                if props.enabled != candidate.enabled {
+                    ui.set_text_style(*label, control_label_style(candidate.enabled));
+                    ui.reset_style_slot_motion(*node, StyleSlotId::named("label"));
+                }
                 ui.set_disabled(*node, !candidate.enabled);
                 ui.set_control_value(*node, candidate.value);
                 let name = ui.intern(candidate.accessible_label.as_deref().unwrap_or(&candidate.label));

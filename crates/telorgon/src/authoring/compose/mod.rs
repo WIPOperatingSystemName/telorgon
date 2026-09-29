@@ -5,6 +5,7 @@
 
 mod component;
 mod components;
+pub(crate) use components::compile_slot_effects;
 pub(crate) mod context;
 mod element;
 mod event;

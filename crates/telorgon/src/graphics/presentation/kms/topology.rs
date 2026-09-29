@@ -79,9 +79,24 @@ pub struct KmsConnector {
     pub connector_type_id: u32,
     pub status: ConnectorStatus,
     pub physical_millimeters: SizeI,
+    pub identity: super::KmsMonitorIdentity,
     pub modes: Vec<KmsConnectorMode>,
     pub possible_encoders: Vec<u32>,
     pub possible_crtcs_mask: u32,
+}
+
+impl KmsConnector {
+    pub fn name(&self) -> String {
+        let kind = match self.connector_type {
+            1 => "VGA", 2 => "DVI-I", 3 => "DVI-D", 4 => "DVI-A",
+            5 => "Composite", 6 => "SVIDEO", 7 => "LVDS", 8 => "Component",
+            9 => "DIN", 10 => "DP", 11 => "HDMI-A", 12 => "HDMI-B",
+            13 => "TV", 14 => "eDP", 15 => "Virtual", 16 => "DSI",
+            17 => "DPI", 18 => "Writeback", 19 => "SPI", 20 => "USB",
+            _ => return format!("DRM-{}-{}", self.connector_type, self.connector_type_id),
+        };
+        format!("{kind}-{}", self.connector_type_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +294,14 @@ fn query_connector(device: &KmsDevice, id: u32) -> Result<Option<KmsConnector>, 
             .ok_or_else(|| KmsError::new(KmsErrorKind::Native, "DRM returned connector id zero"))?,
         connector_type: connector.connector_type,
         connector_type_id: connector.connector_type_id,
+        // Missing/unreadable EDID must not prevent an otherwise usable output from starting.
+        identity: KmsTopology::object_properties(device, connector.connector_id, KmsPropertyObject::Connector)
+            .ok()
+            .and_then(|properties| properties.named("EDID").and_then(|p| u32::try_from(p.value).ok()))
+            .filter(|id| *id != 0)
+            .and_then(|id| device.read_property_blob(id, 128 * 256).ok())
+            .and_then(|bytes| super::KmsMonitorIdentity::from_edid(&bytes))
+            .unwrap_or_default(),
         status: match connector.connection {
             DRM_MODE_CONNECTED => ConnectorStatus::Connected,
             2 => ConnectorStatus::Disconnected,

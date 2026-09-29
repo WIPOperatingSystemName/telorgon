@@ -3,6 +3,8 @@
 //! This package is intentionally independent of Winit, X11, wlroots, and Rust compositor stacks.
 
 mod model;
+mod edid;
+pub use edid::KmsMonitorIdentity;
 
 #[cfg(target_os = "linux")]
 pub mod ffi;

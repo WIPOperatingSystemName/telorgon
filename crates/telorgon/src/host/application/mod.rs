@@ -7,6 +7,7 @@ pub(super) mod declaration;
 mod capture_config;
 pub use capture_config::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
     WaylandCapture, CaptureProtocols, DirectCaptureAccess, InternalCapture};
+pub mod display_control;
 mod output_scale;
 pub use output_scale::OutputScale;
 mod delta_queue;
@@ -21,12 +22,12 @@ mod interaction;
 mod keybindings;
 #[cfg(any(
     feature = "application-software",
-    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))
 ))]
 mod native;
 #[cfg(any(
     feature = "application-software",
-    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 pub(super) mod profiler;
@@ -125,6 +126,7 @@ pub(crate) mod portal_wire;
 mod portal_picker_client;
 
 mod scroll;
+pub use scroll::WheelScrollSettings;
 
 #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
 mod portal_picker_application;

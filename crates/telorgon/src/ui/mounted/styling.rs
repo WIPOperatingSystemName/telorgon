@@ -242,6 +242,90 @@ impl MountedUi {
         }
     }
 
+    pub(crate) fn reset_style_slot_motion(&mut self, node: NodeId, slot: StyleSlotId) {
+        if let Some(index) = self.style_bindings.iter().position(|binding| {
+            binding.slots.iter().any(|target| {
+                target.slot == slot
+                    && if slot == StyleSlotId::named("root") {
+                        target.node == node
+                    } else {
+                        binding.state_root == node
+                    }
+            })
+        }) {
+            let binding = &mut self.style_bindings[index];
+            if !binding.reset_style_slots.contains(&slot) {
+                binding.reset_style_slots.push(slot);
+            }
+            binding.theme_revision = 0;
+            self.enqueue_style_binding(index);
+        }
+    }
+
+    /// Passive visuals own their explicitly requested state without retaining a second,
+    /// inherited foundation binding competing for the same node's paint properties.
+    pub(crate) fn set_visual_style(
+        &mut self,
+        node: NodeId,
+        style: Option<Arc<crate::theme::CompiledComponentStyle>>,
+        own: bool,
+        overlay: bool,
+    ) -> bool {
+        let slot = StyleSlotBinding {
+            slot: StyleSlotId::named("root"),
+            node,
+        };
+        let Some(index) = self
+            .style_bindings
+            .iter()
+            .position(|binding| binding.slots.as_slice() == [slot])
+        else {
+            return false;
+        };
+        let parent_control = self
+            .nodes
+            .core(node)
+            .and_then(|core| core.parent)
+            .and_then(|parent| self.nearest_control(parent));
+        let control = self
+            .interactions
+            .get(node)
+            .is_some_and(|interaction| interaction.behavior != ControlBehavior::None);
+        let state_root = if own || control {
+            node
+        } else {
+            parent_control.unwrap_or(node)
+        };
+        let inherited_state_root = if own && !control {
+            parent_control
+        } else {
+            None
+        };
+        let binding = &mut self.style_bindings[index];
+        let reparented = binding.state_root != state_root;
+        if reparented
+            || binding.local_style != style
+            || binding.local_style_overlay != overlay
+            || binding.inherited_state_root != inherited_state_root
+        {
+            binding.state_root = state_root;
+            binding.inherited_state_root = inherited_state_root;
+            binding.local_style = style;
+            binding.local_style_overlay = overlay;
+            binding.theme_revision = 0;
+            binding.interaction_revision = 0;
+            binding.inherited_interaction_revision = 0;
+            if reparented {
+                binding.reset_style_slots.push(slot.slot);
+                self.rebuild_style_binding_index();
+            } else {
+                self.enqueue_style_binding(index);
+            }
+            return true;
+        }
+        false
+    }
+
     /// Requalifies automatically mounted foundation bindings for an application or shell view.
     pub fn set_theme_domain(&mut self, domain: ThemeDomainId, scope: ThemeScopeId) {
         for (index, binding) in self.style_bindings.iter_mut().enumerate() {

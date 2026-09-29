@@ -1,6 +1,6 @@
 #![cfg(any(
     feature = "application-software",
-    feature = "application-vulkan-windows"
+    feature = "application-vulkan"
 ))]
 
 use std::num::NonZeroU16;

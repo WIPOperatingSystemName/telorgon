@@ -1,7 +1,7 @@
 #![cfg(all(
     feature = "application-software",
     any(
-        feature = "application-vulkan-windows",
+        feature = "application-vulkan",
         feature = "shell-wayland-linux",
         feature = "embedded-vulkan"
     )

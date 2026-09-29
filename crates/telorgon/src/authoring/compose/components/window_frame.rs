@@ -1,12 +1,16 @@
 use std::marker::PhantomData;
 
-use crate::authoring::compose::{Alignment, Container, Dimension, Element, Insets, Key, View, stack};
+use crate::authoring::compose::{
+    Alignment, Container, Dimension, Element, Insets, Key, View, stack,
+};
 use crate::foundation::ColorRgba8;
+use crate::shell::window_chrome::{
+    ShellActionId, WindowAction, WindowChromeRole, WindowResizeEdge,
+};
 use crate::ui::{
     Background, Border, BoxDecoration, BoxStyle, CornerRadii, LayoutStyle, Outline, Overflow,
     Shadow, ShadowList,
 };
-use crate::shell::window_chrome::{ShellActionId, WindowAction, WindowChromeRole, WindowResizeEdge};
 
 pub struct MissingContent;
 pub struct HasContent;
@@ -18,6 +22,11 @@ pub struct WindowFrame<State = MissingContent> {
 }
 
 impl<State> WindowFrame<State> {
+    pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
+        self.root = self.root.cursor(icon);
+        self
+    }
+
     pub fn child(mut self, child: impl View) -> Self {
         self.root = self.root.child(child);
         self
@@ -59,6 +68,11 @@ impl<State> WindowFrame<State> {
 
     pub fn align_items(mut self, alignment: Alignment) -> Self {
         self.root = self.root.align_items(alignment);
+        self
+    }
+
+    pub fn center_content(mut self) -> Self {
+        self.root = self.root.center_content();
         self
     }
 
@@ -179,10 +193,29 @@ pub struct WindowContentSlot {
 }
 
 impl WindowContentSlot {
+    pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
+        self.content = self.content.cursor(icon);
+        self
+    }
+
     /// Adds managed GUI content to this slot. Server-side compositor frames normally leave it
     /// empty because the hosted Wayland surface is composited into the same bounds externally.
     pub fn child(mut self, child: impl View) -> Self {
         self.content = self.content.child(child);
+        self
+    }
+
+    pub fn children<I, V>(mut self, children: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: View,
+    {
+        self.content = self.content.children(children);
+        self
+    }
+
+    pub fn maybe(mut self, condition: bool, child: impl View) -> Self {
+        self.content = self.content.maybe(condition, child);
         self
     }
 
@@ -344,3 +377,36 @@ pub trait WindowChromeViewExt: View + Sized {
 }
 
 impl<T: View> WindowChromeViewExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authoring::compose::{ElementKind, text};
+
+    #[test]
+    fn common_modifiers_preserve_the_frame_content_slot_contract() {
+        let frame = window_frame()
+            .cursor(crate::CursorIcon::Move)
+            .center_content()
+            .content_slot(
+                window_content_slot()
+                    .cursor(crate::CursorIcon::Default)
+                    .children([text("First"), text("Second")])
+                    .maybe(false, text("Excluded"))
+                    .maybe(true, text("Third")),
+            )
+            .cursor(crate::CursorIcon::Grab)
+            .child(text("Title"))
+            .into_element();
+        let (_, ElementKind::Container(root), role, _, cursor) = frame.into_parts() else {
+            panic!("expected a frame container")
+        };
+        assert_eq!(role, Some(WindowChromeRole::Frame));
+        assert_eq!(cursor, Some(crate::CursorIcon::Grab.into()));
+        assert_eq!(root.children.len(), 2);
+        let ElementKind::Container(content) = root.children[0].kind() else {
+            panic!("expected a content slot")
+        };
+        assert_eq!(content.children.len(), 3);
+    }
+}

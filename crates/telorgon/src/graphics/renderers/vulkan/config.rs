@@ -23,6 +23,8 @@ pub enum VulkanLiveResizeMode {
 /// This value owns no Vulkan handle and does not imply that a device is available.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VulkanConfig {
+    /// Requires the Khronos validation layer when explicitly enabled. Disabled by default so
+    /// ordinary debug builds can run without Vulkan development tools installed.
     pub enable_validation: bool,
     /// Enables the Windows Vulkan-to-D3D11 external-memory bridge used by the DXGI presenter.
     /// Unsupported adapters retain the Vulkan WSI presenter.
@@ -48,7 +50,7 @@ pub struct VulkanConfig {
 impl Default for VulkanConfig {
     fn default() -> Self {
         Self {
-            enable_validation: cfg!(debug_assertions),
+            enable_validation: false,
             enable_dxgi_presenter: cfg!(target_os = "windows"),
             enable_swapchain_maintenance1: true,
             enable_present_wait: true,

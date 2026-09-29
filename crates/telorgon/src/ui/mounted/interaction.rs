@@ -36,7 +36,20 @@ impl MountedUi {
         self.nodes
             .mark_dirty(node, DirtyFlags::STYLE | DirtyFlags::PAINT);
         self.enqueue_style_bindings_for_state(node);
+        if flag.bits() & !InteractionFlags::ROUTER_OWNED.bits() != 0 {
+            self.enqueue_inherited_style_bindings(node);
+        }
         true
+    }
+
+    pub(super) fn enqueue_inherited_style_bindings(&mut self, node: NodeId) {
+        // Semantic properties change infrequently. Pointer/focus publication never scans
+        // these bindings and continues to use the indexed primary state owners.
+        for index in 0..self.style_bindings.len() {
+            if self.style_bindings[index].inherited_state_root == Some(node) {
+                self.enqueue_style_binding(index);
+            }
+        }
     }
 
     /// Publishes router-owned transient/focus state. This is intentionally separated from
@@ -154,6 +167,27 @@ impl MountedUi {
             cursor = self.nodes.core(current).and_then(|core| core.parent);
         }
         false
+    }
+
+    /// Enables visual pointer states without making the node a control or focus target.
+    pub fn set_visual_interaction(&mut self, node: NodeId, hover: bool, press: bool) -> bool {
+        if !self.nodes.contains(node) {
+            return false;
+        }
+        if self.interactions.get(node).is_none() {
+            if !hover && !press {
+                return false;
+            }
+            self.interactions.insert(node, InteractionSnapshot::default());
+        }
+        let interaction = self.interactions.get_mut(node).unwrap();
+        if interaction.visual_hover == hover && interaction.visual_press == press {
+            return false;
+        }
+        interaction.visual_hover = hover;
+        interaction.visual_press = press;
+        interaction.revision = interaction.revision.wrapping_add(1).max(1);
+        true
     }
 
     pub fn set_hover_within(&mut self, node: NodeId, enabled: bool) -> bool {

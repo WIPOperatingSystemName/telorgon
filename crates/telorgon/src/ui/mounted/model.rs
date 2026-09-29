@@ -602,6 +602,10 @@ pub struct ImageVisual {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct InteractionSnapshot {
     pub flags: InteractionFlags,
+    /// Publish hover on a visual node without registering control behavior.
+    pub visual_hover: bool,
+    /// Publish pointer press on a visual node without activation or focus behavior.
+    pub visual_press: bool,
     /// Include descendants when the input router computes hover for this node.
     pub hover_within: bool,
     pub enabled: bool,
@@ -618,6 +622,8 @@ impl Default for InteractionSnapshot {
     fn default() -> Self {
         Self {
             flags: InteractionFlags::default(),
+            visual_hover: false,
+            visual_press: false,
             hover_within: false,
             enabled: true,
             visible: true,
@@ -800,6 +806,8 @@ pub struct StyleVariantSelection {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleBinding {
     pub state_root: NodeId,
+    /// Optional ancestor supplying component-owned state, never pointer or focus state.
+    pub inherited_state_root: Option<NodeId>,
     pub scope: ThemeScopeId,
     pub component_style: ComponentStyleId,
     pub slots: Vec<StyleSlotBinding>,
@@ -808,14 +816,17 @@ pub struct StyleBinding {
     pub local_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
     pub(crate) local_style_overlay: bool,
     pub(crate) reset_style_motion: bool,
+    pub(crate) reset_style_slots: Vec<StyleSlotId>,
     pub theme_revision: u64,
     pub interaction_revision: u64,
+    pub inherited_interaction_revision: u64,
 }
 
 impl StyleBinding {
     pub fn new(state_root: NodeId, scope: ThemeScopeId, component_style: ComponentStyleId) -> Self {
         Self {
             state_root,
+            inherited_state_root: None,
             scope,
             component_style,
             slots: Vec::new(),
@@ -824,8 +835,10 @@ impl StyleBinding {
             local_style: None,
             local_style_overlay: false,
             reset_style_motion: false,
+            reset_style_slots: Vec::new(),
             theme_revision: 0,
             interaction_revision: 0,
+            inherited_interaction_revision: 0,
         }
     }
 

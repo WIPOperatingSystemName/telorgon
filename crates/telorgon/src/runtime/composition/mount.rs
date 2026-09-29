@@ -58,6 +58,7 @@ impl CompositionDriver {
             ElementKind::Container(ContainerElement {
                 inline_style,
                 hover_within,
+                effects,
                 scrollable,
                 style,
                 layout,
@@ -78,20 +79,22 @@ impl CompositionDriver {
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
                 writer.hover_within(node, hover_within);
-                if let Some(style) = inline_style {
-                    writer.style_id(node, style.id);
-                    writer.style_binding(
-                        StyleBinding::new(node, ThemeScopeId::new(0, 1), style.id)
-                            .slot(StyleSlotId::named("root"), node)
-                            .local_style(style),
-                    );
-                }
+                writer.visual_interaction(node, effects.has_hover(), effects.has_press());
+                let effect_overlay = inline_style.is_none();
+                let local_style = effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "box", "default"),
+                    &style, StylePropertyPatch::default(), inline_style.as_deref(),
+                ).or(inline_style);
+                let has_local_style = local_style.is_some();
+                writer.visual_style(node, local_style, has_local_style || hover_within, effect_overlay);
                 MountedElement {
                     key: None,
                     kind: MountedKind::Container {
                         node,
                         style,
                         layout,
+                        effect_properties: effects.mask(),
+                        has_local_style,
                         children,
                     },
                 }
@@ -104,6 +107,11 @@ impl CompositionDriver {
                     props.box_style,
                     props.layout,
                 );
+                writer.visual_interaction(text.node, props.effects.has_hover(), false);
+                writer.visual_style(text.node, props.effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "text", "default"),
+                    &props.box_style, StylePropertyPatch::default(), None,
+                ), props.effects.active(), true);
                 MountedElement {
                     key: None,
                     kind: MountedKind::Text {
@@ -120,6 +128,11 @@ impl CompositionDriver {
                     props.style,
                     props.layout,
                 );
+                writer.visual_interaction(image.node, props.effects.has_hover(), false);
+                writer.visual_style(image.node, props.effects.compile_for(
+                    ComponentStyleId::named(ThemeDomainId::APPLICATION, "image", "default"),
+                    &props.style, StylePropertyPatch::default(), None,
+                ), props.effects.active(), true);
                 if let Some(label) = &props.accessible_label {
                     let name = writer.intern(label);
                     writer
@@ -150,6 +163,7 @@ impl CompositionDriver {
                 });
                 let children = mounted_children.into_iter().collect::<Result<Vec<_>, _>>()?;
                 writer.hover_within(control.node, true);
+                writer.layout_style(control.node, props.layout);
                 writer.style_id(control.node, props.style_id);
                 let mut binding =
                     StyleBinding::new(control.node, ThemeScopeId::new(0, 1), props.style_id)
@@ -221,12 +235,12 @@ impl CompositionDriver {
                 let mut check_second = None;
                 let mut mixed = None;
                 let mut label = None;
-                let control = writer.toggle_node(styles.container, |writer| {
+                let control = writer.toggle_node(props.style, |writer| {
                     writer.container(
                         BoxStyle::default(),
                         LayoutStyle {
                             flow: Flow::Horizontal,
-                            gap: 8.0,
+                            gap: if props.label.is_empty() { 0.0 } else { 8.0 },
                             ..LayoutStyle::default()
                         },
                         |writer| {
@@ -287,7 +301,7 @@ impl CompositionDriver {
                     control.node,
                     ComponentStyleId::named(ThemeDomainId::APPLICATION, "checkbox", "default"),
                 );
-                writer.style_binding(
+                writer.style_binding(compound_effect_binding(
                     StyleBinding::new(
                         control.node,
                         ThemeScopeId::new(0, 1),
@@ -314,10 +328,13 @@ impl CompositionDriver {
                         StyleSlotId::named("label"),
                         label.expect("checkbox mounts its label"),
                     ),
-                );
+                    props.local_style(),
+                ));
+                writer.hover_within(control.node, true);
                 writer.disabled(control.node, !props.enabled);
                 writer.checked(control.node, props.value != SemanticCheckState::Unchecked);
-                let name = writer.intern(&props.label);
+                writer.mixed(control.node, props.value == SemanticCheckState::Mixed);
+                let name = writer.intern(props.accessible_label.as_deref().unwrap_or(&props.label));
                 writer
                     .semantic_node(control.node, toggle_semantics(name, &props))
                     .map_err(|_| ViewError::MissingButtonLabel)?;
@@ -344,18 +361,17 @@ impl CompositionDriver {
                 })
             }
             ToggleKind::Switch => {
-                let mut styles =
+                let styles =
                     switch_styles(props.value == SemanticCheckState::Checked, props.enabled);
-                if let Some(width) = props.width { styles.container.width = crate::ui::SizeRule::Logical(width); }
                 let mut track = None;
                 let mut thumb = None;
                 let mut label = None;
-                let control = writer.toggle_node(styles.container, |writer| {
+                let control = writer.toggle_node(props.style, |writer| {
                     writer.container(
                         BoxStyle { width: crate::ui::SizeRule::Fill(1.0), ..Default::default() },
                         LayoutStyle {
                             flow: Flow::Horizontal,
-                            gap: 8.0,
+                            gap: if props.label.is_empty() { 0.0 } else { 8.0 },
                             ..LayoutStyle::default()
                         },
                         |writer| {
@@ -395,7 +411,7 @@ impl CompositionDriver {
                     control.node,
                     ComponentStyleId::named(ThemeDomainId::APPLICATION, "switch", "default"),
                 );
-                writer.style_binding(
+                writer.style_binding(compound_effect_binding(
                     StyleBinding::new(
                         control.node,
                         ThemeScopeId::new(0, 1),
@@ -414,10 +430,12 @@ impl CompositionDriver {
                         StyleSlotId::named("label"),
                         label.expect("switch mounts its label"),
                     ),
-                );
+                    props.local_style(),
+                ));
+                writer.hover_within(control.node, true);
                 writer.disabled(control.node, !props.enabled);
                 writer.checked(control.node, props.value == SemanticCheckState::Checked);
-                let name = writer.intern(&props.label);
+                let name = writer.intern(props.accessible_label.as_deref().unwrap_or(&props.label));
                 writer
                     .semantic_node(control.node, toggle_semantics(name, &props))
                     .map_err(|_| ViewError::MissingButtonLabel)?;
@@ -450,14 +468,14 @@ impl CompositionDriver {
         props: SliderElement,
         owner: ComponentInstanceId,
     ) -> Result<MountedElement, ViewError> {
-        let styles = slider_styles(props.value, props.enabled, props.width.into());
+        let styles = slider_styles(props.value, props.enabled, props.style.width);
         let mut track = None;
         let mut fill = None;
         let mut thumb = None;
         let mut before_thumb = None;
         let mut after_thumb = None;
         let mut label = None;
-        let control = writer.slider_node(styles.container, |writer| {
+        let control = writer.slider_node(props.style, |writer| {
             writer.container(
                 BoxStyle {
                     width: SizeRule::Fill(1.0),
@@ -528,7 +546,7 @@ impl CompositionDriver {
             control.node,
             ComponentStyleId::named(ThemeDomainId::APPLICATION, "slider", "default"),
         );
-        writer.style_binding(
+        writer.style_binding(compound_effect_binding(
             StyleBinding::new(
                 control.node,
                 ThemeScopeId::new(0, 1),
@@ -548,7 +566,9 @@ impl CompositionDriver {
                 StyleSlotId::named("label"),
                 label.expect("slider mounts its label"),
             ),
-        );
+            props.local_style(&styles.thumb),
+        ));
+        writer.hover_within(control.node, true);
         writer.disabled(control.node, !props.enabled);
         writer.control_value(control.node, props.value);
         writer.value_track(

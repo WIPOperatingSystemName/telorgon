@@ -154,6 +154,13 @@ pub(crate) mod tests {
         level: f32,
     ) -> AudioNode {
         AudioNode {
+            device: None,
+            profile_device: None,
+            is_virtual: None,
+            media_role: None,
+            advertised_rate: None,
+            advertised_format: None,
+            bluetooth_codec: None,
             handle: ObjectHandle {
                 epoch: 1,
                 incarnation: 1,

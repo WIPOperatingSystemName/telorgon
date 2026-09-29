@@ -15,6 +15,14 @@ pub struct AudioControls {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioNode {
     pub handle: ObjectHandle,
+    pub device: Option<ObjectHandle>,
+    pub profile_device: Option<i32>,
+    pub is_virtual: Option<bool>,
+    pub media_role: Option<String>,
+    /// Advertised node properties, not a claim about the negotiated hardware format.
+    pub advertised_rate: Option<u32>,
+    pub advertised_format: Option<String>,
+    pub bluetooth_codec: Option<String>,
     pub name: String,
     pub description: String,
     pub media_class: String,
@@ -40,6 +48,9 @@ pub struct DeviceChoice {
     /// Associated device/profile indexes advertised by EnumRoute; empty means unknown.
     pub devices: Vec<i32>,
     pub profiles: Vec<i32>,
+    pub priority: Option<i32>,
+    /// SPA direction: 0 input, 1 output. None for profiles or an unreported route direction.
+    pub direction: Option<u32>,
 }
 impl AudioControls {
     pub fn new(connection: ConnectionHandle) -> Result<Self, MediaError> {
@@ -74,6 +85,19 @@ impl AudioControls {
                 };
                 Some(AudioNode {
                     handle: o.handle,
+                    device: o.properties.get("device.id")
+                        .and_then(|id| id.parse::<u32>().ok())
+                        .and_then(|id| snapshot.objects.get(&id))
+                        .filter(|device| device.kind == ObjectKind::Device)
+                        .map(|device| device.handle),
+                    profile_device: o.properties.get("card.profile.device").and_then(|value| value.parse().ok()),
+                    is_virtual: o.properties.get("node.virtual").and_then(|value| match value.as_str() {
+                        "true" | "1" => Some(true), "false" | "0" => Some(false), _ => None,
+                    }),
+                    media_role: o.properties.get("media.role").cloned(),
+                    advertised_rate: o.properties.get("audio.rate").and_then(|value| value.parse().ok()),
+                    advertised_format: o.properties.get("audio.format").cloned(),
+                    bluetooth_codec: o.properties.get("api.bluez5.codec").cloned(),
                     name: o.properties.get("node.name").cloned().unwrap_or_default(),
                     description: o
                         .properties

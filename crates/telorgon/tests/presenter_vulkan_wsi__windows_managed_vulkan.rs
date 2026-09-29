@@ -1,4 +1,4 @@
-#![cfg(feature = "application-vulkan-windows")]
+#![cfg(feature = "application-vulkan")]
 #![cfg(target_os = "windows")]
 
 use std::time::{Duration, Instant};

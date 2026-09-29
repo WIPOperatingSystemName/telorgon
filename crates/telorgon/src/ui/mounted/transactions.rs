@@ -436,6 +436,9 @@ impl MountedUi {
             ) {
                 self.enqueue_style_bindings_for_state(patch.node);
             }
+            if matches!(patch.kind, PropertyKind::Enabled | PropertyKind::Checked | PropertyKind::Busy) {
+                self.enqueue_inherited_style_bindings(patch.node);
+            }
         }
         changed
     }

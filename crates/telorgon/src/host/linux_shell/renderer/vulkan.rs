@@ -177,6 +177,41 @@ pub(in crate::host::linux_shell) struct VulkanShellRenderer {
 }
 
 impl VulkanShellRenderer {
+    pub(super) fn import_live_target(&self, buffer: &GbmBuffer<'_, '_>) -> AppResult<VulkanDmaBufScanoutTarget> {
+        let mut target = PreparedVulkan { device: self.device.clone() }.import(buffer).map_err(app_error)?;
+        // Never scan out uninitialized GPU memory, even for the first transition frame.
+        let mut recording = self.device.begin_owned_frame().map_err(app_error)?;
+        {
+            let view = target.target();
+            let mut context = recording.context_mut();
+            self.device.render_composite(&mut [], &[], &mut context, &view, &RenderRequest {
+                force: true, load: TargetLoad::Clear(ColorRgba8::rgba(0, 0, 0, 255)),
+                store: TargetStore::Store, region: None,
+            }).map_err(app_error)?;
+        }
+        let mut receipt = recording.finish().map_err(app_error)?.submit().map_err(app_error)?;
+        if let Err(error) = receipt.wait(std::time::Duration::from_secs(3)) {
+            // Imported scanout targets are borrowed by recordings, not pinned by receipts.
+            // On failed initialization, drain the queue before destroying the image. This is
+            // explicit mode-generation retirement, outside normal frame submission, with no
+            // queue lock held. A lost device permits resource destruction as well.
+            let idle = unsafe { crate::graphics::renderers::vulkan::interop::wait_presentation_queues_idle(&self.device) };
+            if !matches!(idle, Ok(()) | Err(ash::vk::Result::ERROR_DEVICE_LOST)) {
+                // A poisoned queue lock cannot establish completion. Retain the import until
+                // process exit rather than destroy memory the GPU may still access.
+                std::mem::forget(target);
+            }
+            return Err(app_error(error));
+        }
+        target.mark_initialized();
+        Ok(target)
+    }
+    pub(super) fn exchange_live_targets(&mut self, targets: &mut Vec<VulkanDmaBufScanoutTarget>) {
+        std::mem::swap(&mut self.targets, targets);
+        self.target_versions = vec![0; self.targets.len()];
+        self.damage_history.clear();
+    }
+
     pub(super) fn clear_capture_cursor(&mut self) {
         let had_scene = self.capture_cursor_scene.take().is_some();
         let had_placement = self.capture_cursor_placement.take().is_some();

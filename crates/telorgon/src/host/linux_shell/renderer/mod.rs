@@ -3,7 +3,7 @@ mod capture_damage;
 mod scanout;
 mod capture;
 pub(super) use capture::{CaptureBuffer, CaptureJob, CaptureView, CaptureSubmitFailure};
-pub(super) use scanout::prepare;
+pub(super) use scanout::{prepare, LivePool, prepare_live_pool, exchange_pool};
 mod software;
 mod vulkan;
 

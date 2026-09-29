@@ -133,7 +133,7 @@ where
                 self.host_wake_pending = false;
                 self.poll_presentation(event_loop);
             }
-            #[cfg(any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")))]
+            #[cfg(all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")))]
             HostEvent::PresentationWake => {
                 self.poll_presentation(event_loop);
             }
@@ -285,18 +285,15 @@ where
                     crate::runtime::instrumentation::InputRecordingSource::Scroll,
                     "input.gui.scroll",
                 );
-                let delta = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => PointF {
-                        x: x * 24.0,
-                        y: y * 24.0,
-                    },
-                    MouseScrollDelta::PixelDelta(position) => PointF {
+                let event = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => InputEvent::mouse_wheel(PointF { x, y }),
+                    MouseScrollDelta::PixelDelta(position) => InputEvent::mouse_scroll(PointF {
                         x: position.x as f32 / self.layout_scale_factor(),
                         y: position.y as f32 / self.layout_scale_factor(),
-                    },
+                    }),
                 };
                 if let Some(runtime) = self.runtime.as_mut() {
-                    runtime.queue_input(InputEvent::mouse_scroll(delta));
+                    runtime.queue_input(event);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

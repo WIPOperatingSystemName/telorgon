@@ -1,5 +1,5 @@
 use crate::foundation::{PointF, SizeF};
-use crate::input::{InputEvent, PointerDeviceKind, PointerId};
+use crate::input::{InputEvent, PointerDeviceKind, PointerId, ScrollPrecision};
 
 pub const LISTEN_POINTER: u16 = 1 << 0;
 pub const LISTEN_ACTION: u16 = 1 << 1;
@@ -21,7 +21,7 @@ impl From<InputEvent> for PlatformInput {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InputCoalescer {
     pointer: Option<InputEvent>,
-    scroll: Option<(PointerId, PointerDeviceKind, PointF)>,
+    scroll: Option<(PointerId, PointerDeviceKind, PointF, ScrollPrecision)>,
     resize: Option<SizeF>,
     ordered: Vec<PlatformInput>,
     diagnostics: InputCoalescingDiagnostics,
@@ -53,6 +53,7 @@ impl InputCoalescer {
                     pointer, device, ..
                 },
             ) => {
+                self.flush_scroll();
                 self.diagnostics.pointer_moves_received =
                     self.diagnostics.pointer_moves_received.saturating_add(1);
                 if !matches!(
@@ -74,12 +75,18 @@ impl InputCoalescer {
                 pointer,
                 device,
                 delta,
+                precision,
             }) => {
+                self.flush_pointer();
                 self.diagnostics.scroll_events_received =
                     self.diagnostics.scroll_events_received.saturating_add(1);
-                if let Some((pending_pointer, pending_device, pending_delta)) = &mut self.scroll
+                if let Some((pending_pointer, pending_device, pending_delta, pending_precision)) = &mut self.scroll
                     && *pending_pointer == pointer
                     && *pending_device == device
+                    && *pending_precision == precision
+                    // A reversal must cancel old motion, not disappear in a summed delta.
+                    && pending_delta.x * delta.x >= 0.0
+                    && pending_delta.y * delta.y >= 0.0
                 {
                     pending_delta.x += delta.x;
                     pending_delta.y += delta.y;
@@ -87,7 +94,7 @@ impl InputCoalescer {
                         self.diagnostics.scroll_events_coalesced.saturating_add(1);
                 } else {
                     self.flush_scroll();
-                    self.scroll = Some((pointer, device, delta));
+                    self.scroll = Some((pointer, device, delta, precision));
                 }
             }
             PlatformInput::Resize(size) => {
@@ -148,11 +155,12 @@ impl InputCoalescer {
     }
 
     fn flush_scroll(&mut self) {
-        if let Some((pointer, device, delta)) = self.scroll.take() {
+        if let Some((pointer, device, delta, precision)) = self.scroll.take() {
             self.ordered.push(PlatformInput::Input(InputEvent::Scroll {
                 pointer,
                 device,
                 delta,
+                precision,
             }));
         }
     }
@@ -248,5 +256,26 @@ mod tests {
                 if position == (PointF { x: 2.0, y: 2.0 })
         ));
         assert_eq!(batch.diagnostics.pointer_moves_coalesced, 0);
+    }
+    #[test]
+    fn wheel_reversals_precision_and_pointer_targets_fence_coalescing() {
+        let events = vec![
+            InputEvent::mouse_wheel(PointF { x: 0.0, y: -1.0 }),
+            InputEvent::mouse_wheel(PointF { x: 0.0, y: 1.0 }),
+            InputEvent::mouse_scroll(PointF { x: 0.0, y: 0.25 }),
+            InputEvent::mouse_moved(PointF { x: 50.0, y: 50.0 }),
+            InputEvent::mouse_scroll(PointF { x: 0.0, y: 0.25 }),
+        ];
+        let mut input = InputCoalescer::default();
+        for event in &events {
+            input.push(event.clone().into());
+        }
+        assert_eq!(
+            input.drain().events,
+            events
+                .into_iter()
+                .map(PlatformInput::Input)
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -1,4 +1,6 @@
-//! Bounded startup negotiation. Nothing here runs in the frame loop.
+mod live;
+pub(in crate::host::linux_shell) use live::{LivePool, prepare_live_pool, exchange_pool};
+// Bounded scanout negotiation.
 use super::{ShellRenderer, software::SoftwareShellRenderer, vulkan::PreparedVulkan};
 use crate::host::application::{AppError, AppResult, Renderer};
 use crate::foundation::SizeI;

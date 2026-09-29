@@ -44,7 +44,7 @@ use telorgon::{
 };
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 use telorgon::{AppRuntime, WindowOptions};
@@ -56,7 +56,7 @@ use telorgon::{
 
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 struct ManagedFixture;
@@ -238,7 +238,7 @@ impl MountedComponent for ComponentFixture {
 
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 impl MountedComponent for ManagedFixture {
@@ -294,7 +294,7 @@ fn compile_scene_path(
 
 #[cfg(any(
     feature = "application-software",
-    all(feature = "application-vulkan-windows", target_os = "windows"),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 fn compile_renderer_free_runtime_path(runtime: &mut AppRuntime<ManagedFixture>) {
@@ -1908,7 +1908,7 @@ fn current_public_paths_compile() {
         .expect("valid neutral scroll delta");
     #[cfg(any(
         feature = "application-software",
-        all(feature = "application-vulkan-windows", target_os = "windows"),
+        all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
         all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     let _window = WindowOptions::default();
@@ -1922,7 +1922,7 @@ fn current_public_paths_compile() {
     let _unsupported_task_host = telorgon::UnsupportedTaskHost;
     #[cfg(any(
         feature = "application-software",
-        all(feature = "application-vulkan-windows", target_os = "windows"),
+        all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
         all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     {
@@ -2007,7 +2007,7 @@ fn current_public_paths_compile() {
     let _scene_entry = compile_scene_path;
     #[cfg(any(
         feature = "application-software",
-        all(feature = "application-vulkan-windows", target_os = "windows"),
+        all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
         all(feature = "shell-wayland-linux", target_os = "linux")
     ))]
     let _runtime_entry = compile_renderer_free_runtime_path;
@@ -2047,7 +2047,7 @@ fn current_public_paths_compile() {
     let _shell_surface_primitive_entry = compile_shell_surface_primitive_paths;
     #[cfg(feature = "application-software")]
     let _backend_entry = compile_software_backend_path;
-    #[cfg(feature = "application-vulkan-windows")]
+    #[cfg(feature = "application-vulkan")]
     let _vulkan_policy = telorgon::renderer_vulkan::VulkanConfig::default();
 
     assert_composed_component::<ComposedFixture>();

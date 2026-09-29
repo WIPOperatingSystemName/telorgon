@@ -680,25 +680,26 @@ pub(super) fn widget_probe_context(widgets: &[WidgetLayer]) -> String {
         active.map_or_else(|| "client-or-desktop".into(), WidgetLayer::probe_context))
 }
 
-// Discrete wheel axes are measured in notches, not logical pixels. Keep
-// continuous axes unchanged so touchpad precision is preserved.
-pub(super) fn widget_scroll_distance(
-    horizontal: f64,
-    vertical: f64,
-    discrete_x: i32,
-    discrete_y: i32,
-) -> PointF {
-    const PIXELS_PER_NOTCH: f32 = 48.0;
-    let axis = |continuous: f64, notches: i32| {
-        if notches == 0 { continuous as f32 } else { notches as f32 * PIXELS_PER_NOTCH }
-    };
-    PointF { x: axis(horizontal, discrete_x), y: axis(vertical, discrete_y) }
+// Keep mixed axes separate: a continuous horizontal axis must not acquire wheel easing
+// just because the vertical axis has discrete steps. Linux signs describe viewport travel.
+pub(super) fn widget_scroll_input(
+    horizontal: f64, vertical: f64, discrete_x: i32, discrete_y: i32,
+) -> [crate::input::InputEvent; 2] {
+    [
+        crate::input::InputEvent::mouse_scroll(PointF {
+            x: if discrete_x == 0 { -horizontal as f32 } else { 0.0 },
+            y: if discrete_y == 0 { -vertical as f32 } else { 0.0 },
+        }),
+        crate::input::InputEvent::mouse_wheel(PointF {
+            x: -(discrete_x as f32), y: -(discrete_y as f32),
+        }),
+    ]
 }
 
 pub(super) fn widget_pointer_scroll(
     widgets: &mut [WidgetLayer],
     p: PointF,
-    delta: PointF,
+    events: [crate::input::InputEvent; 2],
     now: MonotonicInstant,
     locked: bool,
 ) -> AppResult<bool> {
@@ -714,14 +715,13 @@ pub(super) fn widget_pointer_scroll(
     let w = &mut widgets[i];
     let probe = stall_probe::begin();
     w.layer.pointer_motion(w.local(p), now);
-    // Linux axes describe viewport travel (positive down/right); UI scroll
-    // deltas describe content movement (positive up/left).
-    let event = crate::input::InputEvent::mouse_scroll(PointF {
-        x: -delta.x,
-        y: -delta.y,
-    });
-    w.layer.runtime.shell_input(event.clone())?;
-    w.layer.runtime.queue_input(event);
+    for event in events {
+        if matches!(event, crate::input::InputEvent::Scroll { delta, .. } if delta == PointF::default()) {
+            continue;
+        }
+        w.layer.runtime.shell_input(event.clone())?;
+        w.layer.runtime.queue_input(event);
+    }
     w.layer.runtime.flush_input(now);
     stall_probe::finish("widget_scroll", probe, || w.probe_context());
     Ok(true)

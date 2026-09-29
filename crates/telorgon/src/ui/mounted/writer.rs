@@ -726,11 +726,27 @@ impl<'a, A> MountWriter<'a, A> {
     pub fn style_binding(&mut self, binding: StyleBinding) -> bool {
         self.ui.register_style_binding(binding)
     }
+    pub(crate) fn layout_style(&mut self, node: NodeId, layout: LayoutStyle) -> bool {
+        self.ui.set_layout_style(node, layout)
+    }
     pub fn style_id(&mut self, node: NodeId, style: ComponentStyleId) -> bool {
         self.ui.set_style_id(node, style)
     }
     pub fn hover_within(&mut self, node: NodeId, enabled: bool) -> bool {
         self.ui.set_hover_within(node, enabled)
+    }
+    /// Enables visual pointer states without activation, capture, or focus behavior.
+    pub fn visual_interaction(&mut self, node: NodeId, hover: bool, press: bool) -> bool {
+        self.ui.set_visual_interaction(node, hover, press)
+    }
+    pub(crate) fn visual_style(
+        &mut self,
+        node: NodeId,
+        style: Option<Arc<crate::theme::CompiledComponentStyle>>,
+        own: bool,
+        overlay: bool,
+    ) -> bool {
+        self.ui.set_visual_style(node, style, own, overlay)
     }
     pub fn style_override(
         &mut self,

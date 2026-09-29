@@ -22,6 +22,11 @@ pub(in crate::host::linux_shell) struct SoftwareShellRenderer {
 }
 
 impl SoftwareShellRenderer {
+    pub(super) fn invalidate_targets(&mut self) {
+        self.target_versions.fill(0);
+        self.damage_history.clear();
+    }
+
     pub(super) fn new(targets: usize) -> Self {
         Self {
             renderer: SoftwareRenderer,

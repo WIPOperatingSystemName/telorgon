@@ -91,6 +91,8 @@ pub struct LinuxShellConfig {
     pub session: crate::services::session::SessionConfig,
     /// All compositor geometry uses logical units; this selects pixels per logical unit.
     pub output_scale: super::OutputScale,
+    /// Optional live control of the host’s single physical output.
+    pub display_control: Option<super::display_control::DisplayControl>,
     /// Window border thickness in logical units.
     pub window_border: i32,
     /// Allowed horizontal overflow during window dragging, in logical units.
@@ -129,6 +131,7 @@ impl Default for LinuxShellConfig {
             socket_name: None,
             session: crate::services::session::SessionConfig::default(),
             output_scale: super::OutputScale::Auto,
+            display_control: None,
             window_border: 4,
             window_drag_horizontal_overflow: Some(0),
             preferred_window_minimum: SizeI {
@@ -343,7 +346,7 @@ impl ReadyGuiApplication {
     pub fn run(self) -> AppResult<()> {
         #[cfg(any(
             feature = "application-software",
-            any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
+            all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))
         ))]
         {
             validate_application_name(&self.name)?;
@@ -365,7 +368,7 @@ impl ReadyGuiApplication {
 
         #[cfg(not(any(
             feature = "application-software",
-            any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
+            all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))
         )))]
         {
             let _ = self.into_parts()?;

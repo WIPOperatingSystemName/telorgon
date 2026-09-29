@@ -128,6 +128,8 @@ enum MountedKind {
         node: UiNodeId,
         style: BoxStyle,
         layout: crate::ui::LayoutStyle,
+        effect_properties: u8,
+        has_local_style: bool,
         children: Vec<MountedElement>,
     },
     Text {

@@ -95,6 +95,7 @@ pub struct AppRuntimeCore<D: ComponentDriver> {
     scene_assets: Option<assets::SceneAssets>,
     deltas: SceneDeltaQueue,
     input: InputCoalescer,
+    scroll: super::scroll::ScrollRuntime,
     extent: SizeF,
     scene_epoch: u64,
     interaction: InteractionRouter,
@@ -204,7 +205,7 @@ impl AppRuntimeCore<CompositionDriver> {
     #[cfg(any(
         feature = "application-software",
         feature = "shell-wayland-linux",
-        any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux"))
+        all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux"))
     ))]
     pub(crate) fn from_composition_driver(
         driver: CompositionDriver,
@@ -281,6 +282,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             scene_assets: None,
             deltas: SceneDeltaQueue::new(3),
             input: InputCoalescer::default(),
+            scroll: Default::default(),
             extent: SizeF {
                 width: extent.width.max(1) as f32,
                 height: extent.height.max(1) as f32,
@@ -315,6 +317,11 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             self.view.scheduler_mut().request();
         }
         Ok(result)
+    }
+
+    pub fn set_wheel_scroll_settings(&mut self, settings: super::WheelScrollSettings) {
+        self.scroll.settings = settings;
+        self.view.scheduler_mut().request();
     }
 
     pub fn set_motion_preference(&mut self, preference: MotionPreference) {
@@ -469,6 +476,8 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
 
     /// Cancels all transient interaction state when the containing native view deactivates.
     pub fn deactivate_view(&mut self, timestamp: MonotonicInstant) {
+        self.scroll.cancel();
+        self.view.scheduler_mut().request();
         let old_focus = self.interaction.focused();
         if self.interaction.view_deactivated(self.view.ui_mut()) {
             self.view.scheduler_mut().request();
@@ -486,6 +495,11 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         #[cfg(feature = "profiler")]
         let _input_span = crate::runtime::instrumentation::span!("input.dispatch");
         let frame_needed_before = self.view.scheduler().needs_frame();
+        if self.scroll.advance(
+            self.view.ui_mut(), &self.layout, timestamp, self.motion_preference,
+        ) {
+            self.view.scheduler_mut().request();
+        }
         let external_updates_processed = if self.view.external_updates_ready() {
             let processed = self.view.process_external_updates();
             self.sync_interaction();
@@ -539,6 +553,9 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                         ..
                     },
                 ) => {
+                    if state == crate::input::ButtonState::Pressed {
+                        self.scroll.cancel();
+                    }
                     let position = self
                         .interaction
                         .pointer_position(pointer)
@@ -561,14 +578,17 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                         );
                     }
                 }
-                PlatformInput::Input(event @ InputEvent::Scroll { pointer, delta, .. }) => {
+                PlatformInput::Input(event @ InputEvent::Scroll { pointer, delta, precision, .. }) => {
                     let position = self
                         .interaction
                         .pointer_position(pointer)
                         .unwrap_or_default();
                     let hit = self.layout.hit_test(self.view.ui_mut(), position);
                     if let Some(target) = hit {
-                        if super::scroll::wheel(self.view.ui_mut(), &self.layout, target, delta) {
+                        if self.scroll.wheel(
+                            self.view.ui_mut(), &self.layout, target, delta, precision,
+                            timestamp, self.motion_preference,
+                        ) {
                             self.view.scheduler_mut().request();
                         }
                         self.view.dispatch_ui(
@@ -688,6 +708,12 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                 ..PreparedFrame::default()
             });
         }
+        let scroll_changed = self.scroll.advance(
+            self.view.ui_mut(), &self.layout, now, self.motion_preference,
+        );
+        if scroll_changed {
+            self.view.scheduler_mut().request();
+        }
         let theme = {
             #[cfg(feature = "profiler")]
             let _span = crate::runtime::instrumentation::span!("theme.resolve");
@@ -696,17 +722,33 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         };
         self.view
             .scheduler_mut()
-            .set_animation_active(theme.active_animations);
+            .set_animation_active(theme.active_animations || self.scroll.active());
         if theme.changed {
             self.view.scheduler_mut().request();
         }
         self.view.scheduler_mut().begin_frame();
-        let layout = {
+        let mut layout = {
             #[cfg(feature = "profiler")]
             let _span = crate::runtime::instrumentation::span!("layout.update");
             self.layout
                 .update(self.view.ui_mut(), &mut self.text, self.extent, 1.0)
         };
+        // Recheck bounds after resize/recomposition, before compiling the scene.
+        let bounds_changed = layout.arranged != 0
+            && super::scroll::correct_bounds(self.view.ui_mut(), &self.layout);
+        let motion_changed = self.scroll.advance(
+            self.view.ui_mut(), &self.layout, now, self.motion_preference,
+        );
+        if bounds_changed || motion_changed {
+            let correction = self.layout.update(self.view.ui_mut(), &mut self.text, self.extent, 1.0);
+            layout.measured += correction.measured;
+            layout.arranged += correction.arranged;
+            layout.spatial_updated += correction.spatial_updated;
+            layout.cache_hits += correction.cache_hits;
+            layout.intrinsic_passes += correction.intrinsic_passes;
+        }
+        self.view.scheduler_mut()
+            .set_animation_active(theme.active_animations || self.scroll.active());
         let compile = {
             #[cfg(feature = "profiler")]
             let _span = crate::runtime::instrumentation::span!("scene.compile");

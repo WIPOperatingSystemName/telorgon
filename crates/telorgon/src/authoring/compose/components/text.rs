@@ -1,5 +1,8 @@
 use crate::foundation::ColorRgba8;
-use crate::ui::{BoxStyle, LayoutStyle};
+use crate::ui::{
+    Background, Border, BoxDecoration, BoxStyle, CornerRadii, LayoutStyle, Outline, Overflow,
+    Shadow, ShadowList,
+};
 
 use crate::authoring::compose::{
     Alignment, Dimension, Element, ElementKind, Insets, Key, TextStyle, View,
@@ -12,15 +15,38 @@ pub struct TextElement {
     pub style: TextStyle,
     pub box_style: BoxStyle,
     pub layout: LayoutStyle,
+    pub effects: super::interaction::InteractionEffects,
 }
 
 #[derive(Clone, Debug)]
 pub struct Text {
     key: Option<Key>,
+    pointer_request: Option<crate::PointerRequest>,
     element: TextElement,
 }
 
 impl Text {
+    pub fn hover_effect(mut self, effect: super::interaction::InteractionEffect) -> Self {
+        self.element.effects.hover.push(effect);
+        self
+    }
+    pub fn hover_effects(
+        mut self,
+        effects: impl IntoIterator<Item = super::interaction::InteractionEffect>,
+    ) -> Self {
+        self.element.effects.hover.extend(effects);
+        self
+    }
+    pub fn hover_transition(mut self, transition: crate::theme::TransitionSpec) -> Self {
+        self.element.effects.hover_transition = Some(transition);
+        self
+    }
+
+    pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
+        self.pointer_request = Some(icon.into().into());
+        self
+    }
+
     pub fn key(mut self, key: impl Into<Key>) -> Self {
         self.key = Some(key.into());
         self
@@ -47,8 +73,73 @@ impl Text {
         self
     }
 
+    pub fn margin(mut self, margin: impl Into<Insets>) -> Self {
+        self.element.box_style.margin = margin.into().0;
+        self
+    }
+
     pub fn box_style(mut self, style: BoxStyle) -> Self {
         self.element.box_style = style;
+        self
+    }
+
+    pub fn layout_style(mut self, layout: LayoutStyle) -> Self {
+        self.element.layout = layout;
+        self
+    }
+
+    pub fn decoration(mut self, decoration: BoxDecoration) -> Self {
+        self.element.box_style.decoration = decoration;
+        self
+    }
+
+    pub fn background(mut self, background: impl Into<Background>) -> Self {
+        self.element.box_style.decoration.background = background.into();
+        self
+    }
+
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.element.box_style.decoration.corner_radii = CornerRadii::all(radius);
+        self
+    }
+
+    pub fn corner_radii(mut self, radii: CornerRadii) -> Self {
+        self.element.box_style.decoration.corner_radii = radii;
+        self
+    }
+
+    pub fn uniform_border(mut self, width: f32, color: ColorRgba8) -> Self {
+        self.element.box_style.decoration.border = Border::all(width, color);
+        self
+    }
+
+    pub fn border_sides(mut self, border: Border) -> Self {
+        self.element.box_style.decoration.border = border;
+        self
+    }
+
+    pub fn outline(mut self, outline: Outline) -> Self {
+        self.element.box_style.decoration.outline = outline;
+        self
+    }
+
+    pub fn shadow(mut self, shadow: Shadow) -> Self {
+        self.element.box_style.decoration.shadows = ShadowList::one(shadow);
+        self
+    }
+
+    pub fn shadows(mut self, shadows: ShadowList) -> Self {
+        self.element.box_style.decoration.shadows = shadows;
+        self
+    }
+
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.element.box_style.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn overflow(mut self, overflow: Overflow) -> Self {
+        self.element.box_style.overflow = overflow;
         self
     }
 
@@ -100,26 +191,37 @@ impl Text {
     ///
     /// Fluent setters called afterward override individual fields, matching container/`BoxStyle`
     /// ordering semantics.
-    pub fn style(mut self, style: TextStyle) -> Self {
+    pub fn text_style(mut self, style: TextStyle) -> Self {
         self.element.style = style;
         self
+    }
+
+    #[deprecated(since = "0.1.12", note = "use `text_style` for normalized vocabulary")]
+    pub fn style(self, style: TextStyle) -> Self {
+        self.text_style(style)
     }
 }
 
 impl View for Text {
     fn into_element(self) -> Element {
-        Element::from_kind(self.key, ElementKind::Text(self.element))
+        let element = Element::from_kind(self.key, ElementKind::Text(self.element));
+        match self.pointer_request {
+            Some(request) => element.with_pointer_request(request),
+            None => element,
+        }
     }
 }
 
 pub fn text(content: impl ToString) -> Text {
     Text {
         key: None,
+        pointer_request: None,
         element: TextElement {
             content: content.to_string(),
             style: TextStyle::default(),
             box_style: BoxStyle::default(),
             layout: LayoutStyle::default(),
+            effects: Default::default(),
         },
     }
 }
@@ -132,7 +234,8 @@ mod tests {
     fn text_style_and_fluent_setters_share_one_sparse_override() {
         let color = ColorRgba8::rgba(230, 232, 238, 255);
         let view = text("Heading")
-            .style(TextStyle::new().size(24.0).weight(600).color(color))
+            .text_style(TextStyle::new().size(24.0).weight(600).color(color))
+            .cursor(crate::CursorIcon::Help)
             .size(28.0)
             .into_element();
         let ElementKind::Text(text) = view.kind() else {
@@ -149,12 +252,13 @@ mod tests {
         assert_eq!(resolved.line_height, 35.0);
         assert_eq!(resolved.weight, 600);
         assert_eq!(resolved.color, color);
+        assert_eq!(view.into_parts().4, Some(crate::CursorIcon::Help.into()));
     }
 
     #[test]
     fn text_alignment_uses_the_shared_authoring_alignment() {
         let view = text("Centered")
-            .style(TextStyle::new().text_align(Alignment::End))
+            .text_style(TextStyle::new().text_align(Alignment::End))
             .text_align(Alignment::Center)
             .into_element();
         let ElementKind::Text(text) = view.kind() else {

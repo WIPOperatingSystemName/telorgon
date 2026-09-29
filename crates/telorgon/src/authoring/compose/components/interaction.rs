@@ -3,12 +3,12 @@ use crate::theme::{
     CompiledComponentStyle, CompiledSlotStyle, CompiledStateStyle, InteractionState, TransitionSpec,
 };
 use crate::ui::{
-    Background, Border, InteractionFlags, Outline, Shadow, ShadowList, StylePropertyPatch,
-    StyleSlotId,
+    Background, Border, BoxStyle, ComponentStyleId, InteractionFlags, Outline, Shadow, ShadowList,
+    StylePropertyPatch, StyleSlotId,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-/// Composable changes to a button's interaction appearance. Later effects win per property.
+/// Composable changes to a widget's interaction appearance. Later effects win per property.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InteractionEffect {
     Background(ColorRgba8),
@@ -58,8 +58,84 @@ impl InteractionEffect {
 /// Compatibility name for existing hover declarations.
 pub type HoverEffect = InteractionEffect;
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InteractionEffects {
+    pub hover: Vec<InteractionEffect>,
+    pub hover_transition: Option<TransitionSpec>,
+    pub press: Vec<InteractionEffect>,
+    pub press_transition: Option<TransitionSpec>,
+}
+impl InteractionEffects {
+    pub fn has_hover(&self) -> bool {
+        !self.hover.is_empty() || self.hover_transition.is_some()
+    }
+    pub fn has_press(&self) -> bool {
+        !self.press.is_empty() || self.press_transition.is_some()
+    }
+    pub fn active(&self) -> bool {
+        self.has_hover() || self.has_press()
+    }
+    pub fn mask(&self) -> u8 {
+        self.hover
+            .iter()
+            .chain(&self.press)
+            .fold(0, |mask, effect| mask | effect.property())
+    }
+    pub fn invalid(&self) -> bool {
+        self.hover
+            .iter()
+            .chain(&self.press)
+            .any(|effect| !effect.valid())
+            || self.hover_transition.is_some_and(|spec| spec.repeat)
+            || self.press_transition.is_some_and(|spec| spec.repeat)
+    }
+    pub fn compile_for(
+        &self,
+        style_id: ComponentStyleId,
+        style: &BoxStyle,
+        style_override: StylePropertyPatch,
+        inline: Option<&CompiledComponentStyle>,
+    ) -> Option<Arc<CompiledComponentStyle>> {
+        self.active().then(|| {
+            compile_effects(
+                style_id,
+                style,
+                style_override,
+                inline,
+                &self.hover,
+                self.hover_transition,
+                &self.press,
+                self.press_transition,
+            )
+        })
+    }
+}
+
 pub(super) fn compile(
     props: &super::button::ButtonElement,
+    hover: &[InteractionEffect],
+    hover_transition: Option<TransitionSpec>,
+    press: &[InteractionEffect],
+    press_transition: Option<TransitionSpec>,
+) -> Arc<CompiledComponentStyle> {
+    compile_effects(
+        props.style_id,
+        &props.style,
+        props.style_override,
+        props.inline_style.as_deref(),
+        hover,
+        hover_transition,
+        press,
+        press_transition,
+    )
+}
+
+fn compile_effects(
+    style_id: ComponentStyleId,
+    box_style: &BoxStyle,
+    style_override: StylePropertyPatch,
+    inline: Option<&CompiledComponentStyle>,
     hover: &[InteractionEffect],
     hover_transition: Option<TransitionSpec>,
     press: &[InteractionEffect],
@@ -73,48 +149,60 @@ pub(super) fn compile(
     let press_spec = press_transition.unwrap_or(default);
     let has_hover = !hover.is_empty() || hover_transition.is_some();
     let has_press = !press.is_empty() || press_transition.is_some();
+    let root = StyleSlotId::named("root");
     let mut style = if has_hover {
-        compile_layer(
-            props,
-            props.inline_style.as_deref(),
+        compile_slot_effects(
+            style_id,
+            box_style,
+            style_override,
+            inline,
+            root,
+            InteractionState::Hovered,
             hover,
             hover_spec,
-            InteractionState::Hovered,
         )
     } else {
-        compile_layer(
-            props,
-            props.inline_style.as_deref(),
+        compile_slot_effects(
+            style_id,
+            box_style,
+            style_override,
+            inline,
+            root,
+            InteractionState::Pressed,
             press,
             press_spec,
-            InteractionState::Pressed,
         )
     };
     if has_hover && has_press {
-        style = compile_layer(
-            props,
+        style = compile_slot_effects(
+            style_id,
+            box_style,
+            style_override,
             Some(style.as_ref()),
+            root,
+            InteractionState::Pressed,
             press,
             press_spec,
-            InteractionState::Pressed,
         );
         Arc::make_mut(&mut style).transition = hover_spec;
     }
     style
 }
 
-fn compile_layer(
-    props: &super::button::ButtonElement,
+pub(crate) fn compile_slot_effects(
+    style_id: ComponentStyleId,
+    box_style: &BoxStyle,
+    style_override: StylePropertyPatch,
     base_style: Option<&CompiledComponentStyle>,
+    root: StyleSlotId,
+    state: InteractionState,
     effects: &[InteractionEffect],
     transition: TransitionSpec,
-    state: InteractionState,
 ) -> Arc<CompiledComponentStyle> {
-    let root = StyleSlotId::named("root");
     let mut style = base_style
         .cloned()
         .unwrap_or_else(|| CompiledComponentStyle {
-            id: props.style_id,
+            id: style_id,
             slots: BTreeMap::new(),
             variants: BTreeMap::new(),
             states: BTreeMap::new(),
@@ -132,8 +220,8 @@ fn compile_layer(
         .map(|slot| slot.patch)
         .unwrap_or_default();
     let mut authored = base;
-    authored.overlay(props.style_override);
-    let mut transform = authored.transform.unwrap_or(props.style.transform);
+    authored.overlay(style_override);
+    let mut transform = authored.transform.unwrap_or(box_style.transform);
     if let Some(x) = authored.translation_x {
         transform.translation.x = x;
     }
@@ -156,7 +244,7 @@ fn compile_layer(
         transform.origin.y = y;
     }
     let normal_transform = transform;
-    let mut border = authored.border.unwrap_or(props.style.decoration.border);
+    let mut border = authored.border.unwrap_or(box_style.decoration.border);
     if let Some(color) = authored.border_color {
         border = recolor(border, color);
     }
@@ -167,7 +255,7 @@ fn compile_layer(
         border.left.width = width;
     }
     let normal_border = border;
-    let mut normal_outline = authored.outline.unwrap_or(props.style.decoration.outline);
+    let mut normal_outline = authored.outline.unwrap_or(box_style.decoration.outline);
     if let Some(width) = authored.outline_width {
         normal_outline.width = width;
     }
@@ -183,7 +271,7 @@ fn compile_layer(
                 resting.background = Some(
                     authored
                         .background
-                        .unwrap_or(props.style.decoration.background),
+                        .unwrap_or(box_style.decoration.background),
                 );
                 target.background = Some(Background::Color(color));
             }
@@ -207,7 +295,7 @@ fn compile_layer(
                 target.outline = Some(value);
             }
             InteractionEffect::Shadow(value) => {
-                resting.shadows = Some(authored.shadows.unwrap_or(props.style.decoration.shadows));
+                resting.shadows = Some(authored.shadows.unwrap_or(box_style.decoration.shadows));
                 target.shadows = Some(ShadowList::one(value));
             }
             // Press patches only the affected transform axes so hover lift and
@@ -239,7 +327,7 @@ fn compile_layer(
         .entry(root)
         .or_default()
         .patch
-        .overlay(props.style_override);
+        .overlay(style_override);
     style.slots.entry(root).or_default().patch.overlay(resting);
     let state_style = style
         .states

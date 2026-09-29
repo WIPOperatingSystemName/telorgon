@@ -25,7 +25,7 @@ pub use composite::{
     CompositeSelectionBehavior, CompositeSelectionRequest, CompositeStateMachine,
     DisabledItemPolicy, WritingDirection,
 };
-pub use event::{ButtonState, EventPhase, InputEvent, PointerInputEvent, ValueChangePhase};
+pub use event::{DEFAULT_WHEEL_STEP, ButtonState, EventPhase, InputEvent, PointerInputEvent, ValueChangePhase};
 pub use focus::{
     FocusCandidate, FocusChange, FocusClearReason, FocusDiagnostics, FocusError,
     FocusIndicatorPolicy, FocusInputModality, FocusMoveReason, FocusOrigin, FocusScopeId,

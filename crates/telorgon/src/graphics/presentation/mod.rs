@@ -451,11 +451,11 @@ mod tests {
     }
 }
 
-#[cfg(all(feature = "application-vulkan-windows", target_os = "windows"))]
+#[cfg(all(feature = "application-vulkan", target_os = "windows"))]
 pub mod dxgi;
 #[cfg(feature = "application-software")]
 pub mod softbuffer;
 #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
 pub mod kms;
-#[cfg(any(feature = "application-vulkan-windows", feature = "application-vulkan-linux"))]
+#[cfg(feature = "application-vulkan")]
 pub mod wsi;

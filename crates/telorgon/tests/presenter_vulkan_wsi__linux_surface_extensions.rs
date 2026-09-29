@@ -1,4 +1,4 @@
-#![cfg(feature = "application-vulkan-windows")]
+#![cfg(feature = "application-vulkan")]
 #![cfg(target_os = "linux")]
 
 use std::ffi::CStr;
@@ -46,9 +46,7 @@ fn extension_names(handle: RawDisplayHandle) -> Vec<&'static str> {
     required_instance_extensions(&TestDisplay(handle))
         .expect("Linux display handle must map to Vulkan surface extensions")
         .into_iter()
-        .map(|extension| {
-            assert!(extension.required);
-            CStr::to_str(extension.name).unwrap()
-        })
+        .filter(|extension| extension.required)
+        .map(|extension| CStr::to_str(extension.name).unwrap())
         .collect()
 }

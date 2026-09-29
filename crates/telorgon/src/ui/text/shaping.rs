@@ -312,7 +312,7 @@ mod tests {
     fn font_seed_and_embedded_faces_are_shared_but_atlases_are_independent() {
         let mut first = TextEngine::with_atlas_size(128, 128).unwrap();
         let mut second = TextEngine::with_atlas_size(256, 256).unwrap();
-        let seed = super::system_font_seed();
+        let seed = super::super::font_database::seed(true).unwrap();
         assert_eq!(first.font_system.db().len(), seed.1.len());
         let face = seed.1.faces().next().expect("system test font").id;
         let bytes = seed

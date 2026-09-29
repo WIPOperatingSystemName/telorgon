@@ -42,7 +42,7 @@ impl Component for Entries {
             row = row.child(
                 button().child(text(window.title).color(crate::ColorRgba8::rgba(248, 249, 252, 255)))
                     .key(format!("{}:{}", id.slot(), id.generation()))
-                    .icon(icon)
+                    .child(image(icon).width(24.0).height(24.0))
                     .width(40.0)
                     .height(40.0)
                     .on_press(move |this: &mut Self| {

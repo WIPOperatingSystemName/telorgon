@@ -92,6 +92,48 @@ fn hit_testing_and_focus_use_canonical_geometry() {
 }
 
 #[test]
+fn passive_visual_hit_testing_preserves_descendants_and_ordinary_control_routing() {
+    let mut ui = MountedUi::default();
+    let mut label = None;
+    let mut button = None;
+    MountWriter::<()>::new(&mut ui).root(
+        BoxStyle::default(), LayoutStyle::default(), |writer| {
+            button = Some(writer.button_node(
+                BoxStyle {
+                    width: SizeRule::Logical(120.0), height: SizeRule::Logical(40.0),
+                    ..BoxStyle::default()
+                }, |writer| {
+                    label = Some(writer.text("Label", ColorRgba8::default(), 14.0).node);
+                },
+            ).node);
+        },
+    );
+    let label = label.unwrap();
+    let button = button.unwrap();
+    let root = ui.nodes.core(button).unwrap().parent.unwrap();
+    let mut layout = TestLayout::default();
+    layout.update(&mut ui, SizeF { width: 200.0, height: 100.0 }, 1.0);
+    let rect = layout.computed(label).unwrap().border_rect;
+    let label_point = PointF { x: rect.x + rect.width / 2.0, y: rect.y + rect.height / 2.0 };
+    let background_point = PointF { x: 180.0, y: 80.0 };
+
+    assert_eq!(layout.hit_test(&mut ui, label_point), Some(button));
+    assert_eq!(layout.hit_test(&mut ui, background_point), None);
+    ui.set_visual_interaction(root, true, true);
+    assert_eq!(layout.hit_test(&mut ui, label_point), Some(label));
+    assert_eq!(layout.hit_test(&mut ui, background_point), Some(root));
+    assert_eq!(layout.focus_order(&mut ui), vec![button]);
+    ui.set_disabled(button, true);
+    assert_eq!(layout.hit_test(&mut ui, label_point), Some(label));
+    ui.set_disabled(button, false);
+    ui.set_visual_interaction(root, false, false);
+    assert_eq!(layout.hit_test(&mut ui, label_point), Some(button));
+    ui.set_visual_interaction(label, true, false);
+    assert_eq!(layout.hit_test(&mut ui, label_point), Some(label));
+    assert_eq!(layout.hit_test(&mut ui, background_point), None);
+}
+
+#[test]
 fn foundation_buttons_center_their_content_on_both_axes() {
     let mut ui = MountedUi::default();
     let (button, label);
@@ -142,6 +184,44 @@ fn foundation_buttons_center_their_content_on_both_axes() {
 
     assert!((button_center.x - label_center.x).abs() < 0.001);
     assert!((button_center.y - label_center.y).abs() < 0.001);
+}
+
+#[test]
+fn scroll_visual_hit_testing_keeps_raw_children_without_changing_scroll_ownership() {
+    let mut ui = MountedUi::default();
+    let mut scroll = None;
+    let mut label = None;
+    MountWriter::<()>::new(&mut ui).root(
+        BoxStyle::default(), LayoutStyle::default(), |writer| {
+            scroll = Some(writer.scroll(
+                BoxStyle {
+                    width: SizeRule::Logical(160.0), height: SizeRule::Logical(80.0),
+                    ..BoxStyle::default()
+                }, LayoutStyle::default(), |writer| {
+                    label = Some(writer.text("Label", ColorRgba8::default(), 14.0).node);
+                },
+            ).node);
+        },
+    );
+    let scroll = scroll.unwrap();
+    let label = label.unwrap();
+    let mut layout = TestLayout::default();
+    layout.update(&mut ui, SizeF { width: 200.0, height: 100.0 }, 1.0);
+    let rect = layout.computed(label).unwrap().border_rect;
+    let point = PointF { x: rect.x + rect.width / 2.0, y: rect.y + rect.height / 2.0 };
+    assert_eq!(layout.hit_test(&mut ui, point), Some(scroll));
+    for (hover, press) in [(true, false), (false, true)] {
+        ui.set_visual_interaction(scroll, hover, press);
+        assert_eq!(layout.hit_test(&mut ui, point), Some(label));
+        assert_eq!(ui.nearest_control(label), Some(scroll));
+        assert!(layout.focus_order(&mut ui).is_empty());
+    }
+    ui.set_visual_interaction(scroll, false, false);
+    assert_eq!(layout.hit_test(&mut ui, point), Some(scroll));
+    ui.set_hover_within(scroll, true);
+    assert_eq!(layout.hit_test(&mut ui, point), Some(label));
+    ui.set_hover_within(scroll, false);
+    assert_eq!(layout.hit_test(&mut ui, point), Some(scroll));
 }
 
 #[test]

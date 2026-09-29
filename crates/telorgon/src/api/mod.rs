@@ -130,7 +130,7 @@ pub mod app {
 pub use crate::host::application::HeadlessRuntime;
 #[cfg(any(
     feature = "application-software",
-    any(all(feature = "application-vulkan-windows", target_os = "windows"), all(feature = "application-vulkan-linux", target_os = "linux")),
+    all(feature = "application-vulkan", any(target_os = "windows", target_os = "linux")),
     all(feature = "shell-wayland-linux", target_os = "linux")
 ))]
 pub use crate::host::application::{

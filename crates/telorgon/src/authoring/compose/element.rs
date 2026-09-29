@@ -278,6 +278,8 @@ fn validate_element(
         ElementKind::Button(value) => Some(&value.style),
         ElementKind::Image(value) => Some(&value.style),
         ElementKind::Text(value) => Some(&value.box_style),
+        ElementKind::Toggle(value) => Some(&value.style),
+        ElementKind::Slider(value) => Some(&value.style),
         _ => None,
     };
     if style.and_then(|style| style.aspect_ratio).is_some_and(|ratio| !ratio.is_finite() || ratio <= 0.0) {
@@ -285,6 +287,9 @@ fn validate_element(
     }
     match &element.kind {
         ElementKind::Container(container) => {
+            if container.effects.invalid() {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
+            }
             if !container.layout.gap.is_finite() {
                 return Err(ViewError::InvalidNumber("gap"));
             }
@@ -299,12 +304,18 @@ fn validate_element(
             }
         }
         ElementKind::Text(text) => {
+            if text.effects.invalid() {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
+            }
             let resolved = text.style.resolve();
             if !resolved.size.is_finite() || !resolved.line_height.is_finite() {
                 return Err(ViewError::InvalidNumber("text metrics"));
             }
         }
         ElementKind::Image(image) => {
+            if image.effects.invalid() {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
+            }
             if image.content_version == 0 {
                 return Err(ViewError::InvalidNumber("image content version"));
             }
@@ -317,6 +328,9 @@ fn validate_element(
             }
         }
         ElementKind::Button(button) => {
+            if !button.layout.gap.is_finite() {
+                return Err(ViewError::InvalidNumber("gap"));
+            }
             if button.invalid_interaction_effect {
                 return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
             }
@@ -333,12 +347,18 @@ fn validate_element(
             validate_callback(button.on_press.as_ref(), component)?;
         }
         ElementKind::Toggle(toggle) => {
-            if toggle.label.trim().is_empty() {
+            if toggle.effects.invalid() {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
+            }
+            if toggle.accessible_label.as_deref().unwrap_or(&toggle.label).trim().is_empty() {
                 return Err(ViewError::MissingButtonLabel);
             }
             validate_callback(toggle.on_change.as_ref(), component)?;
         }
         ElementKind::Slider(slider) => {
+            if slider.effects.invalid() || slider.thumb_press_effects.iter().any(|effect| !effect.valid()) {
+                return Err(ViewError::InvalidNumber("interaction effect or repeating interaction transition"));
+            }
             if slider.accessible_label.as_deref().unwrap_or(&slider.label).trim().is_empty() {
                 return Err(ViewError::MissingButtonLabel);
             }
