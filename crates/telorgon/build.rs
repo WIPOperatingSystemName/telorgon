@@ -28,6 +28,7 @@ fn main() {
 fn embed_xwayland() {
     println!("cargo:rerun-if-env-changed=TELORGON_XWAYLAND_PAYLOAD");
     println!("cargo:rerun-if-changed=src/integrations/x11/payload_format.rs");
+    let source = xwayland::source_pin();
     let path = xwayland::payload_path();
     assert!(
         path.is_absolute(),
@@ -48,8 +49,21 @@ fn embed_xwayland() {
         .take(payload_format::MAX_COMPRESSED as u64 + 1)
         .read_to_end(&mut bytes)
         .expect("cannot read Xwayland payload");
-    payload_format::validate(&bytes, &std::env::var("TARGET").unwrap())
+    let manifest = payload_format::validate(&bytes, &source.target)
         .unwrap_or_else(|e| panic!("invalid Xwayland payload: {e}"));
+    assert!(
+        manifest.xwayland_version == source.version
+            && manifest.components.iter().any(|component| {
+                component.name == "xwayland"
+                    && component.version == source.version
+                    && component.input_sha256 == source.sha256
+            }),
+        "Xwayland payload does not match the pinned source version and checksum"
+    );
+    println!(
+        "cargo:rustc-env=TELORGON_PINNED_XWAYLAND_VERSION={}",
+        source.version
+    );
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     std::fs::write(output.join("xwayland.payload"), bytes)
         .expect("cannot stage validated Xwayland payload");

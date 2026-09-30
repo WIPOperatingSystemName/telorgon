@@ -12,6 +12,8 @@ import re
 import shutil
 import subprocess
 import tomllib
+from abi_audit import create_audit
+from native_inputs import locked_sources, source_directory, source_lock
 
 
 def output(*argv):
@@ -30,7 +32,8 @@ def stage(work, destination, packaging):
     overlap = set(policy["host"]) & set(policy["private"])
     if overlap:
         raise ValueError(f"libraries cannot be both host and private: {sorted(overlap)}")
-    lock = tomllib.loads((third_party / "sources.lock.toml").read_text())
+    lock = source_lock(third_party.parent)
+    sources = locked_sources(third_party.parent)
     if destination.exists():
         raise ValueError("stage must be a new directory")
     destination.mkdir(parents=True, mode=0o700)
@@ -38,10 +41,10 @@ def stage(work, destination, packaging):
     (destination / "lib").mkdir()
     (destination / "licenses").mkdir()
     inventory, edges, seen = [], {}, set()
-    for source in lock["source"]:
+    for source in sources.values():
         inventory.append(dict(name=source["name"], version=source["version"],
                               input_sha256=source["sha256"], license="See licenses and source references"))
-        directory = work / "sources" / (source["name"] + "-" + source["version"])
+        directory = work / "sources" / source_directory(source)
         candidates = [directory / name for name in ("COPYING", "COPYING.md", "LICENSE", "LICENSE.txt")]
         for notice in candidates:
             if notice.is_file():
@@ -60,7 +63,7 @@ def stage(work, destination, packaging):
         dependencies = tomllib.loads(dependency_lock.read_text())['source']
         shutil.copyfile(dependency_lock, destination / 'licenses/dependencies.lock.toml')
         for source in dependencies:
-            directory = work / 'sources' / source['source_root']
+            directory = work / 'sources' / source_directory(source)
             notices = [directory / name for name in (
                 'COPYING', 'COPYING.md', 'LICENSE', 'LICENSE.txt', 'LICENSE.TXT',
                 'COPYING.LIB', 'Copyright', 'README', 'docs/FTL.TXT', 'docs/GPLv2.TXT')]
@@ -80,11 +83,8 @@ def stage(work, destination, packaging):
         pending.append(target)
     while pending:
         path = pending.pop()
-        versions = [tuple(map(int, v.split("."))) for v in re.findall(r"GLIBC_(\d+(?:\.\d+)+)", output("readelf", "--version-info", path))]
-        if any(v > (2, 39) for v in versions):
-            raise ValueError(f"host glibc floor exceeded: {path.name}")
         needed = re.findall(r"\(NEEDED\).*\[(.*?)\]", output("readelf", "-d", path))
-        edges[path.relative_to(destination).as_posix()] = dict(needed=needed, glibc_floor=".".join(map(str, max(versions))) if versions else None)
+        edges[path.relative_to(destination).as_posix()] = needed
         for soname in needed:
             if soname in policy["host"] or soname in seen:
                 continue
@@ -121,9 +121,12 @@ def stage(work, destination, packaging):
             raise ValueError(f"RUNPATH relocation failed: {relative}")
     keyboard = destination / "share/X11/xkb"
     shutil.copytree(work / "private/share/xkeyboard-config-2", keyboard, symlinks=False)
-    (destination / "licenses/static-closure.json").write_text(json.dumps(edges, indent=2, sort_keys=True) + "\n")
+    # Audit relocated bytes, so packing cannot accidentally reuse pre-patchelf
+    # hashes or omit a private library's newer glibc requirement.
+    audit = create_audit(destination, edges, policy, lock, output)
+    (destination / "licenses/static-closure.json").write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n")
     (work / "components.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
-    (work / "static-closure.json").write_text(json.dumps(edges, indent=2, sort_keys=True) + "\n")
+    (work / "static-closure.json").write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n")
     print(f"Staged {len(seen)} private libraries; dynamic loading remains unqualified.")
 
 

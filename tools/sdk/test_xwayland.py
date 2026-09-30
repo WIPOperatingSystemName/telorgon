@@ -6,9 +6,10 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from source_cache import prepare
+from native_inputs import host_glibc, source_directory
 
 RECIPES = Path(__file__).resolve().parents[2] / 'third_party/recipes/xwayland'
 sys.path.insert(0, str(RECIPES))
@@ -78,6 +79,31 @@ class SourceCacheTests(unittest.TestCase):
                               ('libXau', 'libxcb'), ('xcb-proto', 'libxcb'),
                               ('libxcb', 'libX11'), ('libX11', 'libxkbfile')]:
             self.assertLess(names.index(before), names.index(after))
+
+    def test_newer_glibc_is_supported_without_a_version_pin(self):
+        libc = Mock()
+        libc.gnu_get_libc_version.return_value = b'2.43'
+        with patch('native_inputs.ctypes.CDLL', return_value=libc), \
+                patch('native_inputs.platform.machine', return_value='x86_64'), \
+                patch('native_inputs.platform.system', return_value='Linux'):
+            self.assertEqual(host_glibc(), '2.43')
+
+    def test_non_gnu_or_foreign_architecture_is_rejected(self):
+        with patch('native_inputs.platform.machine', return_value='aarch64'):
+            with self.assertRaisesRegex(ValueError, 'x86-64'):
+                host_glibc()
+        with patch('native_inputs.platform.machine', return_value='x86_64'), \
+                patch('native_inputs.platform.system', return_value='Linux'), \
+                patch('native_inputs.ctypes.CDLL', return_value=object()):
+            with self.assertRaisesRegex(ValueError, 'GNU libc'):
+                host_glibc()
+
+    def test_source_directory_follows_pin_and_cannot_escape_work_tree(self):
+        entry = {'name': 'xwayland', 'version': '24.1.14'}
+        self.assertEqual(source_directory(entry), 'xwayland-24.1.14')
+        entry['source_root'] = '../foreign'
+        with self.assertRaisesRegex(ValueError, 'directory'):
+            source_directory(entry)
 
 
 if __name__ == '__main__':

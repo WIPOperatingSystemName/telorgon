@@ -421,7 +421,10 @@ mod tests {
         let a = extract(embedded(), &temp.0).unwrap();
         let b = extract(embedded(), &temp.0).unwrap();
         assert_eq!(a.path(), b.path());
-        assert_eq!(a.manifest().xwayland_version, "24.1.13");
+        assert_eq!(
+            a.manifest().xwayland_version,
+            env!("TELORGON_PINNED_XWAYLAND_VERSION")
+        );
         assert!(a.path().join("bin/Xwayland").is_file());
     }
 }

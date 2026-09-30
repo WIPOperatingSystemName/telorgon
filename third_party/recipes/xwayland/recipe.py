@@ -1,28 +1,21 @@
-"""Pinned-source, offline native build recipe for an isolated glibc 2.39 root."""
-import ctypes
+"""Pinned-source, offline native build recipe for x86-64 GNU/Linux."""
 import json
 import os
 from pathlib import Path
-import platform
 import subprocess
 import sys
 import tarfile
-import tomllib
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'tools/sdk'))
+from native_inputs import host_glibc, locked_sources, source_directory
 
 
 def verify_environment(recipes, with_dependencies=False):
-    libc = ctypes.CDLL(None)
-    libc.gnu_get_libc_version.restype = ctypes.c_char_p
-    if platform.machine() != "x86_64" or libc.gnu_get_libc_version() != b"2.39":
-        raise ValueError("build in the isolated x86-64/glibc 2.39 root")
-    if with_dependencies:
-        return b"Native dependencies compiled from dependencies.lock.toml; host libc/graphics are platform inputs.\n"
-    inventory = subprocess.check_output(
-        ["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\n"])
-    if not with_dependencies and inventory != (recipes / "build-packages.lock.tsv").read_bytes():
-        raise ValueError("isolated build package inventory differs from build-packages.lock.tsv")
-    return inventory
+    version = host_glibc()
+    libraries = 'pinned sources' if with_dependencies else 'host development libraries'
+    return (f'glibc\t{version}\tx86_64\n'
+            f'Native dependencies: {libraries}; host libc/graphics are platform inputs.\n').encode()
 
 
 def compile_payload(work, cache, recipes, with_dependencies=False, jobs=4):
@@ -34,8 +27,8 @@ def compile_payload(work, cache, recipes, with_dependencies=False, jobs=4):
     work.mkdir(parents=True, exist_ok=False)
     sources, build, private = work / "sources", work / "build", work / "private"
     sources.mkdir(); build.mkdir()
-    lock = tomllib.loads((recipes.parents[1] / "sources.lock.toml").read_text())
-    for source in lock["source"]:
+    locked = locked_sources(recipes.parents[2])
+    for source in locked.values():
         archive = cache / Path(urlparse(source["url"]).path).name
         with tarfile.open(archive) as stream:
             stream.extractall(sources, filter="data")
@@ -66,34 +59,34 @@ def compile_payload(work, cache, recipes, with_dependencies=False, jobs=4):
         print("RUN", *command, flush=True)
         subprocess.run(command, cwd=cwd or work, env=env, check=True)
 
-    for project, patch in [("xwayland-24.1.13", "0001-xwayland-private-helpers.patch"),
-                           ("xkbcomp-1.5.0", "0002-xkbcomp-parent-lifetime.patch")]:
+    for project, patch in [("xwayland", "0001-xwayland-private-helpers.patch"),
+                           ("xkbcomp", "0002-xkbcomp-parent-lifetime.patch")]:
         run("patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", recipes.parents[1] / "patches/xwayland" / patch,
-            cwd=sources / project)
+            cwd=sources / source_directory(locked[project]))
 
     def meson(name, source, flags=(), target=None, install=False):
         directory = build / name
-        run("meson", "setup", directory, sources / source, "--prefix=" + str(private),
+        run("meson", "setup", directory, sources / source_directory(locked[source]), "--prefix=" + str(private),
             "--libdir=lib", "--buildtype=release", "--wrap-mode=nodownload", *flags)
         run("meson", "compile", "-C", directory, "-j", str(jobs), *([target] if target else []))
         if install:
             run("meson", "install", "-C", directory, "--no-rebuild")
 
-    meson("xorgproto", "xorgproto-2024.1", install=True)
-    meson("protocols", "wayland-protocols-1.47", ["-Dtests=false"], install=True)
+    meson("xorgproto", "xorgproto", install=True)
+    meson("protocols", "wayland-protocols", ["-Dtests=false"], install=True)
     if with_dependencies:
         from dependencies import compile_libraries
         compile_libraries(entries, sources, build, private, run, jobs)
         (work / 'dependencies.lock.toml').write_bytes((recipes / 'dependencies.lock.toml').read_bytes())
     font = build / "font"
     font.mkdir()
-    run(sources / "libXfont2-2.0.8/configure", "--prefix=" + str(private), "--disable-static",
+    run(sources / source_directory(locked['libXfont2']) / 'configure', "--prefix=" + str(private), "--disable-static",
         "--enable-builtins", "--disable-fc", "--disable-devel-docs", cwd=font)
     run("make", "-j" + str(jobs), cwd=font)
     run("make", "install", cwd=font)
-    meson("xkbcomp", "xkbcomp-1.5.0", ["-Dxkb-config-root=/nonexistent/telorgon-xkb"], target="xkbcomp")
-    meson("keyboard", "xkeyboard-config-2.46", ["-Dnls=false"], install=True)
-    meson("xwayland", "xwayland-24.1.13", [
+    meson("xkbcomp", "xkbcomp", ["-Dxkb-config-root=/nonexistent/telorgon-xkb"], target="xkbcomp")
+    meson("keyboard", "xkeyboard-config", ["-Dnls=false"], install=True)
+    meson("xwayland", "xwayland", [
         "-Dxvfb=false", "-Dglamor=true", "-Dglx=true", "-Ddri3=true", "-Ddrm=true",
         "-Dmitshm=true", "-Dxinerama=true", "-Dxv=true", "-Dxres=true",
         "-Dxdmcp=false", "-Dxdm-auth-1=false", "-Dsecure-rpc=false", "-Dlisten_tcp=false",

@@ -15,6 +15,8 @@ import struct
 import tempfile
 import tomllib
 import zlib
+from abi_audit import AUDIT_PATH, REPOSITORY, decode_audit, is_elf, validate_audit
+from native_inputs import locked_sources, source_lock
 
 MAX_COMPRESSED = 64 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
@@ -37,6 +39,8 @@ def digest(data):
 def pack(stage, components):
     stage = Path(stage)
     policy = tomllib.loads(Path(__file__).with_name("runtime-policy.toml").read_text())
+    lock = source_lock(REPOSITORY)
+    xwayland = locked_sources(REPOSITORY)["xwayland"]
     if stage.is_symlink() or not stage.is_dir():
         raise ValueError("stage must be a real directory")
     if not isinstance(components, list) or not 1 <= len(components) <= 256:
@@ -50,7 +54,11 @@ def pack(stage, components):
         if len(c["input_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in c["input_sha256"]):
             raise ValueError("invalid component source hash")
         names.add(c["name"])
+    xwayland_components = [c for c in components if c["name"] == "xwayland"]
+    if len(xwayland_components) != 1 or (xwayland_components[0]["version"], xwayland_components[0]["input_sha256"]) != (xwayland["version"], xwayland["sha256"]):
+        raise ValueError("Xwayland component provenance does not match the source lock")
     entries, chunks, expanded, offset = [], [], 0, 0
+    owned, audit_raw = {}, None
     # Walk explicitly: Path.rglob can silently omit directory symlinks.
     pending, paths, visited = [stage], [], 0
     while pending:
@@ -86,8 +94,14 @@ def pack(stage, components):
         if len(raw) != info.st_size:
             raise ValueError(f"stage changed during packing: {relative}")
         executable = relative.startswith("bin/")
-        if executable and (len(raw) < 64 or raw[:6] != b"\x7fELF\x02\x01" or raw[18:20] != b"\x3e\x00"):
-            raise ValueError(f"expected x86-64 ELF executable: {relative}")
+        if executable or relative.startswith("lib/"):
+            if not is_elf(raw):
+                raise ValueError(f"expected x86-64 ELF file: {relative}")
+            owned[relative] = {"sha256": digest(raw)}
+        if relative == AUDIT_PATH:
+            if len(raw) > MAX_MANIFEST:
+                raise ValueError("ELF audit bound exceeded")
+            audit_raw = raw
         compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
         compressed = compressor.compress(raw) + compressor.flush()
         entries.append(dict(path=relative, mode=0o500 if executable else 0o400,
@@ -101,8 +115,11 @@ def pack(stage, components):
     names = {e["path"] for e in entries}
     if not {"bin/Xwayland", "bin/xkbcomp"} <= names or not any(p.startswith("share/X11/xkb/") for p in names) or not any(p.startswith("licenses/") for p in names):
         raise ValueError("stage lacks required executables, keyboard data or notices")
-    manifest = dict(schema=1, target="x86_64-unknown-linux-gnu", minimum_glibc="2.39",
-                    xwayland_version="24.1.13", components=sorted(components, key=lambda c: c["name"]), entries=entries)
+    if audit_raw is None:
+        raise ValueError("stage lacks a hash-bound ELF audit; restage the payload")
+    floor = validate_audit(decode_audit(audit_raw), owned, policy, lock, xwayland)
+    manifest = dict(schema=1, target=lock["target"], minimum_glibc=floor,
+                    xwayland_version=xwayland["version"], components=sorted(components, key=lambda c: c["name"]), entries=entries)
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     if len(encoded) > MAX_MANIFEST:
         raise ValueError("manifest bound exceeded")

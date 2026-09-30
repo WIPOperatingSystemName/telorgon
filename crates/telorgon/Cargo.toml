@@ -64,8 +64,8 @@ shell-xwayland = [
     "dep:flate2",
     "dep:serde_json",
 ]
-# Distribution builds supply a validated payload; Cargo never downloads it.
-shell-xwayland-embedded = ["shell-xwayland", "dep:serde", "dep:sha2"]
+# Cargo prepares and validates the pinned native payload before embedding it.
+shell-xwayland-embedded = ["shell-xwayland", "dep:serde", "dep:sha2", "dep:toml"]
 embedded-vulkan = [
     "dep:ash",
     "dep:bytemuck",
@@ -130,6 +130,7 @@ roxmltree = "0.21.1"
 tower.workspace = true
 
 [build-dependencies]
+toml = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

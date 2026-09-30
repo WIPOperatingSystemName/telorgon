@@ -3,7 +3,6 @@
 schema = 1
 release_ready = false
 target = "x86_64-unknown-linux-gnu"
-minimum_glibc = "2.39"
 
 # Verified using the installed Ubuntu archive keyring (CD Image Signing Key 2012).
 [build_base]

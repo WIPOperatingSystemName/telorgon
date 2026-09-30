@@ -51,6 +51,35 @@ fn digest_valid(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+
+fn numeric_version(value: &str, minimum_parts: usize, minimum_major: u16) -> Option<[u16; 3]> {
+    if value.len() > 17 {
+        return None;
+    }
+    let mut version = [0; 3];
+    let mut count = 0;
+    for part in value.split('.') {
+        if count == 3
+            || part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        version[count] = part.parse().ok()?;
+        count += 1;
+    }
+    (count >= minimum_parts && version[0] >= minimum_major).then_some(version)
+}
+
+/// Numeric comparison includes historical ABI requirements such as GLIBC_2.2.5.
+pub fn glibc_version(value: &str) -> Option<[u16; 3]> {
+    numeric_version(value, 2, 2)
+}
+
+pub fn xwayland_version(value: &str) -> bool {
+    numeric_version(value, 3, 1).is_some()
+}
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 1024
@@ -77,8 +106,8 @@ pub fn parse<'a>(bytes: &'a [u8], target: &str) -> Result<(Manifest, &'a [u8]), 
     if manifest.schema != 1
         || manifest.target != target
         || target != "x86_64-unknown-linux-gnu"
-        || manifest.minimum_glibc != "2.39"
-        || manifest.xwayland_version != "24.1.13"
+        || glibc_version(&manifest.minimum_glibc).is_none()
+        || !xwayland_version(&manifest.xwayland_version)
         || manifest.entries.is_empty()
         || manifest.entries.len() > MAX_ENTRIES
         || manifest.components.is_empty()
@@ -98,6 +127,11 @@ pub fn parse<'a>(bytes: &'a [u8], target: &str) -> Result<(Manifest, &'a [u8]), 
         {
             return Err("invalid component provenance".into());
         }
+    }
+    if !manifest.components.iter().any(|component| {
+        component.name == "xwayland" && component.version == manifest.xwayland_version
+    }) {
+        return Err("payload Xwayland version differs from its component provenance".into());
     }
     let data = &bytes[12 + n..];
     let mut paths = BTreeSet::new();
@@ -217,8 +251,8 @@ pub(crate) fn fixture() -> Vec<u8> {
     }
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schema":1,"target":"x86_64-unknown-linux-gnu","minimum_glibc":"2.39",
-        "xwayland_version":"24.1.13", "components":[{"name":"test-only",
-        "version":"0","input_sha256":hash(b"test"),"license":"synthetic fixture"}],"entries":entries
+        "xwayland_version":"99.0.0", "components":[{"name":"xwayland",
+        "version":"99.0.0","input_sha256":hash(b"test"),"license":"synthetic fixture"}],"entries":entries
     }))
     .unwrap();
     let mut bytes = MAGIC.to_vec();
@@ -231,6 +265,65 @@ pub(crate) fn fixture() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn changed_manifest(change: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let bytes = fixture();
+        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let mut manifest: serde_json::Value = serde_json::from_slice(&bytes[12..12 + n]).unwrap();
+        change(&mut manifest);
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let mut changed = MAGIC.to_vec();
+        changed.extend((encoded.len() as u32).to_le_bytes());
+        changed.extend(encoded);
+        changed.extend(&bytes[12 + n..]);
+        changed
+    }
+
+    #[test]
+    fn accepts_audited_glibc_requirements_without_consulting_the_build_host() {
+        for requirement in ["2.2.5", "2.39", "2.43", "3.0"] {
+            let bytes = changed_manifest(|manifest| {
+                manifest["minimum_glibc"] = serde_json::json!(requirement);
+            });
+            assert!(
+                validate(&bytes, "x86_64-unknown-linux-gnu").is_ok(),
+                "{requirement}"
+            );
+        }
+        for requirement in [
+            "",
+            "1.0",
+            "2",
+            "2.043",
+            "2.43.0.1",
+            "2.65536",
+            "2.2.65536",
+            "+2.43",
+            "2.43\n",
+        ] {
+            let bytes = changed_manifest(|manifest| {
+                manifest["minimum_glibc"] = serde_json::json!(requirement);
+            });
+            assert!(
+                validate(&bytes, "x86_64-unknown-linux-gnu").is_err(),
+                "{requirement}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_xwayland_version_to_agree_with_component_provenance() {
+        let bytes = changed_manifest(|manifest| {
+            manifest["xwayland_version"] = serde_json::json!("99.0.1");
+        });
+        assert!(validate(&bytes, "x86_64-unknown-linux-gnu").is_err());
+        let bytes = changed_manifest(|manifest| {
+            manifest["xwayland_version"] = serde_json::json!("99.0.1");
+            manifest["components"][0]["version"] = serde_json::json!("99.0.1");
+        });
+        assert!(validate(&bytes, "x86_64-unknown-linux-gnu").is_ok());
+    }
+
     #[test]
     fn rejects_corruption_truncation_and_trailing_bytes() {
         let bytes = fixture();

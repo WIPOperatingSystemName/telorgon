@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Offline source verification, preflight and isolated-root payload compilation.
+"""Offline source verification, preflight and native payload compilation.
 
 --fetch downloads checksum-pinned sources. --with-dependencies builds private
-libraries as well as Xwayland. Build tools, glibc 2.39 and host graphics development
+libraries as well as Xwayland. Build tools, GNU libc and host graphics development
 interfaces must be available. No system packages are installed. --compile requires
 a fresh work directory. Compilation does not qualify a release.
 """
@@ -13,8 +13,10 @@ import shutil
 import subprocess
 import tomllib
 
+from native_inputs import locked_sources
 
-def preflight(with_dependencies=False):
+
+def preflight(with_dependencies=False, environment=None):
     failures = []
     programs = ("meson", "ninja", "make", "patch", "cc", "pkg-config", "wayland-scanner", "readelf", "patchelf")
     if with_dependencies:
@@ -33,7 +35,8 @@ def preflight(with_dependencies=False):
         if with_dependencies:
             dependencies = ("libdrm >= 2.4.116", "gbm", "egl", "gl", "dri")
         for dependency in dependencies:
-            if subprocess.run(["pkg-config", "--exists", dependency], check=False).returncode:
+            if subprocess.run(["pkg-config", "--exists", dependency], env=environment,
+                              check=False).returncode:
                 failures.append(f"missing build dependency: {dependency}")
     return failures
 
@@ -60,9 +63,8 @@ def main():
         parser.error("--compile requires --source-cache")
     repository = Path(__file__).resolve().parents[2]
     recipes = repository / "third_party/recipes/xwayland"
-    lock = tomllib.loads((repository / "third_party/sources.lock.toml").read_text())
     failures = preflight(args.with_dependencies) if args.preflight else []
-    sources = list(lock['source'])
+    sources = list(locked_sources(repository).values())
     if args.with_dependencies:
         sources.extend(tomllib.loads((recipes / 'dependencies.lock.toml').read_text())['source'])
     if args.source_cache:

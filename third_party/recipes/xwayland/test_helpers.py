@@ -10,8 +10,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+
+REPOSITORY = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPOSITORY / 'tools/sdk'))
+from native_inputs import locked_sources, source_directory
 
 
 def keymap(symbols):
@@ -30,7 +35,8 @@ def run_tests(build_work, stage, work):
     shutil.copytree(stage, relocated)
     scratch = work / "private xkm;literal"
     scratch.mkdir(mode=0o700)
-    source = (build_work / "sources/xwayland-24.1.13/xkb/ddxLoad.c").read_text()
+    xwayland = source_directory(locked_sources(REPOSITORY)['xwayland'])
+    source = (build_work / 'sources' / xwayland / 'xkb/ddxLoad.c').read_text()
     start = source.index("static void\nOutputDirectory(")
     end = source.index("/**\n * Callback invoked", start)
     directory_function = source[start:end]

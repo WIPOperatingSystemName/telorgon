@@ -32,6 +32,8 @@ use std::{
 const GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 
+mod compatibility;
+
 /// Parent endpoints for one generation. Insert `wayland` into libwayland on its
 /// owner thread and record the actual client identity before spawning `command`.
 /// Drive `xwm` with Transport and require both readiness barriers before publish.
@@ -130,6 +132,7 @@ impl Command {
         runtime: Arc<RuntimeFiles>,
         environment: BTreeMap<OsString, OsString>,
     ) -> Result<PreparedServer> {
+        compatibility::ensure_requirement(&payload.manifest().minimum_glibc)?;
         if display.number() != runtime.display_number() {
             return Err(Error(
                 "Xwayland authority and reservation display numbers differ".into(),

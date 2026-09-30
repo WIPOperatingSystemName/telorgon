@@ -2,7 +2,6 @@
 # tracing and GPU-driver qualification remain mandatory; this is not that proof.
 schema = 1
 target = "x86_64-unknown-linux-gnu"
-minimum_glibc = "2.39"
 host = [
   "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2",
   "libpthread.so.0", "librt.so.1", "libresolv.so.2", "libutil.so.1",
