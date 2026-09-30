@@ -145,6 +145,10 @@ name = "desktop_audio"
 required-features = ["desktop-audio-linux"]
 
 [[example]]
+name = "battery_gui"
+required-features = ["application-software"]
+
+[[example]]
 name = "audio_playback"
 required-features = ["audio-linux"]
 

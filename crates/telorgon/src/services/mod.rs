@@ -3,6 +3,7 @@
 pub mod profiler;
 pub mod session;
 pub mod clipboard;
+pub mod battery;
 
 #[cfg(all(feature = "desktop-audio-linux", target_os = "linux"))]
 pub mod audio;

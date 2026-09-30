@@ -4,6 +4,7 @@
 //! ordinary authoring surface with `use telorgon::app::*`.
 
 pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
+pub use crate::services::battery;
 
 pub use crate::host::application::request_exit;
 pub use crate::host::application::{
@@ -122,6 +123,7 @@ pub mod app {
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
     pub use crate::portal::*;
     pub use crate::services::session;
+    pub use crate::services::battery;
     pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
     pub use crate::{DecorationNegotiation, DecorationPolicy};
