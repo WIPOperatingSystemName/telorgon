@@ -1,6 +1,6 @@
 //! Read-only battery and external-power metrics for applications, shells, and embedded hosts.
 //!
-//! Call [`snapshot`] for a fresh async read, or [`monitor()`] to explicitly start periodic reads.
+//! Call [`snapshot`] for a fresh async read, or [`monitor()`] to start native change observation.
 //! A monitor owns its worker; its cloneable handle supplies a stable UI signal and events.
 //! Linux reads the kernel power-supply interface without requiring a desktop session or daemon.
 //! Other native platforms return [`BatteryError::Unsupported`]; embedded hosts can implement
@@ -47,7 +47,8 @@ pub use model::{
     BatteryScope, BatterySnapshot, BatteryState, BatteryTimeEstimate, ExternalPowerSupply,
 };
 pub use monitor::{
-    BatteryEvents, BatteryMonitor, BatteryMonitorConfig, BatteryMonitorHandle, monitor,
+    BatteryEvents, BatteryMonitor, BatteryMonitorConfig, BatteryMonitorHandle, BatteryUpdateMode,
+    monitor,
 };
 pub use status::{
     BatteryAvailability, BatteryEvent, BatteryHealth, BatteryMonitorState, BatteryStatus,

@@ -351,8 +351,9 @@ fn owner_drop_does_not_join_a_blocked_read_and_late_results_are_discarded() {
             disposed,
         },
         BatteryMonitorConfig {
-            refresh_interval: Duration::from_millis(1),
+            fallback_poll_interval: Duration::from_millis(1),
             event_capacity: 32,
+            ..Default::default()
         },
     ))
     .unwrap();
@@ -400,8 +401,9 @@ fn shutdown_interrupts_a_long_polling_wait_and_joins_the_worker() {
     let monitor = futures_lite::future::block_on(BatteryMonitor::start_with_provider(
         FixedProvider,
         BatteryMonitorConfig {
-            refresh_interval: Duration::from_secs(3600),
+            fallback_poll_interval: Duration::from_secs(3600),
             event_capacity: 32,
+            ..Default::default()
         },
     ))
     .unwrap();
@@ -429,12 +431,14 @@ fn invalid_configuration_is_rejected_before_provider_io() {
     }
     for config in [
         BatteryMonitorConfig {
-            refresh_interval: Duration::ZERO,
+            fallback_poll_interval: Duration::ZERO,
             event_capacity: 32,
+            ..Default::default()
         },
         BatteryMonitorConfig {
-            refresh_interval: Duration::from_secs(2),
+            fallback_poll_interval: Duration::from_secs(2),
             event_capacity: 0,
+            ..Default::default()
         },
     ] {
         assert!(matches!(
@@ -476,8 +480,9 @@ fn cancelling_startup_releases_the_provider_and_any_started_worker() {
             disposed,
         },
         BatteryMonitorConfig {
-            refresh_interval: Duration::from_secs(3600),
+            fallback_poll_interval: Duration::from_secs(3600),
             event_capacity: 32,
+            ..Default::default()
         },
     ));
     let waker = std::task::Waker::noop();
@@ -517,4 +522,307 @@ fn startup_reports_provider_errors_and_worker_panics() {
         )),
         Err(BatteryError::WorkerPanicked)
     ));
+}
+
+fn wait_for_state(handle: &BatteryMonitorHandle, check: impl Fn(&BatteryMonitorState) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !check(&handle.state()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not publish expected state"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn notification_driven_worker_stays_idle_then_publishes_live_changes_and_stops() {
+    let (reading, reads) = mpsc::channel();
+    let (reply, replies) = mpsc::channel();
+    let (disposed, disposal) = mpsc::channel();
+    let (notify, notifications) = mpsc::channel();
+    let stop = notify.clone();
+    let monitor = futures_lite::future::block_on(BatteryMonitor::start_worker(
+        ControlledProvider {
+            initial: snapshot(vec![battery("BAT0", BatteryState::Discharging, Some(50.0))]),
+            calls: Cell::new(0),
+            owner: Cell::new(None),
+            reading,
+            replies,
+            disposed,
+        },
+        BatteryMonitorConfig {
+            fallback_poll_interval: Duration::from_millis(1),
+            ..Default::default()
+        },
+        move || WaitSource::Controlled {
+            events: notifications,
+            stop,
+        },
+    ))
+    .unwrap();
+    let handle = monitor.handle();
+    let mut events = handle.subscribe().unwrap();
+    assert!(events.try_recv().is_none(), "baseline must not emit sounds");
+    assert!(
+        matches!(
+            reads.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "notification mode must not use the fallback timer"
+    );
+    notify.send(Refresh::Changed).unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    reply
+        .send(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Charging,
+            Some(51.0),
+        )]))
+        .unwrap();
+    wait_for_state(&handle, |s| s.batteries[0].status.percentage == Some(51));
+    // State is published before event delivery; wait for the worker to reach its next wait.
+    notify.send(Refresh::Changed).unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    let transitions = drain(&mut events);
+    assert!(transitions.iter().any(BatteryEvent::started_charging));
+    assert!(transitions.contains(&BatteryEvent::PercentageChanged {
+        id: "BAT0".into(),
+        previous: Some(50),
+        current: Some(51),
+    }));
+    // Stop while a read is in flight; its reply must not start another read or wait.
+    monitor.stop();
+    reply
+        .send(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Charging,
+            Some(51.0),
+        )]))
+        .unwrap();
+    futures_lite::future::block_on(monitor.shutdown()).unwrap();
+    disposal.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(handle.state().availability, BatteryAvailability::Stopped);
+}
+
+#[test]
+fn lost_native_notifications_replace_pending_sounds_with_a_fresh_baseline() {
+    let handle = handle(
+        snapshot(vec![battery("BAT0", BatteryState::Discharging, Some(50.0))]),
+        32,
+    );
+    let mut events = handle.subscribe().unwrap();
+    handle.shared.observe(Ok(snapshot(vec![battery(
+        "BAT0",
+        BatteryState::Charging,
+        Some(51.0),
+    )])));
+    handle.shared.refresh(
+        Ok(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Full,
+            Some(100.0),
+        )])),
+        true,
+    );
+    assert_eq!(drain(&mut events), vec![BatteryEvent::ResyncRequired]);
+    assert_eq!(handle.state().batteries[0].status.state, BatteryState::Full);
+    handle.shared.observe(Ok(snapshot(vec![battery(
+        "BAT0",
+        BatteryState::Charging,
+        Some(100.0),
+    )])));
+    assert!(
+        events.try_recv().unwrap().started_charging(),
+        "later confirmed transitions resume"
+    );
+}
+
+#[test]
+fn failed_notification_triggered_read_recovers_on_the_timer_without_a_charging_sound() {
+    struct RecoveringProvider {
+        calls: Cell<usize>,
+        reading: mpsc::Sender<()>,
+        replies: mpsc::Receiver<Result<BatterySnapshot, BatteryError>>,
+    }
+    impl BatteryProvider for RecoveringProvider {
+        fn read_snapshot(&self) -> Result<BatterySnapshot, BatteryError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call == 0 {
+                return Ok(snapshot(vec![battery(
+                    "BAT0",
+                    BatteryState::Discharging,
+                    Some(50.0),
+                )]));
+            }
+            self.reading.send(()).unwrap();
+            self.replies.recv().unwrap()
+        }
+    }
+    let (reading, reads) = mpsc::channel();
+    let (reply, replies) = mpsc::channel();
+    let (notify, notifications) = mpsc::channel();
+    let stop = notify.clone();
+    let monitor = futures_lite::future::block_on(BatteryMonitor::start_worker(
+        RecoveringProvider {
+            calls: Cell::new(0),
+            reading,
+            replies,
+        },
+        BatteryMonitorConfig {
+            fallback_poll_interval: Duration::from_millis(1),
+            ..Default::default()
+        },
+        move || WaitSource::Controlled {
+            events: notifications,
+            stop,
+        },
+    ))
+    .unwrap();
+    let handle = monitor.handle();
+    let mut events = handle.subscribe().unwrap();
+    notify.send(Refresh::Changed).unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    reply.send(Err(read_error())).unwrap();
+    // The next read must happen without another notification.
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        handle.state().availability,
+        BatteryAvailability::Unavailable
+    );
+    assert_eq!(
+        handle.snapshot().batteries[0].state,
+        BatteryState::Discharging
+    );
+    assert_eq!(
+        drain(&mut events),
+        vec![BatteryEvent::AvailabilityChanged {
+            previous: BatteryAvailability::Ready,
+            current: BatteryAvailability::Unavailable,
+        }]
+    );
+    reply
+        .send(Ok(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Charging,
+            Some(51.0),
+        )])))
+        .unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(handle.state().availability, BatteryAvailability::Ready);
+    assert_eq!(
+        drain(&mut events),
+        vec![BatteryEvent::AvailabilityChanged {
+            previous: BatteryAvailability::Unavailable,
+            current: BatteryAvailability::Ready,
+        }]
+    );
+    monitor.stop();
+    reply.send(Ok(snapshot(Vec::new()))).unwrap();
+    futures_lite::future::block_on(monitor.shutdown()).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_shutdown_releases_descriptors_even_while_a_handle_survives() {
+    use crate::services::battery::linux::notifications::Notifications;
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let notifications = Notifications::test_socket(socket.into());
+    let wake = Arc::downgrade(&notifications.shutdown_wake());
+    let monitor = futures_lite::future::block_on(BatteryMonitor::start_worker(
+        FixedProvider,
+        BatteryMonitorConfig::default(),
+        move || WaitSource::Native(notifications),
+    ))
+    .unwrap();
+    let handle = monitor.handle();
+    let (finished, completion) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        finished
+            .send(futures_lite::future::block_on(monitor.shutdown()))
+            .unwrap();
+    });
+    completion
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert!(
+        wake.upgrade().is_none(),
+        "retained handles must not keep wake descriptors alive"
+    );
+    assert_eq!(handle.state().availability, BatteryAvailability::Stopped);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_native_socket_resynchronizes_immediately_then_uses_the_fallback_timer() {
+    use crate::services::battery::linux::notifications::Notifications;
+    let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let notifications = Notifications::test_socket(socket.into());
+    let wake = Arc::downgrade(&notifications.shutdown_wake());
+    let (reading, reads) = mpsc::channel();
+    let (reply, replies) = mpsc::channel();
+    let (disposed, disposal) = mpsc::channel();
+    let monitor = futures_lite::future::block_on(BatteryMonitor::start_worker(
+        ControlledProvider {
+            initial: snapshot(vec![battery("BAT0", BatteryState::Discharging, Some(50.0))]),
+            calls: Cell::new(0),
+            owner: Cell::new(None),
+            reading,
+            replies,
+            disposed,
+        },
+        BatteryMonitorConfig {
+            fallback_poll_interval: Duration::from_millis(1),
+            ..Default::default()
+        },
+        move || WaitSource::Native(notifications),
+    ))
+    .unwrap();
+    let handle = monitor.handle();
+    let mut events = handle.subscribe().unwrap();
+    drop(peer); // POLLHUP injects a watcher failure without watching real hardware.
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    reply
+        .send(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Charging,
+            Some(51.0),
+        )]))
+        .unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain(&mut events), vec![BatteryEvent::ResyncRequired]);
+    assert_eq!(
+        handle.state().batteries[0].status.state,
+        BatteryState::Charging
+    );
+    assert!(
+        wake.upgrade().is_none(),
+        "fallback must release native descriptors"
+    );
+    reply
+        .send(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Full,
+            Some(100.0),
+        )]))
+        .unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        drain(&mut events)
+            .iter()
+            .any(BatteryEvent::stopped_charging)
+    );
+    monitor.stop();
+    reply
+        .send(snapshot(vec![battery(
+            "BAT0",
+            BatteryState::Full,
+            Some(100.0),
+        )]))
+        .unwrap();
+    futures_lite::future::block_on(monitor.shutdown()).unwrap();
+    disposal.recv_timeout(Duration::from_secs(5)).unwrap();
 }

@@ -56,6 +56,15 @@ impl Observation {
         }
         events
     }
+
+    pub(super) fn resync(
+        &mut self,
+        result: Result<BatterySnapshot, BatteryError>,
+    ) -> Vec<BatteryEvent> {
+        // Lost kernel notifications invalidate transition history just like a failed read.
+        self.baseline = None;
+        self.update(result)
+    }
 }
 
 fn normalize(mut snapshot: BatterySnapshot) -> BatterySnapshot {

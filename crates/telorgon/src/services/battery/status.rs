@@ -90,7 +90,7 @@ pub struct BatteryMonitorState {
     pub last_error: Option<String>,
 }
 
-/// Changes observed between successful refreshes. Polling may miss intermediate transitions.
+/// Changes observed between successful refreshes. Coalescing or polling may miss transitions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatteryEvent {
     Added {

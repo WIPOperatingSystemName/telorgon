@@ -71,6 +71,21 @@ impl Subscriber {
         }
     }
 
+    pub(super) fn resync(&self) {
+        let waker = {
+            let mut queue = self.queue.lock().expect("battery event lock poisoned");
+            if queue.closed {
+                return;
+            }
+            queue.events.clear();
+            queue.overflow = true;
+            queue.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     fn take(queue: &mut Queue) -> Option<BatteryEvent> {
         if queue.overflow {
             queue.overflow = false;
@@ -82,7 +97,7 @@ impl Subscriber {
     }
 }
 
-/// FIFO observed transitions until overflow replaces pending events with `ResyncRequired`.
+/// FIFO observed transitions until lost notifications or overflow require resynchronization.
 /// Dropping this receiver unsubscribes. Temporary observation failures do not close it;
 /// shutdown drains pending events and then `next()` returns `None`.
 pub struct BatteryEvents {

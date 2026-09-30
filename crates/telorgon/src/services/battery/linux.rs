@@ -12,6 +12,8 @@ use super::{
     BatterySnapshot, BatteryState, BatteryTimeEstimate, ExternalPowerSupply,
 };
 
+pub(super) mod notifications;
+
 pub(super) fn read_snapshot(root: &Path) -> Result<BatterySnapshot, BatteryError> {
     let entries = fs::read_dir(root).map_err(|source| error(root, source))?;
     let mut paths = entries
