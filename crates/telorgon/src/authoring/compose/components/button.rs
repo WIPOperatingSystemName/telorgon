@@ -24,6 +24,7 @@ pub struct ButtonElement {
     pub style_override: StylePropertyPatch,
     pub inline_style: Option<Arc<crate::theme::CompiledComponentStyle>>,
     pub on_press: Option<ComponentCallback>,
+    pub on_input: Option<super::super::InputCallback>,
     pub(crate) invalid_interaction_effect: bool,
     pub(crate) effect_properties: u8,
     pub(crate) effect_overlay: bool,
@@ -137,6 +138,16 @@ impl Button {
 
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.element.enabled = enabled;
+        self
+    }
+
+    /// Handles input targeted at this control. Return true when local state changed.
+    pub fn on_input<C, F>(mut self, callback: F) -> Self
+    where
+        C: Component,
+        F: Fn(&mut C, &crate::ui::UiEvent) -> bool + 'static,
+    {
+        self.element.on_input = Some(super::super::InputCallback::new(callback));
         self
     }
 
@@ -373,6 +384,7 @@ pub fn button() -> Button {
             style_override: StylePropertyPatch::default(),
             inline_style: None,
             on_press: None,
+            on_input: None,
             invalid_interaction_effect: false,
             effect_properties: 0,
             effect_overlay: false,

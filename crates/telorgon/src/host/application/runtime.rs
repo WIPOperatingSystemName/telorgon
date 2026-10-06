@@ -1,4 +1,5 @@
 mod assets;
+mod editor_input;
 
 use crate::foundation::{MonotonicInstant, PointF, SizeF, SizeI};
 #[cfg(all(test, feature = "application-software"))]
@@ -99,6 +100,8 @@ pub struct AppRuntimeCore<D: ComponentDriver> {
     extent: SizeF,
     scene_epoch: u64,
     interaction: InteractionRouter,
+    modifiers: Modifiers,
+    editor_geometry: std::collections::HashMap<NodeId, crate::ui::UiInputGeometry>,
     theme: ThemeRuntime,
     motion_preference: MotionPreference,
 }
@@ -268,6 +271,10 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         theme: ThemeRuntime,
         domain: ThemeDomain,
     ) -> AppResult<Self> {
+        view.set_viewport_size(SizeF {
+            width: extent.width.max(1) as f32,
+            height: extent.height.max(1) as f32,
+        });
         let scope = ThemeRuntime::root_scope(domain);
         view.ui_mut().set_theme_domain(domain.id(), scope.id());
         let runtime = Self {
@@ -289,6 +296,8 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             },
             scene_epoch: 0,
             interaction: InteractionRouter::default(),
+            modifiers: Modifiers::empty(),
+            editor_geometry: Default::default(),
             theme,
             motion_preference: MotionPreference::Full,
         };
@@ -387,6 +396,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             width: extent.width as f32,
             height: extent.height as f32,
         };
+        self.view.set_viewport_size(self.extent);
         self.view.scheduler_mut().request();
         Ok(())
     }
@@ -477,6 +487,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
     /// Cancels all transient interaction state when the containing native view deactivates.
     pub fn deactivate_view(&mut self, timestamp: MonotonicInstant) {
         self.scroll.cancel();
+        self.modifiers = Modifiers::empty();
         self.view.scheduler_mut().request();
         let old_focus = self.interaction.focused();
         if self.interaction.view_deactivated(self.view.ui_mut()) {
@@ -494,6 +505,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
     pub fn flush_input(&mut self, timestamp: MonotonicInstant) -> InputFlushOutcome {
         #[cfg(feature = "profiler")]
         let _input_span = crate::runtime::instrumentation::span!("input.dispatch");
+        self.sync_interaction();
         let frame_needed_before = self.view.scheduler().needs_frame();
         if self.scroll.advance(
             self.view.ui_mut(), &self.layout, timestamp, self.motion_preference,
@@ -537,12 +549,8 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                             .pointer_moved(self.view.ui_mut(), pointer, position, hit);
                     self.apply_pointer_routing(routing, position, timestamp_ns);
                     if let Some(target) = routing.target {
-                        self.view.dispatch_ui(
-                            target,
-                            UiEventKind::Input(event),
-                            LISTEN_POINTER,
-                            timestamp_ns,
-                        );
+                        self.dispatch_observed(target, UiEventKind::Input(event),
+                            LISTEN_POINTER, timestamp_ns, Some(position));
                     }
                 }
                 PlatformInput::Input(
@@ -570,12 +578,8 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                     );
                     self.apply_pointer_routing(routing, position, timestamp_ns);
                     if let Some(target) = routing.target {
-                        self.view.dispatch_ui(
-                            target,
-                            UiEventKind::Input(event),
-                            LISTEN_POINTER,
-                            timestamp_ns,
-                        );
+                        self.dispatch_observed(target, UiEventKind::Input(event),
+                            LISTEN_POINTER, timestamp_ns, Some(position));
                     }
                 }
                 PlatformInput::Input(event @ InputEvent::Scroll { pointer, delta, precision, .. }) => {
@@ -591,22 +595,30 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                         ) {
                             self.view.scheduler_mut().request();
                         }
-                        self.view.dispatch_ui(
-                            target,
-                            UiEventKind::Input(event),
-                            LISTEN_POINTER,
-                            timestamp_ns,
-                        );
+                        self.dispatch_observed(target, UiEventKind::Input(event),
+                            LISTEN_POINTER, timestamp_ns, Some(position));
+                    }
+                }
+                PlatformInput::TextInput { target, event } => {
+                    self.dispatch_text_input(target, event, timestamp_ns);
+                }
+                PlatformInput::Input(InputEvent::TextInput(event)) => {
+                    if let Some(target) = self.interaction.focused() {
+                        self.dispatch_text_input(target, event, timestamp_ns);
+                    }
+                }
+                PlatformInput::Input(InputEvent::ModifiersChanged(modifiers)) => {
+                    self.modifiers = modifiers;
+                    if let Some(target) = self.interaction.focused() {
+                        self.dispatch_observed(target, UiEventKind::Input(InputEvent::ModifiersChanged(modifiers)),
+                            LISTEN_KEY, timestamp_ns, None);
                     }
                 }
                 PlatformInput::Input(InputEvent::Key(key)) => {
+                    self.modifiers = key.modifiers;
                     if let Some(target) = self.interaction.focused() {
-                        self.view.dispatch_ui(
-                            target,
-                            UiEventKind::Input(InputEvent::Key(key.clone())),
-                            LISTEN_KEY,
-                            timestamp_ns,
-                        );
+                        self.dispatch_observed(target, UiEventKind::Input(InputEvent::Key(key.clone())),
+                            LISTEN_KEY, timestamp_ns, None);
                     }
                     if key.logical_key == crate::input::LogicalKey::Named(NamedKey::Tab)
                         && key.state == ButtonState::Pressed
@@ -708,6 +720,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
                 ..PreparedFrame::default()
             });
         }
+        self.sync_interaction();
         let scroll_changed = self.scroll.advance(
             self.view.ui_mut(), &self.layout, now, self.motion_preference,
         );
@@ -740,6 +753,14 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             self.view.ui_mut(), &self.layout, now, self.motion_preference,
         );
         if bounds_changed || motion_changed {
+            let correction = self.layout.update(self.view.ui_mut(), &mut self.text, self.extent, 1.0);
+            layout.measured += correction.measured;
+            layout.arranged += correction.arranged;
+            layout.spatial_updated += correction.spatial_updated;
+            layout.cache_hits += correction.cache_hits;
+            layout.intrinsic_passes += correction.intrinsic_passes;
+        }
+        if self.publish_editor_layouts(now.as_nanos()) {
             let correction = self.layout.update(self.view.ui_mut(), &mut self.text, self.extent, 1.0);
             layout.measured += correction.measured;
             layout.arranged += correction.arranged;
@@ -912,6 +933,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
 
     fn move_focus(&mut self, backwards: bool, timestamp: u64) {
         let order = self.layout.focus_order(self.view.ui_mut());
+        let order = self.interaction.scoped_focus_order(self.view.ui(), order);
         let target = if order.is_empty() {
             None
         } else {
@@ -945,12 +967,10 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             return;
         }
         if let Some(old) = change.old {
-            self.view
-                .dispatch_ui(old, UiEventKind::Focus(false), LISTEN_FOCUS, timestamp);
+            self.dispatch_observed(old, UiEventKind::Focus(false), LISTEN_FOCUS, timestamp, None);
         }
         if let Some(new) = change.new {
-            self.view
-                .dispatch_ui(new, UiEventKind::Focus(true), LISTEN_FOCUS, timestamp);
+            self.dispatch_observed(new, UiEventKind::Focus(true), LISTEN_FOCUS, timestamp, None);
         }
     }
 
@@ -987,9 +1007,14 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
     }
 
     fn sync_interaction(&mut self) {
-        if self.interaction.sync(self.view.ui_mut()) {
+        let old = self.interaction.focused();
+        let changed = self.interaction.sync(self.view.ui_mut());
+        let _ = self.interaction.sync_focus_requests(self.view.ui_mut());
+        let new = self.interaction.focused();
+        if changed || old != new {
             self.view.scheduler_mut().request();
         }
+        self.dispatch_focus_change(FocusChange { old, new }, 0);
     }
 }
 

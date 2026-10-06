@@ -498,6 +498,39 @@ impl<'a, A> MountWriter<'a, A> {
         self.parents.pop();
         Some(ControlHandle::new(node))
     }
+    /// Creates an editor surface with focus behavior but no button activation defaults.
+    #[doc(hidden)]
+    pub fn text_input_node(
+        &mut self,
+        style: BoxStyle,
+        layout: LayoutStyle,
+        enabled: bool,
+        content: impl FnOnce(&mut Self),
+    ) -> ControlHandle {
+        let node = self.mount(NodeKind::TextInput, style, layout, InteractionSnapshot {
+            enabled,
+            focusable: true,
+            behavior: ControlBehavior::TextInput,
+            ..InteractionSnapshot::default()
+        });
+        self.parents.push(node);
+        content(self);
+        self.parents.pop();
+        ControlHandle::new(node)
+    }
+
+    pub fn request_focus(&mut self, node: NodeId) {
+        self.ui.request_focus(node);
+    }
+
+    pub fn text_cursor_rect(&mut self, node: NodeId, rect: Option<RectF>) {
+        self.ui.set_text_cursor_rect(node, rect);
+    }
+
+    pub fn focus_scope(&mut self, node: NodeId, enabled: bool) {
+        self.ui.set_focus_scope(node, enabled);
+    }
+
     /// Creates a platform-neutral text-input node under an existing component host.
     #[doc(hidden)]
     pub fn text_input_node_under(

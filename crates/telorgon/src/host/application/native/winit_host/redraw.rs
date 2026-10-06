@@ -134,6 +134,7 @@ impl<S: NativeRuntimeSource, P: NativePresentation> NativeHost<S, P> {
         } else {
             return Ok(());
         };
+        self.sync_text_input();
         match result {
             Ok(PresentationAction::Idle) => {
                 self.diagnostics.presentations_idle =

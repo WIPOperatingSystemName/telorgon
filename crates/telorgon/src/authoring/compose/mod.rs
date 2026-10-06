@@ -9,6 +9,9 @@ pub(crate) use components::compile_slot_effects;
 pub(crate) mod context;
 mod element;
 mod event;
+mod input_event;
+pub use input_event::InputCallback;
+pub(crate) use input_event::InputHandler;
 mod key;
 pub(crate) mod shell_services;
 mod signal;
@@ -34,11 +37,11 @@ pub use component::{
 pub use components::{
     HoverEffect, InteractionEffect, Button, ButtonElement, Checkbox, Container, ContainerElement, EasyWindowFrame,
     EasyWindowFrameComponent, HasContent, Image, ImageElement, MissingContent, Slider,
-    SliderElement, Switch, Text, TextElement, ToggleElement, ToggleKind, WindowChromeDesign,
+    SliderElement, Switch, Text, TextElement, TextInput, TextInputElement, ToggleElement, ToggleKind, WindowChromeDesign,
     WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle, WindowChromeViewExt,
     WindowContentSlot, WindowControlButtonStyle, WindowControlDesign, WindowControlVisual,
     WindowControlsDesign, WindowFrame, WindowTitleBarStyle, button, card, checkbox, column,
-    easy_window_frame, image, row, slider, spacer, stack, switch, text, window_content_slot,
+    easy_window_frame, image, row, slider, spacer, stack, switch, text, text_input, window_content_slot,
     window_frame,
 };
 pub use context::{InputsChangedContext, MountContext, RuntimeTarget, UnmountContext};

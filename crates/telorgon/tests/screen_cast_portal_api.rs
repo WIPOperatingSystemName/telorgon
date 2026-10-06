@@ -16,16 +16,27 @@ impl Component for CustomChooser {
             for (source, epoch, source_label) in &snapshot.sources {
                 let (source, epoch) = (*source, *epoch);
                 choices = choices.child(
-                    button().child(text(source_label.clone()).color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)))
+                    button()
+                        .child(
+                            text(source_label.clone())
+                                .color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)),
+                        )
                         .on_press(move |this: &mut Self| {
                             let _ = this.capture.approve(request, source, epoch);
                         })
                         .key(format!("{request}:{source:?}:{epoch}")),
                 );
             }
-            choices = choices.child(button().child(text("Cancel capture").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))).on_press(move |this: &mut Self| {
-                let _ = this.capture.deny(request);
-            }));
+            choices = choices.child(
+                button()
+                    .child(
+                        text("Cancel capture")
+                            .color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)),
+                    )
+                    .on_press(move |this: &mut Self| {
+                        let _ = this.capture.deny(request);
+                    }),
+            );
         }
         choices
     }
@@ -46,11 +57,16 @@ impl Component for CustomSharing {
         let mut controls = column();
         for (id, label) in &snapshot.sharing {
             let id = *id;
-            controls = controls.child(button().child(text(format!("Stop {label}")).color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))).on_press(
-                move |this: &mut Self| {
-                    this.capture.stop(id);
-                },
-            ));
+            controls = controls.child(
+                button()
+                    .child(
+                        text(format!("Stop {label}"))
+                            .color(telorgon::ColorRgba8::rgba(248, 249, 252, 255)),
+                    )
+                    .on_press(move |this: &mut Self| {
+                        this.capture.stop(id);
+                    }),
+            );
         }
         controls
     }

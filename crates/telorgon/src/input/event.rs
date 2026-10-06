@@ -84,6 +84,8 @@ pub enum InputEvent {
         precision: ScrollPrecision,
     },
     Key(KeyEvent),
+    ModifiersChanged(crate::input::Modifiers),
+    TextInput(crate::input::TextInputEvent),
 }
 
 impl InputEvent {

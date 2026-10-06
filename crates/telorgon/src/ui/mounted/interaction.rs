@@ -1,6 +1,27 @@
 use super::*;
 
 impl MountedUi {
+    pub fn request_focus(&mut self, node: NodeId) {
+        if let Some(state) = self.interactions.get_mut(node) {
+            state.focus_requested = true;
+        }
+    }
+
+    pub fn set_text_cursor_rect(&mut self, node: NodeId, rect: Option<RectF>) {
+        if let Some(state) = self.interactions.get_mut(node) {
+            state.text_cursor_rect = rect;
+        }
+    }
+
+    pub fn set_focus_scope(&mut self, node: NodeId, enabled: bool) {
+        if self.interactions.get(node).is_none() && self.nodes.contains(node) {
+            self.interactions.insert(node, InteractionSnapshot::default());
+        }
+        if let Some(state) = self.interactions.get_mut(node) {
+            state.focus_scope = enabled;
+        }
+    }
+
     pub(super) fn set_interaction_flag(
         &mut self,
         node: NodeId,

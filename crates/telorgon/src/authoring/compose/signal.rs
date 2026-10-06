@@ -94,6 +94,14 @@ impl<T> Eq for Signal<T> {}
 
 impl<T> SignalWriter<T> {
     pub fn publish(&self, value: T) -> u64 {
+        let (revision, notify) = self.publish_deferred(value);
+        notify();
+        revision
+    }
+
+    /// Updates the visible value immediately; the caller invokes notifications after
+    /// releasing its own publication locks so subscriber callbacks can reenter it.
+    pub(crate) fn publish_deferred(&self, value: T) -> (u64, impl FnOnce()) {
         let (revision, subscribers) = {
             let mut current = self
                 .inner
@@ -106,10 +114,11 @@ impl<T> SignalWriter<T> {
                 current.subscribers.values().cloned().collect::<Vec<_>>(),
             )
         };
-        for subscriber in subscribers {
-            subscriber();
-        }
-        revision
+        (revision, move || {
+            for subscriber in subscribers {
+                subscriber();
+            }
+        })
     }
 
     pub fn publish_if_changed(&self, value: T) -> u64

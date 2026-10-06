@@ -227,7 +227,7 @@ fn desktop_without_widgets_validates_and_has_no_reserved_widget_space() {
         .assets(crate::assets::cursor_test_bundle())
         .compositor(Compositor::new().cursor_theme(crate::assets::cursor_test_theme()))
         .into_ready();
-    let (_, _, widgets, _, _, _, _, _, _) = desktop.into_parts().unwrap();
+    let (_, _, widgets, _, _, _, _, _, _, _, _) = desktop.into_parts().unwrap();
     assert!(widgets.is_empty());
 
     // Verify the direct entrypoint exists without starting a desktop in this test.
@@ -328,4 +328,30 @@ fn managed_windows_retain_custom_frame_and_icon_options() {
     assert_eq!(options.decorations, WindowDecorationMode::Hidden);
     assert_eq!(options.icon.name(), Some("com.example.studio"));
     assert_eq!(options.icon.preferred(64), Some(crate::Icon::new(icon)));
+}
+
+#[test]
+fn network_controller_is_installed_without_io_and_moves_into_shell_ownership() {
+    use crate::network::*;
+    struct Idle;
+    impl NetworkProvider for Idle {
+        fn snapshot(&mut self) -> Result<NetworkSnapshot, NetworkError> { panic!("declarations must not start native work") }
+        fn execute(&mut self, _: NetworkCommand) -> Result<NetworkDispatch, NetworkError> { unreachable!() }
+        fn poll(&mut self, _: u64, _: &NetworkSnapshot) -> Result<Option<NetworkResult>, NetworkError> { unreachable!() }
+        fn abandon(&mut self, _: u64) {}
+    }
+    let controller = NetworkController::with_provider(Default::default(),Idle).unwrap();
+    let handle = controller.handle();
+    let desktop = Application::shell_environment("Network desktop")
+        .network(controller)
+        .assets(crate::assets::cursor_test_bundle())
+        .compositor(Compositor::new().cursor_theme(crate::assets::cursor_test_theme()))
+        .into_ready();
+    let (_,_,_,services,_,_,_,_,_,_,owner) = desktop.into_parts().unwrap();
+    let host = crate::authoring::compose::shell_services::ShellServiceHost::with_registry(services);
+    let installed = host.services.service::<NetworkHandle>().unwrap();
+    assert_eq!(*installed,handle);
+    assert_eq!(host.services.service::<NetworkObserver>().unwrap().signal().snapshot().state,NetworkServiceState::Unstarted);
+    drop(owner);
+    assert_eq!(handle.signal().snapshot().state,NetworkServiceState::Stopped);
 }

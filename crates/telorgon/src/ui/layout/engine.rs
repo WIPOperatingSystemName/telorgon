@@ -316,8 +316,8 @@ impl LayoutEngine {
             let columns = ((content_rect.width + gap) / (width + gap)).floor().max(1.0) as usize;
             for (index, child) in children.into_iter().enumerate() {
                 self.arrange_node(ui, text, child, RectF {
-                    x: content_rect.x + (index % columns) as f32 * (width + gap),
-                    y: content_rect.y + (index / columns) as f32 * (height + gap),
+                    x: (index % columns) as f32 * (width + gap),
+                    y: (index / columns) as f32 * (height + gap),
                     width, height,
                 }, false, scale);
             }

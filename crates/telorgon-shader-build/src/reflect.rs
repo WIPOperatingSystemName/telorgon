@@ -132,10 +132,12 @@ mod tests {
     use super::*;
     use rspirv::binary::Assemble;
 
-    const VERTEX: &[u8] =
-        include_bytes!("../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/liquid.vert.spv");
-    const FRAGMENT: &[u8] =
-        include_bytes!("../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/liquid.frag.spv");
+    const VERTEX: &[u8] = include_bytes!(
+        "../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/liquid.vert.spv"
+    );
+    const FRAGMENT: &[u8] = include_bytes!(
+        "../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/liquid.frag.spv"
+    );
 
     #[test]
     fn liquid_bundle_matches_descriptor_contract_and_uses_explicit_lod() {
@@ -162,10 +164,12 @@ mod tests {
 
     #[test]
     fn gaussian_bundle_uses_the_kernel_buffer_and_explicit_lod() {
-        let vertex =
-            include_bytes!("../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/blur.vert.spv");
-        let fragment =
-            include_bytes!("../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/blur.frag.spv");
+        let vertex = include_bytes!(
+            "../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/blur.vert.spv"
+        );
+        let fragment = include_bytes!(
+            "../../telorgon/src/graphics/renderers/vulkan/shaders/generated/spirv/blur.frag.spv"
+        );
         verify_interface(vertex, "vertex", "blur_vertex").unwrap();
         verify_interface(fragment, "fragment", "blur_fragment").unwrap();
         let module = dr::load_bytes(fragment).unwrap();

@@ -5,6 +5,8 @@
 
 pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
 pub use crate::services::battery;
+pub mod network;
+pub use crate::services::screen_brightness;
 
 pub use crate::host::application::request_exit;
 pub use crate::host::application::{
@@ -87,7 +89,7 @@ mod common {
         WindowChromeCapabilities, WindowChromeHitSpec, WindowChromeModel, WindowChromeRole,
         WindowChromeState, WindowContentStyle, WindowEdgeMask, WindowResizeEdge, WindowTilingState,
         asset_catalog, button, card, checkbox, column, component, easy_window_frame, hashed_key,
-        image, row, slider, spacer, stack, switch, text, window_content_slot, window_frame,
+        image, row, slider, spacer, stack, switch, text, text_input, window_content_slot, window_frame,
     };
 }
 
@@ -114,6 +116,7 @@ pub mod app {
     pub use crate::host::application::{
         Application, Compositor, KeyBindings, KeyChord, LinuxShellConfig, OutputScale, Renderer,
         ShellKeyAction, ShellKeyEvent, ShortcutKey, Window, WindowDecorationMode,
+        SystemShortcutControl, SystemShortcutFeedback,
         WindowFrameFactory, WindowFrameTemplate,
     };
     pub use crate::host::application::{
@@ -124,6 +127,9 @@ pub mod app {
     pub use crate::portal::*;
     pub use crate::services::session;
     pub use crate::services::battery;
+pub use super::network;
+    pub use crate::services::screen_brightness;
+    pub use crate::services::screen_brightness::*;
     pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
     pub use crate::{DecorationNegotiation, DecorationPolicy};
@@ -152,7 +158,7 @@ pub use crate::authoring::compose::{
     WindowChromeDesignError, WindowChromePalette, WindowChromeStateStyle, WindowControlButtonStyle,
     WindowControlDesign, WindowControlVisual, WindowControlsDesign, WindowTitleBarStyle, button,
     card, checkbox, column, easy_window_frame, hashed_key, image, row, slider, spacer, stack,
-    switch, text, window_content_slot, window_frame,
+    switch, text, text_input, window_content_slot, window_frame,
 };
 pub use crate::components::application::primitives::{
     ApplicationPrimitiveDiagnosticCollector, ApplicationPrimitiveDiagnosticKind,
@@ -492,7 +498,7 @@ pub use crate::ui::text::{
     TextCompositionError, TextCompositionKind, TextEdit, TextEditBatch, TextEditError,
     TextEditOutcome, TextEngine, TextError, TextInputConfiguration, TextInputGeometry,
     TextInputPolicy, TextInputPurpose, TextInputRequest, TextInputResyncReason, TextInputSession,
-    TextInputSnapshot, TextLayoutRequest, TextMultiline, TextNavigationDirection,
+    TextInputSnapshot, TextLayoutRequest, TextLineLayout, TextMultiline, TextNavigationDirection,
     TextNavigationUnit, TextOffset, TextRange, TextRangeError, TextResult, TextReturnKeyAction,
     TextRevision, TextRunId, TextRunKey, TextSelection, TextSelectionAdjustment,
     TextSessionCommand, TextSessionDelta, TextSessionDeltaOutcome, TextSessionId, TextSessionPhase,

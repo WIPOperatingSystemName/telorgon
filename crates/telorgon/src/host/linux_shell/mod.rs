@@ -157,7 +157,12 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         assets,
         pointer_config,
         app_icon_profile,
+        screen_brightness,
+        mut network,
     ) = application.into_parts()?;
+    if let Some(network) = network.as_mut() {
+        network.start().map_err(|error| AppError::new(error.to_string()))?;
+    }
     let _stall_probes = stall_probe::Session::from_env();
     let launch_environment = crate::services::session::Environment::inherited();
     let runtime_directory = launch_environment.runtime_directory().map_err(app_error)?;
@@ -175,6 +180,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
 
     let seat = LinuxSeat::open_with_deferred_disable().map_err(app_error)?;
     seat.dispatch(0).map_err(app_error)?;
+    let mut screen_brightness = screen_brightness::Session::start(
+        screen_brightness,
+        seat.state() == SeatState::Enabled,
+    )?;
     let input = LibInputContext::new(&seat, &config.seat_name).map_err(app_error)?;
     let (_drm_seat_device, kms, topology, drm_path) = select_drm_device(&seat, &config)?;
     let connector = topology
@@ -1113,6 +1122,13 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         if seat_ready.swap(false, Ordering::AcqRel) {
             seat.dispatch(0).map_err(app_error)?;
         }
+        screen_brightness.update(
+            seat.state() == SeatState::Enabled && !seat.disable_pending(),
+            session_locked || wayland.session_locked(),
+        );
+        if wayland.shortcuts_inhibited(1) {
+            screen_brightness.cancel_keys();
+        }
         if seat.disable_pending() {
             // Close input device FDs before acknowledging access revocation.
             tiling.finish(&mut windows, &mut configure_scheduler);
@@ -1959,6 +1975,9 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                             alt: keyboard.modifier_active(c"Mod1"),
                             logo: keyboard.modifier_active(c"Mod4"),
                         };
+                        if !pressed {
+                            screen_brightness.release_key(keycode);
+                        }
                         let action = shortcut_keys.route(
                             event,
                             pressed,
@@ -3271,6 +3290,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
                         wayland.cancel_drag(1).map_err(app_error)?;
                     }
                     session_locked = true;
+                    screen_brightness.update(seat.state() == SeatState::Enabled, true);
                     tiling.finish(&mut windows, &mut configure_scheduler);
                     decoration_click.cancel();
                     for frame in frame_layers.values_mut() {
@@ -3353,6 +3373,10 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         }
 
         latency_trace.phase("window_policy_cursor");
+        screen_brightness.update(
+            seat.state() == SeatState::Enabled && !seat.disable_pending(),
+            session_locked || wayland.session_locked(),
+        );
         capture_sessions.set_locked(session_locked || wayland.session_locked());
         let mut published_capture_sources: Vec<_> =
             std::iter::once(crate::shell::capture::CaptureSource::Output(crate::shell::OutputId::MIN))
@@ -4522,3 +4546,5 @@ fn select_drm_device<'seat>(
 
 #[cfg(test)]
 mod tests;
+
+mod screen_brightness;

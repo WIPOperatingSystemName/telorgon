@@ -11,7 +11,7 @@ use std::{
 use crate::foundation::{MonotonicInstant, PointF, SizeF, SizeI};
 use crate::graphics::presentation::{SurfaceMetrics, SurfaceRevision};
 use crate::graphics::render::{AlphaMode, ColorSpace, RenderSceneDelta};
-use crate::input::{ButtonState, InputEvent, KeyEvent, Modifiers, PhysicalKey, PointerButton};
+use crate::input::{ButtonState, InputEvent, PointerButton};
 use crate::platform::contracts::{PendingHostFacts, PostTurnSchedule, RemainingWork, ViewId};
 use crate::platform::winit::{
     ViewRegistry, WinitClockObservation, WinitWakeIntent, interpret_schedule,
@@ -21,7 +21,6 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, Size};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::PhysicalKey as WinitPhysicalKey;
 use winit::window::{
     CursorIcon, CustomCursor, ResizeDirection, Window, WindowAttributes, WindowId,
 };
@@ -518,6 +517,8 @@ struct NativeHost<S: NativeRuntimeSource, P: NativePresentation> {
     suspended: bool,
     host_wake_pending: bool,
     cursor_position: PointF,
+    keyboard: keyboard::NativeKeyboard,
+    ime: ime::NativeIme,
     pointer: Option<ManagedPointer>,
     diagnostics: NativeHostDiagnostics,
     failure: Option<String>,
@@ -835,6 +836,8 @@ impl<S: NativeRuntimeSource, P: NativePresentation> NativeHost<S, P> {
             suspended: false,
             host_wake_pending: false,
             cursor_position: PointF::default(),
+            keyboard: keyboard::NativeKeyboard::default(),
+            ime: ime::NativeIme::default(),
             pointer: None,
             diagnostics: NativeHostDiagnostics::default(),
             failure: None,
@@ -896,12 +899,13 @@ fn flush_windows_compositor() {
     #[cfg(not(feature = "profiler"))]
     let _ = result;
 }
-
 mod dpi;
 mod pointer;
 mod scheduling;
 use pointer::{mouse_button, winit_cursor_icon};
 mod events;
+mod keyboard;
+mod ime;
 mod redraw;
 
 #[cfg(target_os = "windows")]

@@ -1,6 +1,28 @@
 //! Named-function and explicitly authorized desktop-action compositor shortcuts.
 
 use super::{ShellKeyAction, ShellKeyEvent};
+use std::sync::Arc;
+
+/// Feedback for a typed system shortcut after its request has been admitted or rejected.
+/// Levels and native completion remain owned by the corresponding service snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemShortcutControl {
+    Volume,
+    Microphone,
+    ScreenBrightness,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemShortcutFeedback {
+    pub control: SystemShortcutControl,
+    pub accepted: bool,
+}
+#[derive(Clone)]
+struct Feedback(Arc<dyn Fn(SystemShortcutFeedback) + Send + Sync>);
+impl std::fmt::Debug for Feedback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SystemShortcutFeedback")
+    }
+}
 
 /// A layout-resolved XKB symbol, not a physical key position.
 ///
@@ -72,6 +94,9 @@ impl ShortcutKey {
     pub const AudioVolumeMute: Self = Self::from_keysym(0x1008ff12);
     pub const AudioVolumeUp: Self = Self::from_keysym(0x1008ff13);
     pub const MicrophoneMute: Self = Self::from_keysym(0x1008ffb2);
+
+    pub const ScreenBrightnessUp: Self = Self::from_keysym(0x1008ff02);
+    pub const ScreenBrightnessDown: Self = Self::from_keysym(0x1008ff03);
 
     pub const Space: Self = Self::from_keysym(0x20);
     pub const Enter: Self = Self::from_keysym(0xff0d);
@@ -201,12 +226,23 @@ impl KeyChord {
 #[derive(Clone, Debug, Default)]
 pub struct KeyBindings {
     bindings: Vec<(KeyChord, ShortcutHandler)>,
+    feedback: Option<Feedback>,
 }
 
 #[derive(Clone)]
 enum ShortcutHandler {
     #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
-    Mixer { handle: super::audio_mixer::AudioMixerHandle, action: crate::services::audio::AudioSystemAction, on_error: fn(crate::integrations::pipewire::MediaError) },
+    Mixer {
+        handle: super::audio_mixer::AudioMixerHandle,
+        action: crate::services::audio::AudioSystemAction,
+        on_error: fn(crate::integrations::pipewire::MediaError),
+    },
+    ScreenBrightness {
+        handle: crate::screen_brightness::ScreenBrightnessHandle,
+        target: crate::screen_brightness::ScreenBrightnessTarget,
+        config: crate::screen_brightness::ScreenBrightnessKeyConfig,
+        up: bool,
+    },
     Function(fn()),
     #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
     Audio {
@@ -218,6 +254,11 @@ enum ShortcutHandler {
 impl std::fmt::Debug for ShortcutHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ScreenBrightness { target, up, .. } => f
+                .debug_struct("ScreenBrightness")
+                .field("target", target)
+                .field("up", up)
+                .finish(),
             Self::Function(_) => f.write_str("Function"),
             #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
             Self::Mixer { action, .. } => f.debug_tuple("Mixer").field(action).finish(),
@@ -227,32 +268,130 @@ impl std::fmt::Debug for ShortcutHandler {
     }
 }
 impl ShortcutHandler {
-    fn invoke(&self) {
+    fn invoke(&self, event: ShellKeyEvent) -> Option<SystemShortcutFeedback> {
         match self {
+            Self::ScreenBrightness {
+                handle,
+                target,
+                config,
+                up,
+            } => {
+                let result = handle.key_press(*target, event.keycode, *up, *config);
+                let accepted = result.is_ok();
+                if let Err(error) = result {
+                    handle.shared.lock().last_error = Some(error);
+                    handle.shared.publish();
+                }
+                return Some(SystemShortcutFeedback {
+                    control: SystemShortcutControl::ScreenBrightness,
+                    accepted,
+                });
+            }
             Self::Function(handler) => handler(),
             #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
-            Self::Mixer { handle, action, on_error } => {
-                if let Err(error) = handle.execute(super::audio_mixer::MixerAction::System(*action)) { on_error(error); }
-            },
+            Self::Mixer {
+                handle,
+                action,
+                on_error,
+            } => {
+                let result = handle.execute(super::audio_mixer::MixerAction::System(*action));
+                let accepted = result.is_ok();
+                if let Err(error) = result {
+                    on_error(error);
+                }
+                return audio_feedback(*action, accepted);
+            }
             #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
             Self::Audio {
                 handle,
                 action,
                 on_error,
             } => {
-                if let Err(error) = handle.execute(*action) {
+                let result = handle.execute(*action);
+                let accepted = result.is_ok();
+                if let Err(error) = result {
                     on_error(error);
                 }
+                return audio_feedback(*action, accepted);
             }
         }
+        None
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
+fn audio_feedback(
+    action: crate::services::audio::AudioSystemAction,
+    accepted: bool,
+) -> Option<SystemShortcutFeedback> {
+    use crate::services::audio::{AudioControlTarget, AudioSystemAction};
+    let target = match action {
+        AudioSystemAction::AdjustVolume { target, .. }
+        | AudioSystemAction::ToggleMute { target }
+        | AudioSystemAction::SetMute { target, .. } => target,
+        AudioSystemAction::Direct(_) => return None,
+    };
+    let control = match target {
+        AudioControlTarget::DefaultOutput => SystemShortcutControl::Volume,
+        AudioControlTarget::DefaultInput => SystemShortcutControl::Microphone,
+        AudioControlTarget::Node(_) => return None,
+    };
+    Some(SystemShortcutFeedback { control, accepted })
 }
 
 impl KeyBindings {
     pub const fn new() -> Self {
         Self {
             bindings: Vec::new(),
+            feedback: None,
         }
+    }
+
+    /// Observes typed system-key requests without applying a second mutation.
+    /// The host invokes this only for handled fresh presses while shortcuts are permitted.
+    /// Keep the callback short and nonblocking; observe services for confirmed levels.
+    pub fn on_system_action(
+        mut self,
+        feedback: impl Fn(SystemShortcutFeedback) + Send + Sync + 'static,
+    ) -> Self {
+        self.feedback = Some(Feedback(Arc::new(feedback)));
+        self
+    }
+
+    /// Installs physical screen brightness keys, with explicit firmware and held-repeat policy.
+    pub fn screen_brightness_keys(
+        mut self,
+        handle: crate::screen_brightness::ScreenBrightnessHandle,
+        target: crate::screen_brightness::ScreenBrightnessTarget,
+        config: crate::screen_brightness::ScreenBrightnessKeyConfig,
+    ) -> Result<Self, crate::screen_brightness::ScreenBrightnessError> {
+        config.validate()?;
+        if config.handling == crate::screen_brightness::ScreenBrightnessKeyHandling::Disabled {
+            return Ok(self);
+        }
+        for (key, up) in [
+            (ShortcutKey::ScreenBrightnessUp, true),
+            (ShortcutKey::ScreenBrightnessDown, false),
+        ] {
+            let chord = KeyChord::new(key);
+            assert!(
+                !self
+                    .bindings
+                    .iter()
+                    .any(|(existing, _)| existing.overlaps(chord)),
+                "duplicate compositor shortcut: {chord:?}"
+            );
+            self.bindings.push((
+                chord,
+                ShortcutHandler::ScreenBrightness {
+                    handle: handle.clone(),
+                    target,
+                    config,
+                    up,
+                },
+            ));
+        }
+        Ok(self)
     }
 
     /// Adds a shortcut backed by a named function.
@@ -275,19 +414,66 @@ impl KeyBindings {
 
     /// Bind media keys to the reconnecting mixer shared with shell widgets.
     #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
-    pub fn mixer_media_keys(mut self, handle: super::audio_mixer::AudioMixerHandle, step_ui: f32,
-        on_error: fn(crate::integrations::pipewire::MediaError)) -> Result<Self, crate::integrations::pipewire::MediaError> {
-        use crate::services::audio::{AudioControlTarget as Target, AudioSystemAction as Action, Amplification};
-        if !step_ui.is_finite() || step_ui <= 0.0 || step_ui > 1.0 { return Err(crate::integrations::pipewire::MediaError::InvalidArgument("audio key volume step")); }
+    pub fn mixer_media_keys(
+        mut self,
+        handle: super::audio_mixer::AudioMixerHandle,
+        step_ui: f32,
+        on_error: fn(crate::integrations::pipewire::MediaError),
+    ) -> Result<Self, crate::integrations::pipewire::MediaError> {
+        use crate::services::audio::{
+            Amplification, AudioControlTarget as Target, AudioSystemAction as Action,
+        };
+        if !step_ui.is_finite() || step_ui <= 0.0 || step_ui > 1.0 {
+            return Err(crate::integrations::pipewire::MediaError::InvalidArgument(
+                "audio key volume step",
+            ));
+        }
         for (key, action) in [
-            (ShortcutKey::AudioVolumeDown, Action::AdjustVolume { target: Target::DefaultOutput, delta_ui: -step_ui, amplification: Amplification::Forbid }),
-            (ShortcutKey::AudioVolumeUp, Action::AdjustVolume { target: Target::DefaultOutput, delta_ui: step_ui, amplification: Amplification::Forbid }),
-            (ShortcutKey::AudioVolumeMute, Action::ToggleMute { target: Target::DefaultOutput }),
-            (ShortcutKey::MicrophoneMute, Action::ToggleMute { target: Target::DefaultInput }),
+            (
+                ShortcutKey::AudioVolumeDown,
+                Action::AdjustVolume {
+                    target: Target::DefaultOutput,
+                    delta_ui: -step_ui,
+                    amplification: Amplification::Forbid,
+                },
+            ),
+            (
+                ShortcutKey::AudioVolumeUp,
+                Action::AdjustVolume {
+                    target: Target::DefaultOutput,
+                    delta_ui: step_ui,
+                    amplification: Amplification::Forbid,
+                },
+            ),
+            (
+                ShortcutKey::AudioVolumeMute,
+                Action::ToggleMute {
+                    target: Target::DefaultOutput,
+                },
+            ),
+            (
+                ShortcutKey::MicrophoneMute,
+                Action::ToggleMute {
+                    target: Target::DefaultInput,
+                },
+            ),
         ] {
             let chord = KeyChord::new(key);
-            assert!(!self.bindings.iter().any(|(existing, _)| existing.overlaps(chord)), "duplicate compositor shortcut: {chord:?}");
-            self.bindings.push((chord, ShortcutHandler::Mixer { handle: handle.clone(), action, on_error }));
+            assert!(
+                !self
+                    .bindings
+                    .iter()
+                    .any(|(existing, _)| existing.overlaps(chord)),
+                "duplicate compositor shortcut: {chord:?}"
+            );
+            self.bindings.push((
+                chord,
+                ShortcutHandler::Mixer {
+                    handle: handle.clone(),
+                    action,
+                    on_error,
+                },
+            ));
         }
         Ok(self)
     }
@@ -378,7 +564,11 @@ impl KeyBindings {
 
     pub(crate) fn handle(&self, event: ShellKeyEvent) -> ShellKeyAction {
         if let Some((_, handler)) = self.bindings.iter().find(|(chord, _)| chord.matches(event)) {
-            handler.invoke();
+            if let Some(feedback) = handler.invoke(event) {
+                if let Some(callback) = &self.feedback {
+                    (callback.0)(feedback);
+                }
+            }
             ShellKeyAction::Consume
         } else {
             ShellKeyAction::Forward
@@ -391,6 +581,55 @@ mod tests {
     use super::*;
 
     fn noop() {}
+
+    #[test]
+    fn system_feedback_reports_admission_without_mutating_twice() {
+        use crate::screen_brightness::*;
+        let controller = ScreenBrightnessController::new(Default::default()).unwrap();
+        let feedback = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = feedback.clone();
+        let bindings = KeyBindings::new()
+            .bind(KeyChord::new(ShortcutKey::T), noop)
+            .screen_brightness_keys(
+                controller.handle(),
+                ScreenBrightnessTarget::DefaultInternal,
+                Default::default(),
+            )
+            .unwrap()
+            .on_system_action(move |event| received.lock().unwrap().push(event));
+        assert_eq!(
+            bindings.handle(ShellKeyEvent {
+                keysym: u32::from('t'),
+                ..Default::default()
+            }),
+            ShellKeyAction::Consume
+        );
+        assert_eq!(
+            bindings.handle(ShellKeyEvent {
+                keysym: u32::from('q'),
+                ..Default::default()
+            }),
+            ShellKeyAction::Forward
+        );
+        assert!(feedback.lock().unwrap().is_empty());
+        assert_eq!(
+            bindings.handle(ShellKeyEvent {
+                keycode: 224,
+                keysym: 0x1008ff02,
+                ..Default::default()
+            }),
+            ShellKeyAction::Consume
+        );
+        assert_eq!(
+            &*feedback.lock().unwrap(),
+            &[SystemShortcutFeedback {
+                control: SystemShortcutControl::ScreenBrightness,
+                accepted: false
+            }]
+        );
+        // Inert construction rejected the request; observing it created no worker or mutation.
+        assert_eq!(controller.handle().signal().snapshot().pending, 0);
+    }
 
     #[test]
     fn named_letters_ignore_case_but_require_exact_shift_state() {

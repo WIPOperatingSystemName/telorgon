@@ -63,3 +63,5 @@ pub use crate::components::shell::{
     is_indicator_kind,
 };
 pub use crate::components::shell::primitives::{OutputViewRef, ShellLayerRef, ShellRootRef};
+
+pub use crate::services::screen_brightness::*;

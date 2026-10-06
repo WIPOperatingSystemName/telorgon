@@ -173,6 +173,15 @@ impl TextEngine {
         self.prepare_shaped_text(&shaped, color)
     }
 
+    /// Shapes single-line caret, pointer and selection metrics without rasterizing glyphs.
+    pub fn line_layout(
+        &mut self,
+        text: &str,
+        style: &ResolvedTextStyle,
+    ) -> TextResult<super::TextLineLayout> {
+        super::line::layout(&mut self.font_system, text, self.typography.family(&style.font_family), style)
+    }
+
     pub(crate) fn shape_text(&mut self, request: &TextLayoutRequest<'_>) -> ShapedText {
         let font_size = request.style.font_size_px.max(1) as f32;
         let line_height = request.style.line_height_px.max(request.style.font_size_px) as f32;

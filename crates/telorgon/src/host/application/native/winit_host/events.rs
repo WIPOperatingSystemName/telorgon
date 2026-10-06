@@ -296,25 +296,49 @@ where
                     runtime.queue_input(event);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.keyboard.modifiers_changed(modifiers.state());
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.queue_input(InputEvent::ModifiersChanged(self.keyboard.modifiers()));
+                }
+            }
+            WindowEvent::Focused(true) => {
+                let timestamp = self.timestamp_at(Instant::now());
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.activate_view(timestamp);
+                }
+                self.sync_text_input();
+                self.mark_redraw(RedrawReason::Input);
+            }
+            WindowEvent::Focused(false) => {
+                self.keyboard.reset();
+                let timestamp = self.timestamp_at(Instant::now());
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.deactivate_view(timestamp);
+                }
+                self.sync_text_input();
+                self.mark_redraw(RedrawReason::Input);
+            }
+            WindowEvent::Ime(event) => self.ime_event(event),
+            native_event @ WindowEvent::KeyboardInput { .. } => {
                 #[cfg(feature = "profiler")]
                 record_gui_input(
                     crate::runtime::instrumentation::InputRecordingSource::Keyboard,
                     "input.gui.keyboard",
                 );
-                if let WinitPhysicalKey::Code(code) = event.physical_key
-                    && let Some(runtime) = self.runtime.as_mut()
-                {
-                    runtime.queue_input(InputEvent::Key(KeyEvent {
-                        physical_key: PhysicalKey::new(code as u32),
-                        state: match event.state {
-                            ElementState::Pressed => ButtonState::Pressed,
-                            ElementState::Released => ButtonState::Released,
-                        },
-                        repeat: event.repeat,
-                        modifiers: Modifiers::empty(),
-                        ..KeyEvent::new(PhysicalKey::new(code as u32), ButtonState::Pressed)
-                    }));
+                let input = crate::platform::winit::WinitKeyboardInput::from_event(&native_event)
+                    .expect("keyboard callback contains keyboard input");
+                if let Some(runtime) = self.runtime.as_mut() {
+                    match self.keyboard.translate(&self.views, window_id, input) {
+                        Ok(key) => runtime.queue_input(InputEvent::Key(key)),
+                        Err(error) => {
+                            self.fail(
+                                event_loop,
+                                format!("keyboard input translation failed: {error}"),
+                            );
+                            return;
+                        }
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop, RedrawSource::NativeCallback),
@@ -356,6 +380,12 @@ where
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         self.suspended = true;
+        self.keyboard.reset();
+        let timestamp = self.timestamp_at(Instant::now());
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.deactivate_view(timestamp);
+        }
+        self.sync_text_input();
         self.redraw.cancel_native_request();
         self.live_resize.cancel();
         if let Err(error) = self.presentation.suspend() {

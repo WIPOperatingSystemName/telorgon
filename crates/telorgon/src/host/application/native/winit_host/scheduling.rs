@@ -240,6 +240,7 @@ impl<S: NativeRuntimeSource, P: NativePresentation> NativeHost<S, P> {
                 .expect("pending runtime work requires a mounted runtime")
                 .flush_input(timestamp)
         };
+        self.sync_text_input();
         self.diagnostics.input_turns = self.diagnostics.input_turns.saturating_add(1);
         if outcome.processed_work() && !outcome.frame_became_needed() {
             self.diagnostics.clean_input_turns =

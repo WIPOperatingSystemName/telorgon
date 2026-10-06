@@ -41,3 +41,6 @@ pub(crate) fn monotonic_time_microseconds() -> Option<u64> {
         .checked_mul(1_000_000)?
         .checked_add(nanoseconds / 1_000)
 }
+
+#[cfg(feature = "shell-screen-brightness-linux")]
+pub mod screen_brightness;

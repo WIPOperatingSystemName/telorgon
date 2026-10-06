@@ -1,4 +1,8 @@
 use super::*;
+use crate::ui::text::{
+    TextAffinity, TextNavigationDirection, TextNavigationUnit, TextOffset, TextRevision,
+    TextSelection, TextSelectionAdjustment, TextSnapshot,
+};
 /// Editing identity captured before an asynchronous paste. A response is only
 /// applicable to this revision and selection of this particular editor.
 #[derive(Clone, Debug)]
@@ -29,6 +33,51 @@ pub struct ClipboardText {
     redo: Vec<(String, usize, usize)>,
 }
 impl ClipboardText {
+    /// Replaces the document baseline, clearing undo and invalidating pending clipboard replies.
+    pub fn reset(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        *self = Self {
+            cursor: text.len(),
+            anchor: text.len(),
+            text,
+            read_only: self.read_only,
+            secure: self.secure,
+            ..Self::default()
+        };
+    }
+    fn navigate(&self, backward: bool, word: bool, extend: bool) -> TextSelection {
+        let snapshot = TextSnapshot::from_parts(
+            Arc::from(self.text.as_str()),
+            TextRevision(self.revision),
+            TextSelection::collapsed(TextOffset::ZERO, TextAffinity::Downstream),
+            None,
+        );
+        snapshot
+            .navigate_selection(
+                TextSelection {
+                    anchor: TextOffset(self.anchor as u32),
+                    active: TextOffset(self.cursor as u32),
+                    affinity: TextAffinity::Downstream,
+                },
+                if word {
+                    TextNavigationUnit::Word
+                } else {
+                    TextNavigationUnit::Grapheme
+                },
+                if backward {
+                    TextNavigationDirection::Backward
+                } else {
+                    TextNavigationDirection::Forward
+                },
+                if extend {
+                    TextSelectionAdjustment::Extend
+                } else {
+                    TextSelectionAdjustment::Move
+                },
+                TextAffinity::Downstream,
+            )
+            .expect("validated editor selection")
+    }
     pub fn key(&mut self, key: &crate::input::KeyEvent) -> ClipboardEditAction {
         use crate::input::{ButtonState, LogicalKey, Modifiers, NamedKey};
         use ClipboardEditAction::*;
@@ -38,13 +87,16 @@ impl ClipboardText {
         if !self.text.is_char_boundary(self.cursor) || !self.text.is_char_boundary(self.anchor) {
             return None;
         }
-        if key
-            .modifiers
-            .intersects(Modifiers::ALT.union(Modifiers::SUPER))
+        let alt_graph = key.modifiers.contains(Modifiers::ALT_GRAPH);
+        if key.modifiers.contains(Modifiers::SUPER)
+            || (key.modifiers.contains(Modifiers::ALT) && !alt_graph)
         {
             return None;
         }
-        if key.modifiers.contains(Modifiers::CONTROL) {
+        if key.modifiers.contains(Modifiers::CONTROL)
+            && !alt_graph
+            && matches!(key.logical_key, LogicalKey::Character(_))
+        {
             let LogicalKey::Character(ch) = &key.logical_key else {
                 return None;
             };
@@ -75,31 +127,18 @@ impl ClipboardText {
                 NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Home | NamedKey::End,
             ) => {
                 let shift = key.modifiers.contains(Modifiers::SHIFT);
-                self.cursor = match key.logical_key {
-                    LogicalKey::Named(NamedKey::Home) => 0,
-                    LogicalKey::Named(NamedKey::End) => self.text.len(),
-                    LogicalKey::Named(NamedKey::ArrowLeft) => {
-                        if !shift && !self.selection().is_empty() {
-                            self.selection().start
-                        } else {
-                            self.text[..self.cursor]
-                                .char_indices()
-                                .last()
-                                .map_or(0, |(i, _)| i)
-                        }
-                    }
+                match key.logical_key {
+                    LogicalKey::Named(NamedKey::Home) => self.cursor = 0,
+                    LogicalKey::Named(NamedKey::End) => self.cursor = self.text.len(),
                     _ => {
-                        if !shift && !self.selection().is_empty() {
-                            self.selection().end
-                        } else {
-                            self.cursor
-                                + self.text[self.cursor..]
-                                    .chars()
-                                    .next()
-                                    .map_or(0, char::len_utf8)
-                        }
+                        let selection = self.navigate(
+                            key.logical_key == LogicalKey::Named(NamedKey::ArrowLeft),
+                            key.modifiers.contains(Modifiers::CONTROL),
+                            shift,
+                        );
+                        self.cursor = selection.active.as_usize();
                     }
-                };
+                }
                 if !shift {
                     self.anchor = self.cursor;
                 }
@@ -110,24 +149,34 @@ impl ClipboardText {
                 if self.read_only {
                     return None;
                 }
+                let original = (self.anchor, self.cursor);
                 if self.selection().is_empty() {
-                    self.anchor = if key.logical_key == LogicalKey::Named(NamedKey::Backspace) {
-                        self.text[..self.cursor]
-                            .char_indices()
-                            .last()
-                            .map_or(0, |(i, _)| i)
-                    } else {
-                        self.cursor
-                            + self.text[self.cursor..]
-                                .chars()
-                                .next()
-                                .map_or(0, char::len_utf8)
-                    };
+                    self.anchor = self
+                        .navigate(
+                            key.logical_key == LogicalKey::Named(NamedKey::Backspace),
+                            key.modifiers.contains(Modifiers::CONTROL),
+                            true,
+                        )
+                        .active
+                        .as_usize();
                 }
-                let _ = self.replace_selection("");
+                if self.selection().is_empty() {
+                    return None;
+                }
+                if self.replace_selection("").is_err() {
+                    (self.anchor, self.cursor) = original;
+                    return None;
+                }
+                // Undo restores the caret before deletion, not the temporary deletion range.
+                if let Some((_, anchor, cursor)) = self.history.last_mut() {
+                    (*anchor, *cursor) = original;
+                }
                 Changed
             }
             _ => {
+                if key.modifiers.contains(Modifiers::CONTROL) && !alt_graph {
+                    return None;
+                }
                 let Some(value) = &key.text else { return None };
                 let value: String = value
                     .as_str()
@@ -301,5 +350,66 @@ mod tests {
         assert_eq!(a.paste(target, "late"), Err(ClipboardError::Stale));
         a.read_only = true;
         assert_eq!(a.replace_selection("blocked"), Err(ClipboardError::Denied));
+    }
+    fn named(key: crate::input::NamedKey, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent::new(PhysicalKey::UNIDENTIFIED, ButtonState::Pressed)
+            .with_logical_key(LogicalKey::Named(key))
+            .with_modifiers(modifiers)
+    }
+    #[test]
+    fn deletion_and_arrows_follow_grapheme_and_word_boundaries() {
+        use crate::input::NamedKey;
+        let mut editor = ClipboardText::default();
+        editor.reset("a e\u{301} 👨‍👩‍👧‍👦");
+        let end = editor.cursor;
+        editor.key(&named(NamedKey::ArrowLeft, Modifiers::empty()));
+        assert_eq!(&editor.text[editor.cursor..], "👨‍👩‍👧‍👦");
+        editor.key(&named(NamedKey::End, Modifiers::empty()));
+        editor.key(&named(NamedKey::Backspace, Modifiers::empty()));
+        assert_eq!(editor.text, "a e\u{301} ");
+        editor.key(&control("z"));
+        assert_eq!(editor.cursor, end);
+        assert_eq!(editor.anchor, end);
+        editor.reset("alpha beta");
+        editor.key(&named(NamedKey::ArrowLeft, Modifiers::CONTROL));
+        assert_eq!(editor.cursor, 6);
+        editor.key(&named(
+            NamedKey::ArrowRight,
+            Modifiers::CONTROL.union(Modifiers::SHIFT),
+        ));
+        assert_eq!(editor.selected_text(), Some("beta"));
+        editor.key(&named(NamedKey::Home, Modifiers::CONTROL));
+        editor.key(&named(NamedKey::Delete, Modifiers::CONTROL));
+        assert_eq!(editor.text, " beta");
+        editor.key(&named(NamedKey::End, Modifiers::empty()));
+        editor.key(&named(NamedKey::Backspace, Modifiers::CONTROL));
+        assert_eq!(editor.text, " ");
+    }
+    #[test]
+    fn reset_clears_undo_and_rejects_pending_paste() {
+        let mut editor = ClipboardText::default();
+        editor.reset("first location");
+        editor.select_all();
+        editor.replace_selection("edited").unwrap();
+        let pending = editor.target();
+        editor.reset("second location");
+        editor.key(&control("z"));
+        assert_eq!(editor.text, "second location");
+        assert_eq!(editor.paste(pending, "late"), Err(ClipboardError::Stale));
+    }
+
+    #[test]
+    fn alt_graph_inserts_produced_text_without_triggering_control_shortcuts() {
+        let mut editor = ClipboardText::default();
+        let event = control("a")
+            .with_modifiers(
+                Modifiers::CONTROL
+                    .union(Modifiers::ALT)
+                    .union(Modifiers::ALT_GRAPH),
+            )
+            .with_text(Some(crate::input::KeyText::new("@").unwrap()));
+        assert_eq!(editor.key(&event), ClipboardEditAction::Changed);
+        assert_eq!(editor.text, "@");
+        assert_eq!(editor.anchor, editor.cursor);
     }
 }

@@ -3,6 +3,7 @@
 mod mount;
 mod reconcile;
 mod signals;
+mod text_input;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -10,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::authoring::compose::{
     ButtonElement, Component, ComponentInstanceId, ContainerElement, Element, ElementKind,
     ElementType, ErasedComponent, EventDispatch, EventHandler, ImageElement, Key, RenderedView,
-    RuntimeTarget, SignalDependency, SignalSubscription, SliderElement, TextElement, ToggleElement,
+    RuntimeTarget, SignalDependency, SignalSubscription, SliderElement, TextElement, TextInputElement, ToggleElement,
     ToggleKind, ViewError,
 };
 use crate::foundation::{ColorRgba8, EdgeInsets, PointF, Transform2D};
@@ -145,6 +146,11 @@ enum MountedKind {
         children: Vec<MountedElement>,
         props: ButtonElement,
     },
+    TextInput {
+        node: UiNodeId,
+        children: Vec<MountedElement>,
+        props: TextInputElement,
+    },
     Checkbox {
         node: UiNodeId,
         indicator: UiNodeId,
@@ -184,6 +190,7 @@ impl MountedElement {
             MountedKind::Text { .. } => ElementType::Text,
             MountedKind::Image { .. } => ElementType::Image,
             MountedKind::Button { .. } => ElementType::Button,
+            MountedKind::TextInput { .. } => ElementType::TextInput,
             MountedKind::Checkbox { .. } => ElementType::Checkbox,
             MountedKind::Switch { .. } => ElementType::Switch,
             MountedKind::Slider { .. } => ElementType::Slider,
@@ -200,6 +207,9 @@ pub struct CompositionDriver {
     root_component: Option<ComponentInstanceId>,
     view_root: Option<UiRoot>,
     handlers: HashMap<UiNodeId, HandlerRoute>,
+    viewport: crate::authoring::compose::Signal<crate::SizeF>,
+    viewport_writer: crate::authoring::compose::SignalWriter<crate::SizeF>,
+    input_handlers: HashMap<UiNodeId, crate::authoring::compose::InputHandler>,
     diagnostics: CompositionDiagnostics,
     last_error: Option<RuntimeError>,
     signal_invalidations: Arc<Mutex<Vec<ComponentInstanceId>>>,
@@ -247,6 +257,10 @@ impl CompositionDriver {
         component: Box<dyn ErasedComponent>,
         target: RuntimeTarget,
     ) -> Self {
+        let (viewport, viewport_writer) = crate::authoring::compose::Signal::new(crate::SizeF {
+            width: 1280.0,
+            height: 800.0,
+        });
         Self {
             typography: Default::default(),
             pending_root: Some(component),
@@ -254,6 +268,9 @@ impl CompositionDriver {
             root_component: None,
             view_root: None,
             handlers: HashMap::new(),
+            viewport,
+            viewport_writer,
+            input_handlers: HashMap::new(),
             diagnostics: CompositionDiagnostics::default(),
             last_error: None,
             signal_invalidations: Arc::new(Mutex::new(Vec::new())),
@@ -269,9 +286,10 @@ impl CompositionDriver {
     /// subscriptions consult this shared slot at publication time.
     pub(crate) fn connect_shell(&mut self, services: crate::authoring::compose::ShellServices) {
         self.shell_services = Some(services.clone());
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         if let Some(root) = self.pending_root.as_mut() {
             root.shell_connected(services);
@@ -287,9 +305,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         event: crate::input::InputEvent,
     ) {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let Some(root) = self.root_component else {
             return;
@@ -312,9 +331,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         reason: crate::authoring::compose::ShellDismissReason,
     ) {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let Some(root) = self.root_component else {
             return;
@@ -352,9 +372,10 @@ impl CompositionDriver {
         context: &mut DriverContext<'_>,
         candidate: Box<dyn ErasedComponent>,
     ) -> bool {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let Some(root) = self.root_component else {
             self.record_error("composition root is not mounted");
@@ -460,9 +481,10 @@ impl CompositionDriver {
     }
 
     fn render_component(&mut self, id: ComponentInstanceId) -> Result<RenderedView, ViewError> {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let component = self
             .arena
@@ -485,9 +507,10 @@ impl CompositionDriver {
         source: ChangeSource,
         context: &mut DriverContext<'_>,
     ) -> bool {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let Some(route) = self.handlers.get(&target).cloned() else {
             return false;
@@ -547,9 +570,10 @@ impl CompositionDriver {
         source: ChangeSource,
         context: &mut DriverContext<'_>,
     ) -> bool {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let Some(HandlerRoute::Value(handler)) = self.handlers.get(&target).cloned() else {
             return false;
@@ -579,12 +603,16 @@ impl CompositionDriver {
 }
 
 impl ComponentDriver for CompositionDriver {
+    fn set_viewport_size(&mut self, size: crate::SizeF) {
+        self.viewport_writer.publish_if_changed(size);
+    }
     type Action = ();
 
     fn mount(&mut self, writer: &mut MountWriter<'_, Self::Action>) -> UiRoot {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let component = self
             .pending_root
@@ -654,9 +682,10 @@ impl ComponentDriver for CompositionDriver {
     }
 
     fn initialize(&mut self, context: &mut DriverContext<'_>) {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         self.process_signal_updates(context);
     }
@@ -683,11 +712,51 @@ impl ComponentDriver for CompositionDriver {
 
     fn dispatch_ui_route(
         &mut self,
-        _event: &UiEvent,
+        event: &UiEvent,
         _listener_mask: u16,
-        _context: &mut DriverContext<'_>,
+        context: &mut DriverContext<'_>,
     ) -> bool {
-        false
+        if event.phase != crate::ui::EventPhase::Target {
+            return false;
+        }
+        let Some(handler) = self.input_handlers.get(&event.target).cloned() else {
+            return false;
+        };
+        if !matches!(event.kind, crate::ui::UiEventKind::Focus(false))
+            && context
+                .ui
+                .interactions
+                .get(event.target)
+                .is_some_and(|state| !state.visible || !state.enabled)
+        {
+            return false;
+        }
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
+            self.shell_services.clone(),
+            self.image_bindings.clone(),
+            self.viewport.clone(),
+        );
+        let result = self.arena
+            .get_mut(handler.owner)
+            .and_then(|slot| slot.component.as_deref_mut())
+            .and_then(|component| handler.dispatch(component, event));
+        match result {
+            Some((changed, restored)) => {
+                self.diagnostics.events_delivered += 1;
+                self.diagnostics.input_mutations_restored += u64::from(restored);
+                if changed {
+                    match self.reconcile_component(context.ui, handler.owner) {
+                        Ok(()) => *context.frame_requested = true,
+                        Err(error) => self.record_error(error),
+                    }
+                }
+                changed
+            }
+            None => {
+                self.diagnostics.stale_events += 1;
+                false
+            }
+        }
     }
 
     fn reject_stale_node_action(&mut self, _target: UiNodeId) {
@@ -699,17 +768,19 @@ impl ComponentDriver for CompositionDriver {
     }
 
     fn process_external_updates(&mut self, context: &mut DriverContext<'_>) -> usize {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         self.process_signal_updates(context)
     }
 
     fn close(&mut self, context: &mut DriverContext<'_>) {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         if let Some(root_component) = self.root_component.take() {
             if let Some(child) = self
@@ -734,6 +805,7 @@ impl ComponentDriver for CompositionDriver {
             *context.frame_requested = true;
         }
         self.handlers.clear();
+        self.input_handlers.clear();
     }
 }
 

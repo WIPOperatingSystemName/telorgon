@@ -46,6 +46,11 @@ pub trait Component: ComponentFields + Sized + 'static {
         crate::authoring::compose::context::watch::<Self, T>(signal)
     }
 
+    /// Logical host viewport size; reading in view subscribes to resize changes.
+    fn viewport_size(&self) -> crate::SizeF {
+        crate::authoring::compose::context::viewport_size()
+    }
+
     fn runtime_target(&self) -> RuntimeTarget {
         crate::authoring::compose::context::target::<Self>()
     }

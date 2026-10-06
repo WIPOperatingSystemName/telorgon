@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::authoring::compose::{
     ButtonElement, Component, ContainerElement, ErasedComponent, ImageElement, Key, SliderElement,
-    TextElement, ToggleElement, ToggleKind,
+    TextElement, TextInputElement, ToggleElement, ToggleKind,
 };
 
 /// One short-lived UI description that can be erased into an owned [`Element`].
@@ -177,6 +177,7 @@ pub enum ElementKind {
     Text(TextElement),
     Image(ImageElement),
     Button(ButtonElement),
+    TextInput(TextInputElement),
     Toggle(ToggleElement),
     Slider(SliderElement),
     Component(Box<dyn ErasedComponent>),
@@ -189,6 +190,7 @@ impl fmt::Debug for ElementKind {
             Self::Text(value) => value.fmt(formatter),
             Self::Image(value) => value.fmt(formatter),
             Self::Button(value) => value.fmt(formatter),
+            Self::TextInput(value) => value.fmt(formatter),
             Self::Toggle(value) => value.fmt(formatter),
             Self::Slider(value) => value.fmt(formatter),
             Self::Component(value) => formatter
@@ -207,6 +209,7 @@ impl ElementKind {
             Self::Text(_) => ElementType::Text,
             Self::Image(_) => ElementType::Image,
             Self::Button(_) => ElementType::Button,
+            Self::TextInput(_) => ElementType::TextInput,
             Self::Toggle(toggle) => match toggle.kind {
                 ToggleKind::Checkbox => ElementType::Checkbox,
                 ToggleKind::Switch => ElementType::Switch,
@@ -224,6 +227,7 @@ pub enum ElementType {
     Text,
     Image,
     Button,
+    TextInput,
     Checkbox,
     Switch,
     Slider,
@@ -276,6 +280,7 @@ fn validate_element(
     let style = match &element.kind {
         ElementKind::Container(value) => Some(&value.style),
         ElementKind::Button(value) => Some(&value.style),
+        ElementKind::TextInput(value) => Some(&value.content.style),
         ElementKind::Image(value) => Some(&value.style),
         ElementKind::Text(value) => Some(&value.box_style),
         ElementKind::Toggle(value) => Some(&value.style),
@@ -345,6 +350,27 @@ fn validate_element(
                 validate_element(child, component)?;
             }
             validate_callback(button.on_press.as_ref(), component)?;
+            if let Some(callback) = &button.on_input {
+                callback.validate(component)?;
+            }
+        }
+        ElementKind::TextInput(input) => {
+            if input.accessible_label.as_deref().is_none_or(|label| label.trim().is_empty()) {
+                return Err(ViewError::MissingButtonLabel);
+            }
+            if !input.content.layout.gap.is_finite() {
+                return Err(ViewError::InvalidNumber("gap"));
+            }
+            let mut keys = HashSet::new();
+            for child in &input.content.children {
+                if let Some(key) = child.key_ref() && !keys.insert(key) {
+                    return Err(ViewError::DuplicateKey(key.clone()));
+                }
+                validate_element(child, component)?;
+            }
+            if let Some(callback) = &input.on_input {
+                callback.validate(component)?;
+            }
         }
         ElementKind::Toggle(toggle) => {
             if toggle.effects.invalid() {

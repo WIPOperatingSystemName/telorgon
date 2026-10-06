@@ -39,6 +39,70 @@ impl DerefMut for TestLayout {
 }
 
 #[test]
+fn nested_grid_cells_use_the_grid_content_origin_once() {
+    let mut ui = MountedUi::default();
+    let mut grid = None;
+    let mut cells = Vec::new();
+    MountWriter::<()>::new(&mut ui).root(
+        BoxStyle {
+            padding: EdgeInsets::all(20.0),
+            ..Default::default()
+        },
+        LayoutStyle::default(),
+        |writer| {
+            writer.container(
+                BoxStyle {
+                    height: SizeRule::Logical(50.0),
+                    ..Default::default()
+                },
+                LayoutStyle::default(),
+                |_| {},
+            );
+            grid = Some(writer.container(
+                BoxStyle {
+                    width: SizeRule::Logical(200.0),
+                    height: SizeRule::Logical(100.0),
+                    padding: EdgeInsets::all(8.0),
+                    ..Default::default()
+                },
+                LayoutStyle {
+                    flow: Flow::Grid { cell_width: 80, cell_height: 30 },
+                    gap: 10.0,
+                    ..Default::default()
+                },
+                |writer| {
+                    for _ in 0..4 {
+                        cells.push(writer.container(
+                            BoxStyle {
+                                width: SizeRule::Fill(1.0),
+                                height: SizeRule::Fill(1.0),
+                                ..Default::default()
+                            },
+                            LayoutStyle::default(),
+                            |_| {},
+                        ));
+                    }
+                },
+            ));
+        },
+    );
+    let mut layout = TestLayout::default();
+    layout.update(&mut ui, SizeF { width: 300.0, height: 250.0 }, 1.0);
+    let origin = layout.computed(grid.unwrap()).unwrap().content_rect;
+    assert_eq!((origin.x, origin.y), (28.0, 78.0));
+    for (index, cell) in cells.into_iter().enumerate() {
+        let cell = layout.computed(cell).unwrap();
+        assert_eq!(cell.border_rect, RectF {
+            x: origin.x + (index % 2) as f32 * 90.0,
+            y: origin.y + (index / 2) as f32 * 40.0,
+            width: 80.0,
+            height: 30.0,
+        });
+        assert_eq!(cell.visible_rect, cell.border_rect);
+    }
+}
+
+#[test]
 fn hit_testing_and_focus_use_canonical_geometry() {
     let mut ui = MountedUi::default();
     let button;

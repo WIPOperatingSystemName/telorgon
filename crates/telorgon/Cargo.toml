@@ -9,6 +9,7 @@ description = "Retained, component-based UI framework with software and Vulkan r
 
 [features]
 tray-linux = []
+networkmanager-linux = ["dep:async-channel"]
 # Ordinary applications compile both managed desktop backends. Runtime entrypoint declarations
 # choose between them; downstream applications do not select a renderer with Cargo features.
 default = ["application-software", "application-vulkan", "bundled-fonts"]
@@ -49,6 +50,8 @@ shell-wayland-linux = [
     "dep:gpu-allocator",
     "dep:sha2",
 ]
+shell-screen-brightness-linux = ["shell-wayland-linux"]
+shell-screen-brightness-ddc-linux = ["shell-screen-brightness-linux"]
 pipewire-linux = ["dep:pipewire"]
 audio-linux = ["pipewire-linux", "dep:rtrb"]
 midi-linux = ["pipewire-linux", "dep:rtrb"]
@@ -208,3 +211,11 @@ required-features = ["desktop-audio-linux", "application-software"]
 [[example]]
 name = "tray_publisher"
 required-features = ["tray-linux"]
+
+[[example]]
+name = "screen_brightness_ddc_broker"
+required-features = ["shell-screen-brightness-ddc-linux"]
+
+[[example]]
+name = "network_status"
+required-features = ["networkmanager-linux"]

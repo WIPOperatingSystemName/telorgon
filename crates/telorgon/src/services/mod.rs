@@ -10,3 +10,7 @@ pub mod audio;
 
 #[cfg(all(feature = "tray-linux", target_os = "linux"))]
 pub mod tray;
+
+pub mod screen_brightness;
+
+pub mod network;

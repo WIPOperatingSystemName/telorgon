@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::input::{ChangeSource, ValueChangePhase};
-use crate::ui::{EventPhase, MountWriter, MountedUi, UiEvent, UiEventKind, UiNodeId};
+use crate::ui::{EventPhase, MountWriter, MountedUi, UiEvent, UiEventKind, UiInputGeometry, UiNodeId};
 
 use crate::runtime::{
     Command, Component, ComponentDiagnostics, ComponentDriver, ComponentId, ComponentRuntimeDriver,
@@ -181,6 +181,11 @@ impl<A: ComponentDriver> ViewRuntime<A> {
         self.sync_deadline();
     }
 
+    pub(crate) fn set_viewport_size(&mut self, size: crate::SizeF) {
+        self.driver.set_viewport_size(size);
+        self.scheduler.request();
+    }
+
     fn dispatch_driver_ui_route(&mut self, event: &UiEvent, listener_mask: u16) {
         let mut frame_requested = false;
         {
@@ -210,6 +215,23 @@ impl<A: ComponentDriver> ViewRuntime<A> {
         listener_mask: u16,
         timestamp: u64,
     ) {
+        let modifiers = match &kind {
+            UiEventKind::Input(crate::InputEvent::Key(key)) => key.modifiers,
+            UiEventKind::Input(crate::InputEvent::ModifiersChanged(modifiers)) => *modifiers,
+            _ => crate::input::Modifiers::empty(),
+        };
+        self.dispatch_ui_observed(target, kind, listener_mask, timestamp, None, modifiers);
+    }
+
+    pub(crate) fn dispatch_ui_observed(
+        &mut self,
+        target: UiNodeId,
+        kind: UiEventKind,
+        listener_mask: u16,
+        timestamp: u64,
+        geometry: Option<UiInputGeometry>,
+        modifiers: crate::input::Modifiers,
+    ) {
         if !self.ui.nodes.contains(target) {
             return;
         }
@@ -235,6 +257,8 @@ impl<A: ComponentDriver> ViewRuntime<A> {
                         kind: kind.clone(),
                         phase: EventPhase::Capture,
                         timestamp,
+                        geometry,
+                        modifiers,
                     },
                     listener_mask,
                 );
@@ -247,6 +271,8 @@ impl<A: ComponentDriver> ViewRuntime<A> {
                 kind: kind.clone(),
                 phase: EventPhase::Target,
                 timestamp,
+                geometry,
+                modifiers,
             },
             listener_mask,
         );
@@ -264,6 +290,8 @@ impl<A: ComponentDriver> ViewRuntime<A> {
                         kind: kind.clone(),
                         phase: EventPhase::Bubble,
                         timestamp,
+                        geometry,
+                        modifiers,
                     },
                     listener_mask,
                 );

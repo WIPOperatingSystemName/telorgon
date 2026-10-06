@@ -6,9 +6,10 @@ impl CompositionDriver {
         writer: &mut MountWriter<'_, ()>,
         component: Box<dyn ErasedComponent>,
     ) -> Result<MountedElement, ViewError> {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         let type_id = component.component_type_id();
         let id = self.arena.insert(component);
@@ -60,6 +61,7 @@ impl CompositionDriver {
                 hover_within,
                 effects,
                 scrollable,
+                focus_scope,
                 style,
                 layout,
                 children,
@@ -78,6 +80,7 @@ impl CompositionDriver {
                 let children = mounted_children
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
+                writer.focus_scope(node, focus_scope);
                 writer.hover_within(node, hover_within);
                 writer.visual_interaction(node, effects.has_hover(), effects.has_press());
                 let effect_overlay = inline_style.is_none();
@@ -197,6 +200,9 @@ impl CompositionDriver {
                     self.handlers
                         .insert(control.node, HandlerRoute::Activate(handler.bind(owner)));
                 }
+                if let Some(handler) = &props.on_input {
+                    self.input_handlers.insert(control.node, handler.bind(owner));
+                }
                 MountedElement {
                     key: None,
                     kind: MountedKind::Button {
@@ -206,6 +212,7 @@ impl CompositionDriver {
                     },
                 }
             }
+            ElementKind::TextInput(props) => self.mount_text_input(writer, props, owner)?,
             ElementKind::Toggle(props) => self.mount_toggle(writer, props, owner)?,
             ElementKind::Slider(props) => self.mount_slider(writer, props, owner)?,
             ElementKind::Component(component) => self.mount_component(writer, component)?,

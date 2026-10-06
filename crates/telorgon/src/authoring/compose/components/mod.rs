@@ -11,6 +11,7 @@ mod image;
 mod slider;
 mod switch;
 mod text;
+mod text_input;
 mod toggle;
 mod window_frame;
 
@@ -26,6 +27,7 @@ pub use image::{Image, ImageElement, image};
 pub use slider::{Slider, SliderElement, slider};
 pub use switch::{Switch, switch};
 pub use text::{Text, TextElement, text};
+pub use text_input::{TextInput, TextInputElement, text_input};
 pub use toggle::{ToggleElement, ToggleKind};
 pub use window_frame::{
     HasContent, MissingContent, WindowChromeViewExt, WindowContentSlot, WindowFrame,

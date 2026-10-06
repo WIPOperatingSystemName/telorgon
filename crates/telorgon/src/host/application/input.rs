@@ -9,6 +9,8 @@ pub const LISTEN_FOCUS: u16 = 1 << 3;
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformInput {
     Input(InputEvent),
+    /// A composition belongs to the generational editor that opened its native session.
+    TextInput { target: crate::ui::UiNodeId, event: crate::input::TextInputEvent },
     Resize(SizeF),
 }
 

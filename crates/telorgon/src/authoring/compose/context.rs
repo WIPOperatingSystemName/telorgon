@@ -246,12 +246,33 @@ thread_local! {
 pub(crate) type ImageBindings = std::rc::Rc<
     RefCell<std::collections::BTreeMap<crate::ui::ImageId, crate::graphics::render::ImageResource>>,
 >;
+thread_local! {
+    static VIEWPORTS: RefCell<Vec<Option<Signal<crate::SizeF>>>> = const { RefCell::new(Vec::new()) };
+}
+pub(crate) fn viewport_size() -> crate::SizeF {
+    VIEWPORTS
+        .with_borrow(|stack| {
+            stack.last().and_then(|value| value.as_ref()).map(|signal| *observe(signal))
+        })
+        .unwrap_or(crate::SizeF { width: 1280.0, height: 800.0 })
+}
+
 pub(crate) struct ProviderGuard;
 impl ProviderGuard {
     pub(crate) fn enter(services: Option<super::ShellServices>) -> Self {
         PROVIDERS.with_borrow_mut(|stack| stack.push(services));
+        VIEWPORTS.with_borrow_mut(|stack| stack.push(None));
         IMAGE_PROVIDERS.with_borrow_mut(|stack| stack.push(None));
         Self
+    }
+    pub(crate) fn enter_with_viewport(
+        services: Option<super::ShellServices>,
+        images: ImageBindings,
+        viewport: Signal<crate::SizeF>,
+    ) -> Self {
+        let guard = Self::enter_with_images(services, images);
+        VIEWPORTS.with_borrow_mut(|stack| *stack.last_mut().unwrap() = Some(viewport));
+        guard
     }
     pub(crate) fn enter_with_images(
         services: Option<super::ShellServices>,
@@ -264,6 +285,9 @@ impl ProviderGuard {
 }
 impl Drop for ProviderGuard {
     fn drop(&mut self) {
+        VIEWPORTS.with_borrow_mut(|stack| {
+            stack.pop();
+        });
         IMAGE_PROVIDERS.with_borrow_mut(|stack| {
             stack.pop();
         });

@@ -1,7 +1,4 @@
-#![cfg(any(
-    feature = "application-software",
-    feature = "application-vulkan"
-))]
+#![cfg(any(feature = "application-software", feature = "application-vulkan"))]
 
 use std::num::NonZeroU16;
 

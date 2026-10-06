@@ -13,6 +13,7 @@ pub struct ContainerElement {
     pub hover_within: bool,
     pub effects: super::interaction::InteractionEffects,
     pub scrollable: bool,
+    pub focus_scope: bool,
     pub style: BoxStyle,
     pub layout: LayoutStyle,
     pub children: Vec<Element>,
@@ -29,6 +30,12 @@ pub struct Container {
 }
 
 impl Container {
+    /// Keeps keyboard focus inside this mounted scope and restores its previous owner on removal.
+    pub fn focus_scope(mut self, enabled: bool) -> Self {
+        self.element.focus_scope = enabled;
+        self
+    }
+
     pub fn cursor(mut self, icon: impl Into<crate::CursorIcon>) -> Self {
         self.pointer_request = Some(icon.into().into());
         self
@@ -300,6 +307,7 @@ fn container(flow: Flow) -> Container {
             hover_within: false,
             effects: Default::default(),
             scrollable: false,
+            focus_scope: false,
             style: BoxStyle {
                 width: SizeRule::Fill(1.0),
                 height: SizeRule::Fill(1.0),

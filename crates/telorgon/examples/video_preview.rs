@@ -169,16 +169,19 @@ mod linux {
                 ..Default::default()
             },
         )?;
-        let result = Application::gui("org.telorgon.examples.video-preview", "Telorgon video preview")
-            .renderer(Renderer::Software)
-            .window(
-                Window::new("Video preview")
-                    .size(680, 560)
-                    .content(Preview {
-                        frames: preview.signal(),
-                    }),
-            )
-            .run();
+        let result = Application::gui(
+            "org.telorgon.examples.video-preview",
+            "Telorgon video preview",
+        )
+        .renderer(Renderer::Software)
+        .window(
+            Window::new("Video preview")
+                .size(680, 560)
+                .content(Preview {
+                    frames: preview.signal(),
+                }),
+        )
+        .run();
         preview.shutdown();
         if let Some(session) = session {
             futures_lite::future::block_on(session.close());

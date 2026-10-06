@@ -26,6 +26,9 @@ use crate::runtime::{
 pub trait ComponentDriver {
     type Action: 'static;
 
+    #[doc(hidden)]
+    fn set_viewport_size(&mut self, _size: crate::SizeF) {}
+
     fn mount(&mut self, ui: &mut MountWriter<'_, Self::Action>) -> UiRoot;
 
     #[doc(hidden)]

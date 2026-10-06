@@ -9,7 +9,7 @@ mod transactions;
 
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::foundation::{ColorRgba8, PointF};
+use crate::foundation::{ColorRgba8, PointF, RectF};
 use crate::graphics::scene::{DirtyFlags, NodeArena, NodeId, SparseSet};
 pub use crate::input::EventPhase;
 use crate::input::InputEvent;
@@ -610,12 +610,23 @@ pub struct UiEvent {
     pub kind: UiEventKind,
     pub phase: EventPhase,
     pub timestamp: u64,
+    /// Logical coordinates relative to the target control's border origin.
+    pub geometry: Option<UiInputGeometry>,
+    pub modifiers: crate::input::Modifiers,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UiInputGeometry {
+    pub position: Option<PointF>,
+    pub border_rect: RectF,
+    pub content_rect: RectF,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiEventKind {
     Input(InputEvent),
     Focus(bool),
     Text(StringId),
+    Layout(UiInputGeometry),
 }
 
 #[cfg(test)]

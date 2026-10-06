@@ -611,6 +611,11 @@ pub struct InteractionSnapshot {
     pub enabled: bool,
     pub visible: bool,
     pub focusable: bool,
+    /// Constrain focus to descendants while this visible scope is mounted.
+    pub focus_scope: bool,
+    /// One-shot request consumed by the owning application input router.
+    pub focus_requested: bool,
+    pub text_cursor_rect: Option<crate::foundation::RectF>,
     pub behavior: ControlBehavior,
     pub value: f32,
     pub listener_mask: u16,
@@ -628,6 +633,9 @@ impl Default for InteractionSnapshot {
             enabled: true,
             visible: true,
             focusable: false,
+            focus_scope: false,
+            focus_requested: false,
+            text_cursor_rect: None,
             behavior: ControlBehavior::None,
             value: 0.0,
             listener_mask: 0,

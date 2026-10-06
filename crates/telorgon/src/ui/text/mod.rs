@@ -7,6 +7,7 @@ mod composition;
 mod edit;
 mod error;
 mod glyph;
+mod line;
 mod navigation;
 mod range;
 mod retained;
@@ -25,6 +26,7 @@ pub use composition::{TextCompositionCommand, TextCompositionError, TextComposit
 pub use edit::{TextChange, TextEdit, TextEditBatch, TextEditError, TextEditOutcome};
 pub use error::{TextError, TextResult};
 pub use glyph::AtlasGlyph;
+pub use line::TextLineLayout;
 pub use navigation::{
     TEXT_SEGMENTATION_CRATE_VERSION, TEXT_SEGMENTATION_PROFILE, TEXT_SEGMENTATION_UNICODE_VERSION,
     TextNavigationDirection, TextNavigationUnit, TextSelectionAdjustment,

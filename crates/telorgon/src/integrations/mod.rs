@@ -12,3 +12,6 @@ pub mod wireplumber;
 
 #[cfg(all(feature = "tray-linux", target_os = "linux"))]
 pub(crate) mod status_notifier;
+
+#[cfg(all(feature = "networkmanager-linux", target_os = "linux"))]
+pub mod networkmanager;

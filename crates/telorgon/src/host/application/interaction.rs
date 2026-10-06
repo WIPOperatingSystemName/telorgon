@@ -10,6 +10,7 @@ use crate::graphics::scene::NodeId;
 use crate::ui::{ControlBehavior, InteractionFlags, MountedUi};
 
 mod passive;
+mod focus;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InteractionDiagnostics {
@@ -59,6 +60,10 @@ pub struct InteractionRouter {
     pointers: HashMap<PointerId, PointerRoute>,
     controls: HashMap<NodeId, ActivationStateMachine>,
     focused: Option<NodeId>,
+    focus_scope: Option<NodeId>,
+    scope_restore: Vec<(NodeId, Option<NodeId>)>,
+    suspended_focus: Option<NodeId>,
+    deactivated: bool,
     always_show_focus: bool,
     diagnostics: InteractionDiagnostics,
 }
@@ -133,6 +138,9 @@ impl InteractionRouter {
         let Some(captured) = self.pointers.get(&pointer).and_then(|route| route.captured) else {
             return routing;
         };
+        if self.behavior(ui, captured) == Some(ControlBehavior::TextInput) {
+            return routing;
+        }
         let inside = raw_hit.is_some_and(|node| ui.is_descendant_or_self(node, captured));
         let outcome = self.handle_activation(
             ui,
@@ -180,6 +188,13 @@ impl InteractionRouter {
         let Some(behavior) = self.behavior(ui, target) else {
             return routing;
         };
+        if behavior == ControlBehavior::TextInput && button == PointerButton::PRIMARY {
+            self.set_capture(pointer, target, match state {
+                ButtonState::Pressed => PointerCaptureRequest::Capture(pointer),
+                ButtonState::Released => PointerCaptureRequest::Release(pointer),
+            });
+            return routing;
+        }
         if !matches!(behavior, ControlBehavior::Activate | ControlBehavior::Value) {
             return routing;
         }
@@ -278,6 +293,8 @@ impl InteractionRouter {
     }
 
     pub(crate) fn view_deactivated(&mut self, ui: &mut MountedUi) -> bool {
+        self.suspended_focus = self.focused;
+        self.deactivated = true;
         let controls: Vec<_> = self.controls.keys().copied().collect();
         let mut changed = false;
         for control in controls {
@@ -313,7 +330,7 @@ impl InteractionRouter {
         focus_visible: bool,
     ) -> FocusChange {
         let target = target.filter(|node| {
-            ui.interactions.get(*node).is_some_and(|interaction| {
+            self.in_focus_scope(ui, *node) && ui.interactions.get(*node).is_some_and(|interaction| {
                 interaction.focusable
                     && interaction.enabled
                     && interaction.visible
@@ -334,7 +351,9 @@ impl InteractionRouter {
         }
 
         if let Some(old) = old {
-            self.handle_activation(ui, old, ActivationInput::FocusLost);
+            if matches!(self.behavior(ui, old), Some(ControlBehavior::Activate | ControlBehavior::Value)) {
+                self.handle_activation(ui, old, ActivationInput::FocusLost);
+            }
             self.publish_flag(ui, old, InteractionFlags::FOCUSED, false);
             self.publish_flag(ui, old, InteractionFlags::FOCUS_VISIBLE, false);
         }
@@ -400,7 +419,7 @@ impl InteractionRouter {
                         && interaction.visible
                         && matches!(
                             interaction.behavior,
-                            ControlBehavior::Activate | ControlBehavior::Value
+                            ControlBehavior::Activate | ControlBehavior::Value | ControlBehavior::TextInput
                         )
                 });
                 if !eligible {

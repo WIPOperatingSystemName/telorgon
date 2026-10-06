@@ -11,6 +11,8 @@ pub mod gesture;
 mod keyboard;
 mod pointer;
 mod route;
+mod text_input;
+pub use text_input::TextInputEvent;
 pub mod shortcut;
 
 pub use activation::{

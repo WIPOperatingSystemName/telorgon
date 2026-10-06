@@ -7,6 +7,7 @@ impl CompositionDriver {
             | MountedKind::Text { node, .. }
             | MountedKind::Image { node, .. }
             | MountedKind::Button { node, .. }
+            | MountedKind::TextInput { node, .. }
             | MountedKind::Checkbox { node, .. }
             | MountedKind::Switch { node, .. }
             | MountedKind::Slider { node, .. } => Some(*node),
@@ -84,7 +85,12 @@ impl CompositionDriver {
     ) -> Result<MountedElement, (MountedElement, ViewError)> {
         let candidate_type = candidate.kind().identity();
         let same_identity =
-            old.key.as_ref() == candidate.key_ref() && old.element_type() == candidate_type;
+            old.key.as_ref() == candidate.key_ref() && old.element_type() == candidate_type
+                && match (&old.kind, candidate.kind()) {
+                    (MountedKind::Container { node, .. }, ElementKind::Container(container)) =>
+                        (ui.kinds.get(*node) == Some(&crate::ui::NodeKind::Scroll)) == container.scrollable,
+                    _ => true,
+                };
         if !same_identity {
             let Some(old_root) = self.root_node(&old) else {
                 return Err((old, ViewError::StaleParent));
@@ -134,6 +140,7 @@ impl CompositionDriver {
                     next_layout.scroll_offset = ui.layouts.get(*node).map_or(crate::PointF::default(), |l| l.scroll_offset);
                 }
                 ui.set_layout_style(*node, next_layout);
+                ui.set_focus_scope(*node, candidate.focus_scope);
                 ui.set_hover_within(*node, candidate.hover_within);
                 ui.set_visual_interaction(*node, candidate.effects.has_hover(), candidate.effects.has_press());
                 *has_local_style = local_style.is_some();
@@ -256,6 +263,14 @@ impl CompositionDriver {
                     }
                     None => {
                         self.handlers.remove(node);
+                    }
+                }
+                match &candidate.on_input {
+                    Some(handler) => {
+                        self.input_handlers.insert(*node, handler.bind(owner));
+                    }
+                    None => {
+                        self.input_handlers.remove(node);
                     }
                 }
                 *props = candidate;
@@ -405,6 +420,12 @@ impl CompositionDriver {
                 *props = candidate;
                 Ok(())
             }
+            (MountedKind::TextInput { node, children, props }, ElementKind::TextInput(candidate)) => {
+                match self.reconcile_text_input(ui, *node, children, props, candidate, owner) {
+                    Ok(()) => Ok(()),
+                    Err(error) => return Err((old, error)),
+                }
+            }
             (MountedKind::Component { id, .. }, ElementKind::Component(candidate)) => self
                 .update_component_candidate(ui, *id, candidate)
                 .map(|_| ()),
@@ -492,9 +513,10 @@ impl CompositionDriver {
     }
 
     pub(super) fn teardown_metadata(&mut self, mut mounted: MountedElement) {
-        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_images(
+        let _scope = crate::authoring::compose::context::ProviderGuard::enter_with_viewport(
             self.shell_services.clone(),
             self.image_bindings.clone(),
+            self.viewport.clone(),
         );
         match &mut mounted.kind {
             MountedKind::Container { children, .. } => {
@@ -503,8 +525,10 @@ impl CompositionDriver {
                 }
             }
             MountedKind::Text { .. } | MountedKind::Image { .. } => {}
-            MountedKind::Button { node, children, .. } => {
+            MountedKind::Button { node, children, .. }
+            | MountedKind::TextInput { node, children, .. } => {
                 self.handlers.remove(node);
+                self.input_handlers.remove(node);
                 for child in std::mem::take(children) {
                     self.teardown_metadata(child);
                 }

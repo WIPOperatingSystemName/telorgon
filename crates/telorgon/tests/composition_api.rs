@@ -243,7 +243,12 @@ impl Component for PointerFixture {
                     .child(text("Open").color(telorgon::ColorRgba8::rgba(248, 249, 252, 255))),
             )
             .child(spacer().cursor(CursorIcon::None))
-            .child(button().cursor(CursorIcon::None).height(32.0).child(text("Hidden")))
+            .child(
+                button()
+                    .cursor(CursorIcon::None)
+                    .height(32.0)
+                    .child(text("Hidden")),
+            )
             .child(button().cursor(CursorIcon::Default).child(text("Default")))
             .child(button().child(text("Default pointer cursor")))
     }
@@ -266,14 +271,36 @@ fn composed_views_retain_semantic_pointer_requests() {
         telorgon::PointerIcon::Pointer
     )));
     assert!(requests.contains(&telorgon::PointerRequest::Hidden));
-    let button_requests: Vec<_> = runtime.ui().kinds.iter()
+    let button_requests: Vec<_> = runtime
+        .ui()
+        .kinds
+        .iter()
         .filter(|(_, kind)| **kind == telorgon::NodeKind::Button)
         .map(|(node, _)| runtime.ui().pointer_requests.get(node).copied())
         .collect();
     assert!(button_requests.contains(&Some(telorgon::PointerRequest::Hidden)));
-    assert!(button_requests.contains(&Some(telorgon::PointerRequest::Semantic(telorgon::PointerIcon::Default))));
-    assert_eq!(button_requests.iter().filter(|request| **request == Some(telorgon::PointerRequest::Hidden)).count(), 1);
-    assert_eq!(button_requests.iter().filter(|request| **request == Some(telorgon::PointerRequest::Semantic(telorgon::PointerIcon::Pointer))).count(), 2);
+    assert!(
+        button_requests.contains(&Some(telorgon::PointerRequest::Semantic(
+            telorgon::PointerIcon::Default
+        )))
+    );
+    assert_eq!(
+        button_requests
+            .iter()
+            .filter(|request| **request == Some(telorgon::PointerRequest::Hidden))
+            .count(),
+        1
+    );
+    assert_eq!(
+        button_requests
+            .iter()
+            .filter(|request| **request
+                == Some(telorgon::PointerRequest::Semantic(
+                    telorgon::PointerIcon::Pointer
+                )))
+            .count(),
+        2
+    );
 }
 
 #[component]
