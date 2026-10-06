@@ -9,7 +9,7 @@ impl InteractionRouter {
     pub(crate) fn scoped_focus_order(&self, ui: &MountedUi, order: Vec<NodeId>) -> Vec<NodeId> {
         order
             .into_iter()
-            .filter(|node| self.in_focus_scope(ui, *node))
+            .filter(|node| self.focus_eligible(ui, *node))
             .collect()
     }
 
@@ -22,35 +22,45 @@ impl InteractionRouter {
         let scope = nodes.iter().rev().copied().find(|node| {
             ui.interactions
                 .get(*node)
-                .is_some_and(|state| state.focus_scope && state.visible && state.enabled)
+                .is_some_and(|state| state.focus_scope)
+                && self.control_available(ui, *node)
         });
         let mut restore = None;
-        while let Some((previous_scope, previous_focus)) = self.scope_restore.last().copied() {
-            if scope.is_some_and(|scope| ui.is_descendant_or_self(scope, previous_scope)) {
-                break;
+        let mut index = 0;
+        while index < self.scope_restore.len() {
+            let (previous_scope, previous_focus) = self.scope_restore[index];
+            if ui
+                .interactions
+                .get(previous_scope)
+                .is_some_and(|state| state.focus_scope)
+                && self.control_available(ui, previous_scope)
+            {
+                index += 1;
+                continue;
             }
-            self.scope_restore.pop();
-            restore = Some(previous_focus);
+            self.scope_restore.remove(index);
+            if let Some(next) = self.scope_restore.get_mut(index) {
+                // The next scope was entered from this one. Preserve its outer return
+                // link even when the closing scope and its focused descendant are gone.
+                next.1 = previous_focus;
+            } else {
+                restore = Some(previous_focus);
+            }
         }
         let changed_scope = self.focus_scope != scope;
         if let Some(scope) = scope
-            && self
+            && !self
                 .scope_restore
-                .last()
-                .is_none_or(|(previous, _)| *previous != scope)
+                .iter()
+                .any(|(previous, _)| *previous == scope)
         {
-            self.scope_restore.push((scope, self.focused));
+            let return_owner = restore.unwrap_or_else(|| {
+                self.focused
+                    .or(self.suspended_focus.map(|(owner, _)| owner))
+            });
+            self.scope_restore.push((scope, return_owner));
         }
         self.focus_scope = scope;
-        let eligible = |node: NodeId, ui: &MountedUi| {
-            self.in_focus_scope(ui, node)
-                && ui.interactions.get(node).is_some_and(|state| {
-                    state.enabled
-                        && state.visible
-                        && state.focusable
-                        && state.behavior != ControlBehavior::None
-                })
-        };
         let mut requested = None;
         for node in &nodes {
             if ui
@@ -58,15 +68,22 @@ impl InteractionRouter {
                 .get(*node)
                 .is_some_and(|state| state.focus_requested)
             {
-                if eligible(*node, ui) {
+                if self.focus_eligible(ui, *node) {
                     requested = Some(*node);
                 }
                 ui.interactions.get_mut(*node).unwrap().focus_requested = false;
             }
         }
-        let restored = restore.flatten().filter(|node| eligible(*node, ui));
-        let current = self.focused.filter(|node| eligible(*node, ui));
-        let first = || nodes.iter().copied().find(|node| eligible(*node, ui));
+        let restored = restore
+            .flatten()
+            .filter(|node| self.focus_eligible(ui, *node));
+        let current = self.focused.filter(|node| self.focus_eligible(ui, *node));
+        let first = || {
+            nodes
+                .iter()
+                .copied()
+                .find(|node| self.focus_eligible(ui, *node))
+        };
         let target = requested
             .or(restored)
             .or(current)
@@ -79,10 +96,7 @@ impl InteractionRouter {
             new: self.focused,
         }
     }
-
-    pub(crate) fn view_activated(&mut self, ui: &mut MountedUi) -> FocusChange {
-        self.deactivated = false;
-        let target = self.suspended_focus.take();
-        self.set_focus(ui, target, false)
-    }
 }
+
+#[cfg(test)]
+mod tests;

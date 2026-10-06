@@ -186,6 +186,49 @@ fn focused(runtime: &ComposedAppRuntime, node: UiNodeId) -> bool {
 }
 
 #[test]
+fn clicking_blank_background_blurs_the_editor_and_stops_text_delivery() {
+    let (mut runtime, events) = mounted();
+    let mut tick = 0;
+    let editor = click(&mut runtime, "Main editor", &mut tick);
+    assert!(focused(&runtime, editor));
+    events.lock().unwrap().clear();
+    input(
+        &mut runtime,
+        InputEvent::mouse_moved(PointF { x: 440.0, y: 260.0 }),
+        &mut tick,
+    );
+    input(
+        &mut runtime,
+        InputEvent::mouse_button(PointerButton::PRIMARY, ButtonState::Pressed),
+        &mut tick,
+    );
+    input(
+        &mut runtime,
+        InputEvent::mouse_button(PointerButton::PRIMARY, ButtonState::Released),
+        &mut tick,
+    );
+    assert!(!focused(&runtime, editor));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| { event.target == editor && event.kind == UiEventKind::Focus(false) })
+    );
+    events.lock().unwrap().clear();
+    input(
+        &mut runtime,
+        InputEvent::Key(
+            KeyEvent::new(PhysicalKey::UNIDENTIFIED, ButtonState::Pressed)
+                .with_logical_key(LogicalKey::Character(KeyText::new("x").unwrap()))
+                .with_text(Some(KeyText::new("x").unwrap())),
+        ),
+        &mut tick,
+    );
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
 fn editors_receive_real_pointer_geometry_capture_and_modifier_snapshots_without_button_activation()
 {
     let (mut runtime, events) = mounted();

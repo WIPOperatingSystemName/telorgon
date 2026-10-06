@@ -121,6 +121,26 @@ impl InputCoalescer {
             || !self.ordered.is_empty()
     }
 
+    /// Invalidates input from the previous activation without losing window geometry.
+    pub(crate) fn discard_interaction(&mut self) -> Vec<(PointerId, PointF)> {
+        self.flush_pointer();
+        let positions = self.ordered.iter().filter_map(|event| match event {
+            PlatformInput::Input(InputEvent::PointerMoved { pointer, position, .. }) => {
+                Some((*pointer, *position))
+            }
+            _ => None,
+        }).collect();
+        self.scroll = None;
+        self.ordered.clear();
+        self.diagnostics = InputCoalescingDiagnostics {
+            events_received: self.diagnostics.resize_events_received,
+            resize_events_received: self.diagnostics.resize_events_received,
+            resize_events_coalesced: self.diagnostics.resize_events_coalesced,
+            ..Default::default()
+        };
+        positions
+    }
+
     #[cfg(any(feature = "profiler", test))]
     pub(crate) fn has_only_pending_pointer_moves(&self) -> bool {
         self.diagnostics.events_received != 0

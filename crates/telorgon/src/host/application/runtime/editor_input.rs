@@ -76,15 +76,11 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         !changed.is_empty()
     }
 
-    /// Restores a still-eligible control after native window activation.
-    pub fn activate_view(&mut self, timestamp: MonotonicInstant) {
-        let change = self.interaction.view_activated(self.view.ui_mut());
-        self.dispatch_focus_change(change, timestamp.as_nanos());
-        self.sync_interaction();
-    }
-
     pub(crate) fn text_input_context(&self) -> Option<(NodeId, RectF)> {
         let node = self.interaction.focused()?;
+        if !self.interaction.focus_eligible(self.view.ui(), node) {
+            return None;
+        }
         let state = self.view.ui().interactions.get(node)?;
         if state.behavior != ControlBehavior::TextInput
             || self
@@ -121,6 +117,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
         timestamp: u64,
     ) {
         if self.interaction.focused() == Some(target)
+            && self.interaction.focus_eligible(self.view.ui(), target)
             && self
                 .view
                 .ui()

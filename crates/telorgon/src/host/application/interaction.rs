@@ -11,6 +11,8 @@ use crate::ui::{ControlBehavior, InteractionFlags, MountedUi};
 
 mod passive;
 mod focus;
+mod focus_state;
+mod view_lifecycle;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InteractionDiagnostics {
@@ -62,7 +64,8 @@ pub struct InteractionRouter {
     focused: Option<NodeId>,
     focus_scope: Option<NodeId>,
     scope_restore: Vec<(NodeId, Option<NodeId>)>,
-    suspended_focus: Option<NodeId>,
+    suspended_focus: Option<(NodeId, bool)>,
+    focus_visible: bool,
     deactivated: bool,
     always_show_focus: bool,
     diagnostics: InteractionDiagnostics,
@@ -81,15 +84,8 @@ impl InteractionRouter {
         self.pointers.get(&pointer).map(|route| route.position)
     }
 
-    pub fn set_always_show_focus(&mut self, ui: &mut MountedUi, always: bool) -> bool {
-        if self.always_show_focus == always {
-            return false;
-        }
-        self.always_show_focus = always;
-        let Some(focused) = self.focused else {
-            return false;
-        };
-        self.publish_flag(ui, focused, InteractionFlags::FOCUS_VISIBLE, always)
+    pub(crate) fn observe_pointer_position(&mut self, pointer: PointerId, position: PointF) {
+        self.pointers.entry(pointer).or_default().position = position;
     }
 
     pub(crate) fn pointer_moved(
@@ -99,6 +95,10 @@ impl InteractionRouter {
         position: PointF,
         raw_hit: Option<NodeId>,
     ) -> PointerRouting {
+        self.observe_pointer_position(pointer, position);
+        if !self.is_active() {
+            return PointerRouting::default();
+        }
         let synchronized = self.sync(ui);
         let hit = raw_hit.and_then(|node| ui.nearest_control(node));
         let hovered_hit = hit.filter(|node| self.behavior(ui, *node).is_some());
@@ -163,6 +163,9 @@ impl InteractionRouter {
         state: ButtonState,
         raw_hit: Option<NodeId>,
     ) -> PointerRouting {
+        if !self.is_active() {
+            return PointerRouting::default();
+        }
         let synchronized = self.sync(ui);
         let hit = raw_hit.and_then(|node| ui.nearest_control(node));
         let visual_changed = self.visual_pointer_button(ui, pointer, button, state, raw_hit);
@@ -174,6 +177,13 @@ impl InteractionRouter {
             ..PointerRouting::default()
         };
         let Some(target) = control else {
+            if state == ButtonState::Pressed && button == PointerButton::PRIMARY {
+                let focus = self.set_focus(ui, None, false);
+                if focus.old != focus.new {
+                    routing.focus = Some(focus);
+                    routing.changed = true;
+                }
+            }
             return routing;
         };
 
@@ -229,10 +239,14 @@ impl InteractionRouter {
     }
 
     pub(crate) fn key(&mut self, ui: &mut MountedUi, key: &KeyEvent) -> KeyRouting {
+        if !self.is_active() {
+            return KeyRouting::default();
+        }
         self.sync(ui);
         let Some(target) = self.focused else {
             return KeyRouting::default();
         };
+        self.focus_visible = true;
         let focus_changed = self.publish_flag(ui, target, InteractionFlags::FOCUS_VISIBLE, true);
         if self.behavior(ui, target) != Some(ControlBehavior::Activate) {
             return KeyRouting {
@@ -292,84 +306,6 @@ impl InteractionRouter {
         })
     }
 
-    pub(crate) fn view_deactivated(&mut self, ui: &mut MountedUi) -> bool {
-        self.suspended_focus = self.focused;
-        self.deactivated = true;
-        let controls: Vec<_> = self.controls.keys().copied().collect();
-        let mut changed = false;
-        for control in controls {
-            changed |= self
-                .handle_activation(ui, control, ActivationInput::ViewDeactivated)
-                .changed;
-        }
-        // Clear the published state before discarding the route: subsequent motion
-        // otherwise has no previous owner whose hover flag it can remove.
-        let hovered: Vec<_> = self
-            .pointers
-            .values()
-            .filter_map(|route| route.hovered)
-            .collect();
-        for node in hovered {
-            changed |= self.publish_flag(ui, node, InteractionFlags::HOVERED, false);
-        }
-        for route in self.pointers.values_mut() {
-            route.captured = None;
-            route.hovered = None;
-            route.raw_hovered = None;
-            route.visual_pressed.clear();
-        }
-        changed |= self.publish_visual_interaction(ui);
-        let focus = self.set_focus(ui, None, false);
-        changed | (focus.old != focus.new)
-    }
-
-    pub(crate) fn set_focus(
-        &mut self,
-        ui: &mut MountedUi,
-        target: Option<NodeId>,
-        focus_visible: bool,
-    ) -> FocusChange {
-        let target = target.filter(|node| {
-            self.in_focus_scope(ui, *node) && ui.interactions.get(*node).is_some_and(|interaction| {
-                interaction.focusable
-                    && interaction.enabled
-                    && interaction.visible
-                    && interaction.behavior != ControlBehavior::None
-            })
-        });
-        let old = self.focused;
-        if old == target {
-            if let Some(target) = target {
-                self.publish_flag(
-                    ui,
-                    target,
-                    InteractionFlags::FOCUS_VISIBLE,
-                    focus_visible || self.always_show_focus,
-                );
-            }
-            return FocusChange { old, new: target };
-        }
-
-        if let Some(old) = old {
-            if matches!(self.behavior(ui, old), Some(ControlBehavior::Activate | ControlBehavior::Value)) {
-                self.handle_activation(ui, old, ActivationInput::FocusLost);
-            }
-            self.publish_flag(ui, old, InteractionFlags::FOCUSED, false);
-            self.publish_flag(ui, old, InteractionFlags::FOCUS_VISIBLE, false);
-        }
-        self.focused = target;
-        if let Some(target) = target {
-            self.publish_flag(ui, target, InteractionFlags::FOCUSED, true);
-            self.publish_flag(
-                ui,
-                target,
-                InteractionFlags::FOCUS_VISIBLE,
-                focus_visible || self.always_show_focus,
-            );
-        }
-        FocusChange { old, new: target }
-    }
-
     pub(crate) fn sync(&mut self, ui: &mut MountedUi) -> bool {
         let stale_controls: Vec<_> = self
             .controls
@@ -398,6 +334,13 @@ impl InteractionRouter {
         }
         let mut changed = !stale_controls.is_empty();
 
+        let disabled_controls: Vec<_> = self.controls.keys().copied().filter(|node| {
+            !self.control_available(ui, *node)
+        }).collect();
+        for node in disabled_controls {
+            changed |= self.handle_activation(ui, node, ActivationInput::SetEnabled(false)).changed;
+        }
+
         let pointer_ids: Vec<_> = self.pointers.keys().copied().collect();
         for pointer in pointer_ids {
             let Some((hovered, captured)) = self.pointers.get(&pointer)
@@ -415,8 +358,7 @@ impl InteractionRouter {
             }
             if let Some(captured) = captured {
                 let eligible = ui.interactions.get(captured).is_some_and(|interaction| {
-                    interaction.enabled
-                        && interaction.visible
+                    self.control_available(ui, captured)
                         && matches!(
                             interaction.behavior,
                             ControlBehavior::Activate | ControlBehavior::Value | ControlBehavior::TextInput
@@ -434,11 +376,7 @@ impl InteractionRouter {
             }
         }
 
-        if self.focused.is_some_and(|node| {
-            !ui.interactions.get(node).is_some_and(|interaction| {
-                interaction.enabled && interaction.visible && interaction.focusable
-            })
-        }) {
+        if self.focused.is_some_and(|node| !self.focus_eligible(ui, node)) {
             let focus = self.set_focus(ui, None, false);
             changed |= focus.old != focus.new;
             self.diagnostics.stale_owners_rejected += 1;
@@ -449,18 +387,14 @@ impl InteractionRouter {
 
     fn behavior(&self, ui: &MountedUi, node: NodeId) -> Option<ControlBehavior> {
         ui.interactions.get(node).and_then(|interaction| {
-            (interaction.enabled
-                && interaction.visible
+            (self.control_available(ui, node)
                 && interaction.behavior != ControlBehavior::None)
                 .then_some(interaction.behavior)
         })
     }
 
     fn ensure_machine(&mut self, ui: &MountedUi, node: NodeId) -> bool {
-        let enabled = ui
-            .interactions
-            .get(node)
-            .is_some_and(|interaction| interaction.enabled && interaction.visible);
+        let enabled = self.control_available(ui, node);
         self.controls
             .entry(node)
             .or_insert_with(|| ActivationStateMachine::new(enabled));
@@ -802,6 +736,14 @@ mod tests {
             PointF::default(),
             Some(fixture.first),
         );
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
+        router.view_activated(&mut fixture.ui);
+        router.pointer_moved(
+            &mut fixture.ui,
+            pointer,
+            PointF::default(),
+            Some(fixture.first),
+        );
         assert!(has(&fixture.ui, fixture.first, InteractionFlags::HOVERED));
     }
 
@@ -899,6 +841,42 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn disabling_keyboard_armed_button_cancels_pending_space_release() {
+        let mut fixture = fixture();
+        let mut router = InteractionRouter::default();
+        router.set_focus(&mut fixture.ui, Some(fixture.first), true);
+        let mut space = KeyEvent::new(crate::input::PhysicalKey::UNIDENTIFIED, ButtonState::Pressed)
+            .with_logical_key(LogicalKey::Named(NamedKey::Space));
+        assert!(router.key(&mut fixture.ui, &space).activation.is_none());
+        assert!(has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+
+        fixture.ui.set_disabled(fixture.first, true);
+        router.sync(&mut fixture.ui);
+        assert_eq!(router.focused(), None);
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
+        fixture.ui.set_disabled(fixture.first, false);
+        router.sync(&mut fixture.ui);
+
+        let pointer = PointerId::new(23);
+        let mut activations = 0;
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let routed = router.pointer_button(
+                &mut fixture.ui, pointer, PointerButton::PRIMARY,
+                state, Some(fixture.first_label),
+            );
+            if let Some((target, _)) = routed.activation {
+                assert_eq!(target, fixture.first);
+                activations += 1;
+            }
+        }
+        assert_eq!(activations, 1, "reenabled button must accept one normal click");
+        space.state = ButtonState::Released;
+        assert!(router.key(&mut fixture.ui, &space).activation.is_none());
+        assert_eq!(router.diagnostics().activations, 1);
+        assert!(!has(&fixture.ui, fixture.first, InteractionFlags::PRESSED));
     }
 
     #[test]
