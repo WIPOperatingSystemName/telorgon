@@ -7,26 +7,17 @@ use crate::assets::{
     AppIconProfile, AssetBundle, ClientCursorMode, CursorTheme, CursorThemeAsset,
     PointerConfiguration, PointerThemeOverrides,
 };
-use crate::authoring::compose::{Component, ErasedComponent, RuntimeTarget};
+use crate::authoring::compose::{Component, RuntimeTarget};
 use crate::foundation::{ColorRgba8, SizeI};
 use crate::runtime::CompositionDriver;
-use crate::shell::window_chrome::{ShellActionId, WindowChromeModel, WindowContentStyle};
+use crate::shell::window_chrome::{ShellActionId, WindowChromeModel};
 
 use crate::host::application::{
     AppError, AppResult, KeyBindings, WindowDecorationMode, WindowOptions,
 };
 
-/// Renderer policy selected by an application declaration.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Renderer {
-    /// Uses the entrypoint's platform default renderer policy.
-    #[default]
-    Auto,
-    /// Requires the Vulkan renderer.
-    Vulkan,
-    /// Requires the deterministic software renderer.
-    Software,
-}
+pub use super::render_policy::Renderer;
+pub use super::window_frame::{WindowFrameFactory, WindowFrameTemplate};
 
 /// XKB rule names for the managed desktop seat. `None` retains libxkbcommon's
 /// existing defaults; an explicit empty options string disables default options.
@@ -568,104 +559,6 @@ impl fmt::Debug for ShellActionHandler {
             .debug_struct("ShellActionHandler")
             .field("id", &self.id)
             .finish()
-    }
-}
-
-/// Creates a fresh compositor-owned frame composition for one Wayland toplevel.
-///
-/// Implementations are reusable templates. The host supplies one immutable
-/// [`WindowChromeModel`] for each frame instance, while the template owns any shared visual
-/// configuration needed to construct that instance.
-pub trait WindowFrameTemplate: 'static {
-    /// None inherits desktop motion; Some(none()) explicitly disables it.
-    fn motion(&self, _model: &WindowChromeModel) -> Option<crate::WindowMotion> {
-        None
-    }
-    type Component: Component;
-
-    fn compose(&self, model: WindowChromeModel) -> Self::Component;
-
-    /// Opts into a separate client backing, allowing client alpha to reveal the desktop when
-    /// its background is transparent. `None` preserves a custom template's composed backing.
-    /// This only affects externally supplied compositor surfaces, not managed GUI children.
-    fn content_style(&self, _model: &WindowChromeModel) -> Option<WindowContentStyle> {
-        None
-    }
-}
-
-impl<F, C> WindowFrameTemplate for F
-where
-    F: Fn(WindowChromeModel) -> C + 'static,
-    C: Component,
-{
-    type Component = C;
-
-    fn compose(&self, model: WindowChromeModel) -> Self::Component {
-        self(model)
-    }
-}
-
-/// Type-erased storage for one reusable [`WindowFrameTemplate`].
-///
-/// The model is the only shell-owned input. Everything visual and interactive is authored with
-/// normal composition primitives plus the explicit frame/content/action roles. Templates may
-/// additionally describe the independent backing/preview for externally supplied client pixels.
-pub struct WindowFrameFactory {
-    #[cfg_attr(
-        not(all(feature = "shell-wayland-linux", target_os = "linux")),
-        allow(dead_code)
-    )]
-    motion: Box<dyn Fn(&WindowChromeModel) -> Option<crate::WindowMotion>>,
-    #[cfg_attr(
-        not(all(feature = "shell-wayland-linux", target_os = "linux")),
-        allow(dead_code)
-    )]
-    compose: Box<dyn Fn(WindowChromeModel) -> Box<dyn ErasedComponent>>,
-    #[cfg_attr(
-        not(all(feature = "shell-wayland-linux", target_os = "linux")),
-        allow(dead_code)
-    )]
-    content_style: Box<dyn Fn(&WindowChromeModel) -> Option<WindowContentStyle>>,
-}
-
-impl WindowFrameFactory {
-    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
-    pub(crate) fn motion(&self, model: &WindowChromeModel) -> Option<crate::WindowMotion> {
-        (self.motion)(model)
-    }
-    fn new<T>(template: T) -> Self
-    where
-        T: WindowFrameTemplate,
-    {
-        let template = std::rc::Rc::new(template);
-        let style_template = std::rc::Rc::clone(&template);
-        let motion_template = std::rc::Rc::clone(&template);
-        Self {
-            compose: Box::new(move |model| Box::new(template.compose(model))),
-            motion: Box::new(move |model| motion_template.motion(model)),
-            content_style: Box::new(move |model| style_template.content_style(model)),
-        }
-    }
-
-    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
-    pub(crate) fn content_style(&self, model: &WindowChromeModel) -> Option<WindowContentStyle> {
-        (self.content_style)(model)
-    }
-
-    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
-    pub(crate) fn compose(&self, model: WindowChromeModel) -> CompositionDriver {
-        CompositionDriver::from_erased_for_target(self.candidate(model), RuntimeTarget::Compositor)
-    }
-
-    #[cfg(all(feature = "shell-wayland-linux", target_os = "linux"))]
-    pub(crate) fn candidate(&self, model: WindowChromeModel) -> Box<dyn ErasedComponent> {
-        (self.compose)(model)
-    }
-}
-
-impl fmt::Debug for WindowFrameFactory {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WindowFrameFactory")
     }
 }
 

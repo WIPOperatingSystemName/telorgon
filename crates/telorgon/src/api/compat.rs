@@ -28,7 +28,7 @@ pub use crate::graphics::presentation::softbuffer as presenter_softbuffer;
 #[cfg(feature = "application-vulkan")]
 pub use crate::graphics::presentation::wsi as presenter_vulkan_wsi;
 pub use crate::graphics::render;
-#[cfg(any(feature = "application-software", feature = "shell-wayland-linux"))]
+#[cfg(any(feature = "application-software", feature = "shell-wayland-linux", feature = "embedded-software"))]
 pub use crate::graphics::renderers::software as renderer_software;
 #[cfg(any(
     feature = "application-vulkan",
@@ -38,7 +38,7 @@ pub use crate::graphics::renderers::software as renderer_software;
 pub use crate::graphics::renderers::vulkan as renderer_vulkan;
 pub use crate::graphics::scene;
 pub use crate::host::application as application_host;
-#[cfg(feature = "embedded-vulkan")]
+#[cfg(any(feature = "embedded-vulkan", feature = "embedded-software"))]
 pub use crate::host::embedded as embed;
 #[cfg(any(test, all(feature = "shell-wayland-linux", target_os = "linux")))]
 pub use crate::integrations::wayland::compositor as compositor_wayland;
@@ -58,6 +58,7 @@ pub use crate::platform::winit as platform_winit;
 pub use crate::runtime::instrumentation as profiler;
 #[cfg(feature = "profiler")]
 pub use crate::services::profiler as profiler_server;
+#[cfg(not(target_os = "uefi"))]
 pub use crate::services::session;
 pub use crate::shell::window_chrome;
 pub use crate::ui::accessibility;

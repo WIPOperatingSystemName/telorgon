@@ -1,6 +1,7 @@
 
 #[cfg(feature = "profiler")]
 pub mod profiler;
+#[cfg(not(target_os = "uefi"))]
 pub mod session;
 pub mod clipboard;
 pub mod battery;

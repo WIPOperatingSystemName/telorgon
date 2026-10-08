@@ -1,4 +1,5 @@
 use super::*;
+use crate::shell::window_chrome::WindowContentStyle;
 use crate::authoring::compose::{ComponentFields, View, text};
 
 #[test]

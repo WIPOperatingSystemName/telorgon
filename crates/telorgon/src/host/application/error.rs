@@ -21,6 +21,7 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+#[cfg(not(target_os = "uefi"))]
 impl From<crate::services::session::Error> for AppError {
     fn from(error: crate::services::session::Error) -> Self {
         Self::new(error.to_string())

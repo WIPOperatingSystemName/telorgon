@@ -10,6 +10,11 @@ use crate::foundation::{SizeF, SizeI};
 pub use crate::graphics::render::{AlphaMode, ColorSpace};
 use thiserror::Error;
 
+#[cfg(feature = "boot-uefi")]
+pub mod uefi;
+#[cfg(all(target_os = "linux", feature = "boot-splash-linux"))]
+pub mod linux_framebuffer;
+
 /// Monotonically increasing identity for one set of host-observed surface metrics.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SurfaceRevision(u64);

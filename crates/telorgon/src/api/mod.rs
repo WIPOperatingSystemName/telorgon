@@ -3,6 +3,7 @@
 //! Subsystem ownership remains visible through focused modules while applications can import the
 //! ordinary authoring surface with `use telorgon::app::*`.
 
+#[cfg(not(target_os = "uefi"))]
 pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
 pub use crate::services::battery;
 pub mod network;
@@ -113,6 +114,7 @@ pub mod app {
     pub use crate::authoring::compose::{
         TilePreviewDesign, TilePreviewMotion, TileTarget, WindowTiling,
     };
+    #[cfg(not(target_os = "uefi"))]
     pub use crate::host::application::{
         Application, Compositor, KeyBindings, KeyChord, LinuxShellConfig, OutputScale, Renderer,
         ShellKeyAction, ShellKeyEvent, ShortcutKey, Window, WindowDecorationMode,
@@ -125,11 +127,13 @@ pub mod app {
     };
     #[cfg(all(feature = "shell-screencast-linux", target_os = "linux"))]
     pub use crate::portal::*;
+    #[cfg(not(target_os = "uefi"))]
     pub use crate::services::session;
     pub use crate::services::battery;
 pub use super::network;
     pub use crate::services::screen_brightness;
     pub use crate::services::screen_brightness::*;
+    #[cfg(not(target_os = "uefi"))]
     pub use crate::services::session::{GuiSessionConfig, ApplicationRegistry, ApplicationSpec, ApplicationRef, ApplicationHandle, SessionApplications};
     pub use crate::{ClientCursorMode, CursorGraphic, CursorTheme, cursor};
     pub use crate::{DecorationNegotiation, DecorationPolicy};

@@ -188,7 +188,7 @@ impl ImagePixelFormat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageResource {
     pub image: ImageId,
     pub content_version: u64,

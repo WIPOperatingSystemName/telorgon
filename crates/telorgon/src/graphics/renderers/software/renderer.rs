@@ -1,3 +1,8 @@
+mod color;
+use color::{decode_target_channel, encode_target_channel, srgb_decode_byte};
+#[cfg(any(target_os = "uefi", test))]
+mod uefi_fill;
+
 mod scaled;
 #[cfg(any(target_os = "linux", test))]
 mod frame_border;
@@ -892,6 +897,10 @@ fn draw_box(
     clip: Option<&RenderClip>,
     region: RectF,
 ) {
+    #[cfg(target_os = "uefi")]
+    if uefi_fill::try_draw_box(raster, instance, spatial, clip, region) {
+        return;
+    }
     let transform = spatial.map_or(crate::foundation::Affine2D::IDENTITY, |value| value.transform);
     let Some(inverse) = transform.inverse() else {
         return;
@@ -1467,39 +1476,6 @@ fn sample_image_linear(
             amount_y,
         )
     })
-}
-
-fn decode_target_channel(value: u8, color_space: ColorSpace) -> f32 {
-    match color_space {
-        ColorSpace::Linear => f32::from(value) / 255.0,
-        ColorSpace::Srgb => srgb_decode_byte(value),
-        ColorSpace::Extended | ColorSpace::BackendDefined => unreachable!("validated color space"),
-    }
-}
-
-fn encode_target_channel(value: f32, color_space: ColorSpace) -> u8 {
-    let value = value.clamp(0.0, 1.0);
-    let encoded = match color_space {
-        ColorSpace::Linear => value,
-        ColorSpace::Srgb => {
-            if value <= 0.003_130_8 {
-                value * 12.92
-            } else {
-                1.055 * value.powf(1.0 / 2.4) - 0.055
-            }
-        }
-        ColorSpace::Extended | ColorSpace::BackendDefined => unreachable!("validated color space"),
-    };
-    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
-}
-
-fn srgb_decode_byte(value: u8) -> f32 {
-    let value = f32::from(value) / 255.0;
-    if value <= 0.040_45 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 fn lerp(first: f32, second: f32, amount: f32) -> f32 {

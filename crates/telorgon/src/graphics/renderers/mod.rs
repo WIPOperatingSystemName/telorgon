@@ -1,5 +1,5 @@
 
-#[cfg(any(feature = "application-software", feature = "shell-wayland-linux"))]
+#[cfg(any(feature = "application-software", feature = "shell-wayland-linux", feature = "embedded-software"))]
 pub mod software;
 #[cfg(any(
     feature = "application-vulkan",

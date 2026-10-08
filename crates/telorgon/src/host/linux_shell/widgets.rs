@@ -1,6 +1,8 @@
 //! Shell surface lifetime and sampled geometry over the existing retained runtimes.
 mod output_previews;
 mod pointer_button;
+mod view_lifecycle;
+pub(super) use view_lifecycle::sync_widget_focus;
 mod pointer_motion;
 pub(super) use pointer_motion::{queue_widget_pointer_motion, flush_widget_pointer_motion};
 #[cfg(test)]
@@ -258,18 +260,7 @@ impl WidgetLayer {
             let sample = self.track.sample(now);
             self.track = GeometryTrack::new(sample, target, movement, now, true);
         }
-        if next.visible && !self.spec.visible || !self.initialized && next.visible {
-            self.focused = next.focus == ShellFocus::OnOpen;
-        }
-        if self.spec.visible && !next.visible {
-            self.layer
-                .runtime
-                .deactivate_view(MonotonicInstant::from_nanos(now));
-        }
-        if !next.visible {
-            self.focused = false;
-            self.captured.clear();
-        }
+        self.update_input_visibility(next, MonotonicInstant::from_nanos(now));
         self.spec = next;
         self.target = target;
         self.initialized = true;
@@ -576,11 +567,7 @@ impl WidgetLayer {
             && self.binding.0.borrow().is_some_and(|s| s.visible)
     }
     pub(super) fn contains(&mut self, p: PointF) -> bool {
-        if !self.spec.visible
-            || !self.parent_visible
-            || !self.binding.0.borrow().is_some_and(|s| s.visible)
-            || self.spec.pointer == ShellPointer::PassThrough
-        {
+        if !self.input_visible() || self.spec.pointer == ShellPointer::PassThrough {
             return false;
         }
         if self.spec.pointer == ShellPointer::Modal {
@@ -714,6 +701,7 @@ pub(super) fn widget_pointer_scroll(
     };
     let w = &mut widgets[i];
     let probe = stall_probe::begin();
+    w.layer.runtime.activate_view(now);
     w.layer.pointer_motion(w.local(p), now);
     for event in events {
         if matches!(event, crate::input::InputEvent::Scroll { delta, .. } if delta == PointF::default()) {
@@ -762,51 +750,6 @@ pub(super) fn widget_key(
     Ok(true)
 }
 
-pub(super) fn sync_widget_focus(
-    widgets: &mut [WidgetLayer],
-    wayland: &mut NativeCompositor<'_>,
-    display: &Display,
-    windows: &BTreeMap<WaylandSurfaceId, ClientWindow>,
-    locked: bool,
-    saved: &mut Option<WaylandSurfaceId>,
-    active: &mut bool,
-    now: MonotonicInstant,
-) -> AppResult<()> {
-    if locked {
-        for w in widgets {
-            if w.focused || !w.captured.is_empty() {
-                w.layer.runtime.deactivate_view(now);
-            }
-            w.focused = false;
-            w.captured.clear();
-        }
-        *saved = None;
-        *active = false;
-        return Ok(());
-    }
-    let wants = widgets.iter().any(|w| w.spec.visible && w.focused);
-    if wants && !*active {
-        *saved = wayland
-            .core()
-            .seats
-            .get(&1)
-            .and_then(|s| s.keyboard_focus)
-            .map(|f| f.surface);
-        wayland
-            .set_keyboard_focus(1, None, display.next_serial())
-            .map_err(app_error)?;
-    } else if !wants && *active {
-        let restore = saved.take().filter(|id| {
-            windows.get(id).is_some_and(|w| !w.minimized)
-                && wayland.core().world.surface(*id).is_some()
-        });
-        wayland
-            .set_keyboard_focus(1, restore, display.next_serial())
-            .map_err(app_error)?;
-    }
-    *active = wants;
-    Ok(())
-}
 pub(super) fn widget_keyboard_event(
     event: crate::host::application::ShellKeyEvent,
     pressed: bool,
@@ -1023,3 +966,6 @@ mod taskbar_context_tests;
 
 #[cfg(test)]
 mod icon_publication_tests;
+
+#[cfg(test)]
+mod view_lifecycle_tests;

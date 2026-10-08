@@ -71,6 +71,9 @@ pub(in super::super) fn flush_widget_pointer_motion(
     for w in widgets {
         if let Some(position) = w.pending_motion.take() {
             let probe = stall_probe::begin();
+            if w.pointer_hovered && w.input_visible() {
+                w.layer.runtime.activate_view(now);
+            }
             w.layer
                 .runtime
                 .shell_input(crate::input::InputEvent::mouse_moved(position))?;

@@ -391,13 +391,18 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
     }
 
     pub fn resize(&mut self, extent: SizeI) -> AppResult<()> {
-        if extent.width <= 0 || extent.height <= 0 {
-            return Err(AppError::new("runtime extent must be positive"));
-        }
-        self.extent = SizeF {
+        self.resize_logical(SizeF {
             width: extent.width as f32,
             height: extent.height as f32,
-        };
+        })
+    }
+
+    pub fn resize_logical(&mut self, extent: SizeF) -> AppResult<()> {
+        if !extent.width.is_finite() || !extent.height.is_finite()
+            || extent.width <= 0.0 || extent.height <= 0.0 {
+            return Err(AppError::new("runtime extent must be positive"));
+        }
+        self.extent = extent;
         self.view.set_viewport_size(self.extent);
         self.view.scheduler_mut().request();
         Ok(())

@@ -78,6 +78,9 @@ pub struct TextEngine {
 
 impl TextEngine {
     pub fn new() -> TextResult<Self> {
+        #[cfg(target_os = "uefi")]
+        return Self::without_system_fonts();
+        #[cfg(not(target_os = "uefi"))]
         Self::with_atlas_size(DEFAULT_ATLAS_SIZE, DEFAULT_ATLAS_SIZE)
     }
 

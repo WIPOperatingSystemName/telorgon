@@ -76,6 +76,12 @@ embedded-vulkan = [
     "dep:sha2",
 ]
 embedded-profiler = ["instrumentation"]
+embedded-software = []
+boot = ["font-inter", "font-jetbrains-mono"]
+boot-preview = ["boot", "application-software"]
+boot-config = ["boot", "dep:toml"]
+boot-uefi = ["boot-config", "embedded-software", "dep:r-efi"]
+boot-splash-linux = ["boot-config", "embedded-software"]
 profiler = [
     "instrumentation",
     "dep:axum",
@@ -85,13 +91,12 @@ profiler = [
 ]
 
 [dependencies]
+r-efi = { version = "6.0.0", default-features = false, optional = true }
+blocking.workspace = true
 x11rb-protocol = { version = "=0.13.2", default-features = false, features = ["std", "composite", "randr", "shape", "xfixes", "sync", "render"], optional = true }
 x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes"], optional = true }
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"], optional = true }
-async-process.workspace = true
-blocking.workspace = true
 futures-lite.workspace = true
-libc.workspace = true
 ash = { workspace = true, optional = true }
 ash-window = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
@@ -120,6 +125,10 @@ winit = { workspace = true, optional = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, optional = true }
 windows-sys = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "uefi"))'.dependencies]
+async-process.workspace = true
+libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 async-channel = { version = "2.5", optional = true }

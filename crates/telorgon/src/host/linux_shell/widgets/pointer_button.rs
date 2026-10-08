@@ -56,6 +56,7 @@ pub(in super::super) fn widget_pointer_button(
         }
         let w = &mut widgets[i];
         let probe = stall_probe::begin();
+        w.layer.runtime.activate_view(now);
         w.layer.pointer_motion(w.local(p), now);
         let event = crate::input::InputEvent::mouse_button(
             match button {

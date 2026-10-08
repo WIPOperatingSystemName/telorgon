@@ -3,6 +3,7 @@
 #[cfg(all(feature = "shell-wayland-linux", not(target_os = "linux")))]
 compile_error!("feature `shell-wayland-linux` is supported only for Linux targets");
 
+#[cfg(not(target_os = "uefi"))]
 pub(super) mod declaration;
 mod capture_config;
 pub use capture_config::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
@@ -14,11 +15,16 @@ mod delta_queue;
 // Keep the platform-neutral compositor transaction and retained-scene tests executable on the
 // development host even when the native Wayland/KMS owner is compiled only for Linux.
 mod error;
+mod render_policy;
+mod window_frame;
+pub use render_policy::Renderer;
+pub use window_frame::{WindowFrameFactory, WindowFrameTemplate};
 pub(super) mod exit;
 #[cfg(feature = "application-software")]
 mod headless;
 mod input;
 mod interaction;
+#[cfg(not(target_os = "uefi"))]
 mod keybindings;
 #[cfg(any(
     feature = "application-software",
@@ -68,11 +74,11 @@ pub use crate::runtime::{
     MonotonicInstant, NoAction, Read, RuntimeError, State, SwitchBranch, TimerHandle, Ui,
     UnmountContext, UpdateContext, ViewRuntime,
 };
+#[cfg(not(target_os = "uefi"))]
 pub use declaration::{
     Application, Compositor, CompositorVisual, GuiApplication, KeyboardConfig, LinuxShellConfig,
-    ReadyCompositor, ReadyGuiApplication, ReadyShellEnvironment, ReadyWindow, Renderer,
+    ReadyCompositor, ReadyGuiApplication, ReadyShellEnvironment, ReadyWindow,
     ShellEnvironment, ShellEnvironmentWithCompositor, ShellKeyAction, ShellKeyEvent, Window,
-    WindowFrameFactory, WindowFrameTemplate,
 };
 pub use delta_queue::SceneDeltaQueue;
 pub use error::{AppError, AppResult};
@@ -81,6 +87,7 @@ pub use exit::request_exit;
 pub use headless::HeadlessRuntime;
 pub use input::{LISTEN_ACTION, LISTEN_FOCUS, LISTEN_KEY, LISTEN_POINTER, PlatformInput};
 pub use interaction::{InteractionDiagnostics, InteractionRouter};
+#[cfg(not(target_os = "uefi"))]
 pub use keybindings::{KeyBindings, KeyChord, ShortcutKey, SystemShortcutControl, SystemShortcutFeedback};
 pub use runtime::{
     AppRuntime, AppRuntimeCore, ComposedAppRuntime, InputFlushOutcome, PreparedFrame,
@@ -136,4 +143,5 @@ pub use portal_picker_application::{PortalPickerApplication, ReadyPortalPickerAp
 #[cfg(all(target_os = "linux", feature = "desktop-audio-linux"))]
 pub mod audio_mixer;
 
+#[cfg(not(target_os = "uefi"))]
 mod shell_screen_brightness;

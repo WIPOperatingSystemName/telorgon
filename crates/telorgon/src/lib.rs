@@ -1,10 +1,13 @@
 //! Telorgon SDK: curated application API and explicit subsystem owners.
 
 extern crate self as telorgon;
+extern crate alloc;
 
 mod api;
 pub mod assets;
 pub mod authoring;
+#[cfg(feature = "boot")]
+pub mod boot;
 pub mod components;
 pub mod data;
 pub mod foundation;
