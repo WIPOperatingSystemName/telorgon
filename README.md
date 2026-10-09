@@ -96,6 +96,17 @@ consumers must update the former `Desktop` names and `desktop-*` feature selecti
 Freedesktop `.desktop` application files, `[Desktop Entry]`, and XDG environment keys retain their
 standard names.
 
+## Development in Custom Distro
+
+When this repository is checked out as `distro/sources/telorgon`, implement
+framework changes here. The distro Python pipeline snapshots those edits and
+builds application packages; generated source copies under `out/` are build
+outputs. From the distro root, use `python3 build.py deploy <packages> --name <vm>`
+to install them with guest pacman in a private development VM. Rebuild every
+affected application for framework changes, use `--build-profile release` for
+performance checks, and test the changed interaction after installation. See
+`distro/docs/build.md` for VM setup and the deployment workflow.
+
 ## License
 
 Telorgon-owned source code, documentation, themes, protocols, tests, and tools in this repository

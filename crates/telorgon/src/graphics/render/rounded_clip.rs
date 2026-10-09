@@ -17,6 +17,35 @@ mod tests {
     use crate::foundation::ColorRgba8;
 
     #[test]
+    fn straight_bands_and_interior_match_reference_distance_exactly() {
+        for radii in [CornerRadii::all(12.0), CornerRadii {
+            top_left: 3.0, top_right: 12.0, bottom_right: 17.0, bottom_left: 0.0,
+        }] {
+            let clip = RoundedClip::new(RectF { x: 1.25, y: -2.75, width: 80.0, height: 60.0 }, radii);
+            for point in [PointF { x: f32::NAN, y: f32::NAN }, PointF { x: f32::INFINITY, y: 30.0 }] {
+                let result = clip.coverage(point);
+                assert!(result.is_finite());
+            }
+            for y in -20..260 {
+                for x in -20..340 {
+                    let point = PointF { x: x as f32 * 0.25, y: y as f32 * 0.25 };
+                    let local_x = point.x - clip.rect.x;
+                    let local_y = point.y - clip.rect.y;
+                    let radius = if local_x < 40.0 {
+                        if local_y < 30.0 { radii.top_left } else { radii.bottom_left }
+                    } else if local_y < 30.0 { radii.top_right } else { radii.bottom_right };
+                    let qx = (local_x - 40.0).abs() - (40.0 - radius);
+                    let qy = (local_y - 30.0).abs() - (30.0 - radius);
+                    let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+                    let reference = (0.5 - distance).clamp(0.0, 1.0);
+                    assert_eq!(clip.coverage(point), reference);
+                    assert_eq!(clip.inverse().coverage(point), 1.0 - reference);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_square_coverage_does_not_shrink_geometric_hit_bounds() {
         let clip = RoundedClip::new(
             RectF { x: 0.5, y: 0.5, width: 10.0, height: 10.0 },
@@ -294,7 +323,11 @@ impl RoundedClip {
         let radius = radius.min(half_x.min(half_y));
         let qx = (x - half_x).abs() - (half_x - radius);
         let qy = (y - half_y).abs() - (half_y - radius);
-        let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+        // The straight bands and interior have at most one positive axis. Avoid
+        // a library hypot call there; it contributes exactly that nonnegative axis.
+        let corner = if qx > 0.0 && qy > 0.0 { qx.hypot(qy) }
+            else { qx.max(0.0) + qy.max(0.0) };
+        let distance = corner + qx.max(qy).min(0.0) - radius;
         (0.5 - distance).clamp(0.0, 1.0)
     }
 }

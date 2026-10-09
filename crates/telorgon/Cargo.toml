@@ -8,6 +8,7 @@ readme.workspace = true
 description = "Retained, component-based UI framework with software and Vulkan rendering"
 
 [features]
+desktop-settings-linux = ["dep:serde_json", "dep:sha2"]
 tray-linux = []
 networkmanager-linux = ["dep:async-channel"]
 # Ordinary applications compile both managed desktop backends. Runtime entrypoint declarations

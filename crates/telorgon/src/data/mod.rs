@@ -4,6 +4,8 @@
 mod autosave;
 mod error;
 mod file;
+#[cfg(all(feature = "desktop-settings-linux", target_os = "linux"))]
+pub(crate) use file::replace as replace_file;
 mod format;
 mod persistence;
 mod registry;

@@ -1204,9 +1204,14 @@ impl ShellComposition {
         }
 
         let order_changed = self.order != next_order;
-        if order_changed || extent_changed {
-            // Reordering can change every overlap in the stack. It is infrequent and correctness
-            // is clearer than attempting a fragile pairwise overlap reconstruction here.
+        let surviving_order_changed = !self.order.iter()
+            .filter(|key| next_states.get(key).is_some_and(|state| state.bounds.is_some()))
+            .eq(next_order.iter().filter(|key| {
+                self.placements.get(key).is_some_and(|state| state.bounds.is_some())
+            }));
+        if surviving_order_changed || extent_changed {
+            // Existing layers changing relative order can affect all their overlaps. Inserting
+            // or removing a menu/tooltip already damages its own bounds above.
             damage = Some(output);
         }
 
@@ -1321,7 +1326,11 @@ impl ShellComposition {
                 .collect(),
             placements,
             surface_revisions,
-            damage: if damage == Some(output) { None } else { damage },
+            // Animation-only frames must still advance presentation, but an unchanged color
+            // needs only a minimal valid repaint, not another complete desktop rasterization.
+            damage: if damage == Some(output) { None } else {
+                Some(damage.unwrap_or(RectI { x: 0, y: 0, width: 1, height: 1 }))
+            },
         })
     }
 }
@@ -1451,3 +1460,7 @@ mod tests;
 
 #[cfg(test)]
 mod external_admission_tests;
+
+#[cfg(test)]
+#[path = "scene/damage_tests.rs"]
+mod damage_tests;

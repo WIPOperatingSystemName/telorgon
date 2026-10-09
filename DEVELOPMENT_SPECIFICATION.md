@@ -444,6 +444,15 @@ reproducibility evidence distinct.
 
 ## 22. Incremental adoption
 
+Implement changes in their owning source repository. Generated build snapshots
+and temporary experiment directories are outputs; they cannot be the only copy
+of a fix. When Telorgon is developed inside Custom Distro, use the distro Python
+pipeline to snapshot edited source, build versioned packages and install them
+through guest pacman in a private development VM. Rebuild affected applications
+for framework changes and use release builds for rendering measurements. Record
+the actual source/package identities and interaction results; compilation and
+installation alone do not qualify desktop behavior.
+
 Start with an inventory of current modules, interfaces, dependencies, and violations.
 
 Establish a baseline, prevent new violations, and migrate one subsystem at a time. Separate
