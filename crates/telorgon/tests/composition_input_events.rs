@@ -123,7 +123,10 @@ impl Component for ResponsivePanel {
         let width = self.viewport_size().width;
         let content = column()
             .key("responsive-content")
-            .child(text(format!("Width: {width}")));
+            .child(text(format!("Width: {width}")))
+            .child(button().accessible_label("Navigation").children(
+                (width >= 600.0).then(|| text("Navigation")),
+            ));
         if width < 600.0 {
             content.scrollable()
         } else {
@@ -149,9 +152,11 @@ fn composed_viewport_changes_update_nested_components_and_remount_scroll_contain
     )
     .unwrap();
     for (width, scrolls) in [(900, 0), (500, 1), (850, 0)] {
-        runtime
-            .resize(telorgon::SizeI { width, height: 700 })
-            .unwrap();
+        runtime.queue_input(telorgon::PlatformInput::Resize(telorgon::SizeF {
+            width: width as f32,
+            height: 700.0,
+        }));
+        runtime.flush_input(telorgon::MonotonicInstant::ZERO);
         runtime
             .prepare_frame(telorgon::MonotonicInstant::ZERO, true)
             .unwrap();
@@ -163,6 +168,10 @@ fn composed_viewport_changes_update_nested_components_and_remount_scroll_contain
                 .any(|(_, text)| runtime.ui().string(text.content)
                     == Some(format!("Width: {width}").as_str()))
         );
+        assert!(runtime.ui().semantics.iter().any(|(_, semantic)| {
+            matches!(semantic.name, telorgon::SemanticName::Text(name)
+                if runtime.ui().string(name) == Some("Navigation"))
+        }), "navigation label must survive removing its visible text");
         assert_eq!(
             runtime
                 .ui()

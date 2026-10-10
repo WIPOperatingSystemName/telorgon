@@ -139,7 +139,13 @@ impl MountedUi {
     }
     pub fn intern(&mut self, text: impl AsRef<str>) -> StringId {
         let text = text.as_ref();
-        if let Some(index) = self.strings.iter().position(|candidate| candidate == text) {
+        // Dynamic buffers belong to text nodes and can change or be recycled.
+        // Interned labels must keep independent, immutable storage.
+        if let Some(index) = self.strings.iter().enumerate().find_map(|(index, candidate)| {
+            (candidate == text
+                && !self.dynamic_text_strings.values().contains(&StringId(index as u32)))
+                .then_some(index)
+        }) {
             return StringId(index as u32);
         }
         let id = StringId(self.strings.len() as u32);

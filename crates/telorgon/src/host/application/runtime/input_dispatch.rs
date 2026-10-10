@@ -43,6 +43,7 @@ impl<D: ComponentDriver> AppRuntimeCore<D> {
             match event {
                 PlatformInput::Resize(size) => {
                     self.extent = size;
+                    self.view.set_viewport_size(size);
                     self.view.scheduler_mut().request();
                 }
                 PlatformInput::Input(
