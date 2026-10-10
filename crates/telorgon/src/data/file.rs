@@ -14,7 +14,7 @@ impl Drop for Temporary {
     }
 }
 
-fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -39,7 +39,7 @@ fn replace(path: &Path, text: &str) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    file.write_all(text.as_bytes())?;
+    file.write_all(bytes)?;
     if let Ok(metadata) = fs::metadata(path) {
         file.set_permissions(metadata.permissions())?;
     }
@@ -77,7 +77,7 @@ impl Core {
         }
         let result: DataResult<u64> = (|| {
             let (revision, text) = self.serialize()?;
-            replace(path, &text).map_err(|source| DataError::Io {
+            replace(path, text.as_bytes()).map_err(|source| DataError::Io {
                 path: path.into(),
                 source,
             })?;

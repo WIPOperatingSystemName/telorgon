@@ -8,7 +8,7 @@ use crate::graphics::renderers::software::{
 };
 
 use super::super::geometry::{accumulated_damage, full_rect};
-use super::super::scene::{ShellFrame, ShellSceneKey};
+use super::super::scene::{ShellFrame, ShellLayerKey, ShellPlacement, ShellSceneKey};
 use crate::host::application::{AppError, AppResult};
 
 pub(in crate::host::linux_shell) struct SoftwareShellRenderer {
@@ -16,9 +16,15 @@ pub(in crate::host::linux_shell) struct SoftwareShellRenderer {
     scenes: BTreeMap<ShellSceneKey, SoftwareScene>,
     motion_snapshots: BTreeMap<u64, SoftwareSurface>,
     surface: SoftwareSurface,
+    backdrop: Option<Backdrop>,
     content_version: u64,
     target_versions: Vec<u64>,
     damage_history: VecDeque<(u64, Option<RectI>)>,
+}
+
+struct Backdrop {
+    placements: Vec<ShellPlacement>,
+    pixels: SoftwareSurface,
 }
 
 impl SoftwareShellRenderer {
@@ -33,6 +39,7 @@ impl SoftwareShellRenderer {
             scenes: BTreeMap::new(),
             motion_snapshots: BTreeMap::new(),
             surface: SoftwareSurface::default(),
+            backdrop: None,
             content_version: 0,
             target_versions: vec![0; targets],
             damage_history: VecDeque::new(),
@@ -70,7 +77,9 @@ impl SoftwareShellRenderer {
             .target_versions
             .get(target_index)
             .ok_or_else(|| AppError::new("software scanout target index is invalid"))?;
-        let render_damage = accumulated_damage(
+        // The retained CPU surface already has the previous composition. Only the
+        // scanout copy needs damage accumulated for a particular presentation target.
+        let copy_damage = accumulated_damage(
             previous_target_version,
             self.content_version,
             &self.damage_history,
@@ -91,24 +100,46 @@ impl SoftwareShellRenderer {
                 rounded_clips: placement.rounded_clips,
             });
         }
-        self.renderer
-            .render_composite(
-                &mut self.surface,
-                &layers,
-                frame.extent,
-                render_damage,
-                ColorRgba8 {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                },
-            )
-            .map_err(|error| AppError::new(error.to_string()))?;
+        let output = full_rect(frame.extent);
+        // Cache only the contiguous, full-output bottom layers. Partial, clipped, glass or
+        // moving layers stay on the ordinary compositor path. Scene deltas invalidate pixels.
+        let base_count = frame.placements.iter().take_while(|placement| {
+            matches!(placement.key, ShellLayerKey::Background | ShellLayerKey::Widget(_))
+                && placement.target == output
+                && placement.clip.is_none_or(|clip| clip == output)
+                && placement.rounded_clips.iter().all(Option::is_none)
+                && !frame.glass.contains_key(&placement.scene)
+                && !frame.frame_borders.contains_key(&placement.scene)
+        }).count();
+        if base_count == 0 {
+            self.backdrop = None;
+            self.renderer.render_composite(&mut self.surface, &layers, frame.extent,
+                frame.damage, ColorRgba8::rgba(0, 0, 0, 255))
+                .map_err(|error| AppError::new(error.to_string()))?;
+        } else {
+            let placements = &frame.placements[..base_count];
+            let stale = self.backdrop.as_ref().is_none_or(|cached| {
+                cached.pixels.framebuffer_extent() != frame.extent
+                    || cached.placements != placements
+                    || frame.updates.iter().any(|update| {
+                        placements.iter().any(|placement| placement.scene == update.key)
+                    })
+            });
+            if stale {
+                let mut pixels = SoftwareSurface::default();
+                self.renderer.render_composite(&mut pixels, &layers[..base_count], frame.extent,
+                    None, ColorRgba8::rgba(0, 0, 0, 255))
+                    .map_err(|error| AppError::new(error.to_string()))?;
+                self.backdrop = Some(Backdrop { placements: placements.to_vec(), pixels });
+            }
+            self.renderer.render_composite_over(&mut self.surface, &layers[base_count..],
+                frame.extent, frame.damage, &self.backdrop.as_ref().unwrap().pixels)
+                .map_err(|error| AppError::new(error.to_string()))?;
+        }
         for scene in self.scenes.values_mut() {
             scene.discard_pending_damage();
         }
-        Ok(render_damage.unwrap_or_else(|| full_rect(frame.extent)))
+        Ok(copy_damage.unwrap_or_else(|| full_rect(frame.extent)))
     }
 
     fn render_motion(&mut self, motion: &super::super::motion::MotionFrame) -> AppResult<()> {
@@ -230,3 +261,6 @@ impl SoftwareShellRenderer {
 
 #[cfg(test)]
 mod motion_tests;
+
+#[cfg(test)]
+mod backdrop_tests;

@@ -43,6 +43,9 @@ document only when requested or when a lasting architectural decision needs to b
 ## Efficient implementation workflow
 
 - Inspect the working tree and preserve unrelated user changes.
+- Implement fixes in this source checkout. Generated snapshots, temporary copies and build
+  directories are outputs, never the sole home of an implementation. Carry a useful experiment
+  back into its owning source files before rebuilding, testing or reporting it complete.
 - Read the affected implementation and its direct callers, then complete a coherent change before
   running checks. Do not compile or test after each small edit.
 - Reuse established patterns and dependencies where suitable. Avoid unrelated cleanup, broad
@@ -65,7 +68,7 @@ until a relevant change invalidates it.
 | Deterministic logic or bug fix | Use an existing focused test; add a small regression test when it meaningfully verifies behavior |
 | Public API, feature gates, cross-module integration | Narrow compile/test targets covering the changed contract |
 | Unsafe code, resource lifetime, synchronization, authorization | Targeted verification of the affected invariant; broaden only when evidence requires it |
-| Visual, device, compositor, or media interoperability | Compile or deterministic checks where useful; leave live qualification to the user |
+| Visual, device, compositor, or media interoperability | Focused deterministic checks plus the affected behavior in the distro development VM when available; leave physical hardware qualification to the user |
 
 - Do not write tests that merely mirror the implementation, verify trivial assignments, or exist only
   to accompany every addition. Prefer tests with observable outcomes and meaningful failure cases.
@@ -81,9 +84,19 @@ until a relevant change invalidates it.
 
 ## User-run testing and scope
 
-Leave GUI applications, compositor sessions, device interaction, services, and background processes
-to the user unless explicitly asked to run them. When useful, provide a short manual check describing
-the changed behavior and expected result. Avoid exhaustive testing checklists unless requested.
+For desktop changes tested in a distro workspace, edit this repository's source and use the
+outer distro Python pipeline to build and install packages into a private development VM:
+`python3 build.py deploy <packages> --name <vm> --build-profile release` from the distro root.
+The pipeline snapshots the source, verifies transferred packages, installs with guest pacman and
+checks versions. Rebuild/deploy every application affected by a framework change. Test the actual
+interaction after installation and retain its package/source identities and observations under
+the distro's `out/`. Do not copy standalone binaries into package-owned guest paths or edit frozen
+build inputs. See the distro's `docs/build.md` for development VM setup and session restart behavior.
+
+Use a separate named VM to preserve user work. These guest tests do not authorize host services,
+physical device changes, or unrequested interaction with the user's desktop. If the VM or pipeline
+is unavailable, report that limitation and provide a short manual check; do not call compilation
+or installation a successful runtime test.
 
 Do not modify system configuration, install dependencies globally, or change adjacent repositories
 as incidental setup. Keep generated work and build outputs in their intended locations.

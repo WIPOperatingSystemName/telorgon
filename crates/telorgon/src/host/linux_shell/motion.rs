@@ -8,6 +8,7 @@ pub(super) mod geometry;
 mod image;
 mod admission;
 mod timing;
+mod shadow;
 pub(super) use image::{SnapshotInput, image_scene, position_images};
 use geometry::GeometryTrack;
 
@@ -155,7 +156,7 @@ pub(super) struct WindowMotionController {
     closing: BTreeMap<u32, ClosingWindow>,
     next_id: u64,
     widget_opacities: BTreeMap<u32, f32>,
-    shadows: Option<super::scene::ShellComposition>,
+    shadows: Option<shadow::Shadows>,
 }
 fn next_id(next: &mut u64) -> u64 {
     *next = next.checked_add(1).expect("motion identity exhausted");
@@ -388,8 +389,18 @@ impl WindowMotionController {
             .filter(|id| states.contains_key(id) && self.presented.insert(*id))
             .collect();
         if preference == MotionPreference::Reduced {
+            // Previously presented snapshots may differ from the underlying scenes.
+            // Restore those pixels when cancelling motion, even without a scene delta.
+            if self.windows.values().any(|visual| visual.last_output.is_some())
+                || !self.closing.is_empty()
+            {
+                frame.damage = None;
+            }
             self.windows.clear();
             self.closing.clear();
+            if let Some(shadows) = &mut self.shadows {
+                shadows.synchronize(frame, Vec::new());
+            }
             return;
         }
         self.windows
@@ -471,7 +482,7 @@ impl WindowMotionController {
                     x: outer.x.round() as i32,
                     y: outer.y.round() as i32,
                 };
-                if let Some(layer) = motion_shadow(*id, instance, position) {
+                if let Some(layer) = shadow::layer(*id, instance, position) {
                     shadow_orders.insert(layer.key, order);
                     shadow_layers.push(layer);
                 }
@@ -867,7 +878,7 @@ impl WindowMotionController {
                     y: visual_outer.y,
                 };
                 visual.last_shadow = Some((instance.clone(), position));
-                if let Some(layer) = motion_shadow(id, instance, position) {
+                if let Some(layer) = shadow::layer(id, instance, position) {
                     shadow_orders.insert(layer.key, visual.order);
                     shadow_layers.push(layer);
                 }
@@ -939,19 +950,11 @@ impl WindowMotionController {
             // Motion changes can uncover any underlying layer, including shadows.
             frame.damage = None;
         }
-        let shadow_frame = self
-            .shadows
-            .get_or_insert_with(|| super::scene::ShellComposition::new(frame.extent))
-            .synchronize_with_force(frame.extent, shadow_layers, true)
-            .expect("forced shadow frame");
-        if shadow_frame.damage.is_some() || !shadow_frame.updates.is_empty() {
-            // Include old shadow pixels when changing/removing the independent placement.
-            frame.damage = None;
-        }
-        frame.updates.extend(shadow_frame.updates);
-        frame.live_scenes.extend(shadow_frame.live_scenes);
+        let shadow_placements = self.shadows
+            .get_or_insert_with(|| shadow::Shadows::new(frame.extent))
+            .synchronize(frame, shadow_layers);
         // Insert before the corresponding window, preserving the family stacking order.
-        for placement in shadow_frame.placements {
+        for placement in shadow_placements {
             let index = shadow_orders[&placement.key];
             let position = outputs
                 .iter()
@@ -973,19 +976,6 @@ impl WindowMotionController {
         placements.extend(outputs.map(|(_, p)| p));
         frame.placements = placements;
     }
-}
-
-fn motion_shadow(
-    id: u32,
-    instance: crate::graphics::render::BoxInstance,
-    position: crate::foundation::PointI,
-) -> Option<super::scene::ShellLayer> {
-    let mut layer = super::scene::ShellLayer::frame_shadow(id, instance, position)?;
-    layer.key = ShellLayerKey::MotionShadow(id);
-    if let super::scene::ShellLayerContent::Decoration { scene, .. } = &mut layer.content {
-        *scene = ShellSceneKey::MotionShadow(id);
-    }
-    Some(layer)
 }
 
 

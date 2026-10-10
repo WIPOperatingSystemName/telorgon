@@ -3,6 +3,9 @@ use crate::graphics::render::{BatchKey, ClipId, PipelineKind, RenderScene, Round
 use crate::graphics::scene::NodeId;
 use crate::ui::CornerRadii;
 
+mod partial;
+mod performance;
+
 #[test]
 fn frame_border_survives_opaque_and_translucent_controls() {
     let extent = SizeI {

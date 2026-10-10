@@ -12,29 +12,13 @@ pub(super) fn encode_target_channel(value: f32, color_space: ColorSpace) -> u8 {
     let value = value.clamp(0.0, 1.0);
     match color_space {
         ColorSpace::Linear => (value * 255.0).round().clamp(0.0, 255.0) as u8,
-        ColorSpace::Srgb => {
-            #[cfg(target_os = "uefi")]
-            {
-                uefi::encode_clamped(value)
-            }
-            #[cfg(not(target_os = "uefi"))]
-            {
-                reference_encode_clamped(value)
-            }
-        }
+        ColorSpace::Srgb => cached::encode_clamped(value),
         ColorSpace::Extended | ColorSpace::BackendDefined => unreachable!("validated color space"),
     }
 }
 
 pub(super) fn srgb_decode_byte(value: u8) -> f32 {
-    #[cfg(target_os = "uefi")]
-    {
-        uefi::decode_byte(value)
-    }
-    #[cfg(not(target_os = "uefi"))]
-    {
-        reference_decode_byte(value)
-    }
+    cached::decode_byte(value)
 }
 
 fn reference_decode_byte(value: u8) -> f32 {
@@ -58,10 +42,9 @@ fn reference_encode_clamped(value: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-// The reference path remains the desktop implementation. UEFI's soft-float ABI makes repeating
-// powf for every pixel expensive, so cache exact byte decoding and encoding decision boundaries.
-#[cfg(any(target_os = "uefi", test))]
-mod uefi {
+// Reuse exact byte decoding and encoding decision boundaries on every software backend.
+// Values near an encoding boundary still use the reference formula to preserve byte rounding.
+mod cached {
     use std::sync::OnceLock;
 
     use super::{reference_decode_byte, reference_decode_unit, reference_encode_clamped};

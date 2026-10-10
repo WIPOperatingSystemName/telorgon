@@ -15,3 +15,7 @@ pub mod tray;
 pub mod screen_brightness;
 
 pub mod network;
+
+pub mod display;
+#[cfg(all(feature = "desktop-settings-linux", target_os = "linux"))]
+pub mod desktop_settings;
