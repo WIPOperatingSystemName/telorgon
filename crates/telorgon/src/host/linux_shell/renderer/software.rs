@@ -1,4 +1,3 @@
-use crate::host::linux_shell::motion::{SnapshotInput, position_images};
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::foundation::{ColorRgba8, RectI};
@@ -9,12 +8,15 @@ use crate::graphics::renderers::software::{
 
 use super::super::geometry::{accumulated_damage, full_rect};
 use super::super::scene::{ShellFrame, ShellLayerKey, ShellPlacement, ShellSceneKey};
+mod motion;
 use crate::host::application::{AppError, AppResult};
 
 pub(in crate::host::linux_shell) struct SoftwareShellRenderer {
     renderer: SoftwareRenderer,
     scenes: BTreeMap<ShellSceneKey, SoftwareScene>,
-    motion_snapshots: BTreeMap<u64, SoftwareSurface>,
+    motion_snapshots: BTreeMap<u64, crate::graphics::render::ImageResource>,
+    motion_mixes: BTreeMap<u64, motion::Mix>,
+    motion_outputs: BTreeMap<u64, motion::Output>,
     surface: SoftwareSurface,
     backdrop: Option<Backdrop>,
     content_version: u64,
@@ -38,6 +40,8 @@ impl SoftwareShellRenderer {
             renderer: SoftwareRenderer,
             scenes: BTreeMap::new(),
             motion_snapshots: BTreeMap::new(),
+            motion_mixes: BTreeMap::new(),
+            motion_outputs: BTreeMap::new(),
             surface: SoftwareSurface::default(),
             backdrop: None,
             content_version: 0,
@@ -140,114 +144,6 @@ impl SoftwareShellRenderer {
             scene.discard_pending_damage();
         }
         Ok(copy_damage.unwrap_or_else(|| full_rect(frame.extent)))
-    }
-
-    fn render_motion(&mut self, motion: &super::super::motion::MotionFrame) -> AppResult<()> {
-        use super::super::motion::SnapshotContent;
-        for command in &motion.snapshots {
-            let mut surface = SoftwareSurface::default();
-            match &command.content {
-                SnapshotContent::Capture(placements) => {
-                    let layers = placements
-                        .iter()
-                        .map(|p| {
-                            Ok(SoftwareCompositeLayer {
-                                scene: self.scenes.get(&p.scene).ok_or_else(|| {
-                                    AppError::new(format!(
-                                        "motion capture {} scene {:?} missing (layer {:?})",
-                                        command.id, p.scene, p.key
-                                    ))
-                                })?,
-                                target: p.target,
-                                clip: p.clip,
-                                rounded_clips: p.rounded_clips,
-                            })
-                        })
-                        .collect::<AppResult<Vec<_>>>()?;
-                    self.renderer
-                        .render_composite(
-                            &mut surface,
-                            &layers,
-                            command.extent,
-                            None,
-                            ColorRgba8::rgba(0, 0, 0, 0),
-                        )
-                        .map_err(|e| AppError::new(e.to_string()))?;
-                }
-                SnapshotContent::Mix(inputs) => {
-                    let scene = self.sample_motion_scene(command.extent, inputs, true)?;
-                    self.renderer
-                        .render_composite(
-                            &mut surface,
-                            &[SoftwareCompositeLayer {
-                                scene: &scene,
-                                target: full_rect(command.extent),
-                                clip: None,
-                                rounded_clips: [None; 2],
-                            }],
-                            command.extent,
-                            None,
-                            ColorRgba8::rgba(0, 0, 0, 0),
-                        )
-                        .map_err(|e| AppError::new(e.to_string()))?;
-                }
-            }
-            self.motion_snapshots.insert(command.id, surface);
-        }
-        for output in &motion.outputs {
-            let scene =
-                self.sample_motion_scene(output.extent, &[(output.source, output.opacity).into()], false)?;
-            self.scenes.insert(ShellSceneKey::Motion(output.id), scene);
-        }
-        self.motion_snapshots
-            .retain(|id, _| motion.live.contains(id));
-        Ok(())
-    }
-    fn sample_motion_scene(
-        &self,
-        extent: crate::foundation::SizeI,
-        inputs: &[SnapshotInput],
-        additive: bool,
-    ) -> AppResult<SoftwareScene> {
-        use crate::graphics::render::{
-            ImageAlphaMode, ImageColorEncoding, ImageId, ImagePixelFormat, ImageResource,
-        };
-        let images = inputs
-            .iter()
-            .enumerate()
-            .map(|(i, input)| (ImageId(i as u32 + 1), input.weight))
-            .collect::<Vec<_>>();
-        let mut source = super::super::motion::image_scene(extent, &images, additive);
-        position_images(&mut source, inputs);
-        for (input, (image, _)) in inputs.iter().zip(images) {
-            let snapshot = &input.id;
-            let pixels = self
-                .motion_snapshots
-                .get(snapshot)
-                .ok_or_else(|| AppError::new("motion snapshot missing"))?;
-            source
-                .set_image_resource(ImageResource {
-                    image,
-                    content_version: 1,
-                    extent: pixels.framebuffer_extent(),
-                    color_encoding: ImageColorEncoding::Srgb,
-                    alpha_mode: ImageAlphaMode::Premultiplied,
-                    pixel_format: ImagePixelFormat::Rgba8,
-                    pixels: pixels.pixels_rgba8().into(),
-                })
-                .map_err(|e| AppError::new(e.to_string()))?;
-        }
-        let mut scene = self
-            .renderer
-            .create_scene()
-            .map_err(|e| AppError::new(e.to_string()))?;
-        self.renderer
-            .apply_scene_delta(
-                &mut scene,
-                &source.take_delta().expect("new motion image scene"),
-            )
-            .map_err(|e| AppError::new(e.to_string()))?;
-        Ok(scene)
     }
 
     pub(super) fn pixels(&self) -> &[u8] {

@@ -6,10 +6,24 @@ pub(in crate::host::linux_shell) fn image_scene(
     inputs: &[(crate::graphics::render::ImageId, f32)],
     additive: bool,
 ) -> crate::graphics::render::RenderScene {
+    let mut scene = crate::graphics::render::RenderScene::default();
+    update_image_scene(&mut scene, extent, inputs, additive);
+    scene
+}
+
+pub(in crate::host::linux_shell) fn update_image_scene(
+    scene: &mut crate::graphics::render::RenderScene,
+    extent: SizeI,
+    inputs: &[(crate::graphics::render::ImageId, f32)],
+    additive: bool,
+) {
     use crate::foundation::{ColorRgba8, RectF, SizeF};
     use crate::graphics::render::*;
     use crate::graphics::scene::NodeId;
-    let mut scene = RenderScene::default();
+    for index in inputs.len()..scene.images.len() {
+        scene.images.remove(NodeId::new(index as u32 + 1, 1));
+        scene.remove_image_resource(ImageId(index as u32 + 1));
+    }
     scene.extent = SizeF {
         width: extent.width as f32,
         height: extent.height as f32,
@@ -56,7 +70,6 @@ pub(in crate::host::linux_shell) fn image_scene(
         });
     }
     scene.set_draw_order(order);
-    scene
 }
 
 /// Snapshot bounds in units of the window geometry, independent of shadow padding.
@@ -72,7 +85,7 @@ pub(super) fn relative_bounds(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::host::linux_shell) struct SnapshotInput {
     pub id: u64,
     pub weight: f32,

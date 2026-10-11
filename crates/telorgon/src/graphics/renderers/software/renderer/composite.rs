@@ -231,7 +231,7 @@ impl SoftwareRenderer {
             color_encoding: ImageColorEncoding::Srgb,
             alpha_mode: ImageAlphaMode::Premultiplied,
             pixel_format: ImagePixelFormat::Rgba8,
-            pixels: surface.framebuffer_rgba8,
+            pixels: surface.framebuffer_rgba8.into(),
         };
         // Interior normalization was resolved in the source; output clips apply once here.
         target.coverage_normalization = None;

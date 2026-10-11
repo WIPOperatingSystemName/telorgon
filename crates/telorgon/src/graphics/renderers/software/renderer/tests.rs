@@ -156,7 +156,7 @@ fn image_tint_recolors_the_source_alpha_mask() {
         color_encoding: ImageColorEncoding::Srgb,
         alpha_mode: ImageAlphaMode::Straight,
         pixel_format: ImagePixelFormat::Rgba8,
-        pixels: vec![0, 0, 0, 255],
+        pixels: vec![0, 0, 0, 255].into(),
     };
     let instance = ImageInstance {
         node,
