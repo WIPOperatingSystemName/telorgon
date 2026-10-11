@@ -386,7 +386,7 @@ mod flat_tests {
                 let image = SoftwareImage {
                     extent: SizeI { width: 80, height: 80 }, color_encoding: ImageColorEncoding::Srgb,
                     alpha_mode: alpha, pixel_format: format,
-                    pixels: [18, 27, 41, 150].repeat(80 * 80),
+                    pixels: [18, 27, 41, 150].repeat(80 * 80).into(),
                 };
                 let rect = RectF { x: 0.0, y: 0.0, width: 80.0, height: 80.0 };
                 let instance = ImageInstance {

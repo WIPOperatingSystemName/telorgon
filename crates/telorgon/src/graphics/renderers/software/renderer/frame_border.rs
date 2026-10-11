@@ -67,6 +67,7 @@ impl SoftwareScene {
             let height = extent.height as usize;
             let interior = &mut cache.interior.image_resources
                 .get_mut(&frame_border::IMAGE).unwrap().pixels;
+            let interior = Arc::make_mut(interior);
             clear_region(interior, width, height, region,
                 ColorRgba8::rgba(0, 0, 0, 0), ColorSpace::Srgb);
             self.draw_region(&mut RasterTarget {
@@ -78,6 +79,7 @@ impl SoftwareScene {
 
             let output = &mut cache.output.image_resources
                 .get_mut(&frame_border::IMAGE).unwrap().pixels;
+            let output = Arc::make_mut(output);
             clear_region(output, width, height, region,
                 ColorRgba8::rgba(0, 0, 0, 0), ColorSpace::Srgb);
             let mut target = RasterTarget {

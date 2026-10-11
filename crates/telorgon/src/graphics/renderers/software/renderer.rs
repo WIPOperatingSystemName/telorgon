@@ -17,6 +17,9 @@ mod frame_border;
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
+mod image_mix;
+mod image_resources;
 
 use crate::foundation::{ColorRgba8, RectF, RectI, SizeF, SizeI};
 
@@ -36,7 +39,7 @@ struct SoftwareImage {
     color_encoding: ImageColorEncoding,
     alpha_mode: ImageAlphaMode,
     pixel_format: ImagePixelFormat,
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +47,7 @@ pub struct SoftwareRenderer;
 
 #[derive(Clone, Debug, Default)]
 pub struct SoftwareScene {
+    image_mix_opacity: Option<f32>,
     frame_border: Option<BoxInstance>,
     #[cfg(any(target_os = "linux", test))]
     frame_cache: std::sync::Arc<std::sync::Mutex<Option<frame_border::FrameCache>>>,
@@ -142,49 +146,7 @@ impl RenderBackend for SoftwareRenderer {
                     .copy_from_slice(&page.pixels_a8[source..source + page.width as usize]);
             }
         }
-        for update in &delta.image_resources {
-            match update {
-                ImageResourceDelta::Write(update) => {
-                    let image = scene
-                        .image_resources
-                        .entry(update.image)
-                        .or_insert_with(|| SoftwareImage {
-                            extent: update.extent,
-                            color_encoding: update.color_encoding,
-                            alpha_mode: update.alpha_mode,
-                            pixel_format: update.pixel_format,
-                            pixels: vec![
-                                0;
-                                update.extent.width as usize
-                                    * update.extent.height as usize
-                                    * 4
-                            ],
-                        });
-                    if image.extent != update.extent || image.pixel_format != update.pixel_format {
-                        image.extent = update.extent;
-                        image.pixel_format = update.pixel_format;
-                        image.pixels.resize(
-                            update.extent.width as usize * update.extent.height as usize * 4,
-                            0,
-                        );
-                    }
-                    image.color_encoding = update.color_encoding;
-                    image.alpha_mode = update.alpha_mode;
-                    let destination_stride = update.extent.width as usize * 4;
-                    let copy_bytes = update.rect.width as usize * 4;
-                    for row in 0..update.rect.height as usize {
-                        let source = row * update.row_bytes;
-                        let target = (update.rect.y as usize + row) * destination_stride
-                            + update.rect.x as usize * 4;
-                        image.pixels[target..target + copy_bytes]
-                            .copy_from_slice(&update.pixels[source..source + copy_bytes]);
-                    }
-                }
-                ImageResourceDelta::Remove(image) => {
-                    scene.image_resources.remove(image);
-                }
-            }
-        }
+        scene.apply_image_resources(&delta.image_resources);
         for update in &delta.material_resources {
             match update {
                 MaterialResourceDelta::Upsert(resource) => {
@@ -333,6 +295,10 @@ impl SoftwareSurface {
         &self.framebuffer_rgba8
     }
 
+    pub(crate) fn into_pixels_rgba8(self) -> Arc<[u8]> {
+        self.framebuffer_rgba8.into()
+    }
+
     pub fn presented_damage(&self) -> &DamageRegion {
         &self.presented_damage
     }
@@ -461,6 +427,10 @@ impl SoftwareScene {
     }
 
     fn draw_region(&self, target: &mut RasterTarget<'_>, region: RectF) {
+        if let Some(opacity) = self.image_mix_opacity {
+            image_mix::draw(self, opacity, target, region);
+            return;
+        }
         for item in &self.draw_order {
             target.blend_mode = item.batch.blend;
             let item_clip = self

@@ -9,7 +9,8 @@ mod image;
 mod admission;
 mod timing;
 mod shadow;
-pub(super) use image::{SnapshotInput, image_scene, position_images};
+mod damage;
+pub(super) use image::{SnapshotInput, image_scene, position_images, update_image_scene};
 use geometry::GeometryTrack;
 
 #[derive(Clone, Debug)]
@@ -157,6 +158,7 @@ pub(super) struct WindowMotionController {
     next_id: u64,
     widget_opacities: BTreeMap<u32, f32>,
     shadows: Option<shadow::Shadows>,
+    damage: damage::MotionDamage,
 }
 fn next_id(next: &mut u64) -> u64 {
     *next = next.checked_add(1).expect("motion identity exhausted");
@@ -205,6 +207,7 @@ impl WindowMotionController {
     /// Forget captures and input transforms after immediate presentation. Preserve monotonic
     /// snapshot IDs and retained shadow epochs so the next frame can safely publish fresh data.
     pub(super) fn reset_after_fallback(&mut self) {
+        self.damage = damage::MotionDamage::default();
         self.inputs.clear();
         self.closing.clear();
         for visual in self.windows.values_mut() {
@@ -381,7 +384,6 @@ impl WindowMotionController {
     ) {
         frame.motion.fallback = frame.placements.clone();
         self.inputs.clear();
-        let was_active = self.active(sample_now);
         self.presented.retain(|id| states.contains_key(id));
         // Keep first presentation separate from transient capture eviction and reduced motion.
         let first_presentations: BTreeSet<_> = frame.placements.iter()
@@ -389,18 +391,12 @@ impl WindowMotionController {
             .filter(|id| states.contains_key(id) && self.presented.insert(*id))
             .collect();
         if preference == MotionPreference::Reduced {
-            // Previously presented snapshots may differ from the underlying scenes.
-            // Restore those pixels when cancelling motion, even without a scene delta.
-            if self.windows.values().any(|visual| visual.last_output.is_some())
-                || !self.closing.is_empty()
-            {
-                frame.damage = None;
-            }
             self.windows.clear();
             self.closing.clear();
             if let Some(shadows) = &mut self.shadows {
                 shadows.synchronize(frame, Vec::new());
             }
+            self.damage.synchronize(frame);
             return;
         }
         self.windows
@@ -822,11 +818,10 @@ impl WindowMotionController {
                 && !visual.geometry.active(sample_now)
                 && !visual.content.active(sample_now)
             {
-                // Publish the unclipped resting state in the final fully damaged frame.
+                // Publish the unclipped resting state in the final damaged frame.
                 // Clearing this after emitting the placement leaves the shadow clipped until
                 // a later partial hover repaint, making scanout slots disagree outside it.
                 visual.placement_handoff = false;
-                frame.damage = None;
             }
             if state.tiled.is_some() && state.interactive && state.veiled {
                 visual.shared_resize = true;
@@ -946,10 +941,6 @@ impl WindowMotionController {
                 visual.drag_restore = false;
             }
         }
-        if was_active || self.active(sample_now) {
-            // Motion changes can uncover any underlying layer, including shadows.
-            frame.damage = None;
-        }
         let shadow_placements = self.shadows
             .get_or_insert_with(|| shadow::Shadows::new(frame.extent))
             .synchronize(frame, shadow_layers);
@@ -975,6 +966,7 @@ impl WindowMotionController {
         }
         placements.extend(outputs.map(|(_, p)| p));
         frame.placements = placements;
+        self.damage.synchronize(frame);
     }
 }
 

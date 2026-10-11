@@ -216,7 +216,9 @@ fn close_fades_last_image_without_input_and_retires_on_the_final_frame() {
         "request the final clearing frame"
     );
     let end = h.draw(110_000_000, BLUE, false, false);
-    assert!(end.damage.is_none());
+    let previous = middle.placements.last().unwrap().target;
+    assert!(end.damage.is_some_and(|damage|
+        crate::host::linux_shell::geometry::intersect_rect(damage, previous) == Some(previous)));
     assert!(end.motion.outputs.is_empty());
     assert!(end.motion.live.is_empty());
     assert!(!h.motion.active(110_000_000));
@@ -626,10 +628,7 @@ fn opaque_motion_crossfade_never_exposes_background_and_settles() {
         "desktop green must not leak through the crossfade"
     );
     let snapshot = frame.motion.outputs[0].source;
-    assert_eq!(
-        h.renderer.motion_snapshots[&snapshot].pixels_rgba8()[3],
-        255
-    );
+    assert!(h.renderer.motion_mixes.contains_key(&snapshot));
     assert!(
         h.motion.active(100_000_001),
         "one final sample must still be requested"
@@ -787,10 +786,10 @@ fn maximize_fades_before_growth_and_holds_early_ready_content() {
         h.state.veiled = false;
         h.draw(800_000_001, RED, false, false);
         let settled = h.draw(930_000_001, RED, false, false);
-        assert_eq!(
-            settled.damage, None,
-            "restore completion must repaint all scanout slots"
-        );
+        let restored = settled.placements.last().unwrap().target;
+        assert!(settled.damage.is_some_and(|damage|
+            crate::host::linux_shell::geometry::intersect_rect(damage, restored) == Some(restored)),
+            "restore completion must repaint the restored visual bounds");
         assert_eq!(
             settled.placements.last().unwrap().rounded_clips,
             [None; 2],
@@ -986,3 +985,6 @@ fn reduced_motion_cancels_snapshots_and_preserves_placeholder() {
 
 #[path = "opening_tests.rs"]
 mod opening_tests;
+
+#[path = "motion_optimization_tests.rs"]
+mod optimization_tests;
