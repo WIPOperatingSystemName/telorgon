@@ -79,6 +79,8 @@ pub struct LinuxShellConfig {
     /// Startup keymap published to clients of the managed desktop seat.
     pub keyboard: KeyboardConfig,
     pub socket_name: Option<String>,
+    #[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
+    pub client_sessions: Option<super::WaylandSessionControl>,
     pub session: crate::services::session::SessionConfig,
     /// All compositor geometry uses logical units; this selects pixels per logical unit.
     pub output_scale: super::OutputScale,
@@ -120,6 +122,8 @@ impl Default for LinuxShellConfig {
             seat_name: "seat0".to_owned(),
             keyboard: KeyboardConfig::default(),
             socket_name: None,
+            #[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
+            client_sessions: None,
             session: crate::services::session::SessionConfig::default(),
             output_scale: super::OutputScale::Auto,
             display_control: None,
