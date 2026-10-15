@@ -543,8 +543,8 @@ impl Running {
         }
         if phase == SessionPhase::Ready
             && !self.retry_suppressed
-            && !status.success()
-            && self.command.spec.restart == RestartPolicy::OnFailure
+            && (self.command.spec.restart == RestartPolicy::OnExit
+                || (!status.success() && self.command.spec.restart == RestartPolicy::OnFailure))
             && self.retries < 3
         {
             self.restart_at = Some(Instant::now() + Duration::from_secs(1 << self.retries));
@@ -640,6 +640,7 @@ pub(crate) struct SessionOwner {
 }
 
 impl SessionOwner {
+    pub(crate) fn handle(&self) -> SessionHandle { self.handle.clone() }
     pub(crate) fn start(env: Environment, config: SessionConfig) -> Result<Self> {
         Self::start_impl(env, config, false, false)
     }

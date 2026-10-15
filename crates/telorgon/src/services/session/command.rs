@@ -19,6 +19,9 @@ pub enum RestartPolicy {
     /// Retry unsuccessful exits at most three times, with 1/2/4 second backoff. Successful exits
     /// are never restarted. This is opt-in for commands and the default for applications.
     OnFailure,
+    /// Retry any exit at most three times with 1/2/4 second backoff. Useful for
+    /// session services that exit successfully when their server disconnects.
+    OnExit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

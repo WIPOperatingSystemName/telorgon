@@ -161,6 +161,11 @@ impl ApplicationCatalog {
         self.roots = roots.into_iter().filter(|p| p.is_absolute()).collect();
         self
     }
+    /// Read application metadata once in the calling user's session, without
+    /// starting a graphical host or an icon-cache worker.
+    pub fn snapshot(&self) -> Result<Vec<ApplicationMetadata>, String> {
+        self.memory.clone().map(Ok).unwrap_or_else(|| discover(self))
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 struct CatalogSnapshot {

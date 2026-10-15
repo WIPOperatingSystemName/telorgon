@@ -47,6 +47,7 @@ use crate::host::application::{
 // Keep this root focused on assembling resources and running the single Wayland/KMS owner loop.
 // Each stateful or policy-heavy subsystem below owns its own invariants and focused tests.
 mod client;
+mod client_sessions;
 mod capture;
 mod capture_direct;
 #[cfg(feature = "shell-screencast-linux")]
@@ -390,6 +391,8 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
     // source with it so input, seat changes, DRM flips, and GPU completions wake the same owner
     // thread without a fixed Wayland-only sleep.
     let runtime_wake = EventNotifier::new("desktop runtime wake")?;
+    let mut client_sessions = config.client_sessions.clone()
+        .map(|control| client_sessions::ClientSessions::new(control, runtime_wake.clone()));
     #[cfg(all(feature = "shell-xwayland", target_env = "gnu"))]
     let mut compatibility: Option<compatibility::Compatibility> = None;
     #[cfg(all(feature = "shell-xwayland-embedded", target_env = "gnu"))]
@@ -746,6 +749,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         connector, mode_index, scale_policy, output_scale.get(), &runtime_wake);
 
     loop {
+        if let Some(clients) = &mut client_sessions { clients.apply(&display); }
         wayland.dispatch_clipboard(session_locked);
         latency_trace.phase("schedule");
         if let (Some(stats), Some(started)) = (&mut frame_stats, owner_stats_start.take()) {
@@ -881,6 +885,7 @@ pub(crate) fn run(application: ReadyShellEnvironment) -> AppResult<()> {
         // Service deadlines may shorten pacing, but known IO must never be delayed.
         let wait = if io_ready { Some(Duration::ZERO) } else { wait };
         display.dispatch_and_flush(wait).map_err(app_error)?;
+        if let Some(clients) = &mut client_sessions { clients.accept(&display); }
         latency_trace.event("client_events_flushed", [0; 4]);
         owner_stats_start = frame_stats.as_ref().map(|_| Instant::now());
         latency_trace.phase("kms_completions");

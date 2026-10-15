@@ -42,6 +42,8 @@ pub use registry::{
     ApplicationHandle, ApplicationRef, ApplicationRegistry, ApplicationSpec, SessionApplications,
 };
 mod supervisor;
+mod host;
+pub use host::SessionHost;
 #[cfg(test)]
 mod tests;
 

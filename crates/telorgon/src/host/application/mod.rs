@@ -9,6 +9,10 @@ mod capture_config;
 pub use capture_config::{Capture, CaptureSources, PortalCapture, PortalSessionIntegration,
     WaylandCapture, CaptureProtocols, DirectCaptureAccess, InternalCapture};
 pub mod display_control;
+#[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
+mod wayland_session;
+#[cfg(all(target_os = "linux", feature = "shell-wayland-linux"))]
+pub use wayland_session::WaylandSessionControl;
 mod output_scale;
 pub use output_scale::OutputScale;
 mod delta_queue;

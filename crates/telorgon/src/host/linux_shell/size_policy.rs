@@ -1,5 +1,6 @@
 //! Shared logical sizing policy. Protocol adapters keep their wire constraints.
 use super::*;
+mod bounds;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SizePolicy {
@@ -86,10 +87,13 @@ pub(super) fn apply(
             height: (outer.height - window.requested_size.height).max(0),
         };
         window.size_policy.preferred = config.preferred_window_minimum;
-        window.size_policy.available = SizeI {
+        let available = SizeI {
             width: (area.width - overhead.width).max(1),
             height: (area.height - overhead.height).max(1),
         };
+        let shrank = available.width < window.size_policy.available.width
+            || available.height < window.size_policy.available.height;
+        window.size_policy.available = available;
         if window.tile.is_none() {
             keep_reachable(window, area, config.titlebar_height);
         }
@@ -104,6 +108,14 @@ pub(super) fn apply(
             continue;
         }
         let size = window.size_policy.resolve(window.requested_size);
+        if shrank {
+            // Reflow only when bounds shrink, preserving intentional movement
+            // and ordinary resize anchors during a stable desktop session.
+            window.position = bounds::fit(window.position, SizeI {
+                width: size.width.saturating_add(overhead.width),
+                height: size.height.saturating_add(overhead.height),
+            }, area);
+        }
         if size == window.requested_size || window.last_policy_request == Some(size) {
             continue;
         }

@@ -263,6 +263,26 @@ fn dropped_handles_are_reaped_and_normal_termination_is_not_a_crash() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn session_services_retry_clean_exits_with_a_limit() {
+    let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let owner = SessionOwner::start(Environment::inherited(), fixture.config()).unwrap();
+    for (policy, expected) in [(RestartPolicy::OnFailure, "x"), (RestartPolicy::OnExit, "xxxx")] {
+        let log = fixture.0.join(format!("clean-{policy:?}"));
+        let child = command("/bin/sh")
+            .args([
+                OsString::from("-c"), OsString::from("printf x >> \"$1\"; exit 0"),
+                OsString::from("test"), log.as_os_str().into(),
+            ])
+            .restart(policy).spawn().unwrap();
+        assert!(wait(child.status()).unwrap().success());
+        assert_eq!(std::fs::read_to_string(log).unwrap(), expected);
+    }
+    owner.close();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn crashed_apps_retry_with_a_limit_and_are_offered_after_restart() {
     let _serial = OWNER_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
